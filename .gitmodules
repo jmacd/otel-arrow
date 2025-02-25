@@ -1,0 +1,3 @@
+[submodule "rust/one-collect"]
+	path = rust/one-collect
+	url = git@github.com:microsoft/one-collect.git
