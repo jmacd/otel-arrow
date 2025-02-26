@@ -1,21 +1,26 @@
 // This example begins with a copy of ../beaubourg/src/examples/thread_per_core_engine_example.rs
 
-use beaubourg::{engine::Engine, task::labels::ProcessLabels};
-use engine::thread_per_core;
-use mimalloc_rust::GlobalMiMalloc;
-use tracing::Level;
-use tracing_subscriber::FmtSubscriber;
+use beaubourg::{
+    engine::Engine,
+    engine::thread_per_core,
+    task::labels::ProcessLabels,
+};
 
-use crate::{exporter::TestExporterFactory, processor::TestProcessorFactory, receiver::TestReceiverFactory};
-
+mod common;
 mod exporter;
 mod processor;
 mod receiver;
 
-#[global_allocator]
-static GLOBAL_MIMALLOC: GlobalMiMalloc = GlobalMiMalloc;
+use crate::{
+    exporter::TestExporterFactory,
+    processor::TestProcessorFactory,
+    receiver::TestReceiverFactory,
+};
 
-fn main() -> Result<()> {
+use tracing::Level;
+use tracing_subscriber::FmtSubscriber;
+
+fn main() -> Result<(), anyhow::Error> {
     init()?;
 
     let mut engine = thread_per_core::Engine::new(
@@ -29,7 +34,7 @@ fn main() -> Result<()> {
 }
 
 /// Initializes the collector
-fn init() -> Result<()> {
+fn init() -> Result<(), anyhow::Error> {
     let subscriber = FmtSubscriber::builder().with_max_level(Level::INFO).finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");

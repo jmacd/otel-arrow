@@ -6,3 +6,11 @@ edition = "2021"
 [dependencies]
 one_collect = { path = "../one-collect/one_collect" }
 beaubourg = { path = "../beaubourg" }
+
+# Questionable dependencies below!
+async-trait = "0.1.52"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.8.23"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
