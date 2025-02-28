@@ -19,6 +19,7 @@ use crate::{
 
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
+use selfish::log;
 
 fn main() -> Result<(), anyhow::Error> {
     init()?;
@@ -35,6 +36,9 @@ fn main() -> Result<(), anyhow::Error> {
 
 /// Initializes the collector
 fn init() -> Result<(), anyhow::Error> {
+    let year = 2025;
+    log!("hello world {}", year);
+
     let subscriber = FmtSubscriber::builder().with_max_level(Level::INFO).finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");

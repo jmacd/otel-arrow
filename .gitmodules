@@ -1,3 +1,6 @@
 [submodule "rust/one-collect"]
 	path = rust/one-collect
 	url = git@github.com:microsoft/one-collect.git
+[submodule "rust/linuxtracepoints"]
+	path = rust/linuxtracepoints
+	url = git@github.com:microsoft/LinuxTracepoints-Rust.git
