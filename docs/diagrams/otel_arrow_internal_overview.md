@@ -3,24 +3,24 @@ flowchart LR
     subgraph "OTel-Arrow Pipeline"
         subgraph "Receivers"
             otlp[OTLP]
-            arrow[Arrow]
+            arrow[OTAP]
             custom_receiver[...]
         end
 
         subgraph "Processors" 
-            batch[Batch]
-            memory_limiter[Memory Limiter]
+		    sample[Sample]
+            transform[Transform]
             custom_processor[...]
         end
 
         subgraph "Exporters"
             otlp_exporter[OTLP]
-            arrow_exporter[Arrow]
+            arrow_exporter[OTAP]
             custom_exporter[...]
         end
 
-        Receivers --> |Arrow Record Batches| Processors
-        Processors --> |Arrow Record Batches| Exporters
+        Receivers }--> |Arrow Record Batches| Processors
+        Processors -->{ |Arrow Record Batches| Exporters
     end
 
     subgraph "Telemetry"
@@ -32,11 +32,13 @@ flowchart LR
     subgraph "Destinations"
         backends[Storage/Analysis Backends]
         vendors[Observability Vendors]
-        custom_destination[Custom Solutions]
+        custom_destination[...]
     end
 
     Telemetry --> Receivers
     Exporters --> Destinations
+```
+
 
     classDef blue fill:#326ce5,stroke:#fff,stroke-width:1px,color:#fff;
     classDef lightblue fill:#4285f4,stroke:#fff,stroke-width:1px,color:#fff;
@@ -45,4 +47,3 @@ flowchart LR
     class Receivers,otlp,arrow,custom_receiver blue;
     class Processors,batch,memory_limiter,custom_processor lightblue;
     class Exporters,otlp_exporter,arrow_exporter,custom_exporter green;
-```
