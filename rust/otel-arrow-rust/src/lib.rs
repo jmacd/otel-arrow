@@ -11,6 +11,7 @@
 // limitations under the License.
 
 #![feature(let_chains)]
+#![feature(test)]
 
 #[allow(dead_code)]
 pub(crate) mod arrays;
@@ -21,8 +22,8 @@ mod otlp;
 mod schema;
 #[cfg(test)]
 mod test_util;
-#[cfg(test)]
-mod validation;
+// Validation module made public for benchmarking
+pub mod validation;
 
 pub mod pdata;
 pub mod proto;

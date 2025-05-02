@@ -120,6 +120,16 @@ impl CollectorProcess {
         collector_path: T,
         config_content: &str,
     ) -> error::Result<Self> {
+        // Call the start_with_env method with no extra environment variables
+        Self::start_with_env(collector_path, config_content, None).await
+    }
+
+    /// Start a collector with the given configuration and environment variables
+    pub async fn start_with_env<T: AsRef<Path>>(
+        collector_path: T,
+        config_content: &str,
+        env_vars: Option<std::collections::HashMap<String, String>>,
+    ) -> error::Result<Self> {
         // Create a unique temporary config file for the collector
         // with a random identifier to prevent collision.
         let random_id = format!("{:016x}", rand::random::<u64>());
@@ -133,10 +143,21 @@ impl CollectorProcess {
         file.write_all(config_content.as_bytes())
             .context(error::InputOutputSnafu { desc: "write" })?;
 
-        // Start the collector process with piped stdout and stderr
-        let mut process = Command::new(collector_path.as_ref())
-            .arg("--config")
-            .arg(&config_path)
+        // Start building the command
+        let mut command = Command::new(collector_path.as_ref());
+        
+        // Add arguments
+        command.arg("--config").arg(&config_path);
+        
+        // Add environment variables if provided
+        if let Some(env_map) = env_vars {
+            for (key, value) in env_map {
+                command.env(key, value);
+            }
+        }
+        
+        // Configure streams and spawn the process
+        let mut process = command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

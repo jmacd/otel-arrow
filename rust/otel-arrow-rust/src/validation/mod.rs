@@ -3,6 +3,7 @@
 
 // This module contains a validation test suite for OTLP and OTAP data.
 
+mod benchmarks;
 mod collector;
 mod error;
 mod otap;
@@ -13,3 +14,5 @@ mod tcp_stream;
 
 #[cfg(test)]
 mod testdata;
+
+pub use benchmarks::run_otlp_round_trip_benchmark;
