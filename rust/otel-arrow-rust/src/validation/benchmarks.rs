@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Barrier;
@@ -34,6 +35,49 @@ const MAX_CONCURRENCY: usize = 100;       // Maximum number of concurrent client
 const TEST_DURATION_SECONDS: u64 = 10;    // Duration of each benchmark test
 const WARMUP_DURATION_SECONDS: u64 = 2;   // Warmup time before measuring throughput
 
+/// Latency tracking for percentile calculations
+struct LatencyTracker {
+    latencies: Vec<f64>, // Latencies in milliseconds
+}
+
+impl LatencyTracker {
+    fn new() -> Self {
+        Self {
+            latencies: Vec::new(),
+        }
+    }
+    
+    fn add_latency(&mut self, latency: Duration) {
+        // Convert duration to milliseconds and store
+        self.latencies.push(latency.as_secs_f64() * 1000.0);
+    }
+    
+    fn calculate_percentile(&self, percentile: f64) -> f64 {
+        if self.latencies.is_empty() {
+            return 0.0;
+        }
+        
+        // Create a sorted copy for percentile calculation
+        let mut sorted = self.latencies.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let index = (percentile / 100.0 * (sorted.len() as f64 - 1.0)) as usize;
+        sorted[index]
+    }
+    
+    fn p50(&self) -> f64 {
+        self.calculate_percentile(50.0)
+    }
+    
+    fn p95(&self) -> f64 {
+        self.calculate_percentile(95.0)
+    }
+    
+    fn p99(&self) -> f64 {
+        self.calculate_percentile(99.0)
+    }
+}
+
 /// Simple statistics collection for benchmark runs
 #[derive(Clone)]
 struct BenchStats {
@@ -48,16 +92,23 @@ struct BenchStats {
 }
 
 impl BenchStats {
-    fn new(throughput: f64, total_requests: usize, errors: usize, threads: usize, clients: usize) -> Self {
-        // In a real implementation, we would calculate actual percentiles
-        // Here we're just providing placeholder values
+    fn new(
+        throughput: f64, 
+        total_requests: usize, 
+        errors: usize, 
+        threads: usize, 
+        clients: usize,
+        p50: f64,
+        p95: f64,
+        p99: f64,
+    ) -> Self {
         Self {
             throughput,
             total_requests,
             errors,
-            latency_p50_ms: 0.0, // placeholder
-            latency_p95_ms: 0.0, // placeholder
-            latency_p99_ms: 0.0, // placeholder
+            latency_p50_ms: p50,
+            latency_p95_ms: p95,
+            latency_p99_ms: p99,
             threads,
             clients,
         }
@@ -210,6 +261,7 @@ async fn request_worker(
     stop_flag: Arc<AtomicBool>,
     request_count: Arc<AtomicUsize>,
     error_count: Arc<AtomicUsize>,
+    latency_tracker: Arc<Mutex<LatencyTracker>>,
 ) -> error::Result<()> {
     // Wait for all workers to be ready before starting
     barrier.wait().await;
@@ -223,6 +275,9 @@ async fn request_worker(
         
         // Use select to either process a request or periodically check if we should stop
         let process_request = async {
+            // Start timing for latency measurement
+            let start_time = Instant::now();
+            
             // Acquire the mutex to use the client with timeout
             let mut client_guard = match tokio::time::timeout(client_timeout, client.lock()).await {
                 Ok(guard) => guard,
@@ -239,7 +294,14 @@ async fn request_worker(
                 OTLPMetricsInputType::send_data(&mut *client_guard, req)
             ).await {
                 Ok(Ok(_)) => {
+                    // Record successful request
                     request_count.fetch_add(1, Ordering::SeqCst);
+                    
+                    // Record latency for successful requests only
+                    let latency = start_time.elapsed();
+                    if let Ok(mut tracker) = latency_tracker.lock() {
+                        tracker.add_latency(latency);
+                    }
                 }
                 Ok(Err(_)) | Err(_) => {
                     error_count.fetch_add(1, Ordering::SeqCst);
@@ -334,6 +396,7 @@ async fn run_concurrency_benchmark(
     let request_count = Arc::new(AtomicUsize::new(0));
     let error_count = Arc::new(AtomicUsize::new(0));
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let latency_tracker = Arc::new(Mutex::new(LatencyTracker::new()));
     
     // Total number of async tasks = threads * clients_per_thread
     let total_clients = threads * clients_per_thread;
@@ -349,6 +412,7 @@ async fn run_concurrency_benchmark(
         let stop_flag_clone = stop_flag.clone();
         let request_count_clone = request_count.clone();
         let error_count_clone = error_count.clone();
+        let latency_tracker_clone = latency_tracker.clone();
         let clients_count = clients_per_thread;
         
         // Spawn a new OS thread with its own Tokio runtime
@@ -369,6 +433,7 @@ async fn run_concurrency_benchmark(
                     let stop_flag_inner = stop_flag_clone.clone();
                     let request_count_inner = request_count_clone.clone();
                     let error_count_inner = error_count_clone.clone();
+                    let latency_tracker_inner = latency_tracker_clone.clone();
                     
                     task_handles.push(tokio::spawn(async move {
                         request_worker(
@@ -377,6 +442,7 @@ async fn run_concurrency_benchmark(
                             stop_flag_inner,
                             request_count_inner,
                             error_count_inner,
+                            latency_tracker_inner,
                         ).await
                     }));
                 }
@@ -414,18 +480,41 @@ async fn run_concurrency_benchmark(
     let errors = error_count.load(Ordering::SeqCst);
     let throughput = total_requests as f64 / elapsed.as_secs_f64();
     
+    // Calculate latency percentiles
+    let (p50, p95, p99) = match latency_tracker.lock() {
+        Ok(tracker) => {
+            (tracker.p50(), tracker.p95(), tracker.p99())
+        },
+        Err(_) => {
+            println!("Warning: Failed to obtain latency tracker lock, using default values");
+            (0.0, 0.0, 0.0)
+        }
+    };
+    
     // Create statistics object
-    let stats = BenchStats::new(throughput, total_requests, errors, threads, clients_per_thread);
+    let stats = BenchStats::new(
+        throughput, 
+        total_requests, 
+        errors, 
+        threads, 
+        clients_per_thread,
+        p50,
+        p95,
+        p99
+    );
     
     // Print statistics
     println!(
-        "Threads: {}, Clients/Thread: {}, Total Clients: {}, Throughput: {:.2} req/s, Requests: {}, Errors: {}", 
+        "Threads: {}, Clients/Thread: {}, Total Clients: {}, Throughput: {:.2} req/s, Requests: {}, Errors: {}, Latency(ms): p50={:.2}, p95={:.2}, p99={:.2}", 
         threads, 
         clients_per_thread,
         threads * clients_per_thread,
         stats.throughput,
         stats.total_requests,
-        stats.errors
+        stats.errors,
+        stats.latency_p50_ms,
+        stats.latency_p95_ms,
+        stats.latency_p99_ms
     );
     
     // Wait for all thread workers to finish with a timeout
@@ -466,17 +555,15 @@ async fn run_concurrency_benchmark(
 pub async fn run_otlp_round_trip_benchmark() -> error::Result<(usize, usize)> {
     println!("Running OTLP Round Trip Benchmark...");
     println!("Finding optimal concurrency configuration with GOMAXPROCS=1");
-    println!("Testing threads=[1-8] and clients=[1-16]");
+    println!("Testing threads=[1-4] and clients=[1-4]");
     
     let mut results = Vec::new();
     let mut max_throughput = 0.0;
     let mut optimal_threads = 1;
     let mut optimal_clients = 1;
     
-    // Define the range of threads and clients to test - up to 16 clients and 8 threads
-    // We'll test fewer combinations to speed up the benchmark
-    let thread_counts = [1, 2, 4, 8]; // Number of OS threads
-    let client_counts = [1, 2, 4, 8, 16]; // Number of async clients per thread
+    let thread_counts = [1, 2, 3, 4]; // Number of OS threads
+    let client_counts = [1, 2, 3, 4]; // Number of async clients per thread
     
     // Run the benchmark for each combination of threads and clients
     for &threads in &thread_counts {
