@@ -28,12 +28,13 @@ use crate::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceReq
 use super::collector::{CollectorProcess, COLLECTOR_PATH, TEST_TIMEOUT_SECONDS};
 use super::error;
 use super::service_type::{self, ServiceInputType};
-use super::otlp::{OTLPMetricsInputType, OTLPMetricsOutputType};
+use super::otlp::OTLPMetricsInputType;
 
 // Configuration settings
 const MAX_CONCURRENCY: usize = 100;       // Maximum number of concurrent clients (threads × clients_per_thread)
 const TEST_DURATION_SECONDS: u64 = 10;    // Duration of each benchmark test
 const WARMUP_DURATION_SECONDS: u64 = 2;   // Warmup time before measuring throughput
+const REQUEST_TIMEOUT_MS: u64 = 500;      // Timeout for individual requests in milliseconds
 
 /// Latency tracking for percentile calculations
 struct LatencyTracker {
@@ -84,6 +85,7 @@ struct BenchStats {
     throughput: f64,
     total_requests: usize,
     errors: usize,
+    error_rate: f64,      // Error rate as a percentage (errors / (total_requests + errors) * 100)
     latency_p50_ms: f64,
     latency_p95_ms: f64,
     latency_p99_ms: f64,
@@ -102,10 +104,18 @@ impl BenchStats {
         p95: f64,
         p99: f64,
     ) -> Self {
+        // Calculate error rate as a percentage
+        let error_rate = if total_requests + errors > 0 {
+            (errors as f64 / (total_requests + errors) as f64) * 100.0
+        } else {
+            0.0
+        };
+        
         Self {
             throughput,
             total_requests,
             errors,
+            error_rate,
             latency_p50_ms: p50,
             latency_p95_ms: p95,
             latency_p99_ms: p99,
@@ -116,16 +126,23 @@ impl BenchStats {
     
     fn as_csv_row(&self) -> String {
         format!(
-            "{},{},{:.2},{},{},{:.2},{:.2},{:.2}",
+            "{},{},{:.2},{},{},{:.2},{:.2},{:.2},{:.2}",
             self.threads,
             self.clients,
             self.throughput,
             self.total_requests,
             self.errors,
+            self.error_rate,
             self.latency_p50_ms,
             self.latency_p95_ms,
             self.latency_p99_ms
         )
+    }
+    
+    /// Returns true if the error rate is above an acceptable threshold
+    fn has_high_error_rate(&self) -> bool {
+        // Consider a configuration to have a "high" error rate if more than 5% of requests fail
+        self.error_rate > 5.0
     }
 }
 
@@ -267,7 +284,7 @@ async fn request_worker(
     barrier.wait().await;
     
     let request = create_metric_request();
-    let client_timeout = std::time::Duration::from_millis(500); // 500ms timeout for client operations
+    let client_timeout = std::time::Duration::from_millis(REQUEST_TIMEOUT_MS); // Use configurable timeout
 
     while !stop_flag.load(Ordering::SeqCst) {
         // Clone the request for this iteration
@@ -335,9 +352,12 @@ async fn run_concurrency_benchmark(
     let random_value = rand::random::<u16>();
     let receiver_port = 40000 + (random_value % 25000);
 
-    // Start the test receiver server 
-    let (server_handle, mut request_rx, exporter_port, server_shutdown_tx) =
-        service_type::start_test_receiver::<OTLPMetricsOutputType>().await?;
+    // Start the test receiver server with multiple threads (equal to the maximum client threads)
+    // In our case, that's 4 threads since we're testing threads=[1-4]
+    const MAX_RECEIVER_THREADS: usize = 4;
+    
+    let (server_handles, mut request_rx, exporter_port, server_shutdown_txs) =
+        service_type::start_metrics_test_receiver_with_threads(MAX_RECEIVER_THREADS).await?;
         
     // Spawn a task to continuously drain the request channel to avoid backpressure
     let drain_task = tokio::spawn(async move {
@@ -530,20 +550,24 @@ async fn run_concurrency_benchmark(
         }
     }
     
-    // Clean up
-    let _ = server_shutdown_tx.send(());
+    // Clean up - send shutdown signal to all server instances
+    for shutdown_tx in server_shutdown_txs {
+        let _ = shutdown_tx.send(());
+    }
     
     // Shut down the collector
     collector.shutdown().await?;
     
-    // Wait for the server to shut down with a timeout
-    tokio::time::timeout(
-        std::time::Duration::from_secs(TEST_TIMEOUT_SECONDS),
-        server_handle,
-    )
-    .await
-    .context(error::TestTimeoutSnafu)?
-    .context(error::JoinSnafu)??;
+    // Wait for all server instances to shut down with a timeout
+    for server_handle in server_handles {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(TEST_TIMEOUT_SECONDS),
+            server_handle,
+        )
+        .await
+        .context(error::TestTimeoutSnafu)?
+        .context(error::JoinSnafu)??;
+    }
     
     // Abort the drain task
     drain_task.abort();
@@ -581,8 +605,8 @@ pub async fn run_otlp_round_trip_benchmark() -> error::Result<(usize, usize)> {
                 run_concurrency_benchmark(threads, clients)
             ).await {
                 Ok(Ok(stats)) => {
-                    // Update max throughput if higher
-                    if stats.throughput > max_throughput {
+                    // Update max throughput if higher and error rate is acceptable
+                    if stats.throughput > max_throughput && !stats.has_high_error_rate() {
                         max_throughput = stats.throughput;
                         optimal_threads = threads;
                         optimal_clients = clients;
@@ -590,6 +614,12 @@ pub async fn run_otlp_round_trip_benchmark() -> error::Result<(usize, usize)> {
                     
                     // Store the result
                     results.push(stats.clone());
+                    
+                    // Log if error rate is high
+                    if stats.has_high_error_rate() {
+                        println!("Warning: Configuration with {} threads and {} clients has a high error rate: {:.2}%",
+                                threads, clients, stats.error_rate);
+                    }
                 },
                 Ok(Err(e)) => {
                     println!("Error running benchmark with {} threads and {} clients: {:?}", 
@@ -608,33 +638,67 @@ pub async fn run_otlp_round_trip_benchmark() -> error::Result<(usize, usize)> {
     }
     
     println!("\nResults Summary:");
-    println!("Threads\tClients\tTotal\tThroughput (req/s)\tRequests\tErrors");
-    println!("------------------------------------------------------------------");
+    println!("Threads\tClients\tTotal\tThroughput (req/s)\tRequests\tErrors\t\tError Rate");
+    println!("--------------------------------------------------------------------------------");
     
     // Sort results by throughput for better readability
     results.sort_by(|a, b| b.throughput.partial_cmp(&a.throughput).unwrap());
     
     for stats in &results {
-        println!("{}\t{}\t{}\t{:.2}\t\t{}\t\t{}", 
+        let error_indicator = if stats.has_high_error_rate() { " (!)" } else { "" };
+        println!("{}\t{}\t{}\t{:.2}\t\t{}\t\t{}\t\t{:.2}%{}", 
                 stats.threads, 
                 stats.clients,
                 stats.threads * stats.clients,
                 stats.throughput, 
                 stats.total_requests, 
-                stats.errors);
+                stats.errors,
+                stats.error_rate,
+                error_indicator);
     }
+    
+    // Find stats for the optimal configuration to report error rate
+    let optimal_stats = results.iter()
+        .find(|s| s.threads == optimal_threads && s.clients == optimal_clients);
     
     println!("\nOptimal configuration: {} threads, {} clients per thread (total: {})",
             optimal_threads, optimal_clients, optimal_threads * optimal_clients);
     println!("Maximum throughput: {:.2} req/s", max_throughput);
+    if let Some(stats) = optimal_stats {
+        println!("Error rate: {:.2}% ({} errors out of {} total requests)",
+            stats.error_rate, stats.errors, stats.total_requests + stats.errors);
+    }
     
     // Create a CSV output for easier analysis
     println!("\nCSV Format:");
-    println!("threads,clients,throughput,requests,errors,p50_ms,p95_ms,p99_ms");
+    println!("threads,clients,throughput,requests,errors,error_rate%,p50_ms,p95_ms,p99_ms");
     
     for stats in &results {
         println!("{}", stats.as_csv_row());
     }
+    
+    // Add a summary about error rates
+    println!("\nError Rate Analysis:");
+    
+    // Count configurations with high error rates
+    let high_error_configs = results.iter().filter(|s| s.has_high_error_rate()).count();
+    let total_configs = results.len();
+    
+    if high_error_configs > 0 {
+        println!("{} out of {} tested configurations had high error rates (>5%).", 
+                high_error_configs, total_configs);
+        println!("Configurations with high error rates are marked with (!) in the results summary.");
+        
+        if let Some(highest_error) = results.iter().max_by(|a, b| a.error_rate.partial_cmp(&b.error_rate).unwrap()) {
+            println!("The highest error rate was {:.2}% with {} threads and {} clients.",
+                    highest_error.error_rate, highest_error.threads, highest_error.clients);
+        }
+    } else {
+        println!("All tested configurations had acceptable error rates (<= 5%).");
+    }
+    
+    // Add info about request timeout
+    println!("\nRequest timeout was set to {} ms.", REQUEST_TIMEOUT_MS);
     
     Ok((optimal_threads, optimal_clients))
 }
