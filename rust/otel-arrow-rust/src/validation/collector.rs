@@ -107,12 +107,16 @@ impl CollectorProcess {
             .await
             .context(error::InputOutputSnafu { desc: "wait" })?;
 
-        status
-            .success()
-            .then(|| ())
-            .context(error::BadExitStatusSnafu {
-                code: status.code(),
-            })
+        if !status.success() {
+            eprintln!("Collector exited with: {:?}", status);
+        }
+
+        Ok(())
+    }
+    
+    /// Get the process ID of the running collector process
+    pub fn get_pid(&self) -> Option<u32> {
+        self.process.id()
     }
 
     /// Start a collector with the given configuration

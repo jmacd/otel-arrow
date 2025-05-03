@@ -25,7 +25,7 @@ use crate::proto::opentelemetry::common::v1::{
 use crate::proto::opentelemetry::resource::v1::Resource;
 use crate::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
 
-use super::collector::{CollectorProcess, COLLECTOR_PATH, TEST_TIMEOUT_SECONDS};
+use super::collector::{CollectorProcess, COLLECTOR_PATH};
 use super::error;
 use super::service_type::{self, ServiceInputType};
 use super::otlp::OTLPMetricsInputType;
@@ -35,6 +35,62 @@ const MAX_CONCURRENCY: usize = 100;       // Maximum number of concurrent client
 const TEST_DURATION_SECONDS: u64 = 10;    // Duration of each benchmark test
 const WARMUP_DURATION_SECONDS: u64 = 2;   // Warmup time before measuring throughput
 const REQUEST_TIMEOUT_MS: u64 = 500;      // Timeout for individual requests in milliseconds
+const MEMORY_SAMPLE_INTERVAL_MS: u64 = 100; // Frequency to sample memory usage in milliseconds
+
+/// Memory usage tracking for processes
+struct MemoryUsageTracker {
+    pid: u32,                           // Process ID to monitor
+    samples: Vec<u64>,                  // Memory samples in KB
+}
+
+impl MemoryUsageTracker {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            samples: Vec::new(),
+        }
+    }
+    
+    /// Read current memory usage (RSS) from /proc/{pid}/status
+    fn sample_memory(&mut self) -> std::io::Result<()> {
+        let path = format!("/proc/{}/status", self.pid);
+        let content = std::fs::read_to_string(&path)?;
+        
+        // Parse the VmRSS line from the status file
+        for line in content.lines() {
+            if line.starts_with("VmRSS:") {
+                // VmRSS format: "VmRSS:     12345 kB"
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(rss_kb) = parts[1].parse::<u64>() {
+                        self.samples.push(rss_kb);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Could not find VmRSS in proc status file"
+        ))
+    }
+    
+    /// Get average memory usage in KB
+    fn average_memory_kb(&self) -> f64 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        
+        let sum: u64 = self.samples.iter().sum();
+        sum as f64 / self.samples.len() as f64
+    }
+    
+    /// Get peak memory usage in KB
+    fn peak_memory_kb(&self) -> u64 {
+        self.samples.iter().max().cloned().unwrap_or(0)
+    }
+}
 
 /// Latency tracking for percentile calculations
 struct LatencyTracker {
@@ -91,6 +147,8 @@ struct BenchStats {
     latency_p99_ms: f64,
     threads: usize,      // Number of OS threads used for this run
     clients: usize,      // Number of async clients per thread
+    mem_avg_kb: f64,     // Average memory usage in KB
+    mem_peak_kb: u64,    // Peak memory usage in KB
 }
 
 impl BenchStats {
@@ -103,6 +161,8 @@ impl BenchStats {
         p50: f64,
         p95: f64,
         p99: f64,
+        mem_avg_kb: f64,
+        mem_peak_kb: u64,
     ) -> Self {
         // Calculate error rate as a percentage
         let error_rate = if total_requests + errors > 0 {
@@ -121,12 +181,14 @@ impl BenchStats {
             latency_p99_ms: p99,
             threads,
             clients,
+            mem_avg_kb,
+            mem_peak_kb,
         }
     }
     
     fn as_csv_row(&self) -> String {
         format!(
-            "{},{},{:.2},{},{},{:.2},{:.2},{:.2},{:.2}",
+            "{},{},{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
             self.threads,
             self.clients,
             self.throughput,
@@ -135,7 +197,9 @@ impl BenchStats {
             self.error_rate,
             self.latency_p50_ms,
             self.latency_p95_ms,
-            self.latency_p99_ms
+            self.latency_p99_ms,
+            self.mem_avg_kb,
+            self.mem_peak_kb
         )
     }
     
@@ -361,8 +425,8 @@ async fn run_concurrency_benchmark(
         
     // Spawn a task to continuously drain the request channel to avoid backpressure
     let drain_task = tokio::spawn(async move {
-        while let Some(_) = request_rx.recv().await {
-            // Just drain the requests
+        while let Some(_request) = request_rx.recv().await {
+            // Just drain the requests, we don't need to process them for the benchmark
         }
     });
 
@@ -383,7 +447,10 @@ async fn run_concurrency_benchmark(
         )
     ).await
 	.context(error::TestTimeoutSnafu)??;
-
+    
+    // Get the collector process ID for memory tracking
+    let collector_pid = collector.get_pid().expect("Failed to get collector PID");
+    
     // Create client to send test data with timeout
     let client_endpoint = format!("http://127.0.0.1:{}", receiver_port);
     let client_result = tokio::time::timeout(
@@ -488,6 +555,21 @@ async fn run_concurrency_benchmark(
     // Start measurement
     let start_time = Instant::now();
     
+    // Start a memory sampling task
+    let memory_sample_interval = Duration::from_millis(MEMORY_SAMPLE_INTERVAL_MS);
+    let memory_stop_flag = Arc::new(AtomicBool::new(false));
+    let memory_stop_flag_clone = memory_stop_flag.clone();
+    let memory_handle = tokio::spawn(async move {
+        let mut tracker = MemoryUsageTracker::new(collector_pid);
+        while !memory_stop_flag_clone.load(Ordering::SeqCst) {
+            if let Err(e) = tracker.sample_memory() {
+                eprintln!("Failed to sample memory: {}", e);
+            }
+            time::sleep(memory_sample_interval).await;
+        }
+        tracker
+    });
+    
     // Run for the test duration
     time::sleep(Duration::from_secs(TEST_DURATION_SECONDS)).await;
     
@@ -511,6 +593,19 @@ async fn run_concurrency_benchmark(
         }
     };
     
+    // Retrieve memory statistics
+    memory_stop_flag.store(true, Ordering::SeqCst);
+    let memory_tracker = match tokio::time::timeout(Duration::from_secs(2), memory_handle).await {
+        Ok(Ok(tracker)) => tracker,
+        _ => {
+            println!("Warning: Failed to retrieve memory tracker, using default values");
+            MemoryUsageTracker::new(0) // Use a dummy tracker
+        }
+    };
+    
+    let mem_avg_kb = memory_tracker.average_memory_kb();
+    let mem_peak_kb = memory_tracker.peak_memory_kb();
+    
     // Create statistics object
     let stats = BenchStats::new(
         throughput, 
@@ -520,12 +615,14 @@ async fn run_concurrency_benchmark(
         clients_per_thread,
         p50,
         p95,
-        p99
+        p99,
+        mem_avg_kb,
+        mem_peak_kb
     );
     
     // Print statistics
     println!(
-        "Threads: {}, Clients/Thread: {}, Total Clients: {}, Throughput: {:.2} req/s, Requests: {}, Errors: {}, Latency(ms): p50={:.2}, p95={:.2}, p99={:.2}", 
+        "Threads: {}, Clients/Thread: {}, Total Clients: {}, Throughput: {:.2} req/s, Requests: {}, Errors: {}, Latency(ms): p50={:.2}, p95={:.2}, p99={:.2}, Memory(KB): avg={:.2}, peak={}", 
         threads, 
         clients_per_thread,
         threads * clients_per_thread,
@@ -534,39 +631,33 @@ async fn run_concurrency_benchmark(
         stats.errors,
         stats.latency_p50_ms,
         stats.latency_p95_ms,
-        stats.latency_p99_ms
+        stats.latency_p99_ms,
+        stats.mem_avg_kb,
+        stats.mem_peak_kb
     );
     
-    // Wait for all thread workers to finish with a timeout
+    // Wait for all thread workers to complete gracefully
     for handle in thread_handles {
-        // We can't directly apply a timeout to thread::join, but we can handle errors gracefully
-        // If this becomes an issue, we'd need to implement a more complex solution with channels
-        match handle.join() {
-            Ok(_) => {},
-            Err(e) => {
-                println!("Warning: Thread join error: {:?}", e);
-                // Continue with cleanup even if thread join fails
-            }
-        }
-    }
-    
-    // Clean up - send shutdown signal to all server instances
-    for shutdown_tx in server_shutdown_txs {
-        let _ = shutdown_tx.send(());
+        let _ = handle.join();
     }
     
     // Shut down the collector
-    collector.shutdown().await?;
+    println!("Shutting down collector...");
+    if let Err(e) = collector.shutdown().await {
+        eprintln!("Error shutting down collector: {:?}", e);
+    }
     
-    // Wait for all server instances to shut down with a timeout
-    for server_handle in server_handles {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(TEST_TIMEOUT_SECONDS),
-            server_handle,
-        )
-        .await
-        .context(error::TestTimeoutSnafu)?
-        .context(error::JoinSnafu)??;
+    // Send shutdown signal to the test receiver servers
+    for server_shutdown_tx in server_shutdown_txs {
+        let _ = server_shutdown_tx.send(());
+    }
+    
+    // Wait for server tasks to terminate with timeout
+    for handle in server_handles {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle
+        ).await;
     }
     
     // Abort the drain task
