@@ -13,6 +13,7 @@
 //! This module contains data structures for OTLP and OTAP pipeline data
 
 pub mod otlp;
+pub mod otap;
 
 // TODO use the OTel-Rust API definitions, if such a dependency.
 
