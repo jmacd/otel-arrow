@@ -5,7 +5,6 @@
 //! The rate limiter is explicitly !Send and !Sync, making it suitable only for use within
 //! a single thread or task.
 
-use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
 pub use crate::error::Error;
@@ -35,7 +34,7 @@ impl<T: Clock> Clock for &T {
 /// Rate limit expressed as tokens per second.
 /// Must be finite and positive.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Limit(f64);
+pub struct Limit(f64);
 
 impl Limit {
     /// Creates a new rate limit from tokens per second.
@@ -43,7 +42,6 @@ impl Limit {
     /// # Errors
     ///
     /// Returns `Error::InvalidLimit` if the rate is not finite, positive, or zero.
-    #[allow(dead_code)]
     pub fn new(tokens_per_second: f64) -> Result<Self, Error> {
         if !tokens_per_second.is_finite() || tokens_per_second <= 0.0 {
             return Err(Error::InvalidLimit {
@@ -77,28 +75,21 @@ impl Limit {
 ///
 /// This represents a commitment to consume tokens at a specific time in the future.
 /// The reservation can be checked for validity and cancelled if needed.
-///
-/// **Note**: Reservations cannot be cancelled after creation due to the single-threaded
-/// design. If cancellation is needed, consider using a higher-level wrapper that
-/// tracks reservations externally.
-#[allow(dead_code)]
 #[derive(Debug)]
-pub(crate) struct Reservation {
+pub struct Reservation {
     /// Number of tokens reserved.
-    tokens: usize,
+    /// TODO: Not used, as cancel() and cancel_at() are not implemented.
+    _tokens: usize,
+
     /// Time when the tokens can be consumed.
     time_to_act: Instant,
-    /// Phantom data to ensure !Send + !Sync.
-    _phantom: PhantomData<*const ()>,
 }
 
 impl Reservation {
     /// Returns the delay from a specific time until the reserved tokens can be consumed.
     ///
     /// Returns `Duration::ZERO` if the tokens can be consumed immediately.
-    /// Returns `Duration::MAX` if the reservation is not valid.
-    #[allow(dead_code)]
-    pub(crate) fn delay_from(&self, now: Instant) -> Duration {
+    pub fn delay_from(&self, now: Instant) -> Duration {
         if self.time_to_act <= now {
             Duration::ZERO
         } else {
@@ -112,8 +103,7 @@ impl Reservation {
 /// This limiter is designed for single-threaded use and is explicitly !Send and !Sync.
 /// It provides a reservation-based interface that allows callers to reserve tokens
 /// for future consumption without blocking.
-#[allow(dead_code)]
-pub(crate) struct Limiter<C: Clock> {
+pub struct Limiter<C: Clock> {
     /// The rate limit (tokens per second).
     limit: Limit,
     /// Maximum burst size (maximum tokens available).
@@ -126,8 +116,6 @@ pub(crate) struct Limiter<C: Clock> {
     last_event: Instant,
     /// Clock for time operations.
     clock: C,
-    /// Phantom data to ensure !Send + !Sync.
-    _phantom: PhantomData<*const ()>,
 }
 
 impl<C: Clock> Limiter<C> {
@@ -142,7 +130,7 @@ impl<C: Clock> Limiter<C> {
     /// # Errors
     ///
     /// Returns `Error::InvalidBurst` if burst is zero.
-    pub(crate) fn new(rate: Limit, burst: usize, clock: C) -> Result<Self, Error> {
+    pub fn new(rate: Limit, burst: usize, clock: C) -> Result<Self, Error> {
         if burst == 0 {
             return Err(Error::InvalidBurst { burst });
         }
@@ -155,17 +143,16 @@ impl<C: Clock> Limiter<C> {
             last: now,
             last_event: now,
             clock,
-            _phantom: PhantomData,
         })
     }
 
     /// Returns the number of tokens available at a specific time.
-    pub(crate) fn tokens_at(&self, at: Instant) -> f64 {
+    pub fn tokens_at(&self, at: Instant) -> f64 {
         self.advance_at(at)
     }
 
     /// Returns the number of tokens available now.
-    pub(crate) fn tokens(&mut self) -> f64 {
+    pub fn tokens(&mut self) -> f64 {
         self.tokens_at(self.clock.now())
     }
 
@@ -182,7 +169,7 @@ impl<C: Clock> Limiter<C> {
     /// # Errors
     ///
     /// Returns `Error::InvalidTokenCount` if `n` is zero.
-    pub(crate) fn reserve_n(&mut self, n: usize) -> Result<Reservation, Error> {
+    pub fn reserve_n(&mut self, n: usize) -> Result<Reservation, Error> {
         if n == 0 {
             return Err(Error::InvalidTokenCount { count: n });
         }
@@ -192,7 +179,7 @@ impl<C: Clock> Limiter<C> {
     }
 
     /// Attempts to reserve `n` tokens at a specific time.
-    pub(crate) fn reserve_n_at(&mut self, at: Instant, n: usize) -> Result<Reservation, Error> {
+    pub fn reserve_n_at(&mut self, at: Instant, n: usize) -> Result<Reservation, Error> {
         if n == 0 {
             return Err(Error::InvalidTokenCount { count: n });
         }
@@ -214,9 +201,8 @@ impl<C: Clock> Limiter<C> {
 
         if ok {
             let reservation = Reservation {
-                tokens: n,
+                _tokens: n,
                 time_to_act: at + wait_duration,
-                _phantom: PhantomData,
             };
 
             // Update limiter state

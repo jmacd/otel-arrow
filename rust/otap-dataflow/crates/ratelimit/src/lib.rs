@@ -5,3 +5,8 @@
 
 mod error;
 mod tokenbucket;
+mod processor;
+
+pub use processor::{RateLimitProcessor, RateLimitConfig};
+pub use tokenbucket::{Clock, Limit, Limiter, SystemClock, Reservation};
+pub use error::Error;

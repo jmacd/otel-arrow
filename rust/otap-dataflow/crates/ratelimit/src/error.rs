@@ -27,12 +27,13 @@ pub enum Error {
         count: usize,
     },
 
+    /// The burst size exceeded the configured limit.
     #[error("Burst size exceeded: {request} < {burst}")]
     BurstExceeded {
-        // Requested weight
+        /// Requested weight
         request: usize,
 
-        // Burst allowance
+        /// Burst allowance
         burst: usize,
     },
 }
