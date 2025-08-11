@@ -4,9 +4,9 @@
 //! for controlling the flow of data through the OTAP dataflow pipeline.
 
 mod error;
-mod tokenbucket;
 mod processor;
+mod tokenbucket;
 
-pub use processor::{RateLimitProcessor, RateLimitConfig};
-pub use tokenbucket::{Clock, Limit, Limiter, SystemClock, Reservation};
 pub use error::Error;
+pub use processor::{RateLimitConfig, RateLimitProcessor};
+pub use tokenbucket::{Clock, Limit, Limiter, MonoClock, Reservation};

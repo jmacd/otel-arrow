@@ -1,6 +1,6 @@
 //! Simple example demonstrating the rate limiter functionality.
 
-use otap_df_ratelimit::{Clock, RateLimitConfig, RateLimitProcessor, SystemClock};
+use otap_df_ratelimit::{Clock, MonoClock, RateLimitConfig, RateLimitProcessor};
 
 fn main() {
     println!("Rate Limiter Example");
@@ -30,10 +30,10 @@ fn main() {
     println!("\nRate limit processor created successfully!");
     println!(
         "Available tokens: {:.1}",
-        processor.limiter.tokens_at(SystemClock.now())
+        processor.limiter.tokens_at(MonoClock.now())
     );
 
-    let _res = match processor.limiter.reserve_n_at(SystemClock.now(), 1) {
+    let _res = match processor.limiter.reserve_n_at(MonoClock.now(), 1) {
         Ok(_) => println!("got it!"),
         Err(_) => panic!("noway"),
     };

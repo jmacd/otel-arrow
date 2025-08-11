@@ -15,11 +15,11 @@ pub trait Clock {
     fn now(&self) -> Instant;
 }
 
-/// Standard system clock implementation.
+/// Standard monotonic clock implementation.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SystemClock;
+pub struct MonoClock;
 
-impl Clock for SystemClock {
+impl Clock for MonoClock {
     fn now(&self) -> Instant {
         Instant::now()
     }
