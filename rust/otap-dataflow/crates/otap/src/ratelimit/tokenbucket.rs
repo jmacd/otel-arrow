@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-pub use crate::error::Error;
+pub use super::error::Error;
 
 /// A trait for abstracting time operations to enable testing.
 pub trait Clock {

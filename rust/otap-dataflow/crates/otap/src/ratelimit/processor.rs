@@ -3,8 +3,9 @@
 //! This processor uses a token bucket algorithm to limit the rate of
 //! messages flowing through the pipeline.
 
-use crate::Error;
-use crate::tokenbucket::{Clock, Limit, Limiter, MonoClock};
+use super::super::OtapPdata;
+use super::error::Error;
+use super::tokenbucket::{Clock, Limit, Limiter, MonoClock};
 use async_trait::async_trait;
 use otap_df_engine::TimerCancelHandle;
 use otap_df_engine::control::NodeControlMsg;
@@ -13,7 +14,6 @@ use otap_df_engine::local::processor::{EffectHandler, Processor};
 use otap_df_engine::message::Message;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::marker::PhantomData;
 
 /// Configuration for the rate limit processor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,18 +41,12 @@ impl Default for RateLimitConfig {
 /// Uses a token bucket algorithm with configurable rate limit and burst size.
 /// When the rate limit is exceeded, the processor pauses reading from the pdata channel,
 /// allowing messages to accumulate upstream and creating natural backpressure.
-pub struct RateLimitProcessor<PData> {
+pub struct RateLimitProcessor {
     /// The rate limiter instance
     pub limiter: Limiter<MonoClock>,
-
-    /// If pdata reception is currently paused, this holds the timer handle
-    pub paused_until: Option<TimerCancelHandle>,
-
-    /// Phantom data to maintain the PData type
-    _phantom: PhantomData<PData>,
 }
 
-impl<PData> RateLimitProcessor<PData> {
+impl RateLimitProcessor {
     /// Creates a new rate limit processor with the given configuration.
     ///
     /// # Errors
@@ -62,21 +56,17 @@ impl<PData> RateLimitProcessor<PData> {
         let limit = Limit::new(config.limit)?;
         let limiter = Limiter::new(limit, config.burst, MonoClock)?;
 
-        Ok(Self {
-            limiter,
-            waiting: None,
-            _phantom: PhantomData,
-        })
+        Ok(Self { limiter })
     }
 }
 
 #[async_trait(?Send)]
-impl<PData> Processor<PData> for RateLimitProcessor<PData> {
+impl Processor<OtapPdata> for RateLimitProcessor {
     async fn process(
         &mut self,
-        msg: Message<PData>,
-        effect_handler: &mut EffectHandler<PData>,
-    ) -> Result<(), EngineError<PData>> {
+        msg: Message<OtapPdata>,
+        effect_handler: &mut EffectHandler<OtapPdata>,
+    ) -> Result<(), EngineError<OtapPdata>> {
         match msg {
             Message::PData(data) => {
                 match self.limiter.reserve_n(1) {
@@ -87,7 +77,7 @@ impl<PData> Processor<PData> for RateLimitProcessor<PData> {
                         } else {
                             let when = tokio::time::Instant::now() + delay;
 
-                            let x: TimerCancelHandle = effect_handler.run_timer_at(when).await?;
+                            let _x: TimerCancelHandle = effect_handler.run_timer_at(when).await?;
                         }
                     }
                     Err(Error::BurstExceeded { .. }) => {}

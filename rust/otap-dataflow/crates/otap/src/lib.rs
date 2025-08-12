@@ -32,6 +32,8 @@ pub mod parquet_exporter;
 
 pub mod perf_exporter;
 
+pub mod ratelimit;
+
 pub mod fake_data_generator;
 /// testing utilities
 #[cfg(test)]
