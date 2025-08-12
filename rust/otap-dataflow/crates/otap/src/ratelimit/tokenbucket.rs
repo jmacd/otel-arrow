@@ -5,31 +5,10 @@
 //! The rate limiter is explicitly !Send and !Sync, making it suitable only for use within
 //! a single thread or task.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 pub use super::error::Error;
-
-/// A trait for abstracting time operations to enable testing.
-pub trait Clock {
-    /// Returns the current instant in time.
-    fn now(&self) -> Instant;
-}
-
-/// Standard monotonic clock implementation.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MonoClock;
-
-impl Clock for MonoClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
-
-impl<T: Clock> Clock for &T {
-    fn now(&self) -> Instant {
-        (*self).now()
-    }
-}
 
 /// Rate limit expressed as tokens per second.
 /// Must be finite and positive.
@@ -103,7 +82,7 @@ impl Reservation {
 /// This limiter is designed for single-threaded use and is explicitly !Send and !Sync.
 /// It provides a reservation-based interface that allows callers to reserve tokens
 /// for future consumption without blocking.
-pub struct Limiter<C: Clock> {
+pub struct Limiter {
     /// The rate limit (tokens per second).
     limit: Limit,
     /// Maximum burst size (maximum tokens available).
@@ -114,35 +93,31 @@ pub struct Limiter<C: Clock> {
     last: Instant,
     /// Time of the latest rate-limited event (past or future).
     last_event: Instant,
-    /// Clock for time operations.
-    clock: C,
 }
 
-impl<C: Clock> Limiter<C> {
+impl Limiter {
     /// Creates a new rate limiter with the specified rate and burst size.
     ///
     /// # Arguments
     ///
     /// * `rate` - The rate limit in tokens per second
     /// * `burst` - Maximum number of tokens that can be consumed at once
-    /// * `clock` - Clock implementation for time operations
     ///
     /// # Errors
     ///
     /// Returns `Error::InvalidBurst` if burst is zero.
-    pub fn new(rate: Limit, burst: usize, clock: C) -> Result<Self, Error> {
+    pub fn new(rate: Limit, burst: usize) -> Result<Self, Error> {
         if burst == 0 {
             return Err(Error::InvalidBurst { burst });
         }
 
-        let now = clock.now();
+        let now = Instant::now();
         Ok(Limiter {
             limit: rate,
             burst,
             tokens: burst as f64,
             last: now,
             last_event: now,
-            clock,
         })
     }
 
@@ -153,7 +128,7 @@ impl<C: Clock> Limiter<C> {
 
     /// Returns the number of tokens available now.
     pub fn tokens(&mut self) -> f64 {
-        self.tokens_at(self.clock.now())
+        self.tokens_at(Instant::now())
     }
 
     /// Attempts to reserve `n` tokens for immediate or future consumption.
@@ -174,7 +149,7 @@ impl<C: Clock> Limiter<C> {
             return Err(Error::InvalidTokenCount { count: n });
         }
 
-        let now = self.clock.now();
+        let now = Instant::now();
         self.reserve_n_at(now, n)
     }
 

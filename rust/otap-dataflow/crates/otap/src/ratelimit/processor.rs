@@ -5,7 +5,7 @@
 
 use super::super::OtapPdata;
 use super::error::Error;
-use super::tokenbucket::{Clock, Limit, Limiter, MonoClock};
+use super::tokenbucket::{Limit, Limiter};
 use async_trait::async_trait;
 use otap_df_engine::TimerCancelHandle;
 use otap_df_engine::control::NodeControlMsg;
@@ -14,6 +14,7 @@ use otap_df_engine::local::processor::{EffectHandler, Processor};
 use otap_df_engine::message::Message;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use tokio::time::Instant;
 
 /// Configuration for the rate limit processor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +44,7 @@ impl Default for RateLimitConfig {
 /// allowing messages to accumulate upstream and creating natural backpressure.
 pub struct RateLimitProcessor {
     /// The rate limiter instance
-    pub limiter: Limiter<MonoClock>,
+    pub limiter: Limiter,
 }
 
 impl RateLimitProcessor {
@@ -54,7 +55,7 @@ impl RateLimitProcessor {
     /// Returns an error if the rate limit configuration is invalid.
     pub fn new(config: RateLimitConfig) -> Result<Self, Error> {
         let limit = Limit::new(config.limit)?;
-        let limiter = Limiter::new(limit, config.burst, MonoClock)?;
+        let limiter = Limiter::new(limit, config.burst)?;
 
         Ok(Self { limiter })
     }
@@ -71,13 +72,14 @@ impl Processor<OtapPdata> for RateLimitProcessor {
             Message::PData(data) => {
                 match self.limiter.reserve_n(1) {
                     Ok(reservation) => {
-                        let delay = reservation.delay_from(MonoClock.now());
-                        if delay.is_zero() {
-                            effect_handler.send_message(data).await?;
-                        } else {
-                            let when = tokio::time::Instant::now() + delay;
+                        // Immediately send it. We will delay the next message if necessary.
+                        effect_handler.send_message(data).await?;
 
-                            let _x: TimerCancelHandle = effect_handler.run_timer_at(when).await?;
+                        let now = Instant::now();
+                        let delay = reservation.delay_from(now);
+                        if !delay.is_zero() {
+                            //     let when = tokio::time::Instant::now() + delay;
+                            //     let _x: TimerCancelHandle = effect_handler.run_timer_at(when).await?;
                         }
                     }
                     Err(Error::BurstExceeded { .. }) => {}

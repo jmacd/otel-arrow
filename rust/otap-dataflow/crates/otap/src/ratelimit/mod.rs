@@ -9,4 +9,4 @@ mod tokenbucket;
 
 pub use error::Error;
 pub use processor::{RateLimitConfig, RateLimitProcessor};
-pub use tokenbucket::{Clock, Limit, Limiter, MonoClock, Reservation};
+pub use tokenbucket::{Limit, Limiter, Reservation};
