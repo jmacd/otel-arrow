@@ -34,6 +34,8 @@ pub mod runtime_pipeline;
 pub mod shared;
 pub mod testing;
 
+pub use effect_handler::TimerCancelHandle;
+
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::message::Receiver;
 use crate::node::{NodeWithPDataReceiver, NodeWithPDataSender};

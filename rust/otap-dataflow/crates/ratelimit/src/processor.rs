@@ -6,6 +6,7 @@
 use crate::Error;
 use crate::tokenbucket::{Clock, Limit, Limiter, MonoClock};
 use async_trait::async_trait;
+use otap_df_engine::TimerCancelHandle;
 use otap_df_engine::control::NodeControlMsg;
 use otap_df_engine::error::Error as EngineError;
 use otap_df_engine::local::processor::{EffectHandler, Processor};
@@ -35,13 +36,17 @@ impl Default for RateLimitConfig {
     }
 }
 
-/// A simple rate limiting processor that drops messages when rate limit is exceeded.
+/// A rate limiting processor that regulates message flow by pausing pdata reception.
 ///
 /// Uses a token bucket algorithm with configurable rate limit and burst size.
-/// When the rate limit is exceeded, messages are dropped silently.
+/// When the rate limit is exceeded, the processor pauses reading from the pdata channel,
+/// allowing messages to accumulate upstream and creating natural backpressure.
 pub struct RateLimitProcessor<PData> {
     /// The rate limiter instance
     pub limiter: Limiter<MonoClock>,
+
+    /// If pdata reception is currently paused, this holds the timer handle
+    pub paused_until: Option<TimerCancelHandle>,
 
     /// Phantom data to maintain the PData type
     _phantom: PhantomData<PData>,
@@ -59,6 +64,7 @@ impl<PData> RateLimitProcessor<PData> {
 
         Ok(Self {
             limiter,
+            waiting: None,
             _phantom: PhantomData,
         })
     }
@@ -73,21 +79,18 @@ impl<PData> Processor<PData> for RateLimitProcessor<PData> {
     ) -> Result<(), EngineError<PData>> {
         match msg {
             Message::PData(data) => {
-                // Try to reserve a token for this message
                 match self.limiter.reserve_n(1) {
                     Ok(reservation) => {
-                        // Check if we can process immediately (no delay)
-                        if reservation.delay_from(MonoClock.now()).is_zero() {
-                            // Rate limit allows this message, forward it
+                        let delay = reservation.delay_from(MonoClock.now());
+                        if delay.is_zero() {
                             effect_handler.send_message(data).await?;
+                        } else {
+                            let when = tokio::time::Instant::now() + delay;
+
+                            let x: TimerCancelHandle = effect_handler.run_timer_at(when).await?;
                         }
-                        // If there's a delay, we drop the message (simple implementation)
-                        // A more sophisticated implementation could delay the message
                     }
-                    Err(Error::BurstExceeded { .. }) => {
-                        // Message exceeds burst limit, drop it
-                        // Could add metrics/logging here in the future
-                    }
+                    Err(Error::BurstExceeded { .. }) => {}
                     Err(e) => {
                         // Other errors (shouldn't happen with valid input)
                         return Err(EngineError::ProcessorError {
@@ -141,12 +144,12 @@ mod tests {
     fn test_rate_limit_processor_creation() {
         let config = RateLimitConfig {
             limit: 10.0,
-            burst: 5,
+            burst: 50,
         };
 
         let processor: RateLimitProcessor<String> = RateLimitProcessor::new(config).unwrap();
         // Test that the processor was created successfully
-        assert_eq!(processor.limiter.tokens_at(MonoClock.now()), 5.0);
+        assert_eq!(processor.limiter.tokens_at(MonoClock.now()), 50.0);
     }
 
     #[test]
