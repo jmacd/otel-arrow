@@ -97,6 +97,7 @@ use otel_arrow_rust::otlp::{logs::logs_from, metrics::metrics_from, traces::trac
 use otel_arrow_rust::{Consumer, Producer};
 use prost::{EncodeError, Message};
 
+use crate::context::Context;
 use crate::encoder::encode_spans_otap_batch;
 use crate::{encoder::encode_logs_otap_batch, grpc::OtapArrowBytes};
 
@@ -150,13 +151,28 @@ impl OtlpProtoBytes {
 #[allow(clippy::large_enum_variant)]
 pub enum OtapPdata {
     /// data is serialized as a protobuf service message for one of the OTLP GRPC services
-    OtlpBytes(OtlpProtoBytes),
+    OtlpBytes {
+        /// pipeline context for this request
+        context: Context,
+        /// OTLP bytes
+        value: OtlpProtoBytes,
+    },
 
     /// data is contained in `BatchArrowRecords`, which contain ArrowIPC serialized
-    OtapArrowBytes(OtapArrowBytes),
+    OtapArrowBytes {
+        /// pipeline context for this request
+        context: Context,
+        /// OTAP bytes
+        value: OtapArrowBytes,
+    },
 
     /// data is contained in `OtapBatch` which contains Arrow `RecordBatches` for OTAP payload type
-    OtapArrowRecords(OtapArrowRecords),
+    OtapArrowRecords {
+        /// pipeline context for this request
+        context: Context,
+        /// OTAP records
+        value: OtapArrowRecords,
+    },
 }
 
 impl OtapPdata {
@@ -164,9 +180,45 @@ impl OtapPdata {
     #[must_use]
     pub fn signal_type(&self) -> SignalType {
         match self {
-            Self::OtlpBytes(inner) => inner.signal_type(),
-            Self::OtapArrowBytes(inner) => inner.signal_type(),
-            Self::OtapArrowRecords(inner) => inner.signal_type(),
+            Self::OtlpBytes { value, .. } => value.signal_type(),
+            Self::OtapArrowBytes { value, .. } => value.signal_type(),
+            Self::OtapArrowRecords { value, .. } => value.signal_type(),
+        }
+    }
+
+    /// Read the request context.
+    pub fn context(&self) -> &Context {
+        match self {
+            Self::OtlpBytes { context, .. } => context,
+            Self::OtapArrowBytes { context, .. } => context,
+            Self::OtapArrowRecords { context, .. } => context,
+        }
+    }
+
+    /// For testing, a new otlp bytes OTAP request.
+    #[cfg(test)]
+    pub fn new_otlp_bytes(value: OtlpProtoBytes) -> Self {
+        Self::OtlpBytes {
+            value,
+            context: Default::default(),
+        }
+    }
+
+    /// For testing, a new otlp bytes OTAP request.
+    #[cfg(test)]
+    pub fn new_otap_bytes(value: OtapArrowBytes) -> Self {
+        Self::OtapArrowBytes {
+            value,
+            context: Default::default(),
+        }
+    }
+
+    /// For testing, a new otlp bytes OTAP request.
+    #[cfg(test)]
+    pub fn new_otap_records(value: OtapArrowRecords) -> Self {
+        Self::OtapArrowRecords {
+            value,
+            context: Default::default(),
         }
     }
 }
@@ -213,19 +265,28 @@ impl OtapPdataHelpers for OtapArrowBytes {
 
 impl From<OtapArrowRecords> for OtapPdata {
     fn from(value: OtapArrowRecords) -> Self {
-        Self::OtapArrowRecords(value)
+        Self::OtapArrowRecords {
+            value,
+            context: Context::default(),
+        }
     }
 }
 
 impl From<OtlpProtoBytes> for OtapPdata {
     fn from(value: OtlpProtoBytes) -> Self {
-        Self::OtlpBytes(value)
+        Self::OtlpBytes {
+            value,
+            context: Context::default(),
+        }
     }
 }
 
 impl From<OtapArrowBytes> for OtapPdata {
     fn from(value: OtapArrowBytes) -> Self {
-        Self::OtapArrowBytes(value)
+        Self::OtapArrowBytes {
+            value,
+            context: Context::default(),
+        }
     }
 }
 
@@ -234,9 +295,9 @@ impl TryFrom<OtapPdata> for OtapArrowRecords {
 
     fn try_from(value: OtapPdata) -> Result<Self, Self::Error> {
         match value {
-            OtapPdata::OtapArrowBytes(otap_data) => otap_data.try_into(),
-            OtapPdata::OtapArrowRecords(otap_batch) => Ok(otap_batch),
-            OtapPdata::OtlpBytes(otlp_bytes) => otlp_bytes.try_into(),
+            OtapPdata::OtapArrowBytes { value, .. } => value.try_into(),
+            OtapPdata::OtapArrowRecords { value, .. } => Ok(value),
+            OtapPdata::OtlpBytes { value, .. } => value.try_into(),
         }
     }
 }
@@ -246,9 +307,9 @@ impl TryFrom<OtapPdata> for OtlpProtoBytes {
 
     fn try_from(value: OtapPdata) -> Result<Self, Self::Error> {
         match value {
-            OtapPdata::OtapArrowBytes(otap_data) => otap_data.try_into(),
-            OtapPdata::OtapArrowRecords(otap_batch) => otap_batch.try_into(),
-            OtapPdata::OtlpBytes(otlp_bytes) => Ok(otlp_bytes),
+            OtapPdata::OtapArrowBytes { value, .. } => value.try_into(),
+            OtapPdata::OtapArrowRecords { value, .. } => value.try_into(),
+            OtapPdata::OtlpBytes { value, .. } => Ok(value),
         }
     }
 }
@@ -258,9 +319,9 @@ impl TryFrom<OtapPdata> for OtapArrowBytes {
 
     fn try_from(value: OtapPdata) -> Result<Self, Self::Error> {
         match value {
-            OtapPdata::OtapArrowBytes(otap_data) => Ok(otap_data),
-            OtapPdata::OtapArrowRecords(otap_batch) => otap_batch.try_into(),
-            OtapPdata::OtlpBytes(otlp_bytes) => otlp_bytes.try_into(),
+            OtapPdata::OtapArrowBytes { value, .. } => Ok(value),
+            OtapPdata::OtapArrowRecords { value, .. } => value.try_into(),
+            OtapPdata::OtlpBytes { value, .. } => value.try_into(),
         }
     }
 }
@@ -799,11 +860,18 @@ mod test {
         assert_eq!(traces_bytes.signal_type(), SignalType::Traces);
 
         // Test signal_type for OtapPdata variants
-        let pdata_logs = OtapPdata::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(vec![]));
-        let pdata_metrics =
-            OtapPdata::OtapArrowRecords(OtapArrowRecords::Metrics(Default::default()));
-        let pdata_traces =
-            OtapPdata::OtapArrowBytes(OtapArrowBytes::ArrowTraces(Default::default()));
+        let pdata_logs = OtapPdata::OtlpBytes {
+            context: Default::default(),
+            value: OtlpProtoBytes::ExportLogsRequest(vec![]),
+        };
+        let pdata_metrics = OtapPdata::OtapArrowRecords {
+            context: Default::default(),
+            value: OtapArrowRecords::Metrics(Default::default()),
+        };
+        let pdata_traces = OtapPdata::OtapArrowBytes {
+            context: Default::default(),
+            value: OtapArrowBytes::ArrowTraces(Default::default()),
+        };
 
         assert_eq!(pdata_logs.signal_type(), SignalType::Logs);
         assert_eq!(pdata_metrics.signal_type(), SignalType::Metrics);

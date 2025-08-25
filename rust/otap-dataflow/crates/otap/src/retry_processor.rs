@@ -20,7 +20,6 @@
 //! - **Reliable Delivery**: Messages are tracked until acknowledged
 //! - **Exponential Backoff**: Failed messages are retried with increasing delays
 //! - **Backpressure**: When queue is full, sends NACK upstream instead of dropping messages
-//! - **Automatic Cleanup**: Expired messages are periodically removed
 //!
 //! ## ACK/NACK Behavior
 //!
@@ -53,7 +52,6 @@
 //!     max_retry_delay_ms: 30000,
 //!     backoff_multiplier: 2.0,
 //!     max_pending_messages: 10000,
-//!     cleanup_interval_secs: 60,
 //! };
 //! let processor = RetryProcessor::<MyData>::with_config(config);
 //! ```
@@ -75,12 +73,8 @@ use otap_df_engine::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// Maximum age for failed messages before cleanup (5 minutes)
-const MAX_FAILED_MESSAGE_AGE_SECS: u64 = 300;
 
 /// URN for the RetryProcessor processor
 pub const RETRY_PROCESSOR_URN: &str = "urn:otap:processor:retry_processor";
@@ -96,10 +90,6 @@ pub struct RetryConfig {
     pub max_retry_delay_ms: u64,
     /// Multiplier applied to delay for exponential backoff
     pub backoff_multiplier: f64,
-    /// Maximum number of messages that can be pending retry
-    pub max_pending_messages: usize,
-    /// Interval in seconds for cleanup of expired messages
-    pub cleanup_interval_secs: u64,
 }
 
 impl Default for RetryConfig {
@@ -109,18 +99,16 @@ impl Default for RetryConfig {
             initial_retry_delay_ms: 1000,
             max_retry_delay_ms: 30000,
             backoff_multiplier: 2.0,
-            max_pending_messages: 10000,
-            cleanup_interval_secs: 60,
         }
     }
 }
 
-struct PendingMessage {
-    data: OtapPdata,
-    retry_count: usize,
-    next_retry_time: Instant,
-    last_error: String,
-}
+// struct PendingMessage {
+//     data: OtapPdata,
+//     retry_count: usize,
+//     next_retry_time: Instant,
+//     last_error: String,
+// }
 
 /// OTAP RetryProcessor
 #[allow(unsafe_code)]
@@ -138,9 +126,6 @@ pub static RETRY_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFacto
 /// Register SignalTypeRouter as an OTAP processor factory
 pub struct RetryProcessor {
     config: RetryConfig,
-    pending_messages: HashMap<u64, PendingMessage>,
-    next_message_id: u64,
-    last_cleanup_time: Instant,
 }
 
 /// Factory function to create a SignalTypeRouter processor
@@ -179,12 +164,7 @@ impl RetryProcessor {
     /// Creates a new RetryProcessor with the specified configuration
     #[must_use]
     pub fn with_config(config: RetryConfig) -> Self {
-        Self {
-            config,
-            pending_messages: HashMap::new(),
-            next_message_id: 1,
-            last_cleanup_time: Instant::now(),
-        }
+        Self { config }
     }
 
     fn acknowledge(&mut self, id: u64) {
@@ -251,38 +231,6 @@ impl RetryProcessor {
 
         Ok(())
     }
-
-    fn cleanup_expired_messages(&mut self) {
-        let now = Instant::now();
-        if now.duration_since(self.last_cleanup_time)
-            < Duration::from_secs(self.config.cleanup_interval_secs)
-        {
-            return;
-        }
-
-        // Clean up messages that have exceeded max retries and are old
-        let max_age = Duration::from_secs(MAX_FAILED_MESSAGE_AGE_SECS);
-        let expired_ids: Vec<u64> = self
-            .pending_messages
-            .iter()
-            .filter_map(|(&id, pending)| {
-                let age = now.duration_since(pending.next_retry_time);
-                if pending.retry_count > self.config.max_retries && age > max_age {
-                    Some(id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for id in expired_ids {
-            if self.pending_messages.remove(&id).is_some() {
-                log::warn!("Removed expired message with ID: {id}");
-            }
-        }
-
-        self.last_cleanup_time = now;
-    }
 }
 
 #[async_trait(?Send)]
@@ -293,39 +241,43 @@ impl Processor<OtapPdata> for RetryProcessor {
         effect_handler: &mut EffectHandler<OtapPdata>,
     ) -> Result<(), Error<OtapPdata>> {
         match msg {
-            Message::PData(data) => {
-                // Clone only if we need to add to retry queue AND send downstream
-                // Check if queue is full first to avoid unnecessary clone
-                if self.pending_messages.len() >= self.config.max_pending_messages {
-                    let error_msg = format!(
-                        "Retry queue is full (capacity: {}), cannot add message",
-                        self.config.max_pending_messages
-                    );
-                    log::warn!("{error_msg}");
-                    // Send NACK upstream to signal backpressure instead of forwarding message
-                    // Note: This would need to be implemented in the effect handler
-                    // For now, we'll just log and drop the message
-                    return Err(Error::ProcessorError {
-                        processor: effect_handler.processor_id(),
-                        error: error_msg,
-                    });
-                } else {
-                    // Queue has space, add message for retry and send downstream
-                    let id = self.next_message_id;
-                    self.next_message_id += 1;
+            Message::PData(request) => {
+                let ctx = request.context();
 
-                    let pending = PendingMessage {
-                        data: data.clone(), // Only clone when we know we need to store AND send
-                        retry_count: 0,
-                        next_retry_time: Instant::now(),
-                        last_error: String::new(),
-                    };
+                // // Clone only if we need to add to retry queue AND send downstream
+                // // Check if queue is full first to avoid unnecessary clone
+                // if self.pending_messages.len() >= self.config.max_pending_messages {
+                //     let error_msg = format!(
+                //         "Retry queue is full (capacity: {}), cannot add message",
+                //         self.config.max_pending_messages
+                //     );
+                //     log::warn!("{error_msg}");
+                //     // Send NACK upstream to signal backpressure instead of forwarding message
+                //     // Note: This would need to be implemented in the effect handler
+                //     // For now, we'll just log and drop the message
+                //     return Err(Error::ProcessorError {
+                //         processor: effect_handler.processor_id(),
+                //         error: error_msg,
+                //     });
+                // } else {
+                //     // Queue has space, add message for retry and send downstream
+                //     let id = self.next_message_id;
+                //     self.next_message_id += 1;
 
-                    let _previous = self.pending_messages.insert(id, pending);
-                    log::debug!("Added message {id} to retry queue");
+                //     let pending = PendingMessage {
+                //         data: data.clone(), // Only clone when we know we need to store AND send
+                //         retry_count: 0,
+                //         next_retry_time: Instant::now(),
+                //         last_error: String::new(),
+                //     };
 
-                    effect_handler.send_message(data).await?;
-                }
+                //     let _previous = self.pending_messages.insert(id, pending);
+                //     log::debug!("Added message {id} to retry queue");
+
+                //     effect_handler.send_message(data).await?;
+                // }
+                effect_handler.send_message(request).await?;
+
                 Ok(())
             }
             Message::Control(control_msg) => match control_msg {
@@ -397,12 +349,15 @@ mod tests {
     }
 
     fn create_test_data(_id: u64) -> OtapPdata {
-        OtapPdata::OtapArrowBytes(OtapArrowBytes::ArrowLogs(
-            create_simple_logs_arrow_record_batches(SimpleDataGenOptions {
-                num_rows: 1,
-                ..Default::default()
-            }),
-        ))
+        OtapPdata::OtapArrowBytes {
+            context: Default::default(),
+            value: OtapArrowBytes::ArrowLogs(create_simple_logs_arrow_record_batches(
+                SimpleDataGenOptions {
+                    num_rows: 1,
+                    ..Default::default()
+                },
+            )),
+        }
     }
 
     /// num_rows is a placeholder for maybe a testing helper library for OTAP pdata?
