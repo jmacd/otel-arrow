@@ -140,7 +140,7 @@ impl Exporter<OtapPdata> for ParquetExporter {
                 }
 
                 Message::PData(pdata) => {
-                    let mut otap_batch: OtapArrowRecords = pdata.try_into()?;
+                    let (_, mut otap_batch): (_, OtapArrowRecords) = pdata.try_into()?;
 
                     // generate unique IDs
                     let id_gen_result = id_generator.generate_unique_ids(&mut otap_batch);

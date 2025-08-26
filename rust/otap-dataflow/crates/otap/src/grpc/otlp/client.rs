@@ -5,7 +5,7 @@
 //! request payload.
 //!
 //! The motivation behind this client implementation is that our telemetry pipelines will be
-//! able to receive GRPC OTLP requests, and if there's no need to serialize them, we can keep
+//! able to receive GRPC OTLP requests, and if there's no need to deserialize them, we can keep
 //! the payload serialized as protobuf before then forwarding using these clients.
 
 use http::uri::PathAndQuery;

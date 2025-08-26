@@ -74,7 +74,7 @@ use otap_df_engine::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+//use std::time::{Duration, Instant};
 
 /// URN for the RetryProcessor processor
 pub const RETRY_PROCESSOR_URN: &str = "urn:otap:processor:retry_processor";
@@ -167,70 +167,67 @@ impl RetryProcessor {
         Self { config }
     }
 
-    fn acknowledge(&mut self, id: u64) {
-        if let Some(_removed) = self.pending_messages.remove(&id) {
-            log::debug!("Acknowledged and removed message with ID: {id}");
-        } else {
-            log::warn!("Attempted to acknowledge non-existent message with ID: {id}");
-        }
-    }
+    // fn acknowledge(&mut self, id: u64) {
+    //     if let Some(_removed) = self.pending_messages.remove(&id) {
+    //         log::debug!("Acknowledged and removed message with ID: {id}");
+    //     } else {
+    //         log::warn!("Attempted to acknowledge non-existent message with ID: {id}");
+    //     }
+    // }
 
-    async fn handle_nack(
-        &mut self,
-        id: u64,
-        reason: String,
-        _effect_handler: &mut EffectHandler<OtapPdata>,
-    ) -> Result<(), Error<OtapPdata>> {
-        if let Some(mut pending) = self.pending_messages.remove(&id) {
-            pending.retry_count += 1;
-            pending.last_error = reason;
+    // async fn handle_nack(
+    //     &mut self,
+    //     id: u64,
+    //     reason: String,
+    //     _effect_handler: &mut EffectHandler<OtapPdata>,
+    // ) -> Result<(), Error<OtapPdata>> {
+    //     if let Some(mut pending) = self.pending_messages.remove(&id) {
+    //         pending.retry_count += 1;
+    //         pending.last_error = reason;
 
-            if pending.retry_count <= self.config.max_retries {
-                let delay_ms = (self.config.initial_retry_delay_ms as f64
-                    * self
-                        .config
-                        .backoff_multiplier
-                        .powi(pending.retry_count as i32 - 1))
-                .min(self.config.max_retry_delay_ms as f64) as u64;
+    //         if pending.retry_count <= self.config.max_retries {
+    //             let delay_ms = (self.config.initial_retry_delay_ms as f64
+    //                 * self
+    //                     .config
+    //                     .backoff_multiplier
+    //                     .powi(pending.retry_count as i32 - 1))
+    //             .min(self.config.max_retry_delay_ms as f64) as u64;
 
-                pending.next_retry_time = Instant::now() + Duration::from_millis(delay_ms);
-                let retry_count = pending.retry_count;
-                let _previous = self.pending_messages.insert(id, pending);
-                log::debug!("Scheduled message {id} for retry attempt {retry_count}");
-            } else {
-                log::error!(
-                    "Message {} exceeded max retries ({}), dropping. Last error: {}",
-                    id,
-                    self.config.max_retries,
-                    pending.last_error
-                );
-            }
-        } else {
-            log::warn!("Attempted to handle nack for non-existent message with ID: {id}");
-        }
-        Ok(())
-    }
+    //             pending.next_retry_time = Instant::now() + Duration::from_millis(delay_ms);
+    //             let retry_count = pending.retry_count;
+    //             let _previous = self.pending_messages.insert(id, pending);
+    //             log::debug!("Scheduled message {id} for retry attempt {retry_count}");
+    //         } else {
+    //             log::error!(
+    //                 "Message {} exceeded max retries ({}), dropping. Last error: {}",
+    //                 id,
+    //                 self.config.max_retries,
+    //                 pending.last_error
+    //             );
+    //         }
+    //     } else {
+    //         log::warn!("Attempted to handle nack for non-existent message with ID: {id}");
+    //     }
+    //     Ok(())
+    // }
 
-    async fn process_pending_retries(
-        &mut self,
-        effect_handler: &mut EffectHandler<OtapPdata>,
-    ) -> Result<(), Error<OtapPdata>> {
-        let now = Instant::now();
-        let mut ready_messages = Vec::new();
-
-        for (&id, pending) in &self.pending_messages {
-            if pending.next_retry_time <= now {
-                ready_messages.push((id, pending.data.clone()));
-            }
-        }
-
-        for (id, data) in ready_messages {
-            log::debug!("Retrying message with ID: {id}");
-            effect_handler.send_message(data).await?;
-        }
-
-        Ok(())
-    }
+    // async fn process_pending_retries(
+    //     &mut self,
+    //     effect_handler: &mut EffectHandler<OtapPdata>,
+    // ) -> Result<(), Error<OtapPdata>> {
+    //     let now = Instant::now();
+    //     let mut ready_messages = Vec::new();
+    //     for (&id, pending) in &self.pending_messages {
+    //         if pending.next_retry_time <= now {
+    //             ready_messages.push((id, pending.data.clone()));
+    //         }
+    //     }
+    //     for (id, data) in ready_messages {
+    //         log::debug!("Retrying message with ID: {id}");
+    //         effect_handler.send_message(data).await?;
+    //     }
+    //     Ok(())
+    // }
 }
 
 #[async_trait(?Send)]
@@ -280,35 +277,34 @@ impl Processor<OtapPdata> for RetryProcessor {
 
                 Ok(())
             }
-            Message::Control(control_msg) => match control_msg {
-                NodeControlMsg::Ack { id } => {
-                    self.acknowledge(id);
-                    Ok(())
-                }
-                NodeControlMsg::Nack { id, reason } => {
-                    self.handle_nack(id, reason, effect_handler).await
-                }
-                NodeControlMsg::TimerTick { .. } => {
-                    self.process_pending_retries(effect_handler).await?;
-                    self.cleanup_expired_messages();
-                    Ok(())
-                }
-                NodeControlMsg::Config { config } => {
-                    if let Ok(new_config) = serde_json::from_value::<RetryConfig>(config) {
-                        self.config = new_config;
+            Message::Control(control_msg) => {
+                match control_msg {
+                    NodeControlMsg::Ack { id } => {
+                        // self.acknowledge(id);
                     }
-                    Ok(())
-                }
-                NodeControlMsg::Shutdown { .. } => {
-                    let pending_ids: Vec<u64> = self.pending_messages.keys().cloned().collect();
-                    for id in pending_ids {
-                        if let Some(pending) = self.pending_messages.remove(&id) {
-                            let _ = effect_handler.send_message(pending.data).await;
-                        }
+                    NodeControlMsg::Nack { id, reason } => {
+                        // self.handle_nack(id, reason, effect_handler).await
                     }
-                    Ok(())
-                }
-            },
+                    NodeControlMsg::TimerTick { .. } => {
+                        // self.process_pending_retries(effect_handler).await?;
+                        // self.cleanup_expired_messages();
+                    }
+                    NodeControlMsg::Config { config } => {
+                        // if let Ok(new_config) = serde_json::from_value::<RetryConfig>(config) {
+                        //     self.config = new_config;
+                        // }
+                    }
+                    NodeControlMsg::Shutdown { .. } => {
+                        // let pending_ids: Vec<u64> = self.pending_messages.keys().cloned().collect();
+                        // for id in pending_ids {
+                        //     if let Some(pending) = self.pending_messages.remove(&id) {
+                        //         let _ = effect_handler.send_message(pending.data).await;
+                        //     }
+                        // }
+                    }
+                };
+                Ok(())
+            }
         }
     }
 }
@@ -330,6 +326,7 @@ mod tests {
     use otap_df_engine::local::message::LocalSender;
     use otap_df_engine::testing::test_node;
     use serde_json::json;
+    use std::collections::HashMap;
     use tokio::time::{Duration, sleep};
 
     fn create_test_channel<T>(capacity: usize) -> (mpsc::Sender<T>, mpsc::Receiver<T>) {

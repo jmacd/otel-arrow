@@ -152,7 +152,7 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
                 }
                 //send data
                 Message::PData(message) => {
-                    let message: OtapArrowBytes = message.try_into()?;
+                    let (context, message): (_, OtapArrowBytes) = message.try_into()?;
 
                     match message {
                         // match on OTAPData type and use the respective client to send message
@@ -304,6 +304,7 @@ mod tests {
                         .expect("Timed out waiting for message")
                         .expect("No message received")
                         .try_into()
+                        .map(|u| u.1)
                         .expect("Could convert pdata to OTAPData");
 
                 // Assert that the message received is what the exporter sent

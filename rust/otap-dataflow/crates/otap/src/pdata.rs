@@ -290,38 +290,45 @@ impl From<OtapArrowBytes> for OtapPdata {
     }
 }
 
-impl TryFrom<OtapPdata> for OtapArrowRecords {
+impl TryFrom<OtapPdata> for (Context, OtapArrowRecords) {
     type Error = error::Error;
 
+    // Note: this results in loss of context.  Use try_from_with_context().
     fn try_from(value: OtapPdata) -> Result<Self, Self::Error> {
         match value {
-            OtapPdata::OtapArrowBytes { value, .. } => value.try_into(),
-            OtapPdata::OtapArrowRecords { value, .. } => Ok(value),
-            OtapPdata::OtlpBytes { value, .. } => value.try_into(),
+            OtapPdata::OtapArrowBytes { context, value, .. } => {
+                value.try_into().map(|u| (context, u))
+            }
+            OtapPdata::OtapArrowRecords { context, value } => Ok((context, value)),
+            OtapPdata::OtlpBytes { context, value } => value.try_into().map(|u| (context, u)),
         }
     }
 }
 
-impl TryFrom<OtapPdata> for OtlpProtoBytes {
+impl TryFrom<OtapPdata> for (Context, OtlpProtoBytes) {
     type Error = error::Error;
 
     fn try_from(value: OtapPdata) -> Result<Self, Self::Error> {
         match value {
-            OtapPdata::OtapArrowBytes { value, .. } => value.try_into(),
-            OtapPdata::OtapArrowRecords { value, .. } => value.try_into(),
-            OtapPdata::OtlpBytes { value, .. } => Ok(value),
+            OtapPdata::OtapArrowBytes { context, value } => value.try_into().map(|u| (context, u)),
+            OtapPdata::OtapArrowRecords { context, value } => {
+                value.try_into().map(|u| (context, u))
+            }
+            OtapPdata::OtlpBytes { context, value } => Ok((context, value)),
         }
     }
 }
 
-impl TryFrom<OtapPdata> for OtapArrowBytes {
+impl TryFrom<OtapPdata> for (Context, OtapArrowBytes) {
     type Error = error::Error;
 
     fn try_from(value: OtapPdata) -> Result<Self, Self::Error> {
         match value {
-            OtapPdata::OtapArrowBytes { value, .. } => Ok(value),
-            OtapPdata::OtapArrowRecords { value, .. } => value.try_into(),
-            OtapPdata::OtlpBytes { value, .. } => value.try_into(),
+            OtapPdata::OtapArrowBytes { context, value } => Ok((context, value)),
+            OtapPdata::OtapArrowRecords { context, value } => {
+                value.try_into().map(|u| (context, u))
+            }
+            OtapPdata::OtlpBytes { context, value } => value.try_into().map(|u| (context, u)),
         }
     }
 }
