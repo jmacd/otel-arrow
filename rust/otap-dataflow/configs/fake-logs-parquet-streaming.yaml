@@ -1,0 +1,44 @@
+settings:
+  default_pipeline_ctrl_msg_channel_size: 100
+  default_node_ctrl_msg_channel_size: 100
+  default_pdata_channel_size: 100
+
+nodes:
+  fake_logs_receiver:
+    kind: receiver
+    plugin_urn: "urn:otel:otap:fake_data_generator:receiver"
+    out_ports:
+      out_port:
+        destinations:
+          - parquet_exporter
+        dispatch_strategy: round_robin
+    config:
+      traffic_config:
+        # Generate 10 signals per second for a streaming effect
+        signals_per_second: 10
+        # Generate indefinitely (set to null for continuous streaming)
+        max_signal_count: null
+        # Maximum batch size per message
+        max_batch_size: 100
+        # Only generate logs data (set other weights to 0)
+        metric_weight: 0
+        trace_weight: 0
+        log_weight: 100
+      # Use semantic conventions registry for realistic attribute names
+      registry_path: https://github.com/open-telemetry/semantic-conventions.git[model]
+
+  parquet_exporter:
+    kind: exporter
+    plugin_urn: "urn:otel:otap:parquet:exporter"
+    config:
+      # Output directory for parquet files
+      base_uri: ./output_parquet_files
+      # Partitioning strategy using schema metadata
+      partitioning_strategies:
+        - schema_metadata: ["_part_id"]
+      # Writer options for streaming behavior
+      writer_options:
+        # Flush files when they get older than 15 seconds (for streaming effect)
+        flush_when_older_than: 15s
+        # Target a smaller number of rows per file for streaming
+        target_rows_per_file: 1000
