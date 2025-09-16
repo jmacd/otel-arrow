@@ -88,7 +88,7 @@ tonic = { version = "0.14", default-features = false, features = [
 tonic-middleware = "0.4.0"
 tonic-prost = "0.14"
 prost = "0.14"
-datafusion = "50"
+datafusion = { version = "50", default-features = false, features = ["parquet"] }
 
 [features]
 default = []
