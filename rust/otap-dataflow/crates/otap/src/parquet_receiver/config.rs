@@ -20,6 +20,7 @@ pub struct Config {
     
     /// How often to scan for new files
     #[serde(default = "default_polling_interval")]
+    #[serde(with = "humantime_serde")]
     pub polling_interval: Duration,
     
     /// Optional processing options
@@ -49,6 +50,7 @@ pub struct ProcessingOptions {
     
     /// Minimum file age before processing (helps avoid processing incomplete files)
     #[serde(default)]
+    #[serde(with = "humantime_serde::option")]
     pub min_file_age: Option<Duration>,
     
     /// Whether to validate that related files exist (for debugging)

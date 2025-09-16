@@ -38,7 +38,5 @@ nodes:
         - schema_metadata: ["_part_id"]
       # Writer options for streaming behavior
       writer_options:
-        # Flush files when they get older than 15 seconds (for streaming effect)
         flush_when_older_than: 15s
-        # Target a smaller number of rows per file for streaming
-        target_rows_per_file: 1000
+        target_rows_per_file: 100

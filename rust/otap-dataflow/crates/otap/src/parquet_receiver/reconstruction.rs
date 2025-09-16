@@ -319,11 +319,11 @@ mod tests {
 
     #[test]
     fn test_reconstructor_creation() {
-        let reconstructor = OtapReconstructor::new(Some(1000));
+        let _reconstructor = OtapReconstructor::new(Some(1000));
         // Basic creation test
         assert!(true);
 
-        let default_reconstructor = OtapReconstructor::default();
+        let _default_reconstructor = OtapReconstructor::default();
         assert!(true);
     }
 
@@ -339,7 +339,7 @@ mod tests {
             signal_type: SignalType::Logs,
         };
 
-        let result = reconstructor.reconstruct_simple(query_result).unwrap();
+        let _result = reconstructor.reconstruct_simple(query_result).unwrap();
         
         // Verify we get back an OtapArrowRecords with logs data
         // This is a basic test - in a real scenario we'd check the actual data content

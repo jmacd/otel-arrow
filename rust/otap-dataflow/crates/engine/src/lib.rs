@@ -265,14 +265,26 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             let pipeline_ctx = pipeline_ctx.with_node_context(name.clone(), node_config.kind);
 
             match node_config.kind {
-                otap_df_config::node::NodeKind::Receiver => self.create_receiver(
-                    pipeline_ctx,
-                    &mut receiver_names,
-                    &mut nodes,
-                    &mut receivers,
-                    name.clone(),
-                    node_config.clone(),
-                )?,
+                otap_df_config::node::NodeKind::Receiver => {
+                    log::debug!("🔍 DEBUG: About to call create_receiver for: {}", name);
+                    let result = self.create_receiver(
+                        pipeline_ctx,
+                        &mut receiver_names,
+                        &mut nodes,
+                        &mut receivers,
+                        name.clone(),
+                        node_config.clone(),
+                    );
+                    match &result {
+                        Ok(_) => log::debug!("✅ DEBUG: create_receiver returned Ok for: {}", name),
+                        Err(e) => log::debug!(
+                            "❌ DEBUG: create_receiver returned Error for {}: {:?}",
+                            name,
+                            e
+                        ),
+                    }
+                    result?;
+                }
                 otap_df_config::node::NodeKind::Processor => self.create_processor(
                     pipeline_ctx,
                     &mut processor_names,
@@ -456,18 +468,48 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         node_config: Arc<NodeUserConfig>,
     ) -> Result<(), Error> {
         // Validate plugin URN structure during registration
+        log::debug!(
+            "🔍 DEBUG: Starting receiver creation for URN: {}",
+            node_config.plugin_urn
+        );
+
         otap_df_config::urn::validate_plugin_urn(
             node_config.plugin_urn.as_ref(),
             otap_df_config::node::NodeKind::Receiver,
         )
-        .map_err(|e| Error::ConfigError(Box::new(e)))?;
+        .map_err(|e| {
+            log::debug!("❌ DEBUG: URN format validation failed: {}", e);
+            Error::ConfigError(Box::new(e))
+        })?;
 
-        let factory = self
-            .get_receiver_factory_map()
+        log::debug!("✅ DEBUG: URN format validation passed");
+
+        let factory_map = self.get_receiver_factory_map();
+        log::debug!(
+            "🔍 DEBUG: Available receivers: {:?}",
+            factory_map.keys().collect::<Vec<_>>()
+        );
+        log::debug!(
+            "🔍 DEBUG: Looking for receiver factory: {}",
+            node_config.plugin_urn
+        );
+
+        let factory = factory_map
             .get(node_config.plugin_urn.as_ref())
-            .ok_or_else(|| Error::UnknownReceiver {
-                plugin_urn: node_config.plugin_urn.clone(),
+            .ok_or_else(|| {
+                log::debug!(
+                    "❌ DEBUG: Factory not found for URN: {}",
+                    node_config.plugin_urn
+                );
+                log::debug!("❌ DEBUG: This should cause UnknownReceiver error!");
+                let error = Error::UnknownReceiver {
+                    plugin_urn: node_config.plugin_urn.clone(),
+                };
+                log::debug!("❌ DEBUG: About to return error: {:?}", error);
+                error
             })?;
+
+        log::debug!("✅ DEBUG: Factory found, continuing with receiver creation");
         let runtime_config = ReceiverConfig::new(name.clone());
         let create = factory.create;
 
@@ -484,6 +526,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             create(pipeline_ctx, node_id, node_config, &runtime_config)
                 .map_err(|e| Error::ConfigError(Box::new(e)))?,
         );
+        log::debug!("✅ DEBUG: create_receiver completed successfully");
         Ok(())
     }
 

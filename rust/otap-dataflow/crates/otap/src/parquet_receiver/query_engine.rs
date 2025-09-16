@@ -7,23 +7,16 @@
 //! DataFusion and performing the multi-table joins needed to reconstruct OTAP data.
 
 use crate::parquet_receiver::{
-    config::SignalType,
-    error::ParquetReceiverError,
-    file_discovery::DiscoveredFile,
+    config::SignalType, error::ParquetReceiverError, file_discovery::DiscoveredFile,
 };
 use arrow::record_batch::RecordBatch;
-use datafusion::{
-    execution::{context::SessionContext, options::ParquetReadOptions},
-};
+use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
 use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
 
 /// DataFusion-based query engine for parquet reconstruction
-pub struct ParquetQueryEngine {
-    /// DataFusion session context
-    ctx: SessionContext,
-}
+pub struct ParquetQueryEngine {}
 
 /// Result of a query containing reconstructed data
 #[derive(Debug)]
@@ -41,8 +34,7 @@ pub struct QueryResult {
 impl ParquetQueryEngine {
     /// Create a new query engine instance
     pub fn new() -> Self {
-        let ctx = SessionContext::new();
-        Self { ctx }
+        Self {}
     }
 
     /// Query and reconstruct data for a discovered file
@@ -70,7 +62,10 @@ impl ParquetQueryEngine {
         // Register related tables
         let mut related_table_info = HashMap::new();
         for related_file in &discovered_file.related_files {
-            let table_name = format!("{}_{}", related_file.file_type, discovered_file.partition_id);
+            let table_name = format!(
+                "{}_{}",
+                related_file.file_type, discovered_file.partition_id
+            );
             ctx.register_parquet(
                 &table_name,
                 related_file.path.to_str().ok_or_else(|| {
@@ -270,8 +265,8 @@ mod tests {
     fn test_build_logs_reconstruction_query() {
         let logs_table = "logs_test";
         let mut related_tables = HashMap::new();
-        related_tables.insert("log_attrs".to_string(), "log_attrs_test".to_string());
-        related_tables.insert(
+        let _ = related_tables.insert("log_attrs".to_string(), "log_attrs_test".to_string());
+        let _ = related_tables.insert(
             "resource_attrs".to_string(),
             "resource_attrs_test".to_string(),
         );
@@ -302,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_engine_creation() {
-        let engine = ParquetQueryEngine::new();
+        let _engine = ParquetQueryEngine::new();
         // Just verify we can create the engine successfully
         // Real tests would require actual parquet files
         assert!(true);
