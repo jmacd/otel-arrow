@@ -39,6 +39,8 @@ pub mod pdata;
 
 pub mod parquet_exporter;
 
+pub mod parquet_receiver;
+
 pub mod perf_exporter;
 
 pub mod fake_data_generator;

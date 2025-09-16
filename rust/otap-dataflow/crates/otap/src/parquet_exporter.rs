@@ -111,6 +111,8 @@ impl Exporter<OtapPdata> for ParquetExporter {
         mut msg_chan: MessageChannel<OtapPdata>,
         effect_handler: EffectHandler<OtapPdata>,
     ) -> Result<(), Error> {
+        log::debug!("starting parquet exporter to {:?}", self.config.base_uri);
+
         let object_store =
             object_store::from_uri(&self.config.base_uri).map_err(|e| Error::ExporterError {
                 exporter: effect_handler.exporter_id(),
@@ -143,6 +145,7 @@ impl Exporter<OtapPdata> for ParquetExporter {
         loop {
             match msg_chan.recv().await? {
                 Message::Control(NodeControlMsg::TimerTick { .. }) => {
+                    log::debug!("Parquet exporter: Timer tick received - checking for aged files to flush");
                     let flush_aged_result = writer.flush_aged_beyond_threshold().await;
                     if let Err(e) = flush_aged_result {
                         // TODO - this is not the error handling we want long term.  eventually we
@@ -223,6 +226,13 @@ impl Exporter<OtapPdata> for ParquetExporter {
                             )
                         })
                         .collect::<Vec<_>>();
+                    
+                    log::debug!("Parquet exporter processing batch {} with {} partitions", batch_id, partitions.len());
+                    for (i, partition) in partitions.iter().enumerate() {
+                        let payload_types: Vec<_> = partition.otap_batch.allowed_payload_types().iter().collect();
+                        log::debug!("  Partition {}: {} payload types: {:?}", i, payload_types.len(), payload_types);
+                    }
+                    
                     batch_id += 1;
                     let write_result = writer.write(&writes).await;
                     if let Err(e) = write_result {
@@ -235,6 +245,7 @@ impl Exporter<OtapPdata> for ParquetExporter {
                             error: format!("Parquet write failed: {e}"),
                         });
                     };
+                    log::debug!("Successfully processed parquet batch {} - data written to buffer, checking for flushable files", batch_id - 1);
                 }
 
                 _ => {

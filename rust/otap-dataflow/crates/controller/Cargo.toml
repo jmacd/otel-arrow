@@ -22,6 +22,7 @@ otap-df-engine = { path = "../engine" }
 otap-df-telemetry = { path = "../telemetry" }
 otap-df-admin = { path = "../admin" }
 
+log = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 core_affinity = { workspace = true }

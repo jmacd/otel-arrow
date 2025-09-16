@@ -17,6 +17,7 @@ arrow.workspace = true
 arrow-ipc.workspace = true
 async-trait.workspace = true
 ciborium.workspace = true
+datafusion.workspace = true
 futures.workspace = true
 futures-timer.workspace = true
 http.workspace = true

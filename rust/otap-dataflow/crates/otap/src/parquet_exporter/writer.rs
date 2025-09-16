@@ -77,10 +77,16 @@ impl WriterManager {
     }
 
     pub async fn write(&mut self, writes: &[WriteBatch<'_>]) -> Result<(), ParquetError> {
+        log::debug!("WriterManager.write: Processing {} write batches", writes.len());
+        
         for write in writes {
             // schedule the writes for each payload type for this signal
+            let payload_types: Vec<_> = write.otap_batch.allowed_payload_types().iter().collect();
+            log::debug!("  Batch {}: Scheduling writes for {} payload types: {:?}", write.batch_id, payload_types.len(), payload_types);
+            
             for payload_type in write.otap_batch.allowed_payload_types() {
                 if let Some(record_batch) = write.otap_batch.get(*payload_type) {
+                    log::debug!("    Payload type {:?}: {} rows to write", payload_type, record_batch.num_rows());
                     self.schedule_write_batch(
                         write.batch_id,
                         *payload_type,
@@ -92,7 +98,9 @@ impl WriterManager {
         }
 
         // write the scheduled batches to the files
+        log::debug!("WriterManager.write: Writing {} scheduled batches to parquet buffers", writes.len());
         self.write_scheduled().await?;
+        log::debug!("WriterManager.write: Completed writing to buffers, checking for files to flush");
 
         // if we can determine after the write process that any files should be flushed
         // (e.g. if they've exceeded max size), we'll try to flush them immediately
@@ -100,7 +108,9 @@ impl WriterManager {
         // Note: the files might not actually get flushed if they have child rows that
         // aren't scheduled to be flushed. In this case, we won't continue appending to
         // these files, but we won't flush them until after the children are flushed.
+        log::debug!("WriterManager.write: Scheduling flushes for files that exceed thresholds");
         self.schedule_flushes();
+        log::debug!("WriterManager.write: Attempting to flush {} pending files", self.pending_file_flushes.len());
         self.attempt_flush_scheduled().await?;
 
         Ok(())
@@ -203,6 +213,8 @@ impl WriterManager {
     async fn attempt_flush_scheduled(&mut self) -> Result<(), ParquetError> {
         let mut flushable = Vec::new();
         let mut requeue = Vec::new();
+        
+        log::debug!("attempt_flush_scheduled: Starting flush attempt with {} pending files", self.pending_file_flushes.len());
 
         loop {
             for file_writer in self.pending_file_flushes.drain(..) {
@@ -210,27 +222,48 @@ impl WriterManager {
                     file_writer.batch_ids.iter().cloned(),
                     file_writer.payload_type,
                 ) {
+                    log::debug!("  File for payload type {:?} with {} batches cannot be flushed yet - has unflushed children", 
+                              file_writer.payload_type, file_writer.batch_ids.len());
                     requeue.push(file_writer);
                 } else {
+                    log::debug!("  File for payload type {:?} with {} batches is ready to flush to disk", 
+                              file_writer.payload_type, file_writer.batch_ids.len());
                     flushable.push(file_writer);
                 }
             }
 
             self.pending_file_flushes.append(&mut requeue);
             if flushable.is_empty() {
+                log::debug!("  No files ready to flush this round");
                 break;
             }
+            
+            log::debug!("  Flushing {} files to disk now", flushable.len());
 
             for file_writer in &flushable {
                 self.unflushed_batches_state.decr_unflushed_write(
                     file_writer.batch_ids.iter().cloned(),
                     file_writer.payload_type,
                 );
+                log::debug!("    About to close and write file for payload type {:?} ({} rows, {} batches)", 
+                          file_writer.payload_type, file_writer.rows_written, file_writer.batch_ids.len());
             }
 
             _ = flushable
                 .drain(..)
-                .map(|fw| fw.writer.close())
+                .map(|fw| {
+                    let payload_type = fw.payload_type;
+                    let rows_written = fw.rows_written;
+                    async move {
+                        let result = fw.writer.close().await;
+                        if result.is_ok() {
+                            log::info!("✅ Successfully wrote parquet file to disk: payload type {:?}, {} rows", payload_type, rows_written);
+                        } else {
+                            log::error!("❌ Failed to write parquet file: payload type {:?}, {} rows", payload_type, rows_written);
+                        }
+                        result
+                    }
+                })
                 .collect::<FuturesUnordered<_>>()
                 .try_collect::<Vec<_>>()
                 .await?;
@@ -251,6 +284,7 @@ impl WriterManager {
     /// If this [`WriterManager`] was configured with `[WriterOptions::flush_when_older_than`],
     /// then this method wil flush any current writers with rows older than this threshold.
     pub async fn flush_aged_beyond_threshold(&mut self) -> Result<(), ParquetError> {
+        log::debug!("flush_aged_beyond_threshold: Checking for aged files to flush");
         // schedule flushes -- this will put every writer whose age is older than the threshold
         // into the pending queue
         self.schedule_flushes();
