@@ -6,5 +6,9 @@
 pub mod config;
 pub mod error;
 pub mod file_discovery;
+pub mod parquet_receiver;
 pub mod query_engine; 
 pub mod reconstruction;
+
+// Re-export the main receiver and factory
+pub use parquet_receiver::{ParquetReceiver, PARQUET_RECEIVER_FACTORY, PARQUET_RECEIVER_URN};

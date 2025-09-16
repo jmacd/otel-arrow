@@ -167,18 +167,24 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug> Controller<PData> {
             let obs_evt_reporter = obs_evt_reporter.clone();
             let handle = thread::Builder::new()
                 .name(thread_name.clone())
-                .spawn(move || {
-                    Self::run_pipeline_thread(
-                        pipeline_key,
-                        core_id,
-                        pipeline_config,
-                        pipeline_factory,
-                        pipeline_handle,
-                        obs_evt_reporter,
-                        metrics_reporter,
-                        pipeline_ctrl_msg_tx,
-                        pipeline_ctrl_msg_rx,
-                    )
+                .spawn({
+                    let thread_name_for_log = thread_name.clone();
+                    move || {
+                        log::debug!("🔍 DEBUG: Thread {} starting run_pipeline_thread", thread_name_for_log);
+                        let result = Self::run_pipeline_thread(
+                            pipeline_key,
+                            core_id,
+                            pipeline_config,
+                            pipeline_factory,
+                            pipeline_handle,
+                            obs_evt_reporter,
+                            metrics_reporter,
+                            pipeline_ctrl_msg_tx,
+                            pipeline_ctrl_msg_rx,
+                        );
+                        log::debug!("🔍 DEBUG: Thread {} run_pipeline_thread completed: {:?}", thread_name_for_log, result.is_ok());
+                        result
+                    }
                 })
                 .map_err(|e| Error::ThreadSpawnError {
                     thread_name: thread_name.clone(),
@@ -321,11 +327,16 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug> Controller<PData> {
         }
 
         // Build the runtime pipeline from the configuration
+        log::debug!("🔍 DEBUG: About to call pipeline_factory.build()");
         let runtime_pipeline = pipeline_factory
             .build(pipeline_handle, pipeline_config.clone())
-            .map_err(|e| Error::PipelineRuntimeError {
-                source: Box::new(e),
+            .map_err(|e| {
+                log::error!("❌ DEBUG: Pipeline build failed: {}", e);
+                Error::PipelineRuntimeError {
+                    source: Box::new(e),
+                }
             })?;
+        log::debug!("✅ DEBUG: Pipeline build completed, about to call run_forever()");
 
         // Start the pipeline (this will use the current thread's Tokio runtime)
         runtime_pipeline
@@ -336,8 +347,11 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug> Controller<PData> {
                 pipeline_ctrl_msg_tx,
                 pipeline_ctrl_msg_rx,
             )
-            .map_err(|e| Error::PipelineRuntimeError {
-                source: Box::new(e),
+            .map_err(|e| {
+                log::error!("❌ DEBUG: Pipeline run_forever failed: {}", e);
+                Error::PipelineRuntimeError {
+                    source: Box::new(e),
+                }
             })
     }
 }

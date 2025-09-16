@@ -59,20 +59,34 @@ impl FileDiscovery {
         &mut self,
         signal_types: &[SignalType],
     ) -> Result<Vec<DiscoveredFile>, ParquetReceiverError> {
+        log::debug!("🔍 FileDiscovery::discover_new_files called for signal types: {:?}", signal_types);
+        log::debug!("🔍 Base path: {}", self.base_path.display());
+        log::debug!("🔍 Currently processed files count: {}", self.processed_files.len());
+        
         let mut discovered = Vec::new();
 
         for signal_type in signal_types {
             let signal_dir = self.base_path.join(signal_type_to_dir_name(signal_type));
+            log::debug!("🔍 Looking for {:?} files in directory: {}", signal_type, signal_dir.display());
+            
             if !signal_dir.exists() {
+                log::debug!("⚠️ Directory does not exist: {}", signal_dir.display());
                 continue;
             }
 
+            log::debug!("✅ Directory exists, scanning for files...");
             let files = self.discover_signal_files(&signal_dir, signal_type)?;
+            log::debug!("📁 Found {} files for {:?}", files.len(), signal_type);
             discovered.extend(files);
         }
 
         // Sort by modification time to process files in order
         discovered.sort_by_key(|f| f.modified_time);
+        log::debug!("📋 Total discovered files: {}", discovered.len());
+        
+        for file in &discovered {
+            log::debug!("📄 Discovered: {}", file.path.display());
+        }
 
         Ok(discovered)
     }
