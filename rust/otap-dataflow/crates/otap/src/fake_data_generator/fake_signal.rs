@@ -57,8 +57,12 @@ pub fn fake_otlp_logs(signal_count: usize, registry: &ResolvedRegistry) -> LogsD
         .finish(),
     ];
 
+    let resource = Resource::default();
+    log::debug!("🏭 Generated fake OTLP logs: {} records, resource attributes: {:?}", 
+                signal_count, resource.attributes.len());
+    
     let resources: Vec<ResourceLogs> = vec![
-        ResourceLogs::build(Resource::default())
+        ResourceLogs::build(resource)
             .scope_logs(scopes)
             .finish(),
     ];
