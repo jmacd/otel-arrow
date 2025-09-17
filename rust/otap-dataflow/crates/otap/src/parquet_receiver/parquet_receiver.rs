@@ -142,8 +142,8 @@ impl shared::Receiver<OtapPdata> for ParquetReceiver {
                                         info!("📄 Processing file: {}", file.path.display());
                                     }
 
-                                    // Process partition using streaming coordinator
-                                    match self.streaming_coordinator.process_partition(&files[0].partition_id, &signal_type).await {
+                                    // Process using NEW partition-aware streaming coordinator to fix ID relationship bug
+                                    match self.streaming_coordinator.process_partition_with_object_store(&signal_type).await {
                                         Ok(streaming_batches) => {
                                             info!("� Streaming coordinator found {} batches for partition {}",
                                                 streaming_batches.len(), files[0].partition_id);

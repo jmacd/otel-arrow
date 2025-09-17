@@ -183,74 +183,11 @@ impl Default for ParquetQueryEngine {
     }
 }
 
-/// Build SQL query for logs reconstruction with joins
-fn build_logs_reconstruction_query(
-    logs_table: &str,
-    related_tables: &HashMap<String, String>,
-) -> Result<String, ParquetReceiverError> {
-    let mut query = format!(
-        r#"
-        SELECT 
-            logs.id,
-            logs.timestamp_unix_nano,
-            logs.body,
-            logs.severity_number,
-            logs.severity_text,
-            logs.flags,
-            logs.trace_id,
-            logs.span_id,
-            logs.resource_id,
-            logs.scope_id
-        FROM {logs_table} AS logs"#
-    );
 
-    // Add LEFT JOINs for related tables if they exist
-    if let Some(log_attrs_table) = related_tables.get("log_attrs") {
-        query.push_str(&format!(
-            r#"
-        LEFT JOIN {log_attrs_table} AS log_attrs 
-            ON logs.id = log_attrs.parent_id"#
-        ));
-    }
 
-    if let Some(resource_attrs_table) = related_tables.get("resource_attrs") {
-        query.push_str(&format!(
-            r#"
-        LEFT JOIN {resource_attrs_table} AS resource_attrs 
-            ON logs.resource_id = resource_attrs.parent_id"#
-        ));
-    }
 
-    if let Some(scope_attrs_table) = related_tables.get("scope_attrs") {
-        query.push_str(&format!(
-            r#"
-        LEFT JOIN {scope_attrs_table} AS scope_attrs 
-            ON logs.scope_id = scope_attrs.parent_id"#
-        ));
-    }
 
-    query.push_str(" ORDER BY logs.id");
 
-    Ok(query)
-}
-
-/// Convert signal type to main table name
-fn signal_type_to_table_name(signal_type: &SignalType) -> String {
-    match signal_type {
-        SignalType::Logs => "logs".to_string(),
-        SignalType::Traces => "spans".to_string(),
-        SignalType::Metrics => "univariate_metrics".to_string(),
-    }
-}
-
-/// Convert signal type to directory name
-fn signal_type_to_directory(signal_type: &SignalType) -> String {
-    match signal_type {
-        SignalType::Logs => "logs".to_string(),
-        SignalType::Traces => "traces".to_string(),
-        SignalType::Metrics => "metrics".to_string(),
-    }
-}
 
 #[cfg(test)]
 mod tests {

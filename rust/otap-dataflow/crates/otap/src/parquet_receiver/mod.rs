@@ -8,6 +8,7 @@ pub mod error;
 pub mod file_discovery;
 pub mod id_mapping;
 pub mod parquet_receiver;
+pub mod partition_object_store;
 pub mod query_engine; 
 pub mod reconstruction;
 pub mod streaming_coordinator;

@@ -63,5 +63,6 @@ zip = "=4.2.0"
 portpicker = "0.1.1"
 pretty_assertions = "1.4.1"
 tempfile.workspace = true
-url.workspace = true
+url = "2.5"
 tokio-util.workspace = true
+async-stream = "0.3.6"
