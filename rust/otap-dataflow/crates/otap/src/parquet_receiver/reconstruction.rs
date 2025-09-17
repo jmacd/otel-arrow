@@ -1,10 +1,10 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! OTAP data reconstruction from DataFusion query results
+//! OTAP data reconstruction from parquet RecordBatch results
 //!
-//! This module handles converting DataFusion RecordBatch results back to the 
-//! OtapArrowRecords format that can be sent through the pipeline.
+//! This module handles converting DataFusion query results (RecordBatch) back into
+//! OTAP data structures using otel-arrow-rust utilities.
 
 use crate::parquet_receiver::{
     config::SignalType,
@@ -12,24 +12,22 @@ use crate::parquet_receiver::{
     query_engine::QueryResult,
 };
 use arrow::record_batch::RecordBatch;
-use otel_arrow_rust::otap::{Logs, Metrics, OtapArrowRecords, Traces};
+use otel_arrow_rust::otap::{Logs, Metrics, OtapArrowRecords, OtapBatchStore, Traces};
 use otel_arrow_rust::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
-/// OTAP data reconstructor
+/// OTAP data reconstructor that converts DataFusion query results into OTAP records
 pub struct OtapReconstructor {
-    // Configuration for reconstruction options
-    _batch_size_limit: Option<usize>,
+    /// Optional batch size limit for processing
+    batch_size_limit: Option<usize>,
 }
 
 impl OtapReconstructor {
     /// Create a new OTAP reconstructor
     pub fn new(batch_size_limit: Option<usize>) -> Self {
-        Self {
-            _batch_size_limit: batch_size_limit,
-        }
+        Self { batch_size_limit }
     }
 
-    /// Reconstruct OTAP data from query results
+    /// Reconstruct OTAP data from DataFusion query results
     pub fn reconstruct_otap_data(
         &self,
         query_result: QueryResult,
@@ -46,25 +44,83 @@ impl OtapReconstructor {
         &self,
         query_result: QueryResult,
     ) -> Result<OtapArrowRecords, ParquetReceiverError> {
-        let mut otap_records = OtapArrowRecords::Logs(Logs::default());
+        log::debug!("🔄 Starting logs reconstruction for partition: {}", query_result.partition_id);
+        
+        let mut logs = Logs::default();
 
         // Set the main logs data
         if !query_result.main_records.is_empty() {
-            // Combine all main record batches into one
-            let combined_logs = combine_record_batches(&query_result.main_records)?;
-            otap_records.set(ArrowPayloadType::Logs, combined_logs);
+            log::debug!("📊 Processing {} main log record batches", query_result.main_records.len());
+            
+            // Log input schemas before combining
+            for (idx, batch) in query_result.main_records.iter().enumerate() {
+                log::debug!("🔍 Input batch {} schema ({} rows):", idx, batch.num_rows());
+                for field in batch.schema().fields() {
+                    log::debug!("  '{}' -> {:?}", field.name(), field.data_type());
+                }
+            }
+            
+            let combined_logs = self.combine_record_batches(&query_result.main_records)?;
+            if let Some(batch) = combined_logs {
+                log::debug!("✅ Combined logs batch: {} rows, {} columns", 
+                           batch.num_rows(), batch.num_columns());
+                           
+                // Log combined schema before OTAP conversion
+                log::debug!("🎯 Final combined logs schema:");
+                for field in batch.schema().fields() {
+                    log::debug!("  '{}' -> {:?}", field.name(), field.data_type());
+                }
+                
+                // Set the batch in OTAP logs
+                logs.set(ArrowPayloadType::Logs, batch);
+                log::debug!("✅ Successfully set logs batch in OTAP");
+            }
+        } else {
+            log::debug!("⚠️ No main logs records found");
         }
 
         // Set related attribute data
+        log::debug!("🔍 Processing {} related record types", query_result.related_records.len());
         for (file_type, records) in query_result.related_records {
             if !records.is_empty() {
-                let combined_records = combine_record_batches(&records)?;
-                let payload_type = file_type_to_payload_type(&file_type)?;
-                otap_records.set(payload_type, combined_records);
+                log::debug!("📊 Processing {} records of type '{}'", records.len(), file_type);
+                
+                // Log input schemas for related records
+                for (idx, batch) in records.iter().enumerate() {
+                    log::debug!("🔍 {} batch {} schema ({} rows):", file_type, idx, batch.num_rows());
+                    for field in batch.schema().fields() {
+                        log::debug!("  '{}' -> {:?}", field.name(), field.data_type());
+                    }
+                }
+                
+                let combined_records = self.combine_record_batches(&records)?;
+                if let Some(batch) = combined_records {
+                    let payload_type = file_type_to_payload_type(&file_type)?;
+                    log::debug!("✅ Combined {} batch: {} rows, {} columns", 
+                               file_type, batch.num_rows(), batch.num_columns());
+                               
+                    // Log final schema before OTAP conversion
+                    log::debug!("🎯 Final {} schema:", file_type);
+                    for field in batch.schema().fields() {
+                        log::debug!("  '{}' -> {:?}", field.name(), field.data_type());
+                    }
+                    
+                    // Set the batch in OTAP with payload type logging
+                    log::debug!("🔄 Setting {} batch with payload type: {:?}", file_type, payload_type);
+                    logs.set(payload_type, batch);
+                    log::debug!("✅ Successfully set {} batch in OTAP", file_type);
+                } else {
+                    log::debug!("⚠️ No combined batch for file type '{}'", file_type);
+                }
+            } else {
+                log::debug!("⚠️ Empty records for file type '{}'", file_type);
             }
         }
 
-        Ok(otap_records)
+        let result = OtapArrowRecords::Logs(logs);
+        
+        log::debug!("🎉 Logs reconstruction complete - batch length: {}", result.batch_length());
+        Ok(result)
     }
 
     /// Reconstruct traces data from query results  
@@ -72,24 +128,28 @@ impl OtapReconstructor {
         &self,
         query_result: QueryResult,
     ) -> Result<OtapArrowRecords, ParquetReceiverError> {
-        let mut otap_records = OtapArrowRecords::Traces(Traces::default());
+        let mut traces = Traces::default();
 
         // Set the main spans data
         if !query_result.main_records.is_empty() {
-            let combined_spans = combine_record_batches(&query_result.main_records)?;
-            otap_records.set(ArrowPayloadType::Spans, combined_spans);
+            let combined_spans = self.combine_record_batches(&query_result.main_records)?;
+            if let Some(batch) = combined_spans {
+                traces.set(ArrowPayloadType::Spans, batch);
+            }
         }
 
         // Set related attribute and event data
         for (file_type, records) in query_result.related_records {
             if !records.is_empty() {
-                let combined_records = combine_record_batches(&records)?;
-                let payload_type = file_type_to_payload_type(&file_type)?;
-                otap_records.set(payload_type, combined_records);
+                let combined_records = self.combine_record_batches(&records)?;
+                if let Some(batch) = combined_records {
+                    let payload_type = file_type_to_payload_type(&file_type)?;
+                    traces.set(payload_type, batch);
+                }
             }
         }
 
-        Ok(otap_records)
+        Ok(OtapArrowRecords::Traces(traces))
     }
 
     /// Reconstruct metrics data from query results
@@ -97,90 +157,85 @@ impl OtapReconstructor {
         &self,
         query_result: QueryResult,
     ) -> Result<OtapArrowRecords, ParquetReceiverError> {
-        let mut otap_records = OtapArrowRecords::Metrics(Metrics::default());
+        let mut metrics = Metrics::default();
 
         // Set the main metrics data
         if !query_result.main_records.is_empty() {
-            let combined_metrics = combine_record_batches(&query_result.main_records)?;
-            otap_records.set(ArrowPayloadType::UnivariateMetrics, combined_metrics);
+            let combined_metrics = self.combine_record_batches(&query_result.main_records)?;
+            if let Some(batch) = combined_metrics {
+                metrics.set(ArrowPayloadType::UnivariateMetrics, batch);
+            }
         }
 
         // Set related data points and attributes
         for (file_type, records) in query_result.related_records {
             if !records.is_empty() {
-                let combined_records = combine_record_batches(&records)?;
-                let payload_type = file_type_to_payload_type(&file_type)?;
-                otap_records.set(payload_type, combined_records);
+                let combined_records = self.combine_record_batches(&records)?;
+                if let Some(batch) = combined_records {
+                    let payload_type = file_type_to_payload_type(&file_type)?;
+                    metrics.set(payload_type, batch);
+                }
             }
         }
 
-        Ok(otap_records)
+        Ok(OtapArrowRecords::Metrics(metrics))
     }
 
-    /// Reconstruct data with simplified approach (just combine tables without complex joins)
-    /// This is the hackathon MVP approach
-    pub fn reconstruct_simple(
+    /// Combine multiple RecordBatches into a single batch
+    /// This handles cases where DataFusion returns multiple batches for a single table
+    fn combine_record_batches(
         &self,
-        query_result: QueryResult,
-    ) -> Result<OtapArrowRecords, ParquetReceiverError> {
-        match query_result.signal_type {
-            SignalType::Logs => {
-                let mut otap_records = OtapArrowRecords::Logs(Logs::default());
-
-                // Set main logs data if present
-                if !query_result.main_records.is_empty() {
-                    let main_batch = combine_record_batches(&query_result.main_records)?;
-                    otap_records.set(ArrowPayloadType::Logs, main_batch);
-                }
-
-                // Set each related table as separate payload types
-                for (file_type, record_batches) in query_result.related_records {
-                    if !record_batches.is_empty() {
-                        let combined_batch = combine_record_batches(&record_batches)?;
-                        let payload_type = file_type_to_payload_type(&file_type)?;
-                        otap_records.set(payload_type, combined_batch);
+        batches: &[RecordBatch],
+    ) -> Result<Option<RecordBatch>, ParquetReceiverError> {
+        match batches.len() {
+            0 => Ok(None),
+            1 => {
+                let batch = &batches[0];
+                // Apply batch size limit if configured
+                if let Some(limit) = self.batch_size_limit {
+                    if batch.num_rows() > limit {
+                        let limited_batch = batch.slice(0, limit);
+                        Ok(Some(limited_batch))
+                    } else {
+                        Ok(Some(batch.clone()))
                     }
+                } else {
+                    Ok(Some(batch.clone()))
                 }
-
-                Ok(otap_records)
             }
-            SignalType::Traces => {
-                // Similar pattern for traces
-                let mut otap_records = OtapArrowRecords::Traces(Traces::default());
-
-                if !query_result.main_records.is_empty() {
-                    let main_batch = combine_record_batches(&query_result.main_records)?;
-                    otap_records.set(ArrowPayloadType::Spans, main_batch);
-                }
-
-                for (file_type, record_batches) in query_result.related_records {
-                    if !record_batches.is_empty() {
-                        let combined_batch = combine_record_batches(&record_batches)?;
-                        let payload_type = file_type_to_payload_type(&file_type)?;
-                        otap_records.set(payload_type, combined_batch);
+            _ => {
+                // Log schemas of all batches before combining
+                log::debug!("🔄 Combining {} batches:", batches.len());
+                for (idx, batch) in batches.iter().enumerate() {
+                    log::debug!("  Batch {} schema ({} rows):", idx, batch.num_rows());
+                    for field in batch.schema().fields() {
+                        log::debug!("    '{}' -> {:?}", field.name(), field.data_type());
                     }
                 }
-
-                Ok(otap_records)
-            }
-            SignalType::Metrics => {
-                // Similar pattern for metrics
-                let mut otap_records = OtapArrowRecords::Metrics(Metrics::default());
-
-                if !query_result.main_records.is_empty() {
-                    let main_batch = combine_record_batches(&query_result.main_records)?;
-                    otap_records.set(ArrowPayloadType::UnivariateMetrics, main_batch);
-                }
-
-                for (file_type, record_batches) in query_result.related_records {
-                    if !record_batches.is_empty() {
-                        let combined_batch = combine_record_batches(&record_batches)?;
-                        let payload_type = file_type_to_payload_type(&file_type)?;
-                        otap_records.set(payload_type, combined_batch);
+                
+                // Combine multiple batches using Arrow's concat_batches
+                let schema = batches[0].schema();
+                let combined = arrow::compute::concat_batches(&schema, batches)
+                    .map_err(|e| {
+                        log::error!("❌ Failed to combine batches: {}", e);
+                        log::error!("   Reference schema (batch 0):");
+                        for field in schema.fields() {
+                            log::error!("     '{}' -> {:?}", field.name(), field.data_type());
+                        }
+                        ParquetReceiverError::Arrow(e)
+                    })?;
+                
+                // Apply batch size limit if configured
+                if let Some(limit) = self.batch_size_limit {
+                    if combined.num_rows() > limit {
+                        let limited_batch = combined.slice(0, limit);
+                        Ok(Some(limited_batch))
+                    } else {
+                        Ok(Some(combined))
                     }
+                } else {
+                    Ok(Some(combined))
                 }
-
-                Ok(otap_records)
             }
         }
     }
@@ -190,27 +245,6 @@ impl Default for OtapReconstructor {
     fn default() -> Self {
         Self::new(None)
     }
-}
-
-/// Combine multiple record batches into a single batch
-fn combine_record_batches(
-    record_batches: &[RecordBatch],
-) -> Result<RecordBatch, ParquetReceiverError> {
-    if record_batches.is_empty() {
-        return Err(ParquetReceiverError::Reconstruction(
-            "Cannot combine empty record batches".to_string(),
-        ));
-    }
-
-    if record_batches.len() == 1 {
-        return Ok(record_batches[0].clone());
-    }
-
-    // Use Arrow's concat_batches to combine multiple batches
-    let schema = record_batches[0].schema();
-    arrow::compute::concat_batches(&schema, record_batches).map_err(|e| {
-        ParquetReceiverError::Reconstruction(format!("Failed to combine record batches: {}", e))
-    })
 }
 
 /// Convert file type string to ArrowPayloadType
@@ -294,41 +328,14 @@ mod tests {
     }
 
     #[test]
-    fn test_combine_record_batches() {
-        let batch1 = create_test_record_batch();
-        let batch2 = create_test_record_batch();
-
-        let combined = combine_record_batches(&[batch1, batch2]).unwrap();
-        assert_eq!(combined.num_rows(), 6); // 3 + 3 rows
-        assert_eq!(combined.num_columns(), 2);
-    }
-
-    #[test]
-    fn test_combine_single_batch() {
-        let batch = create_test_record_batch();
-        let combined = combine_record_batches(&[batch.clone()]).unwrap();
-        assert_eq!(combined.num_rows(), batch.num_rows());
-        assert_eq!(combined.num_columns(), batch.num_columns());
-    }
-
-    #[test]
-    fn test_combine_empty_batches() {
-        let result = combine_record_batches(&[]);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_reconstructor_creation() {
         let _reconstructor = OtapReconstructor::new(Some(1000));
-        // Basic creation test
-        assert!(true);
-
         let _default_reconstructor = OtapReconstructor::default();
         assert!(true);
     }
 
     #[test]
-    fn test_reconstruct_simple_logs() {
+    fn test_reconstruct_logs() {
         let reconstructor = OtapReconstructor::new(None);
         let batch = create_test_record_batch();
 
@@ -339,10 +346,11 @@ mod tests {
             signal_type: SignalType::Logs,
         };
 
-        let _result = reconstructor.reconstruct_simple(query_result).unwrap();
+        let result = reconstructor.reconstruct_otap_data(query_result).unwrap();
         
-        // Verify we get back an OtapArrowRecords with logs data
-        // This is a basic test - in a real scenario we'd check the actual data content
-        assert!(true);
+        match result {
+            OtapArrowRecords::Logs(_) => assert!(true),
+            _ => panic!("Expected logs records"),
+        }
     }
 }

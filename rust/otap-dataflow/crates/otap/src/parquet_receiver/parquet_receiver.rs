@@ -9,20 +9,16 @@ use crate::parquet_receiver::{
     file_discovery::FileDiscovery,
     query_engine::ParquetQueryEngine,
     reconstruction::OtapReconstructor,
+    streaming_coordinator::{StreamingConfig, StreamingCoordinator},
 };
-use crate::{pdata::OtapPdata, OTAP_RECEIVER_FACTORIES};
+use crate::{OTAP_RECEIVER_FACTORIES, pdata::OtapPdata};
 use async_trait::async_trait;
 use linkme::distributed_slice;
 use log::{debug, error, info};
 use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::{
-    config::ReceiverConfig,
-    context::PipelineContext,
-    error::Error,
-    node::NodeId,
-    receiver::ReceiverWrapper,
-    shared::receiver as shared,
-    ReceiverFactory,
+    ReceiverFactory, config::ReceiverConfig, context::PipelineContext, error::Error, node::NodeId,
+    receiver::ReceiverWrapper, shared::receiver as shared,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -41,13 +37,13 @@ pub struct ParquetReceiver {
     query_engine: ParquetQueryEngine,
     /// OTAP data reconstructor
     reconstructor: OtapReconstructor,
+    /// Streaming coordinator for multi-stream processing
+    streaming_coordinator: StreamingCoordinator,
 }
 
 impl ParquetReceiver {
     /// Create a new ParquetReceiver with the given configuration
     pub fn new(config: Config) -> Result<Self, ParquetReceiverError> {
-        debug!("Creating ParquetReceiver with config: {:?}", config);
-
         let file_discoverer = FileDiscovery::new(
             config.base_uri.clone().into(),
             config.processing_options.min_file_age,
@@ -55,11 +51,19 @@ impl ParquetReceiver {
         let query_engine = ParquetQueryEngine::new();
         let reconstructor = OtapReconstructor::new(Some(config.processing_options.batch_size));
 
+        // Configure streaming coordinator
+        let streaming_config = StreamingConfig {
+            base_directory: config.base_uri.clone().into(),
+            primary_batch_size: config.processing_options.batch_size,
+        };
+        let streaming_coordinator = StreamingCoordinator::new(streaming_config);
+
         Ok(Self {
             config,
             file_discoverer,
             query_engine,
             reconstructor,
+            streaming_coordinator,
         })
     }
 
@@ -100,8 +104,6 @@ impl shared::Receiver<OtapPdata> for ParquetReceiver {
 
         debug!("🔍 DEBUG: ParquetReceiver polling timer created successfully");
 
-        debug!("🔍 DEBUG: ParquetReceiver entering main loop");
-
         loop {
             tokio::select! {
                 // Handle control messages
@@ -140,39 +142,47 @@ impl shared::Receiver<OtapPdata> for ParquetReceiver {
                                         info!("📄 Processing file: {}", file.path.display());
                                     }
 
-                                    // For now, just process each file individually
-                                    for file in &files {
-                                        // Query a single file to get RecordBatch
-                                        match self.query_engine.query_file(&file).await {
-                                            Ok(query_result) => {
-                                                // Reconstruct OTAP data
-                                                match self.reconstructor.reconstruct_otap_data(query_result) {
+                                    // Process partition using streaming coordinator
+                                    match self.streaming_coordinator.process_partition(&files[0].partition_id, &signal_type).await {
+                                        Ok(streaming_batches) => {
+                                            info!("� Streaming coordinator found {} batches for partition {}",
+                                                streaming_batches.len(), files[0].partition_id);
+
+                                            // Process each streaming batch
+                                            for streaming_batch in streaming_batches {
+                                                log::debug!("📊 Processing streaming batch: {} primary records, max_id: {}",
+                                                           streaming_batch.primary_batch.num_rows(),
+                                                           streaming_batch.max_primary_id);
+
+                                                // Convert streaming batch to OTAP with ID mapping
+                                                match self.streaming_coordinator.batch_to_otap(streaming_batch) {
                                                     Ok(otap_records) => {
+                                                        log::debug!("🎯 OTAP reconstruction successful - batch length: {}", otap_records.batch_length());
+
                                                         // Convert to OtapPdata and send downstream
                                                         let pdata = OtapPdata::new_todo_context(otap_records.into());
 
-                                                        debug!("Sending reconstructed data downstream for signal: {:?}", signal_type);
+                                                        info!("🚀 Sending reconstructed OTAP data downstream for signal: {:?}", signal_type);
 
                                                         // Send the data downstream
                                                         if let Err(e) = effect_handler.send_message(pdata).await {
                                                             error!("Failed to send data downstream: {}", e);
+                                                        } else {
+                                                            log::debug!("✅ Data successfully sent downstream");
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        error!("Failed to reconstruct OTAP data: {}", e);
+                                                        error!("Failed to convert streaming batch to OTAP: {}", e);
                                                         continue;
                                                     }
                                                 }
                                             }
-                                            Err(e) => {
-                                                error!("Failed to query parquet file: {}", e);
-                                                continue;
-                                            }
                                         }
-
-                                        // Mark file as processed
-                                        self.file_discoverer.mark_processed(&file.path);
-                                    }
+                                        Err(e) => {
+                                            error!("Failed to query parquet partition: {}", e);
+                                            continue;
+                                        }
+                                }
                                 } else {
                                     debug!("No new {:?} files found", signal_type);
                                 }
@@ -181,7 +191,7 @@ impl shared::Receiver<OtapPdata> for ParquetReceiver {
                                 error!("Failed to discover {:?} files: {}", signal_type, e);
                                 continue;
                             }
-                        }
+                    }
                     }
                 }
             }
@@ -191,7 +201,6 @@ impl shared::Receiver<OtapPdata> for ParquetReceiver {
         Ok(())
     }
 }
-
 /// Register the ParquetReceiver factory using distributed_slice
 #[allow(unsafe_code)]
 #[distributed_slice(OTAP_RECEIVER_FACTORIES)]

@@ -10,9 +10,16 @@ use crate::parquet_receiver::{
     config::SignalType, error::ParquetReceiverError, file_discovery::DiscoveredFile,
 };
 use arrow::record_batch::RecordBatch;
-use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
+use datafusion::{
+    datasource::{
+        file_format::parquet::ParquetFormat,
+        listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
+    },
+    execution::context::SessionContext,
+};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// DataFusion-based query engine for parquet reconstruction
@@ -37,139 +44,119 @@ impl ParquetQueryEngine {
         Self {}
     }
 
-    /// Query and reconstruct data for a discovered file
+    /// Query and reconstruct data for a discovered file using ListingTable
+    /// This method handles multiple files per partition automatically
     pub async fn query_file(
         &self,
         discovered_file: &DiscoveredFile,
     ) -> Result<QueryResult, ParquetReceiverError> {
-        // Create a new session context for this operation to avoid table name conflicts
-        let ctx = SessionContext::new();
-
-        // Register the main signal table
-        let main_table_name = signal_type_to_table_name(&discovered_file.signal_type);
-        ctx.register_parquet(
-            &main_table_name,
-            discovered_file.path.to_str().ok_or_else(|| {
-                ParquetReceiverError::FileDiscovery(format!(
-                    "Invalid file path: {:?}",
-                    discovered_file.path
-                ))
-            })?,
-            ParquetReadOptions::default(),
+        self.query_partition(
+            &discovered_file.partition_id,
+            &[discovered_file.signal_type.clone()],
         )
-        .await?;
-
-        // Register related tables
-        let mut related_table_info = HashMap::new();
-        for related_file in &discovered_file.related_files {
-            let table_name = format!(
-                "{}_{}",
-                related_file.file_type, discovered_file.partition_id
-            );
-            ctx.register_parquet(
-                &table_name,
-                related_file.path.to_str().ok_or_else(|| {
-                    ParquetReceiverError::FileDiscovery(format!(
-                        "Invalid related file path: {:?}",
-                        related_file.path
-                    ))
-                })?,
-                ParquetReadOptions::default(),
-            )
-            .await?;
-            let _ = related_table_info.insert(related_file.file_type.clone(), table_name);
-        }
-
-        // Execute the main query to get the signal data
-        let main_df = ctx.table(&main_table_name).await?;
-        let main_records = main_df.collect().await?;
-
-        // Query related tables
-        let mut related_records = HashMap::new();
-        for (file_type, table_name) in related_table_info {
-            let related_df = ctx.table(&table_name).await?;
-            let records = related_df.collect().await?;
-            let _ = related_records.insert(file_type, records);
-        }
-
-        Ok(QueryResult {
-            main_records,
-            related_records,
-            partition_id: discovered_file.partition_id,
-            signal_type: discovered_file.signal_type.clone(),
-        })
+        .await
     }
 
-    /// Query and join related data for logs reconstruction
-    /// This performs the multi-table join as described in the design document
-    pub async fn query_logs_with_joins(
+    /// Query data for an entire partition using ListingTable
+    /// This is the preferred method as it handles multiple files automatically
+    pub async fn query_partition(
         &self,
-        discovered_file: &DiscoveredFile,
+        partition_id: &Uuid,
+        signal_types: &[SignalType],
     ) -> Result<QueryResult, ParquetReceiverError> {
-        if discovered_file.signal_type != SignalType::Logs {
-            return Err(ParquetReceiverError::Config(
-                "query_logs_with_joins can only be used with logs signal type".to_string(),
-            ));
-        }
-
-        // Create a new session context for this operation
+        // Create a new session context for this partition
         let ctx = SessionContext::new();
 
-        // Register all tables for this partition
-        let partition_suffix = discovered_file.partition_id.to_string().replace('-', "_");
+        // For now, use a hardcoded base directory - this should come from config in the future
+        let base_directory = std::path::PathBuf::from(
+            "/home/jmacd/src/otel/otel-arrow-tail-sampler/rust/otap-dataflow/output_parquet_files",
+        );
 
-        // Register main logs table
-        let logs_table = format!("logs_{}", partition_suffix);
-        ctx.register_parquet(
-            &logs_table,
-            discovered_file.path.to_str().ok_or_else(|| {
-                ParquetReceiverError::FileDiscovery(format!(
-                    "Invalid file path: {:?}",
-                    discovered_file.path
-                ))
-            })?,
-            ParquetReadOptions::default(),
-        )
-        .await?;
-
-        // Register related tables
-        let mut related_tables = HashMap::new();
-        for related_file in &discovered_file.related_files {
-            let table_name = format!("{}_{}", related_file.file_type, partition_suffix);
-            ctx.register_parquet(
-                &table_name,
-                related_file.path.to_str().ok_or_else(|| {
-                    ParquetReceiverError::FileDiscovery(format!(
-                        "Invalid related file path: {:?}",
-                        related_file.path
-                    ))
-                })?,
-                ParquetReadOptions::default(),
-            )
-            .await?;
-            let _ = related_tables.insert(related_file.file_type.clone(), table_name);
-        }
-
-        // Build the reconstruction query
-        let query = build_logs_reconstruction_query(&logs_table, &related_tables)?;
-
-        // Execute the query
-        let df = ctx.sql(&query).await?;
-        let main_records = df.collect().await?;
-
-        // Also get the separate related records for further processing if needed
+        let mut main_records = Vec::new();
         let mut related_records = HashMap::new();
-        for (file_type, table_name) in &related_tables {
-            let related_df = ctx.table(table_name).await?;
-            let records = related_df.collect().await?;
-            let _ = related_records.insert(file_type.clone(), records);
+        let main_signal_type = signal_types[0].clone(); // Use first signal type as main
+
+        // For logs, we need to query all 4 table types: logs, log_attrs, resource_attrs, scope_attrs
+        if main_signal_type == SignalType::Logs {
+            let table_mappings = [
+                ("logs", true),           // Main table
+                ("log_attrs", false),     // Related table  
+                ("resource_attrs", false), // Related table
+                ("scope_attrs", false),   // Related table
+            ];
+
+            for (table_type, is_main) in table_mappings {
+                let signal_dir = base_directory.join(table_type);
+                let partition_dir = signal_dir.join(format!("_part_id={}", partition_id));
+
+                // Check if partition directory exists
+                if !partition_dir.exists() {
+                    log::debug!("Partition directory does not exist: {}", partition_dir.display());
+                    continue; // Skip if partition doesn't exist for this table type
+                }
+
+                // Create ListingTable for this table type + partition combination
+                let table_url = ListingTableUrl::parse(&format!("file://{}", partition_dir.display()))
+                    .map_err(|e| ParquetReceiverError::Config(format!("Invalid table URL: {}", e)))?;
+
+                let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+                    .with_file_extension("parquet");
+
+                let config = ListingTableConfig::new(table_url).with_listing_options(listing_options);
+
+                // Infer schema and create table
+                let config_with_schema = config
+                    .infer_schema(&ctx.state())
+                    .await
+                    .map_err(|e| ParquetReceiverError::DataFusion(e))?;
+
+                let listing_table = ListingTable::try_new(config_with_schema)
+                    .map_err(|e| ParquetReceiverError::DataFusion(e))?;
+
+                let table_name = table_type;
+                let _ = ctx.register_table(table_name, Arc::new(listing_table))
+                    .map_err(|e| ParquetReceiverError::DataFusion(e))?;
+
+                // Query the table to get all records
+                let df = ctx
+                    .table(table_name)
+                    .await
+                    .map_err(|e| ParquetReceiverError::DataFusion(e))?;
+                let records = df
+                    .collect()
+                    .await
+                    .map_err(|e| ParquetReceiverError::DataFusion(e))?;
+
+                log::debug!("Queried {} table: {} records in {} batches", table_type, 
+                    records.iter().map(|r| r.num_rows()).sum::<usize>(), records.len());
+                
+                // Log schema information for each batch
+                for (batch_idx, batch) in records.iter().enumerate() {
+                    log::debug!("📋 Schema for {} batch {}: {} columns", table_type, batch_idx, batch.num_columns());
+                    for (col_idx, field) in batch.schema().fields().iter().enumerate() {
+                        log::debug!("  Column {}: '{}' -> {:?}", col_idx, field.name(), field.data_type());
+                    }
+                }
+
+                // Store records appropriately
+                if is_main {
+                    main_records = records;
+                } else {
+                    let _ = related_records.insert(table_type.to_string(), records);
+                }
+            }
+        } else {
+            // For traces/metrics (not implemented in hackathon scope)
+            return Err(ParquetReceiverError::Config(format!(
+                "Signal type {:?} not implemented in hackathon scope", main_signal_type
+            )));
         }
 
         Ok(QueryResult {
             main_records,
             related_records,
-            partition_id: discovered_file.partition_id,
-            signal_type: discovered_file.signal_type.clone(),
+            partition_id: *partition_id,
+            signal_type: main_signal_type,
         })
     }
 
@@ -253,6 +240,15 @@ fn signal_type_to_table_name(signal_type: &SignalType) -> String {
         SignalType::Logs => "logs".to_string(),
         SignalType::Traces => "spans".to_string(),
         SignalType::Metrics => "univariate_metrics".to_string(),
+    }
+}
+
+/// Convert signal type to directory name
+fn signal_type_to_directory(signal_type: &SignalType) -> String {
+    match signal_type {
+        SignalType::Logs => "logs".to_string(),
+        SignalType::Traces => "traces".to_string(),
+        SignalType::Metrics => "metrics".to_string(),
     }
 }
 
