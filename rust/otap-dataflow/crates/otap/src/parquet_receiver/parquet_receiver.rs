@@ -7,8 +7,8 @@ use crate::parquet_receiver::{
     config::Config,
     error::ParquetReceiverError,
     file_discovery::FileDiscovery,
-    query_engine::ParquetQueryEngine,
-    reconstruction::OtapReconstructor,
+    // query_engine::ParquetQueryEngine, // Removed - using direct streaming
+    // reconstruction::OtapReconstructor, // Removed - using direct streaming
     streaming_coordinator::{StreamingConfig, StreamingCoordinator},
 };
 use crate::{OTAP_RECEIVER_FACTORIES, pdata::OtapPdata};
@@ -33,10 +33,6 @@ pub struct ParquetReceiver {
     config: Config,
     /// File discovery component
     file_discoverer: FileDiscovery,
-    /// Query engine for parquet operations  
-    query_engine: ParquetQueryEngine,
-    /// OTAP data reconstructor
-    reconstructor: OtapReconstructor,
     /// Streaming coordinator for multi-stream processing
     streaming_coordinator: StreamingCoordinator,
 }
@@ -48,8 +44,6 @@ impl ParquetReceiver {
             config.base_uri.clone().into(),
             config.processing_options.min_file_age,
         );
-        let query_engine = ParquetQueryEngine::new();
-        let reconstructor = OtapReconstructor::new(Some(config.processing_options.batch_size));
 
         // Configure streaming coordinator
         let streaming_config = StreamingConfig {
@@ -61,8 +55,6 @@ impl ParquetReceiver {
         Ok(Self {
             config,
             file_discoverer,
-            query_engine,
-            reconstructor,
             streaming_coordinator,
         })
     }

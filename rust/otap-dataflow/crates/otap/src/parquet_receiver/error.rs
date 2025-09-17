@@ -8,10 +8,6 @@ use thiserror::Error;
 /// Errors that can occur in the parquet receiver
 #[derive(Error, Debug)]
 pub enum ParquetReceiverError {
-    /// DataFusion query engine error
-    #[error("DataFusion error: {0}")]
-    DataFusion(#[from] datafusion::error::DataFusionError),
-    
     /// File system I/O error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

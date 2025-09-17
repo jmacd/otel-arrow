@@ -9,7 +9,7 @@
 use crate::parquet_receiver::{
     config::SignalType,
     error::ParquetReceiverError,
-    query_engine::QueryResult,
+    // query_engine::QueryResult, // Removed - using direct streaming
 };
 use arrow::record_batch::RecordBatch;
 use otel_arrow_rust::otap::{Logs, Metrics, OtapArrowRecords, OtapBatchStore, Traces};

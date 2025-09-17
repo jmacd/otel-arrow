@@ -90,7 +90,8 @@ tonic = { version = "0.14", default-features = false, features = [
 tonic-middleware = "0.4.0"
 tonic-prost = "0.14"
 prost = "0.14"
-datafusion = { version = "50", default-features = false, features = ["parquet"] }
+dependencies = { version = "2.5.0" }
+enum_dispatch = "0.3.12"
 
 [features]
 default = []
