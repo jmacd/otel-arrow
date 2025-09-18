@@ -6,6 +6,7 @@
 use crate::sampling_receiver::{
     config::Config,
     error::Result,
+    query_engine::DataFusionQueryEngine,
 };
 use crate::{OTAP_RECEIVER_FACTORIES, pdata::OtapPdata};
 use async_trait::async_trait;
@@ -26,6 +27,8 @@ pub const SAMPLING_RECEIVER_URN: &str = "urn:otel:otap:sampling:receiver";
 pub struct SamplingReceiver {
     /// Configuration for this receiver
     config: Config,
+    /// DataFusion query engine (lazily initialized)
+    query_engine: Option<DataFusionQueryEngine>,
 }
 
 impl SamplingReceiver {
@@ -39,7 +42,17 @@ impl SamplingReceiver {
             config.base_uri, config.temporal.window_granularity
         );
 
-        Ok(Self { config })
+        // Defer DataFusion query engine creation until first use
+        Ok(Self { config, query_engine: None })
+    }
+
+    /// Initialize the DataFusion query engine if not already done
+    async fn ensure_query_engine(&mut self) -> Result<&DataFusionQueryEngine> {
+        if self.query_engine.is_none() {
+            info!("Initializing DataFusion query engine");
+            self.query_engine = Some(DataFusionQueryEngine::new(self.config.clone()).await?);
+        }
+        Ok(self.query_engine.as_ref().unwrap())
     }
 
     /// Create a SamplingReceiver from configuration  
@@ -60,7 +73,7 @@ impl SamplingReceiver {
 
     /// Process a time window using DataFusion queries
     async fn process_time_window(
-        &self,
+        &mut self,
         window_start_ns: i64,
         window_end_ns: i64,
     ) -> Result<Vec<OtapPdata>> {
@@ -81,10 +94,22 @@ impl SamplingReceiver {
         Ok(results)
     }
 
-    /// Execute a DataFusion query (placeholder implementation)
-    async fn execute_datafusion_query(&self, _query: &str) -> Result<Vec<OtapPdata>> {
-        // Placeholder implementation - will be completed in the DataFusion query engine phase
-        debug!("DataFusion query execution not yet implemented");
+    /// Execute a DataFusion query and convert results to OTAP data
+    async fn execute_datafusion_query(&mut self, query: &str) -> Result<Vec<OtapPdata>> {
+        debug!("Executing DataFusion query: {}", query);
+        
+        // Ensure query engine is initialized
+        let query_engine = self.ensure_query_engine().await?;
+        
+        // Execute the query using the DataFusion engine
+        let record_batches = query_engine.execute_query(query).await?;
+        
+        // TODO: Convert RecordBatch results to OtapPdata
+        // For now, return empty results but log what we got
+        let total_rows: usize = record_batches.iter().map(|batch| batch.num_rows()).sum();
+        info!("DataFusion query returned {} batches with {} total rows", record_batches.len(), total_rows);
+        
+        // TODO: Implement OTAP reconstruction in the next task
         Ok(vec![])
     }
 
@@ -105,7 +130,7 @@ impl SamplingReceiver {
     }
 
     /// Process a single time interval
-    async fn process_interval(&self, effect_handler: &shared::EffectHandler<OtapPdata>) -> Result<()> {
+    async fn process_interval(&mut self, effect_handler: &shared::EffectHandler<OtapPdata>) -> Result<()> {
         let current_time_ns = chrono::Utc::now().timestamp_nanos_opt()
             .unwrap_or_default();
         

@@ -159,6 +159,15 @@ impl SamplingReceiverError {
     }
 }
 
+// Manual From implementation for DataFusionError
+impl From<datafusion::error::DataFusionError> for SamplingReceiverError {
+    fn from(error: datafusion::error::DataFusionError) -> Self {
+        Self::DataFusionError {
+            message: error.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
