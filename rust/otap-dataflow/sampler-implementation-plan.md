@@ -8,10 +8,15 @@ The final output will be a stream of OTAP `RecordBatch`es representing a statist
 
 ## 2. Background & Strategy
 
-Our strategy is based on two key documents:
+Our strategy is based on several documents:
 
-1.  **`query-driven-parquet-receiver-design.md`**: This establishes the architecture for processing time-windowed Parquet files using DataFusion and SQL.
-2.  **`weighted_reservoir_sampling_design.md`**: This provides the detailed design for the `weighted_reservoir_sample` UDAF, which is the core of our sampling logic.
+[query-first-parquet-receiver.md](query-first-parquet-receiver.md)
+
+1. [query-first-parquet-receiver.md](query-first-parquet-receiver.md): This establishes the architecture for processing time-windowed Parquet files using DataFusion and SQL.
+2. [sampler-implementation-plan.md](sampler-implementation-plan.md) : This provides the detailed design for the `weighted_reservoir_sample` UDAF, which is the core of our sampling logic.
+3. [arrow-compute-optimization-plan.md](arrow-compute-optimization-plan.md): This provides feedback on the original parquet_receiver approach in terms of low-level Arrow kernels.
+
+A sample UDAF for simple reserver sampling is given (but not built/tested) showing the Datafusion we will use.
 
 By treating our Parquet files as a queryable, star-schema-like database (as explored in the [OTel Arrow Delta Lake article](https://www.rakirahman.me/otel-arrow-delta-lake/)), we can use a powerful SQL-based approach to define and execute our sampling policy.
 
