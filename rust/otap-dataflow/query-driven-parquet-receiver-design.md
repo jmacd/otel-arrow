@@ -2,11 +2,18 @@
 
 **Design Date**: September 18, 2025  
 **Architecture Phase**: Temporal Windowed Query Processing  
-**Status**: 🎯 **DESIGN PROPOSAL**
+**Status**: 🎯 **OUT OF DATE CONFUSED DIALOG**
 
 ## Executive Summary
 
 This document proposes a **windowed, time-based query-driven architecture** for the Parquet Receiver that solves temporal coordination between exporter and receiver. Instead of immediate file processing, the system uses configurable **processing delays**, **time windows**, and **DataFusion queries** to ensure complete data coverage while handling clock drift and late-arriving data through controlled latency.
+
+**Key Applications**:
+- **Statistical Sampling**: Implements weighted reservoir sampling through custom UDAFs (see `sampler-implementation-plan.md`)
+- **Analytical Queries**: Supports complex SQL queries across time windows for telemetry analytics
+- **Temporal Processing**: Handles late-arriving data and clock drift through configurable time windows
+
+The architecture is **query-driven first** - meaning `log_attributes` becomes the primary table output from DataFusion queries, with other OTAP tables (`logs`, `resource_attributes`, `scope_attributes`) filtered based on the parent_id ranges from the query results.
 
 ## 🕒 Temporal Processing Model
 
@@ -240,11 +247,11 @@ pub enum TableType {
 }
 ```
 
-### **2. Windowed Query Execution**
+### **2. Windowed Query Execution with Sampling Integration**
 
 ```rust
 impl WindowedQueryReceiver {
-    /// Execute DataFusion query with time window constraints
+    /// Execute DataFusion query with time window constraints and sampling
     async fn execute_windowed_query(
         &mut self,
         window_start: DateTime<Utc>,
@@ -252,115 +259,282 @@ impl WindowedQueryReceiver {
         covering_files: Vec<WindowFile>
     ) -> Result<Vec<OtapArrowRecords>, ParquetReceiverError> {
         
-        // Step 1: Register files as temporary DataFusion tables
-        let table_registry = self.register_window_tables(covering_files).await?;
+        // Step 1: Create ListingTable providers for time-windowed files
+        let table_providers = self.create_listing_tables(covering_files).await?;
         
-        // Step 2: Build time-constrained SQL query
-        let windowed_query = self.build_windowed_query(
-            window_start,
-            window_end,
-            &table_registry
-        )?;
+        // Step 2: Register temporal tables with DataFusion context
+        let table_registry = self.register_temporal_tables(table_providers).await?;
         
-        // Step 3: Execute query and get primary records grouped by partition
-        let primary_results = self.datafusion_context
-            .sql(&windowed_query)
-            .await?
-            .collect()
-            .await?;
-        
-        // Step 4: Group results by partition and enrich with attributes
-        let partitioned_results = self.group_and_enrich_results(
-            primary_results,
+        // Step 3: Execute integrated temporal + sampling query
+        let sampling_results = self.execute_temporal_sampling_query(
             window_start,
             window_end,
             &table_registry
         ).await?;
         
-        // Step 5: Convert to OTAP using existing reconstruction logic
-        let mut otap_results = Vec::new();
-        for partition_data in partitioned_results {
-            let otap_records = self.streaming_coordinator
-                .batch_to_otap(partition_data)
-                .await?;
-            otap_results.push(otap_records);
-        }
+        // Step 4: Process query results using existing streaming logic
+        let otap_results = self.process_sampling_results_to_otap(sampling_results).await?;
         
-        // Step 6: Clean up temporary tables
-        self.cleanup_window_tables(&table_registry).await?;
+        // Step 5: Clean up temporary tables
+        self.cleanup_temporal_tables(&table_registry).await?;
         
         Ok(otap_results)
     }
     
-    /// Build SQL query with time window constraints
-    fn build_windowed_query(
+    /// Create ListingTable providers that respect temporal boundaries
+    async fn create_listing_tables(&self, covering_files: Vec<WindowFile>) -> Result<HashMap<String, HashMap<TableType, ListingTable>>, ParquetReceiverError> {
+        let mut table_providers = HashMap::new();
+        
+        // Group files by partition and table type
+        for file in covering_files {
+            let partition_tables = table_providers
+                .entry(file.partition_id.clone())
+                .or_insert_with(HashMap::new);
+            
+            let file_list = partition_tables
+                .entry(file.table_type.clone())
+                .or_insert_with(Vec::new);
+            
+            file_list.push(file.path);
+        }
+        
+        // Create ListingTable for each partition/table combination
+        let mut listing_tables = HashMap::new();
+        for (partition_id, tables) in table_providers {
+            let mut partition_listings = HashMap::new();
+            
+            for (table_type, file_paths) in tables {
+                let listing_table = self.create_listing_table_from_files(file_paths).await?;
+                partition_listings.insert(table_type, listing_table);
+            }
+            
+            listing_tables.insert(partition_id, partition_listings);
+        }
+        
+        Ok(listing_tables)
+    }
+    
+    /// Execute the integrated temporal filtering + weighted sampling query
+    async fn execute_temporal_sampling_query(
         &self,
         window_start: DateTime<Utc>,
         window_end: DateTime<Utc>,
-        table_registry: &WindowTableRegistry
-    ) -> Result<String, ParquetReceiverError> {
-        
+        table_registry: &TemporalTableRegistry
+    ) -> Result<Vec<RecordBatch>, ParquetReceiverError> {
         let window_start_ns = window_start.timestamp_nanos_opt()
             .ok_or_else(|| ParquetReceiverError::InvalidTimestamp)?;
         let window_end_ns = window_end.timestamp_nanos_opt()
             .ok_or_else(|| ParquetReceiverError::InvalidTimestamp)?;
         
-        // Generate UNION query across all primary tables in all partitions
-        let mut union_parts = Vec::new();
+        // Build the integrated query combining temporal filtering with sampling
+        // This query incorporates the sampling logic from sampler-implementation-plan.md
+        let integrated_query = self.build_temporal_sampling_query(
+            window_start_ns,
+            window_end_ns,
+            table_registry
+        )?;
         
-        for (partition_id, tables) in &table_registry.primary_tables {
-            if let Some(primary_table) = tables.get(&TableType::Logs) {
-                union_parts.push(format!(
+        // Execute the query
+        let results = self.datafusion_context
+            .sql(&integrated_query)
+            .await?
+            .collect()
+            .await?;
+        
+        Ok(results)
+    }
+    
+    /// Build integrated query combining temporal filtering with weighted sampling
+    fn build_temporal_sampling_query(
+        &self,
+        window_start_ns: i64,
+        window_end_ns: i64,
+        table_registry: &TemporalTableRegistry
+    ) -> Result<String, ParquetReceiverError> {
+        // Generate UNION query across all partitions for the sampling query
+        let mut partition_queries = Vec::new();
+        
+        for (partition_id, tables) in &table_registry.tables {
+            if let (Some(logs_table), Some(resource_attrs_table), Some(log_attrs_table)) = (
+                tables.get(&TableType::Logs),
+                tables.get(&TableType::ResourceAttrs),
+                tables.get(&TableType::LogAttrs)
+            ) {
+                // This is the core sampling query from sampler-implementation-plan.md
+                // integrated with temporal filtering
+                partition_queries.push(format!(
                     r#"
-                    SELECT *, '{}' as _part_id, {} as _window_start, {} as _window_end
-                    FROM {} 
-                    WHERE timestamp_unix_nano >= {} 
-                      AND timestamp_unix_nano < {}
+                    -- Partition {partition_id}: Temporal + Sampling Query
+                    WITH logs_with_existing_weights AS (
+                        SELECT
+                            l.id,
+                            ra.str as service_name,
+                            -- Get existing adjusted_count if it exists, otherwise use 1.0 as default weight
+                            COALESCE(
+                                CAST(
+                                    (SELECT la.str FROM {log_attrs_table} la 
+                                     WHERE la.parent_id = l.id AND la.key = 'sampling.adjusted_count'
+                                     LIMIT 1) AS DOUBLE
+                                ), 
+                                1.0
+                            ) as input_weight,
+                            '{partition_id}' as _part_id
+                        FROM {logs_table} l
+                        -- TEMPORAL FILTERING: Only process records within the time window
+                        WHERE l.timestamp_unix_nano >= {window_start_ns} 
+                          AND l.timestamp_unix_nano < {window_end_ns}
+                        JOIN {resource_attrs_table} ra ON l.id = ra.parent_id AND ra.key = 'service.name'
+                    ),
+                    sampling_decisions AS (
+                        -- Apply weighted reservoir sampling UDAF
+                        SELECT
+                            service_name,
+                            _part_id,
+                            weighted_reservoir_sample(
+                                STRUCT(
+                                    id,
+                                    input_weight
+                                ),
+                                100 -- The desired sample size 'k'
+                            ) AS sample_decisions
+                        FROM logs_with_existing_weights
+                        GROUP BY service_name, _part_id
+                    ),
+                    exploded_sampling_decisions AS (
+                        -- "Explode" the ListArray to get individual sampled records
+                        SELECT
+                            _part_id,
+                            service_name,
+                            decision.value.id as sampled_id,
+                            decision.value.adjusted_weight as adjusted_weight
+                        FROM sampling_decisions
+                        CROSS JOIN UNNEST(sample_decisions) AS t(decision)
+                    ),
+                    original_log_attributes AS (
+                        -- Get original attributes for sampled records only
+                        SELECT la.*
+                        FROM {log_attrs_table} la
+                        JOIN exploded_sampling_decisions sd ON la.parent_id = sd.sampled_id
+                    ),
+                    adjusted_count_attributes AS (
+                        -- Add new sampling.adjusted_count attributes
+                        SELECT 
+                            sd.sampled_id as parent_id,
+                            'sampling.adjusted_count' as key,
+                            sd.adjusted_weight::TEXT as str,
+                            -- Include all other log_attributes columns with appropriate defaults
+                            '{partition_id}' as _part_id,
+                            -- Add other required columns from log_attributes schema
+                            NULL::TEXT as event_year_date,
+                            NULL::TEXT as region,
+                            NULL::TEXT as service_name as attr_service_name,
+                            NULL::TIMESTAMP as observed_time_utc,
+                            NULL::BOOLEAN as bool,
+                            NULL::BIGINT as int,
+                            NULL::DOUBLE as double,
+                            NULL::TEXT[] as array_val,
+                            NULL::TEXT as array_val_json,
+                            NULL::TEXT as map_val_json
+                        FROM exploded_sampling_decisions sd
+                    )
+                    -- Return the combined log_attributes (original + adjusted_count)
+                    SELECT * FROM original_log_attributes
+                    UNION ALL
+                    SELECT * FROM adjusted_count_attributes
+                    ORDER BY parent_id, key
                     "#,
-                    partition_id,
-                    window_start_ns,
-                    window_end_ns,
-                    primary_table.table_name,
-                    window_start_ns,
-                    window_end_ns
+                    partition_id = partition_id,
+                    logs_table = logs_table.table_name,
+                    resource_attrs_table = resource_attrs_table.table_name,
+                    log_attrs_table = log_attrs_table.table_name,
+                    window_start_ns = window_start_ns,
+                    window_end_ns = window_end_ns
                 ));
             }
         }
         
-        if union_parts.is_empty() {
-            return Err(ParquetReceiverError::NoDataFound);
+        if partition_queries.is_empty() {
+            return Err(ParquetReceiverError::NoValidPartitions);
         }
         
-        // Combine with UNION ALL and order by partition and time
-        let windowed_query = format!(
-            r#"
-            WITH windowed_data AS (
-                {}
+        // Combine all partition queries with UNION ALL
+        let final_query = if partition_queries.len() == 1 {
+            partition_queries.into_iter().next().unwrap()
+        } else {
+            format!(
+                "WITH all_partitions AS (\n{}\n) SELECT * FROM all_partitions ORDER BY _part_id, parent_id, key",
+                partition_queries.join("\nUNION ALL\n")
             )
-            SELECT * FROM windowed_data 
-            ORDER BY _part_id, timestamp_unix_nano
-            "#,
-            union_parts.join(" UNION ALL ")
-        );
+        };
         
-        Ok(windowed_query)
+        Ok(final_query)
     }
 }
 
 #[derive(Debug)]
-pub struct WindowTableRegistry {
-    /// Map of partition_id -> table_type -> registered table info
-    pub primary_tables: HashMap<String, HashMap<TableType, RegisteredTable>>,
-    pub attribute_tables: HashMap<String, HashMap<TableType, RegisteredTable>>,
+pub struct TemporalTableRegistry {
+    /// Map of partition_id -> table_type -> registered temporal table
+    pub tables: HashMap<String, HashMap<TableType, TemporalTable>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct RegisteredTable {
-    pub table_name: String,     // Temporary DataFusion table name
-    pub file_paths: Vec<PathBuf>,
+pub struct TemporalTable {
+    pub table_name: String,           // Temporary DataFusion table name
+    pub listing_table: ListingTable,  // DataFusion ListingTable provider
+    pub file_paths: Vec<PathBuf>,     // Source parquet files (for this time window)
     pub partition_id: String,
     pub table_type: TableType,
+    pub time_range: (DateTime<Utc>, DateTime<Utc>), // Aggregated time range from all files
 }
+```
+
+## 🔗 **Temporal-Sampling Integration Architecture**
+
+### **Key Integration Points**
+
+**1. File Discovery Layer**: 
+- Temporal logic discovers all Parquet files that overlap with the time window
+- Handles file age validation, metadata extraction, and safety margins
+- Creates `ListingTable` providers that respect temporal boundaries
+
+**2. Query Layer**: 
+- DataFusion executes the sampling query from `sampler-implementation-plan.md`
+- Temporal filtering is applied at the SQL level: `WHERE timestamp_unix_nano BETWEEN ... AND ...`
+- Sampling logic operates only on records within the time window
+
+**3. Result Processing Layer**:
+- Query returns `log_attributes` table (with sampling.adjusted_count) as primary output
+- Existing streaming logic filters other tables based on parent_id ranges from sampling results
+- OTAP reconstruction uses proven pipeline
+
+### **Benefits of Integration**
+
+- **Clean Separation**: Temporal windowing handles file discovery, sampling handles data selection
+- **Efficiency**: Only files covering the time window are opened and queried  
+- **Flexibility**: Can combine any temporal window with any sampling strategy
+- **Performance**: DataFusion's optimizer handles both temporal filtering and sampling in single query plan
+
+### **Query Flow Example**
+
+```sql
+-- This single query combines temporal windowing with weighted sampling
+-- Files are pre-selected by temporal logic, query adds time filtering + sampling
+
+WITH logs_with_existing_weights AS (
+    SELECT l.id, ra.str as service_name, COALESCE(...) as input_weight
+    FROM temporal_logs_table l  -- ListingTable with only time-relevant files
+    WHERE l.timestamp_unix_nano >= 1640995200000000000  -- Additional temporal filter
+      AND l.timestamp_unix_nano < 1640995260000000000    -- (window boundaries)
+    JOIN temporal_resource_attrs_table ra ON l.id = ra.parent_id AND ra.key = 'service.name'
+),
+sampling_decisions AS (
+    SELECT service_name, weighted_reservoir_sample(STRUCT(id, input_weight), 100)
+    FROM logs_with_existing_weights GROUP BY service_name
+)
+-- ... rest of sampling query from sampler-implementation-plan.md
+```
+
+**Result**: Time-windowed, statistically sampled OTAP batches with adjusted counts!
 ```
 
 ### **3. Time Window Configuration and Management**
@@ -910,7 +1084,8 @@ let query_config = QuerySpecification {
 
 ### **Phase 5: Query Design and Templates (2 weeks)**
 - [ ] Design and implement configurable SQL query templates
-- [ ] Add support for parameterized queries with dynamic values
+- [ ] Add support for parameterized queries with dynamic values  
+- [ ] **Implement weighted reservoir sampling UDAF** (see `sampler-implementation-plan.md` for detailed implementation)
 - [ ] Create query validation and optimization framework
 - [ ] Implement query result transformation and post-processing
 - [ ] Build query performance monitoring and analytics
@@ -963,6 +1138,7 @@ let query_config = QuerySpecification {
 - **Query Scheduling**: Cron-like scheduling for periodic processing  
 - **Query Optimization**: Custom DataFusion optimizations for OTAP patterns
 - **Query Result Streaming**: Stream large result sets instead of materializing
+- **Statistical Sampling**: Weighted reservoir sampling and other statistical UDAFs (implementation detailed in `sampler-implementation-plan.md`)
 
 ### **External Integrations**
 - **REST API**: HTTP interface for external query submission
