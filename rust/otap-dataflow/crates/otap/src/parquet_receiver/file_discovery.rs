@@ -226,6 +226,12 @@ impl FileDiscovery {
     pub fn processed_count(&self) -> usize {
         self.processed_files.len()
     }
+
+    /// Reset processed files list (for testing)
+    pub fn reset_processed_files(&mut self) {
+        log::debug!("🔄 Resetting processed files list (was: {} files)", self.processed_files.len());
+        self.processed_files.clear();
+    }
 }
 
 /// Extract partition ID from directory name like "_part_id=550e8400-e29b-41d4-a716-446655440000"

@@ -11,64 +11,51 @@ use crate::parquet_receiver::error::ParquetReceiverError;
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt16Array, UInt32Array};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
-use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Maps UInt32 IDs from parquet to UInt16 IDs for OTAP
-/// Maintains the mapping for a single streaming batch
+/// Maps UInt32 IDs from parquet to UInt16 IDs for OTAP using batch normalization
+/// Each batch is normalized to start at 0, fitting within UInt16 space
 #[derive(Debug)]
 pub struct IdMapper {
-    /// Maps original UInt32 ID -> new UInt16 ID
-    id_mapping: HashMap<u32, u16>,
-    /// Next available UInt16 ID
-    next_id: u16,
+    /// The starting ID for this batch (will be subtracted from all IDs)
+    batch_start_id: u32,
 }
 
 impl IdMapper {
-    /// Create a new ID mapper
+    /// Create a new ID mapper for a batch starting at min_id
     pub fn new() -> Self {
         Self {
-            id_mapping: HashMap::new(),
-            next_id: 0,
+            batch_start_id: 0,
         }
     }
 
-    /// Create a new ID mapper starting from a specific ID
-    pub fn new_with_start_id(start_id: u16) -> Self {
-        Self {
-            id_mapping: HashMap::new(),
-            next_id: start_id,
-        }
+    /// Set the starting ID for batch normalization
+    pub fn set_batch_start(&mut self, start_id: u32) {
+        self.batch_start_id = start_id;
+        log::debug!("🎯 Batch normalization: will subtract {} from all IDs", start_id);
     }
 
-    /// Map a UInt32 ID to UInt16 space, assigning new ID if needed
-    pub fn map_id(&mut self, original_id: u32) -> Result<u16, ParquetReceiverError> {
-        if let Some(&mapped_id) = self.id_mapping.get(&original_id) {
-            return Ok(mapped_id);
-        }
-
-        if self.next_id == u16::MAX {
+    /// Normalize a UInt32 ID to UInt16 by subtracting the batch start
+    fn normalize_id(&self, original_id: u32) -> Result<u16, ParquetReceiverError> {
+        if original_id < self.batch_start_id {
             return Err(ParquetReceiverError::Reconstruction(
-                "Exceeded UInt16 ID space - batch too large".to_string()
+                format!("ID {} is less than batch start {}", original_id, self.batch_start_id)
             ));
         }
-
-        let mapped_id = self.next_id;
-        let _ = self.id_mapping.insert(original_id, mapped_id);
-        self.next_id += 1;
-
-        log::debug!("🔄 Mapped ID: {} -> {}", original_id, mapped_id);
-        Ok(mapped_id)
+        
+        let normalized_id = original_id - self.batch_start_id;
+        if normalized_id > u16::MAX as u32 {
+            return Err(ParquetReceiverError::Reconstruction(
+                format!("Normalized ID {} exceeds UInt16 space", normalized_id)
+            ));
+        }
+        
+        Ok(normalized_id as u16)
     }
 
-    /// Get the mapping for an ID without creating a new one
-    pub fn get_mapped_id(&self, original_id: u32) -> Option<u16> {
-        self.id_mapping.get(&original_id).copied()
-    }
-
-    /// Get the number of mapped IDs
-    pub fn mapping_count(&self) -> usize {
-        self.id_mapping.len()
+    /// Get the batch start ID for diagnostics
+    pub fn batch_start(&self) -> u32 {
+        self.batch_start_id
     }
 
     /// Transform a RecordBatch by converting UInt32 ID columns to UInt16 and UTF8View/BinaryView to UTF8/Binary
@@ -115,7 +102,8 @@ impl IdMapper {
     }
 
     /// Transform a child RecordBatch by converting UInt32 parent_id columns to UInt16 and UTF8View/BinaryView to UTF8/Binary
-    pub fn transform_child_batch(&self, batch: &RecordBatch) -> Result<RecordBatch, ParquetReceiverError> {
+    /// Ensures that all parent_ids in the batch have corresponding mappings for self-contained OTAP batches
+    pub fn transform_child_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch, ParquetReceiverError> {
         let mut new_columns = Vec::with_capacity(batch.num_columns());
         let mut new_fields = Vec::with_capacity(batch.num_columns());
 
@@ -124,7 +112,8 @@ impl IdMapper {
 
             if field.name() == "parent_id" && matches!(field.data_type(), DataType::UInt32) {
                 // Transform the parent_id column from UInt32 to UInt16
-                let transformed_column = self.transform_parent_id_column(column)?;
+                // This method will create missing mappings to ensure self-contained batches
+                let transformed_column = self.transform_parent_id_column_with_creation(column)?;
                 let new_field = Field::new("parent_id", DataType::UInt16, field.is_nullable());
                 
                 new_columns.push(transformed_column);
@@ -154,10 +143,12 @@ impl IdMapper {
         let transformed_batch = RecordBatch::try_new(new_schema, new_columns)
             .map_err(|e| ParquetReceiverError::Arrow(e))?;
 
+        log::debug!("🔄 Child batch transformation: {} -> {} rows (should be same)", 
+                   batch.num_rows(), transformed_batch.num_rows());
         Ok(transformed_batch)
     }
 
-    /// Transform a UInt32 ID column to UInt16 using the current mapping
+    /// Transform a UInt32 ID column to UInt16 using batch normalization
     fn transform_id_column(&mut self, column: &ArrayRef) -> Result<ArrayRef, ParquetReceiverError> {
         let uint32_array = column
             .as_any()
@@ -173,8 +164,8 @@ impl IdMapper {
                 uint16_builder.append_null();
             } else {
                 let original_id = uint32_array.value(i);
-                let mapped_id = self.map_id(original_id)?;
-                uint16_builder.append_value(mapped_id);
+                let normalized_id = self.normalize_id(original_id)?;
+                uint16_builder.append_value(normalized_id);
             }
         }
 
@@ -182,7 +173,32 @@ impl IdMapper {
         Ok(Arc::new(uint16_array) as ArrayRef)
     }
 
-    /// Transform a UInt32 parent_id column to UInt16 using existing mappings only
+    /// Transform a UInt32 parent_id column to UInt16 using batch normalization
+    fn transform_parent_id_column_with_creation(&mut self, column: &ArrayRef) -> Result<ArrayRef, ParquetReceiverError> {
+        let uint32_array = column
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| ParquetReceiverError::Reconstruction(
+                "parent_id column is not UInt32Array".to_string()
+            ))?;
+
+        let mut uint16_builder = UInt16Array::builder(uint32_array.len());
+
+        for i in 0..uint32_array.len() {
+            if uint32_array.is_null(i) {
+                uint16_builder.append_null();
+            } else {
+                let original_parent_id = uint32_array.value(i);
+                let normalized_id = self.normalize_id(original_parent_id)?;
+                uint16_builder.append_value(normalized_id);
+            }
+        }
+
+        let uint16_array = uint16_builder.finish();
+        Ok(Arc::new(uint16_array) as ArrayRef)
+    }
+
+    /// Transform a UInt32 parent_id column to UInt16 using batch normalization (legacy method)
     fn transform_parent_id_column(&self, column: &ArrayRef) -> Result<ArrayRef, ParquetReceiverError> {
         let uint32_array = column
             .as_any()
@@ -198,12 +214,12 @@ impl IdMapper {
                 uint16_builder.append_null();
             } else {
                 let original_parent_id = uint32_array.value(i);
-                if let Some(mapped_id) = self.get_mapped_id(original_parent_id) {
-                    uint16_builder.append_value(mapped_id);
-                } else {
-                    // Parent ID not in our mapping - this could indicate data integrity issues
-                    log::warn!("⚠️ Parent ID {} not found in current mapping", original_parent_id);
-                    uint16_builder.append_null();
+                match self.normalize_id(original_parent_id) {
+                    Ok(normalized_id) => uint16_builder.append_value(normalized_id),
+                    Err(_) => {
+                        log::warn!("⚠️ Parent ID {} cannot be normalized with batch start {}", original_parent_id, self.batch_start_id);
+                        uint16_builder.append_null();
+                    }
                 }
             }
         }

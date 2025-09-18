@@ -4,13 +4,15 @@
 //! Direct object store streaming coordinator for multi-table parquet reconstruction
 
 use crate::parquet_receiver::{
-    config::SignalType,
+    config::{Config, SignalType},
+    direct_streaming_merger::DirectStreamingMerger,
+    direct_stream_reader::DirectStreamConfig,
     error::ParquetReceiverError,
     id_mapping::IdMapper,
-    direct_stream_reader::DirectStreamConfig,
-    direct_streaming_merger::DirectStreamingMerger,
 };
+use arrow::array::UInt32Array;
 use arrow::record_batch::RecordBatch;
+use arrow::array::Array;
 use otel_arrow_rust::otap::{Logs, OtapArrowRecords, OtapBatchStore};
 use otel_arrow_rust::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use std::collections::HashMap;
@@ -65,21 +67,63 @@ impl StreamingCoordinator {
         &mut self,
         signal_type: &SignalType,
     ) -> Result<Vec<StreamingBatch>, ParquetReceiverError> {
-        self.process_all_partitions(signal_type).await
+        log::error!("🚀 DIRECT STREAMING COORDINATOR CALLED! Signal type: {:?}", signal_type);
+        log::error!("   Base directory: {}", self.config.base_directory.display());
+        log::error!("   Batch size: {}", self.config.primary_batch_size);
+        
+        let result = self.process_all_partitions(signal_type).await?;
+        log::error!("🎯 DIRECT STREAMING COORDINATOR RETURNING {} batches", result.len());
+        Ok(result)
     }
 
-    /// Convert streaming batch to OTAP records with proper UInt16 ID mapping
+    /// Convert streaming batch to OTAP records with proper UInt16 ID mapping using normalization
     pub fn batch_to_otap(&self, streaming_batch: StreamingBatch) -> Result<OtapArrowRecords, ParquetReceiverError> {
         let mut logs = Logs::default();
-        let mut id_mapper = IdMapper::new();
         
-        log::debug!("🔎 OTAP BATCH CONSTRUCTION (Direct Streaming):");
-        log::debug!("   Primary batch: {} rows", streaming_batch.primary_batch.num_rows());
-        log::debug!("   Child batches: {:?}", streaming_batch.child_batches.keys().collect::<Vec<_>>());
+        // Determine batch normalization parameters from the primary batch
+        let (max_id, min_id) = Self::analyze_id_range(&streaming_batch.primary_batch)?;
+        log::error!("🎯 Batch ID range: {} to {} (will normalize to 0-{})", min_id, max_id, max_id - min_id);
+        
+        // Set up ID mapper for batch normalization
+        let mut id_mapper = IdMapper::new();
+        id_mapper.set_batch_start(min_id);
+        
+        log::error!("🔎 OTAP BATCH CONSTRUCTION (Direct Streaming) - COMPREHENSIVE DIAGNOSTIC:");
+        log::error!("   Primary batch: {} rows", streaming_batch.primary_batch.num_rows());
+        log::error!("   Child batches: {} tables - {:?}", streaming_batch.child_batches.len(), streaming_batch.child_batches.keys().collect::<Vec<_>>());
+        log::error!("   Batch normalization: subtracting {} from all IDs", min_id);
+        
+        // Log detailed analysis of what attributes we have
+        let mut total_attribute_records = 0;
+        for (table_name, child_batch) in &streaming_batch.child_batches {
+            let rows = child_batch.num_rows();
+            total_attribute_records += rows;
+            log::error!("   {} table: {} attribute records", table_name, rows);
+            
+            // Log sample parent_ids from attributes BEFORE transformation
+            if rows > 0 {
+                if let Some(parent_id_col) = child_batch.column_by_name("parent_id") {
+                    if let Some(parent_id_array) = parent_id_col.as_any().downcast_ref::<UInt32Array>() {
+                        let mut sample_parent_ids = Vec::new();
+                        for i in 0..rows.min(10) {
+                            if !parent_id_array.is_null(i) {
+                                sample_parent_ids.push(parent_id_array.value(i));
+                            }
+                        }
+                        log::error!("     Sample BEFORE parent_ids: {:?}", sample_parent_ids);
+                    }
+                }
+            }
+        }
+        
+        log::error!("   TOTAL ATTRIBUTE RECORDS: {}", total_attribute_records);
+        if total_attribute_records == 0 {
+            log::error!("🚨 CRITICAL: NO ATTRIBUTES FOUND! All {} log records will have empty attributes!", streaming_batch.primary_batch.num_rows());
+        }
         
         // Transform primary batch: UInt32 ID -> UInt16 ID
         let transformed_primary = id_mapper.transform_primary_batch(&streaming_batch.primary_batch)?;
-        log::debug!("   ✅ Primary batch transformed");
+        log::error!("   ✅ Primary batch transformed");
         logs.set(ArrowPayloadType::Logs, transformed_primary);
         
         // Transform child batches: UInt32 parent_id -> UInt16 parent_id
@@ -87,19 +131,70 @@ impl StreamingCoordinator {
             let payload_type = self.table_name_to_payload_type(&table_name)?;
             let transformed_child = id_mapper.transform_child_batch(&child_batch)?;
             
-            log::debug!("   ✅ {} transformed: {} rows", table_name, transformed_child.num_rows());
+            log::error!("   ✅ {} transformed: {} rows", table_name, transformed_child.num_rows());
+            
+            // Log sample parent_ids AFTER transformation
+            if transformed_child.num_rows() > 0 {
+                if let Some(parent_id_col) = transformed_child.column_by_name("parent_id") {
+                    if let Some(parent_id_array) = parent_id_col.as_any().downcast_ref::<arrow::array::UInt16Array>() {
+                        let mut sample_parent_ids = Vec::new();
+                        for i in 0..transformed_child.num_rows().min(10) {
+                            if !parent_id_array.is_null(i) {
+                                sample_parent_ids.push(parent_id_array.value(i));
+                            }
+                        }
+                        log::error!("     Sample AFTER parent_ids: {:?}", sample_parent_ids);
+                    }
+                }
+            }
+            
             logs.set(payload_type, transformed_child);
         }
 
         let otap_records = OtapArrowRecords::Logs(logs);
         
-        log::debug!("🔄 Direct streaming OTAP batch complete: {} IDs mapped", id_mapper.mapping_count());
-        log::debug!("   - Primary records: {} logs", otap_records.get(ArrowPayloadType::Logs).map_or(0, |b| b.num_rows()));
+        log::error!("🔄 Direct streaming OTAP batch complete: normalized from {} (batch start: {})", max_id - min_id + 1, min_id);
+        log::error!("   - Primary records: {} logs", otap_records.get(ArrowPayloadType::Logs).map_or(0, |b| b.num_rows()));
         if let Some(attrs_batch) = otap_records.get(ArrowPayloadType::LogAttrs) {
-            log::debug!("   - Attribute records: {} log_attrs", attrs_batch.num_rows());
+            log::error!("   - Attribute records: {} log_attrs", attrs_batch.num_rows());
+        } else {
+            log::error!("🚨 NO log_attrs batch in final OTAP records!");
         }
 
         Ok(otap_records)
+    }
+
+    /// Analyze ID range from a primary batch (max, min)  
+    fn analyze_id_range(batch: &RecordBatch) -> Result<(u32, u32), ParquetReceiverError> {
+        let id_column = batch.column_by_name("id")
+            .ok_or_else(|| ParquetReceiverError::Reconstruction(
+                "No 'id' column found in logs batch".to_string()
+            ))?;
+
+        let id_array = id_column.as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| ParquetReceiverError::Reconstruction(
+                "ID column is not UInt32Array".to_string()
+            ))?;
+
+        let mut min_id = u32::MAX;
+        let mut max_id = 0u32;
+        
+        for i in 0..id_array.len() {
+            if !id_array.is_null(i) {
+                let id = id_array.value(i);
+                min_id = min_id.min(id);
+                max_id = max_id.max(id);
+            }
+        }
+
+        if min_id == u32::MAX {
+            return Err(ParquetReceiverError::Reconstruction(
+                "No valid IDs found in batch".to_string()
+            ));
+        }
+
+        Ok((max_id, min_id))
     }
 
     /// Process all partitions discovered in the base directory
