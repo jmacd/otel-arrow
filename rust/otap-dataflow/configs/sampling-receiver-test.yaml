@@ -1,0 +1,61 @@
+settings:
+  default_pipeline_ctrl_msg_channel_size: 100
+  default_node_ctrl_msg_channel_size: 100
+  default_pdata_channel_size: 100
+
+nodes:
+  # Sampling receiver node with shorter delays for testing
+  sampling_receiver:
+    kind: receiver
+    plugin_urn: "urn:otel:otap:sampling:receiver"
+    out_ports:
+      out_port:
+        destinations:
+          - debug_processor
+        dispatch_strategy: round_robin
+    config:
+      # Base directory containing parquet files
+      base_uri: "file:///home/jmacd/src/otel/otel-arrow-tail-sampler/rust/otap-dataflow/output_parquet_files"
+      signal_types: ["logs"]
+      
+      # Temporal configuration optimized for testing
+      temporal:
+        window_granularity: "30s"       # Smaller windows for faster testing
+        processing_delay: "1s"          # Very short delay since data is static
+        max_clock_drift: "1s"           
+        max_file_duration: "1m"         
+      
+      # Simple pass-through query for testing
+      query: |
+        SELECT *
+        FROM log_attributes
+        WHERE timestamp_unix_nano >= {window_start_ns}
+          AND timestamp_unix_nano < {window_end_ns}
+        ORDER BY _part_id, parent_id, key
+        LIMIT 100
+      
+      # Performance settings
+      performance:
+        batch_size: 100              # Smaller batches for testing
+        enable_arrow_optimization: true
+        memory_limit: "512MB"
+        max_concurrent_files: 5
+        target_partitions: 2
+  
+  # Debug processor with verbose output
+  debug_processor:
+    kind: processor
+    plugin_urn: "urn:otel:debug:processor"
+    out_ports:
+      out_port:
+        destinations:
+          - noop_exporter
+        dispatch_strategy: round_robin
+    config:
+      verbosity: summary          # Less verbose for testing
+
+  # NoOp exporter
+  noop_exporter:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config: {}

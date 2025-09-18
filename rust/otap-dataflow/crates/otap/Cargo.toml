@@ -57,6 +57,7 @@ weaver_resolved_schema = { git = "https://github.com/open-telemetry/weaver.git",
 weaver_resolver = { git = "https://github.com/open-telemetry/weaver.git", tag = "v0.17.0"}
 rand = "0.9.2"
 zip = "=4.2.0"
+url = "2.5"
 
 [dev-dependencies]
 portpicker = "0.1.1"
