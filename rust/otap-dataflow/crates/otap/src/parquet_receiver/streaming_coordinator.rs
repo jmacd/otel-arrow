@@ -17,6 +17,7 @@ use otel_arrow_rust::otap::{Logs, OtapArrowRecords, OtapBatchStore};
 use otel_arrow_rust::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 use tokio::fs;
 
@@ -153,6 +154,10 @@ impl StreamingCoordinator {
 
         let otap_records = OtapArrowRecords::Logs(logs);
         
+        // CRITICAL: Ensure OTAP batches are marked as memory-optimized (not transport-optimized)
+        // This sets COLUMN_ENCODING=PLAIN metadata to prevent OTLP layer from assuming delta encoding
+        let otap_records = Self::ensure_memory_optimized_format(otap_records)?;
+        
         log::error!("🔄 Direct streaming OTAP batch complete: normalized from {} (batch start: {})", max_id - min_id + 1, min_id);
         log::error!("   - Primary records: {} logs", otap_records.get(ArrowPayloadType::Logs).map_or(0, |b| b.num_rows()));
         if let Some(attrs_batch) = otap_records.get(ArrowPayloadType::LogAttrs) {
@@ -162,6 +167,70 @@ impl StreamingCoordinator {
         }
 
         Ok(otap_records)
+    }
+
+    /// Ensure OTAP batches are marked as memory-optimized (not transport-optimized)
+    /// This adds COLUMN_ENCODING=PLAIN metadata to prevent OTLP layer from assuming delta encoding
+    fn ensure_memory_optimized_format(mut otap_records: OtapArrowRecords) -> Result<OtapArrowRecords, ParquetReceiverError> {
+        // Add PLAIN encoding metadata to all batches to indicate memory-optimized format
+        match &mut otap_records {
+            OtapArrowRecords::Logs(logs) => {
+                // Mark logs batch as memory-optimized
+                if let Some(logs_batch) = logs.get(ArrowPayloadType::Logs) {
+                    let updated_batch = Self::add_plain_encoding_metadata(logs_batch, &["id"])?;
+                    logs.set(ArrowPayloadType::Logs, updated_batch);
+                }
+                
+                // Mark log_attrs batch as memory-optimized  
+                if let Some(attrs_batch) = logs.get(ArrowPayloadType::LogAttrs) {
+                    let updated_batch = Self::add_plain_encoding_metadata(attrs_batch, &["parent_id"])?;
+                    logs.set(ArrowPayloadType::LogAttrs, updated_batch);
+                }
+                
+                // Mark other attribute batches as memory-optimized
+                for payload_type in [ArrowPayloadType::ResourceAttrs, ArrowPayloadType::ScopeAttrs] {
+                    if let Some(attrs_batch) = logs.get(payload_type) {
+                        let updated_batch = Self::add_plain_encoding_metadata(attrs_batch, &["parent_id"])?;
+                        logs.set(payload_type, updated_batch);
+                    }
+                }
+            },
+            _ => {
+                // For now, only handle logs
+                return Err(ParquetReceiverError::Reconstruction("Only logs OTAP batches supported".to_string()));
+            }
+        }
+        
+        Ok(otap_records)
+    }
+    
+    /// Add COLUMN_ENCODING=PLAIN metadata to specified columns in a RecordBatch
+    fn add_plain_encoding_metadata(batch: &RecordBatch, column_names: &[&str]) -> Result<RecordBatch, ParquetReceiverError> {
+        use arrow::datatypes::Field;
+        
+        let schema = batch.schema();
+        let mut new_fields = Vec::new();
+        
+        for field in schema.fields() {
+            if column_names.contains(&field.name().as_str()) {
+                // Add COLUMN_ENCODING=PLAIN metadata to this field
+                let mut metadata = field.metadata().clone();
+                let _ = metadata.insert("encoding".to_string(), "plain".to_string());
+                
+                let new_field = Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                    .with_metadata(metadata);
+                new_fields.push(new_field);
+            } else {
+                // Keep original field unchanged
+                new_fields.push(field.as_ref().clone());
+            }
+        }
+        
+        let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
+        let new_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())
+            .map_err(|e| ParquetReceiverError::Arrow(e))?;
+            
+        Ok(new_batch)
     }
 
     /// Analyze ID range from a primary batch (max, min)  

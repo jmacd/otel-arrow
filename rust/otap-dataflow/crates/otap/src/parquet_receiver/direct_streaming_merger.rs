@@ -101,7 +101,7 @@ impl DirectStreamingMerger {
 
     /// Process next streaming merge batch
     pub async fn read_next_merge_batch(&mut self) -> Result<Option<StreamingMergeBatch>, ParquetReceiverError> {
-        log::error!("🚀🚀🚀 DIRECT STREAMING MERGER CALLED!!! 🚀🚀🚀");
+        log::debug!("🚀🚀🚀 DIRECT STREAMING MERGER CALLED!!! 🚀🚀🚀");
         
         // Step 1: Read next batch from logs (primary) table
         let logs_batch = match self.logs_reader.read_next_batch().await? {
@@ -110,7 +110,7 @@ impl DirectStreamingMerger {
         };
 
         let record_count = logs_batch.num_rows();
-        log::error!("📊 Read primary batch: {} logs", record_count);
+        log::debug!("📊 Read primary batch: {} logs", record_count);
 
         // Step 2: Determine max_id from logs batch and log detailed ID analysis
         let (max_id, min_id) = Self::analyze_id_range(&logs_batch)?;
@@ -119,45 +119,33 @@ impl DirectStreamingMerger {
         // Log first few and last few IDs for debugging
         Self::log_id_samples(&logs_batch, "logs")?;
 
-        // Step 3: Collect attribute records for the NORMALIZED range (0 to batch_size-1)
-        // Since each batch will be normalized to start at 0, we need attributes for parent_ids 0 to (batch_size-1)
-        let normalized_min_id = 0;
-        let normalized_max_id = max_id - min_id; // e.g., if logs are 100-199, normalized range is 0-99
-        
+        // Step 3: Collect attribute records up to max_id
         let mut attribute_batches = HashMap::new();
         let mut total_attrs_found = 0;
 
-        log::debug!("🎯 Will collect attributes for normalized range: {} to {} (original range was {} to {})", 
-            normalized_min_id, normalized_max_id, min_id, max_id);
-
-                // Process log_attrs with cursor-based streaming  
+        // Process log_attrs with cursor-based streaming  
         if self.log_attrs_reader.is_some() {
-            log::error!("🔍 CURSOR-BASED STREAMING log_attrs for normalized parent_ids {} to {}", normalized_min_id, normalized_max_id);
-            log::error!("   Log_attrs reader file count: {}", self.log_attrs_reader.as_ref().unwrap().file_count());
-            log::error!("   Log_attrs reader has_more_files: {}", self.log_attrs_reader.as_ref().unwrap().has_more_files());
+            log::debug!("🔍 CURSOR-BASED STREAMING log_attrs for parent_ids {} to {}", min_id, max_id);
+            log::debug!("   Log_attrs reader file count: {}", self.log_attrs_reader.as_ref().unwrap().file_count());
+            log::debug!("   Log_attrs reader has_more_files: {}", self.log_attrs_reader.as_ref().unwrap().has_more_files());
             
-            if let Some(attrs_batch) = self.read_log_attrs_with_cursor_range(normalized_min_id, normalized_max_id).await? {
+            if let Some(attrs_batch) = self.read_log_attrs_with_cursor_range(min_id, max_id).await? {
                 let attrs_count = attrs_batch.num_rows();
                 total_attrs_found += attrs_count;
-                log::error!("✅ Found {} log_attrs for normalized parent_ids {} to {} (cursor-based)", attrs_count, normalized_min_id, normalized_max_id);
+                log::debug!("✅ Found {} log_attrs for parent_ids {} to {} (cursor-based)", attrs_count, min_id, max_id);
                 
                 // Log samples of the attributes found
                 Self::log_attribute_samples(&attrs_batch, "log_attrs")?;
                 let _ = attribute_batches.insert("log_attrs".to_string(), attrs_batch);
             } else {
-                log::error!("🚨 NO log_attrs found for normalized parent_ids {} to {} using cursor-based streaming", normalized_min_id, normalized_max_id);
-                log::error!("   Reader state after failed collection:");
-                log::error!("   - has_more_files: {}", self.log_attrs_reader.as_ref().unwrap().has_more_files());
-                log::error!("   - buffer state: {:?}", self.log_attrs_buffer.as_ref().map(|b| b.num_rows()));
-                log::error!("   - cursor position: {}", self.log_attrs_cursor);
+                log::debug!("🚨 NO log_attrs found for parent_ids {} to {} using cursor-based streaming", min_id, max_id);
+                log::debug!("   Reader state after failed collection:");
+                log::debug!("   - has_more_files: {}", self.log_attrs_reader.as_ref().unwrap().has_more_files());
+                log::debug!("   - buffer state: {:?}", self.log_attrs_buffer.as_ref().map(|b| b.num_rows()));
+                log::debug!("   - cursor position: {}", self.log_attrs_cursor);
             }
         } else {
-            log::error!("ℹ️ No log_attrs reader available");
-        }", self.log_attrs_buffer.as_ref().map(|b| b.num_rows()));
-                log::error!("   - cursor position: {}", self.log_attrs_cursor);
-            }
-        } else {
-            log::debug!("No log_attrs reader available");
+            log::debug!("ℹ️ No log_attrs reader available");
         }
 
         // Process resource_attrs
@@ -212,23 +200,38 @@ impl DirectStreamingMerger {
         let mut collected_records = Vec::new();
         
         log::debug!("🔍 CURSOR-BASED READING log_attrs for parent_ids {} to {}", min_parent_id, max_parent_id);
+        log::debug!("📍 CURSOR STATE: buffer={:?}, cursor_pos={}", 
+            self.log_attrs_buffer.as_ref().map(|b| b.num_rows()), self.log_attrs_cursor);
 
         // Process buffered records first (from previous cursor position)
         if let Some(ref buffer) = self.log_attrs_buffer {
             log::debug!("📦 Processing buffered records from cursor position {}", self.log_attrs_cursor);
+            
+            // Log what's in the buffer
+            if buffer.num_rows() > 0 {
+                if let Ok((buffer_min, buffer_max)) = Self::get_parent_id_range(buffer) {
+                    log::debug!("📦 Buffer contains parent_ids {} to {} ({} rows)", buffer_min, buffer_max, buffer.num_rows());
+                }
+            }
             
             // Extract records from buffer where min_parent_id <= parent_id <= max_parent_id
             let (matching_records, remaining_buffer, new_cursor) = 
                 Self::extract_range_records_from_buffer(&buffer, min_parent_id, max_parent_id, self.log_attrs_cursor)?;
             
             if let Some(matching_batch) = matching_records {
-                log::debug!("✅ Extracted {} records from buffer", matching_batch.num_rows());
+                let batch_min_max = Self::get_parent_id_range(&matching_batch).unwrap_or((0, 0));
+                log::debug!("✅ Extracted {} records from buffer (parent_ids {} to {})", matching_batch.num_rows(), batch_min_max.0, batch_min_max.1);
                 collected_records.push(matching_batch);
+            } else {
+                log::debug!("❌ No matching records found in buffer for range {} to {}", min_parent_id, max_parent_id);
             }
             
             // Update cursor state
             self.log_attrs_buffer = remaining_buffer;
             self.log_attrs_cursor = new_cursor;
+            
+            log::debug!("📍 CURSOR UPDATED: buffer={:?}, cursor_pos={}", 
+                self.log_attrs_buffer.as_ref().map(|b| b.num_rows()), self.log_attrs_cursor);
         }
         
         // Continue reading new files until we have enough attributes
@@ -242,7 +245,8 @@ impl DirectStreamingMerger {
                 
                 // Check if this batch contains records we need
                 let (batch_min_parent_id, batch_max_parent_id) = Self::get_parent_id_range(&batch)?;
-                log::debug!("🔍 Batch parent_id range: {} to {}", batch_min_parent_id, batch_max_parent_id);
+                log::debug!("🔍 Batch parent_id range: {} to {} (file #{}, {} rows)", batch_min_parent_id, batch_max_parent_id, files_read, batch.num_rows());
+                log::debug!("🎯 Target range: {} to {} (seeking log IDs)", min_parent_id, max_parent_id);
                 
                 // Check if this batch has any overlap with our target range
                 if batch_max_parent_id < min_parent_id {
@@ -257,7 +261,18 @@ impl DirectStreamingMerger {
                 
                 if let Some(matching_batch) = matching_records {
                     log::debug!("✅ Extracted {} records from new batch (file #{})", matching_batch.num_rows(), files_read);
+                    
+                    // Check if there's a gap at the beginning of our target range
+                    if collected_records.is_empty() && batch_min_parent_id > min_parent_id {
+                        log::warn!("🚨 GAP DETECTED: log_attrs file #{} starts at parent_id {} but we need parent_ids starting from {} (gap: {} missing parent_ids)", 
+                            files_read, batch_min_parent_id, min_parent_id, batch_min_parent_id - min_parent_id);
+                        log::warn!("   This means log IDs {} to {} will have NO attributes!", min_parent_id, batch_min_parent_id - 1);
+                    }
+                    
                     collected_records.push(matching_batch);
+                } else if collected_records.is_empty() {
+                    log::warn!("🚨 NO MATCHES: log_attrs file #{} (parent_ids {} to {}) has no overlap with target range {} to {}", 
+                        files_read, batch_min_parent_id, batch_max_parent_id, min_parent_id, max_parent_id);
                 }
                 
                 // Always continue to next file - don't buffer until we've read all files
@@ -269,24 +284,37 @@ impl DirectStreamingMerger {
                         // Save remaining records for next iteration
                         log::debug!("💾 Buffering remaining {} records from file #{}", remaining.num_rows(), files_read);
                         self.log_attrs_buffer = Some(remaining);
-                        self.log_attrs_cursor = 0; // Reset cursor for buffered batch
+                        self.log_attrs_cursor = new_cursor;
                     }
                     break;
                 }
                 
-                // If there are remaining records but they're still within our range, 
-                // we need to continue processing them
+                // Check if we have remaining records from partial consumption within our range
                 if let Some(remaining) = remaining_buffer {
-                    // These records are beyond our current range, buffer them
-                    log::debug!("💾 Buffering remaining {} records for next iteration", remaining.num_rows());
+                    // We partially consumed this file - save the remaining records for next iteration
+                    log::debug!("💾 Buffering remaining {} records from partially consumed file #{}", remaining.num_rows(), files_read);
+                    
+                    // Check the parent_id range of what we're buffering
+                    if let Ok((buffer_min, buffer_max)) = Self::get_parent_id_range(&remaining) {
+                        log::debug!("📦 Buffered records contain parent_ids {} to {} for next batch", buffer_min, buffer_max);
+                    }
+                    
                     self.log_attrs_buffer = Some(remaining);
-                    self.log_attrs_cursor = 0; // Reset cursor for buffered batch
-                    break;
+                    self.log_attrs_cursor = new_cursor;
+                    
+                    // We have buffered records - we might want to stop here if they go beyond our range
+                    // Check if buffered records start beyond our current range
+                    if let Ok((buffer_min, _)) = Self::get_parent_id_range(&self.log_attrs_buffer.as_ref().unwrap()) {
+                        if buffer_min > max_parent_id {
+                            log::debug!("🔚 Buffered records start at parent_id {}, beyond current target {}. Stopping file reading.", buffer_min, max_parent_id);
+                            break;
+                        }
+                    }
+                } else {
+                    // Clear buffer state as we fully consumed this file
+                    self.log_attrs_buffer = None;
+                    self.log_attrs_cursor = 0;
                 }
-                
-                // Clear buffer state as we consumed this entire file
-                self.log_attrs_buffer = None;
-                self.log_attrs_cursor = 0;
             } else {
                 log::debug!("📄 No more log_attrs files available after reading {} files", files_read);
                 break;
@@ -846,7 +874,7 @@ impl DirectStreamingMerger {
                     "<no-str-col>".to_string()
                 };
 
-                // log::debug!("   [{}] parent_id={} key={} value={}", i, parent_id, key_info, value_info);
+                log::debug!("   [{}] parent_id={} key='{}' value='{}'", i, parent_id, key_info, value_info);
             }
         }
 

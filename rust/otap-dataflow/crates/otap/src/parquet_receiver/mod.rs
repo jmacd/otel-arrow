@@ -8,10 +8,9 @@ pub mod error;
 pub mod file_discovery;
 pub mod id_mapping;
 pub mod parquet_receiver;
-// pub mod partition_object_store; // Removed - using direct streaming
 pub mod direct_stream_reader;
 pub mod direct_streaming_merger;
-// pub mod reconstruction; // Removed - using direct streaming  
+/// Streaming coordinator for processing parquet data with direct object store access
 pub mod streaming_coordinator;
 
 // Re-export the main receiver and factory

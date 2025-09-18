@@ -11,15 +11,15 @@ redirected to a file. For example
 
 ```
   RUST_LOG=datafusion=debug
-  cargo run --bin df_engine -- ${ARGS} 1> OUT 2> OUT
+  cargo run --bin df_engine -- ${ARGS} 1> OUT 2> ERR
 ```
 
 Note that the command exit status is as-usual. You will know since you
 ran the command whether it exited successfully or not.
 
-This produces a file named `OUT`.
+This produces a files named `OUT` (output) and `ERR` (error).
 
-Now, read the file named `OUT`.
+Now, read the files named `OUT` and `ERR`.
 
 You can use tools such as `grep_search` to understand the output of
 the test. 

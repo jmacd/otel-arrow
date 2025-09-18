@@ -7,8 +7,6 @@ use crate::parquet_receiver::{
     config::Config,
     error::ParquetReceiverError,
     file_discovery::FileDiscovery,
-    // query_engine::ParquetQueryEngine, // Removed - using direct streaming
-    // reconstruction::OtapReconstructor, // Removed - using direct streaming
     streaming_coordinator::{StreamingConfig, StreamingCoordinator},
 };
 use crate::{OTAP_RECEIVER_FACTORIES, pdata::OtapPdata};
