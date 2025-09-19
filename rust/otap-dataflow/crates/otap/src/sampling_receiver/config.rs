@@ -156,7 +156,7 @@ pub fn default_passthrough_query() -> &'static str {
     r#"
     SELECT la.*
     FROM log_attrs la
-    JOIN logs l ON l.id = la.parent_id
+    JOIN logs l ON l.id = la.parent_id AND la._part_id = l._part_id
     WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns})
       AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
     ORDER BY la.parent_id, la.key
@@ -170,8 +170,8 @@ pub fn default_service_filter_query() -> &'static str {
     r#"
     SELECT la.*
     FROM log_attrs la
-    JOIN logs l ON l.id = la.parent_id
-    JOIN resource_attrs ra ON ra.parent_id = l.id AND ra.key = 'service.name'
+    JOIN logs l ON l.id = la.parent_id AND la._part_id = l._part_id
+    JOIN resource_attrs ra ON ra.parent_id = l.id AND ra._part_id = l._part_id AND ra.key = 'service.name'
     WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns})
       AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
       AND ra.str = '{service_name}'

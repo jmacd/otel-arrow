@@ -1,4 +1,3 @@
-//!
 //! This module converts DataFusion query results back into OTAP records,
 //! following the patterns from the parquet_receiver but working with 
 //! DataFusion's output format.
@@ -6,7 +5,7 @@
 use std::sync::Arc;
 use std::collections::HashSet;
 use arrow::record_batch::RecordBatch;
-use arrow::array::{Array, UInt32Array, UInt16Array, Int64Array};
+use arrow::array::{Array, UInt32Array, UInt16Array, Int64Array, StringArray};
 use arrow::datatypes::{Schema, Field, DataType};
 use arrow::compute::kernels::numeric::sub_wrapping;
 use arrow::compute::kernels::cast::cast;
@@ -89,6 +88,11 @@ impl OtapReconstructor {
         
         for (batch_idx, log_attrs_batch) in log_attributes_results.iter().enumerate() {
             debug!("Processing log_attrs batch {}: {} rows", batch_idx, log_attrs_batch.num_rows());
+            
+            // DEBUG: Pretty print the original query results to see if they're already duplicated
+            debug!("🔍 ===== ORIGINAL LOG_ATTRS FROM QUERY (before any processing) =====");
+            self.debug_pretty_print_batch(&format!("ORIGINAL_log_attrs_batch_{}", batch_idx), log_attrs_batch);
+            debug!("🔍 ===== END ORIGINAL LOG_ATTRS =====");
             
             // Analyze batch structure and sorting
             self.debug_batch_analysis("log_attrs", log_attrs_batch);
@@ -176,6 +180,39 @@ impl OtapReconstructor {
         Ok(parent_ids)
     }
     
+    /// Extract partition IDs from log_attrs batch for partition alignment
+    fn extract_partition_ids_from_log_attrs(&self, log_attrs_batch: &RecordBatch) -> Result<HashSet<String>> {
+        let part_id_column = log_attrs_batch.column_by_name("_part_id")
+            .ok_or_else(|| SamplingReceiverError::ReconstructionError {
+                message: "No _part_id column found in log_attrs batch".to_string(),
+            })?;
+        
+        let part_id_array = part_id_column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| SamplingReceiverError::ReconstructionError {
+                message: "_part_id must be a string column".to_string(),
+            })?;
+
+        let mut partition_ids = HashSet::new();
+        for i in 0..part_id_array.len() {
+            if !part_id_array.is_null(i) {
+                let part_id_val = part_id_array.value(i);
+                // Strip leading '/' if present 
+                let cleaned_part_id = if part_id_val.starts_with('/') {
+                    &part_id_val[1..]
+                } else {
+                    part_id_val
+                };
+                let _ = partition_ids.insert(cleaned_part_id.to_string());
+            }
+        }
+        
+        debug!("🔍 Extracted {} unique partition IDs from {} log_attrs rows: {:?}", 
+               partition_ids.len(), log_attrs_batch.num_rows(), partition_ids);
+        Ok(partition_ids)
+    }
+
     /// Step 2: Create MemTable with Arrow array of parent IDs following expert strategy
     async fn create_temp_id_table(&self, parent_ids: &[u32], table_name: &str) -> Result<()> {
         // Convert u32 parent_ids to i64 for DataFusion compatibility (expert uses Int64)
@@ -220,10 +257,15 @@ impl OtapReconstructor {
         let parent_ids = self.extract_parent_ids_from_log_attrs(log_attrs_batch)?;
         debug!("🔍 Need to fetch {} unique log records", parent_ids.len());
         
-        // Query P table (logs) to get the actual log records
+        // Extract partition IDs to ensure partition alignment in separate queries
+        let partition_ids = self.extract_partition_ids_from_log_attrs(log_attrs_batch)?;
+        debug!("🔍 Found {} unique partition IDs: {:?}", partition_ids.len(), partition_ids);
+        
+        // Query P table (logs) with partition alignment
         let logs_query = format!(
-            "SELECT l.* FROM logs l WHERE l.id IN ({})",
-            parent_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
+            "SELECT l.* FROM logs l WHERE l.id IN ({}) AND l._part_id IN ({})",
+            parent_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "),
+            partition_ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(", ")
         );
         
         debug!("🔍 Executing logs query: {}", logs_query);
@@ -244,13 +286,47 @@ impl OtapReconstructor {
             }
         };
         
-        // TODO: Implement R and S queries for resource_attrs and scope_attrs
+        // Query R table (resource_attrs) with partition alignment - handle missing table gracefully
+        let resource_attrs_query = format!(
+            "SELECT ra.* FROM resource_attrs ra WHERE ra._part_id IN ({})",
+            partition_ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(", ")
+        );
+        debug!("🔍 Attempting resource_attrs query: {}", resource_attrs_query);
+        let resource_attrs_batches = match self.query_engine.execute_query(&resource_attrs_query).await {
+            Ok(batches) => {
+                debug!("✅ Resource attrs query executed successfully, got {} batches", batches.len());
+                batches
+            }
+            Err(e) => {
+                // Resource attrs table may not exist - this is optional
+                debug!("⚠️  Resource attrs table not found (optional): {}", e);
+                vec![]
+            }
+        };
+        
+        // Query S table (scope_attrs) with partition alignment - handle missing table gracefully
+        let scope_attrs_query = format!(
+            "SELECT sa.* FROM scope_attrs sa WHERE sa._part_id IN ({})",
+            partition_ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(", ")
+        );
+        debug!("🔍 Attempting scope_attrs query: {}", scope_attrs_query);
+        let scope_attrs_batches = match self.query_engine.execute_query(&scope_attrs_query).await {
+            Ok(batches) => {
+                debug!("✅ Scope attrs query executed successfully, got {} batches", batches.len());
+                batches
+            }
+            Err(e) => {
+                // Scope attrs table may not exist - this is optional
+                debug!("⚠️  Scope attrs table not found (optional): {}", e);
+                vec![]
+            }
+        };
         
         Ok(SeparateQueryResults {
             a_batches: vec![log_attrs_batch.clone()], // A = log_attrs (what we started with)
             p_batches, // P = logs (primary table) - now populated
-            r_batches: vec![], // R = resource_attrs - TODO  
-            s_batches: vec![], // S = scope_attrs - TODO
+            r_batches: resource_attrs_batches, // R = resource_attrs - populated with partition alignment, empty if not exists
+            s_batches: scope_attrs_batches, // S = scope_attrs - populated with partition alignment, empty if not exists
         })
     }
     
@@ -286,6 +362,10 @@ impl OtapReconstructor {
             let filtered_a = self.remove_partition_columns(&merged_a)?;
             // Add PLAIN encoding metadata to prevent OTLP layer from assuming delta encoding
             let plain_encoded_a = self.add_plain_encoding_metadata(&filtered_a, &["parent_id"])?;
+            
+            // Pretty print the final log_attrs batch for debugging (truncated if large)
+            self.debug_pretty_print_batch("FINAL_log_attrs", &plain_encoded_a);
+            
             logs.set(ArrowPayloadType::LogAttrs, plain_encoded_a);
         }
         
@@ -296,6 +376,10 @@ impl OtapReconstructor {
             self.debug_batch_id_ranges(&merged_p, "MERGED_logs")?;
             // Add PLAIN encoding metadata to prevent OTLP layer from assuming delta encoding
             let plain_encoded_p = self.add_plain_encoding_metadata(&merged_p, &["id"])?;
+            
+            // Pretty print the final logs batch for debugging (truncated if large)
+            self.debug_pretty_print_batch("FINAL_logs", &plain_encoded_p);
+            
             logs.set(ArrowPayloadType::Logs, plain_encoded_p);
         }
         
@@ -348,16 +432,23 @@ impl OtapReconstructor {
     /// ✅ VECTORIZED: Merge batches with global offset for consistent ID transformation
     /// This ensures parent_id relationships are preserved across related tables
     fn merge_batches_with_global_offset(&self, batches: Vec<RecordBatch>, table_name: &str, global_offset: u32) -> Result<RecordBatch> {
+        debug!("🔀 merge_batches_with_global_offset: {} batches for table {}", batches.len(), table_name);
+        for (i, batch) in batches.iter().enumerate() {
+            debug!("🔀   Batch {}: {} rows, {} columns", i, batch.num_rows(), batch.num_columns());
+        }
+        
         if batches.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::new(Vec::<Field>::new()))));
         }
         
         if batches.len() == 1 {
             // Single batch - apply global offset for ID normalization
+            debug!("🔀 Single batch path for {}", table_name);
             return self.transform_batch_ids_with_offset(batches.into_iter().next().unwrap(), table_name, global_offset);
         }
         
         // Multiple batches - transform each one with global offset then concatenate
+        debug!("🔀 Multiple batch path for {} - concatenating {} batches", table_name, batches.len());
         let mut transformed_batches = Vec::with_capacity(batches.len());
         
         for batch in batches {
@@ -828,6 +919,87 @@ impl OtapReconstructor {
         let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         debug!("🔍 {} columns: {:?}", batch_name, column_names);
         debug!("🔍 ===== END {} ANALYSIS =====", batch_name.to_uppercase());
+        
+        // Always pretty print batches (with truncation for large ones)
+        self.debug_pretty_print_batch(batch_name, batch);
+    }
+    
+    /// Pretty print small batches for debugging
+    fn debug_pretty_print_batch(&self, batch_name: &str, batch: &RecordBatch) {
+        use arrow::util::pretty::pretty_format_batches;
+        
+        // Truncate large batches to first 50 rows for readability
+        let display_batch = if batch.num_rows() > 50 {
+            debug!("🎨 Truncating {} from {} rows to first 50 rows", batch_name, batch.num_rows());
+            match batch.slice(0, 50) {
+                truncated => truncated,
+            }
+        } else {
+            batch.clone()
+        };
+        
+        match pretty_format_batches(&[display_batch]) {
+            Ok(formatted) => {
+                debug!("🎨 ===== {} PRETTY PRINT ({} rows shown) =====", 
+                    batch_name.to_uppercase(), 
+                    std::cmp::min(batch.num_rows(), 50));
+                for line in formatted.to_string().lines() {
+                    debug!("🎨 {}", line);
+                }
+                debug!("🎨 ===== END {} PRETTY PRINT =====", batch_name.to_uppercase());
+            }
+            Err(e) => {
+                debug!("🎨 Failed to pretty print {}: {}", batch_name, e);
+            }
+        }
+    }
+    
+    /// Debug first few log_attrs records to understand duplicate issue
+    fn debug_first_few_log_attrs(&self, batch: &RecordBatch) {
+        debug!("🕵️ ===== FIRST FEW LOG_ATTRS DEBUGGING =====");
+        debug!("🕵️ Total rows: {}", batch.num_rows());
+        
+        // Get the key columns we care about
+        let parent_id_col = batch.column_by_name("parent_id");
+        let key_col = batch.column_by_name("key");
+        let str_col = batch.column_by_name("str");
+        
+        if let (Some(parent_ids), Some(keys), Some(strs)) = (parent_id_col, key_col, str_col) {
+            if let (Some(parent_id_array), Some(key_array), Some(str_array)) = (
+                parent_ids.as_any().downcast_ref::<UInt16Array>(),
+                keys.as_any().downcast_ref::<StringArray>(),
+                strs.as_any().downcast_ref::<StringArray>()
+            ) {
+                // Show first 10 records
+                let show_count = std::cmp::min(10, batch.num_rows());
+                debug!("🕵️ First {} records:", show_count);
+                for i in 0..show_count {
+                    let parent_id = parent_id_array.value(i);
+                    let key = if key_array.is_null(i) { "NULL" } else { key_array.value(i) };
+                    let str_val = if str_array.is_null(i) { "NULL" } else { str_array.value(i) };
+                    debug!("🕵️   Row {}: parent_id={}, key='{}', str='{}'", i, parent_id, key, str_val);
+                }
+                
+                // Look for duplicates in the first 20 records
+                debug!("🕵️ Looking for duplicate patterns in first 20 records...");
+                let check_count = std::cmp::min(20, batch.num_rows());
+                for i in 0..check_count.saturating_sub(1) {
+                    let curr_parent = parent_id_array.value(i);
+                    let curr_key = if key_array.is_null(i) { "NULL" } else { key_array.value(i) };
+                    let curr_str = if str_array.is_null(i) { "NULL" } else { str_array.value(i) };
+                    
+                    let next_parent = parent_id_array.value(i + 1);
+                    let next_key = if key_array.is_null(i + 1) { "NULL" } else { key_array.value(i + 1) };
+                    let next_str = if str_array.is_null(i + 1) { "NULL" } else { str_array.value(i + 1) };
+                    
+                    if curr_parent == next_parent && curr_key == next_key && curr_str == next_str {
+                        debug!("🚨 DUPLICATE FOUND: Rows {} and {} identical: parent_id={}, key='{}', str='{}'", 
+                            i, i + 1, curr_parent, curr_key, curr_str);
+                    }
+                }
+            }
+        }
+        debug!("🕵️ ===== END LOG_ATTRS DEBUGGING =====");
     }
 }
 
