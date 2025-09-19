@@ -69,8 +69,8 @@ impl SamplingReceiver {
             // Create a new Arc from query engine for the reconstructor
             let query_engine = Arc::new(DataFusionQueryEngine::new(self.config.clone()).await?);
             let reconstructor = OtapReconstructor::new(
-                self.config.clone(),
                 Arc::clone(&query_engine),
+                &self.config,
             );
             self.otap_reconstructor = Some(reconstructor);
         }
@@ -130,9 +130,8 @@ impl SamplingReceiver {
         let reconstructor = self.ensure_otap_reconstructor().await?;
         let _related_data = reconstructor.get_related_data().await?; // This will be implemented
         
-        // Convert query results to a stream and reconstruct OTAP records
-        let stream = futures_util::stream::iter(query_results.into_iter().map(Ok));
-        let otap_records = reconstructor.reconstruct_from_stream(stream).await?;
+        // Convert query results to OTAP records using the reconstructor
+        let otap_records = reconstructor.reconstruct_from_stream(query_results).await?;
         
         info!("Successfully reconstructed {} OTAP records", otap_records.len());
         
