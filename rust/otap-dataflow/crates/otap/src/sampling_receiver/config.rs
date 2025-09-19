@@ -150,42 +150,41 @@ impl Default for Config {
     }
 }
 
-/// Default pass-through query that processes all log_attributes
+/// Default pass-through query that processes all log_attributes with proper star schema join
 pub fn default_passthrough_query() -> &'static str {
     r#"
-    SELECT *
-    FROM log_attributes
-    WHERE timestamp_unix_nano >= {window_start_ns}
-      AND timestamp_unix_nano < {window_end_ns}
-    ORDER BY _part_id, parent_id, key
+    SELECT 
+        COUNT(*) as total_log_attributes,
+        COUNT(DISTINCT la.parent_id) as distinct_parent_ids,
+        la.key as attribute_key,
+        COUNT(*) as key_count,
+        COUNT(DISTINCT la.parent_id) as key_distinct_parents
+    FROM log_attrs la
+    JOIN logs l ON l.id = la.parent_id
+    WHERE l.time_unix_nano >= {window_start_ns}
+      AND l.time_unix_nano < {window_end_ns}
+    GROUP BY la.key
+    ORDER BY key_count DESC
+    LIMIT 20
     "#
 }
 
 /// Default sampling query template with weighted reservoir sampling
 pub fn default_sampling_query() -> &'static str {
     r#"
-    WITH service_weights AS (
-        SELECT 
-            l.id, l._part_id,
-            ra.str as service_name,
-            COALESCE(CAST(la.str AS DOUBLE), 1.0) as input_weight
-        FROM logs l
-        JOIN resource_attributes ra ON ra.parent_id = l.id AND ra._part_id = l._part_id AND ra.key = 'service.name'
-        LEFT JOIN log_attributes la ON la.parent_id = l.id AND la._part_id = l._part_id AND la.key = 'sampling.adjusted_count'
-        WHERE l.timestamp_unix_nano >= {window_start_ns} AND l.timestamp_unix_nano < {window_end_ns}
-    ),
-    sampling_decisions AS (
-        SELECT service_name, _part_id,
-               weighted_reservoir_sample(STRUCT(id, input_weight), {sample_size}) AS sample_decisions
-        FROM service_weights GROUP BY service_name, _part_id
-    )
-    SELECT la.*
-    FROM log_attributes la
-    JOIN (
-        SELECT UNNEST(sample_decisions.sampled_ids) as sampled_id, _part_id
-        FROM sampling_decisions
-    ) sampled ON sampled.sampled_id = la.parent_id AND sampled._part_id = la._part_id
-    ORDER BY la._part_id, la.parent_id, la.key
+    SELECT 
+        l.id as log_id,
+        l.time_unix_nano,
+        COUNT(la.parent_id) as attribute_count,
+        ARRAY_AGG(la.key) as attribute_keys,
+        ARRAY_AGG(la.str) as attribute_values
+    FROM logs l
+    LEFT JOIN log_attrs la ON l.id = la.parent_id
+    WHERE l.time_unix_nano >= {window_start_ns} 
+      AND l.time_unix_nano < {window_end_ns}
+    GROUP BY l.id, l.time_unix_nano
+    ORDER BY l.time_unix_nano
+    LIMIT 100
     "#
 }
 

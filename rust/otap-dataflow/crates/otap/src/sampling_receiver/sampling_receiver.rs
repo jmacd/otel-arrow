@@ -113,31 +113,82 @@ impl SamplingReceiver {
         Ok(vec![])
     }
 
-    /// Calculate time windows based on configuration
-    fn calculate_time_windows(&self, current_time_ns: i64) -> Vec<(i64, i64)> {
-        let window_duration_ns = self.config.temporal.window_granularity.as_nanos() as i64;
-        let processing_delay_ns = self.config.temporal.processing_delay.as_nanos() as i64;
-
-        // Calculate the latest window we can safely process
-        let latest_processable_time = current_time_ns - processing_delay_ns;
+    /// Discover time range from parquet files
+    async fn discover_data_time_range(&mut self) -> Result<(i64, i64)> {
+        let query_engine = self.ensure_query_engine().await?;
         
-        // Align to window boundaries
-        let window_start = (latest_processable_time / window_duration_ns) * window_duration_ns;
-        let window_end = window_start + window_duration_ns;
-
-        // For now, return a single window - later we'll support multiple windows
-        vec![(window_start, window_end)]
+        // Query to find min and max timestamps across all data
+        let discovery_query = r#"
+        SELECT 
+            MIN(time_unix_nano) as min_time,
+            MAX(time_unix_nano) as max_time
+        FROM logs
+        "#;
+        
+        debug!("Discovering data time range with query: {}", discovery_query);
+        let results = query_engine.execute_query(discovery_query).await?;
+        
+        if results.is_empty() {
+            error!("No data found in parquet files");
+            return Err(crate::sampling_receiver::error::SamplingReceiverError::file_discovery_error(
+                "No data found in parquet files"
+            ));
+        }
+        
+        // Extract min and max timestamps
+        let batch = &results[0];
+        let min_col = batch.column_by_name("min_time").unwrap();
+        let max_col = batch.column_by_name("max_time").unwrap();
+        
+        // Cast to timestamp and convert to nanoseconds
+        let min_time_ns = arrow::compute::cast(min_col, &arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Nanosecond, None
+        ))?;
+        let max_time_ns = arrow::compute::cast(max_col, &arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Nanosecond, None
+        ))?;
+        
+        let min_array = min_time_ns.as_any().downcast_ref::<arrow::array::TimestampNanosecondArray>().unwrap();
+        let max_array = max_time_ns.as_any().downcast_ref::<arrow::array::TimestampNanosecondArray>().unwrap();
+        
+        let min_time = min_array.value(0);
+        let max_time = max_array.value(0);
+        
+        info!("Discovered data time range: {} to {} ns", min_time, max_time);
+        Ok((min_time, max_time))
     }
 
-    /// Process a single time interval
+    /// Calculate all time windows to process based on actual data range
+    async fn calculate_all_windows(&mut self) -> Result<Vec<(i64, i64)>> {
+        let (min_time_ns, max_time_ns) = self.discover_data_time_range().await?;
+        let window_duration_ns = self.config.temporal.window_granularity.as_nanos() as i64;
+
+        // Align min time to window boundary (round down to nearest minute)
+        let first_window_start = (min_time_ns / window_duration_ns) * window_duration_ns;
+        
+        // Calculate all windows from first to last
+        let mut windows = Vec::new();
+        let mut current_start = first_window_start;
+        
+        while current_start <= max_time_ns {
+            let current_end = current_start + window_duration_ns;
+            windows.push((current_start, current_end));
+            current_start = current_end;
+        }
+        
+        info!("Generated {} time windows to process", windows.len());
+        Ok(windows)
+    }
+
+    /// Process a single time interval - now processes all data chronologically
     async fn process_interval(&mut self, effect_handler: &shared::EffectHandler<OtapPdata>) -> Result<()> {
-        let current_time_ns = chrono::Utc::now().timestamp_nanos_opt()
-            .unwrap_or_default();
+        let windows = self.calculate_all_windows().await?;
         
-        let windows = self.calculate_time_windows(current_time_ns);
+        info!("Processing {} time windows sequentially", windows.len());
         
-        for (window_start_ns, window_end_ns) in windows {
-            let records = self.process_time_window(window_start_ns, window_end_ns).await?;
+        for (i, (window_start_ns, window_end_ns)) in windows.iter().enumerate() {
+            info!("Processing window {}/{}: {} to {}", i + 1, windows.len(), window_start_ns, window_end_ns);
+            let records = self.process_time_window(*window_start_ns, *window_end_ns).await?;
             
             // Send records downstream
             for record in records {
