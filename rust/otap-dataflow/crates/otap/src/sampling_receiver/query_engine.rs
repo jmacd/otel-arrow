@@ -54,9 +54,9 @@ impl OtapTableType {
     pub fn table_name(self) -> &'static str {
         match self {
             Self::Logs => "logs",
-            Self::LogAttributes => "log_attributes",
-            Self::ResourceAttributes => "resource_attributes", 
-            Self::ScopeAttributes => "scope_attributes",
+            Self::LogAttributes => "log_attrs", // Match query templates
+            Self::ResourceAttributes => "resource_attrs", // Match query templates
+            Self::ScopeAttributes => "scope_attrs", // Match query templates
         }
     }
 

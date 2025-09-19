@@ -26,21 +26,14 @@ nodes:
         max_clock_drift: "1s"           # Minimal clock drift for testing
         max_file_duration: "5m"         # Allow for larger time spans in test files
       
-      # Analytics query showing log attribute statistics  
+      # Pass-through query returning actual log_attributes records for OTAP reconstruction
       query: |
-        SELECT 
-            COUNT(*) as total_log_attributes,
-            COUNT(DISTINCT la.parent_id) as distinct_parent_ids,
-            la.key as attribute_key,
-            COUNT(*) as key_count,
-            COUNT(DISTINCT la.parent_id) as key_distinct_parents
-        FROM log_attributes la
+        SELECT la.*
+        FROM log_attrs la
         JOIN logs l ON l.id = la.parent_id
         WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns})
           AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
-        GROUP BY la.key
-        ORDER BY key_count DESC
-        LIMIT 20
+        ORDER BY la.parent_id, la.key
       
       # Performance tuning - conservative settings for testing
       performance:

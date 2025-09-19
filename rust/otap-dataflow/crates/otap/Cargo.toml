@@ -15,11 +15,14 @@ workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-ipc.workspace = true
+arrow-schema = "53.0"
 async-trait.workspace = true
 ciborium.workspace = true
 datafusion.workspace = true
+datafusion-common = "50.0.0"
 datafusion-expr.workspace = true
 futures.workspace = true
+futures-util = "0.3"
 futures-timer.workspace = true
 http.workspace = true
 humantime-serde.workspace = true

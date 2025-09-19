@@ -7,9 +7,11 @@ use crate::sampling_receiver::{
     config::Config,
     error::Result,
     query_engine::DataFusionQueryEngine,
+    otap_reconstructor::OtapReconstructor,
 };
 use crate::{OTAP_RECEIVER_FACTORIES, pdata::OtapPdata};
 use async_trait::async_trait;
+use futures_util::stream;
 use linkme::distributed_slice;
 use log::{debug, error, info};
 use otap_df_config::node::NodeUserConfig;
@@ -29,6 +31,8 @@ pub struct SamplingReceiver {
     config: Config,
     /// DataFusion query engine (lazily initialized)
     query_engine: Option<DataFusionQueryEngine>,
+    /// OTAP record reconstructor (lazily initialized)
+    otap_reconstructor: Option<OtapReconstructor>,
 }
 
 impl SamplingReceiver {
@@ -43,16 +47,35 @@ impl SamplingReceiver {
         );
 
         // Defer DataFusion query engine creation until first use
-        Ok(Self { config, query_engine: None })
+        Ok(Self { 
+            config, 
+            query_engine: None,
+            otap_reconstructor: None,
+        })
     }
 
     /// Initialize the DataFusion query engine if not already done
     async fn ensure_query_engine(&mut self) -> Result<&DataFusionQueryEngine> {
         if self.query_engine.is_none() {
-            info!("Initializing DataFusion query engine");
-            self.query_engine = Some(DataFusionQueryEngine::new(self.config.clone()).await?);
+            let query_engine = DataFusionQueryEngine::new(self.config.clone()).await?;
+            self.query_engine = Some(query_engine);
         }
         Ok(self.query_engine.as_ref().unwrap())
+    }
+
+    /// Initialize the OTAP reconstructor if not already done
+    async fn ensure_otap_reconstructor(&mut self) -> Result<&OtapReconstructor> {
+        if self.otap_reconstructor.is_none() {
+            let _query_engine = self.ensure_query_engine().await?; // Ensure query engine exists
+            // Create a new Arc from query engine for the reconstructor
+            let query_engine = Arc::new(DataFusionQueryEngine::new(self.config.clone()).await?);
+            let reconstructor = OtapReconstructor::new(
+                self.config.clone(),
+                Arc::clone(&query_engine),
+            );
+            self.otap_reconstructor = Some(reconstructor);
+        }
+        Ok(self.otap_reconstructor.as_ref().unwrap())
     }
 
     /// Create a SamplingReceiver from configuration  
@@ -102,15 +125,19 @@ impl SamplingReceiver {
         let query_engine = self.ensure_query_engine().await?;
         
         // Execute the query using the DataFusion engine
-        let record_batches = query_engine.execute_query(query).await?;
+        let query_results = query_engine.execute_query(query).await?;
         
-        // TODO: Convert RecordBatch results to OtapPdata
-        // For now, return empty results but log what we got
-        let total_rows: usize = record_batches.iter().map(|batch| batch.num_rows()).sum();
-        info!("DataFusion query returned {} batches with {} total rows", record_batches.len(), total_rows);
+        // Get OTAP reconstructor and process results
+        let reconstructor = self.ensure_otap_reconstructor().await?;
+        let _related_data = reconstructor.get_related_data().await?; // This will be implemented
         
-        // TODO: Implement OTAP reconstruction in the next task
-        Ok(vec![])
+        // Convert query results to a stream and reconstruct OTAP records
+        let stream = futures_util::stream::iter(query_results.into_iter().map(Ok));
+        let otap_records = reconstructor.reconstruct_from_stream(stream).await?;
+        
+        info!("Successfully reconstructed {} OTAP records", otap_records.len());
+        
+        Ok(otap_records)
     }
 
     /// Discover time range from parquet files

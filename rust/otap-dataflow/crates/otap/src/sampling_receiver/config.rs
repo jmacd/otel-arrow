@@ -150,41 +150,57 @@ impl Default for Config {
     }
 }
 
-/// Default pass-through query that processes all log_attributes with proper star schema join
+/// Default pass-through query that returns actual log_attributes records for OTAP reconstruction
 pub fn default_passthrough_query() -> &'static str {
     r#"
-    SELECT 
-        COUNT(*) as total_log_attributes,
-        COUNT(DISTINCT la.parent_id) as distinct_parent_ids,
-        la.key as attribute_key,
-        COUNT(*) as key_count,
-        COUNT(DISTINCT la.parent_id) as key_distinct_parents
+    SELECT la.*
     FROM log_attrs la
     JOIN logs l ON l.id = la.parent_id
-    WHERE l.time_unix_nano >= {window_start_ns}
-      AND l.time_unix_nano < {window_end_ns}
-    GROUP BY la.key
-    ORDER BY key_count DESC
-    LIMIT 20
+    WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns})
+      AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
+    ORDER BY la.parent_id, la.key
     "#
 }
 
-/// Default sampling query template with weighted reservoir sampling
+/// Default service-filtered query that returns log_attributes for a specific service
+pub fn default_service_filter_query() -> &'static str {
+    r#"
+    SELECT la.*
+    FROM log_attrs la
+    JOIN logs l ON l.id = la.parent_id
+    JOIN resource_attrs ra ON ra.parent_id = l.id AND ra.key = 'service.name'
+    WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns})
+      AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
+      AND ra.str = '{service_name}'
+    ORDER BY la.parent_id, la.key
+    "#
+}
+
+/// Default sampling query template with service.name filtering
 pub fn default_sampling_query() -> &'static str {
     r#"
-    SELECT 
-        l.id as log_id,
-        l.time_unix_nano,
-        COUNT(la.parent_id) as attribute_count,
-        ARRAY_AGG(la.key) as attribute_keys,
-        ARRAY_AGG(la.str) as attribute_values
-    FROM logs l
-    LEFT JOIN log_attrs la ON l.id = la.parent_id
-    WHERE l.time_unix_nano >= {window_start_ns} 
-      AND l.time_unix_nano < {window_end_ns}
-    GROUP BY l.id, l.time_unix_nano
-    ORDER BY l.time_unix_nano
-    LIMIT 100
+    SELECT la.parent_id, la.key, la.type, la.str, la.int, la.double, la.bool, la.bytes, la.ser
+    FROM log_attrs la
+    JOIN logs l ON l.id = la.parent_id
+    LEFT JOIN resource_attrs ra ON ra.parent_id = l.id AND ra.key = 'service.name'
+    WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns}) 
+      AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
+      AND (ra.str = '{service_name}' OR '{service_name}' = 'all')
+    ORDER BY la.parent_id, la.key
+    "#
+}
+
+/// Service filtering query template
+pub fn service_filter_query() -> &'static str {
+    r#"
+    SELECT la.parent_id, la.key, la.type, la.str, la.int, la.double, la.bool, la.bytes, la.ser
+    FROM log_attrs la
+    JOIN logs l ON l.id = la.parent_id  
+    JOIN resource_attrs ra ON ra.parent_id = l.id AND ra.key = 'service.name'
+    WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns})
+      AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
+      AND ra.str = '{service_name}'
+    ORDER BY la.parent_id, la.key
     "#
 }
 

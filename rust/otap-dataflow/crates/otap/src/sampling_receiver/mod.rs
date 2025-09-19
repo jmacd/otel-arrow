@@ -4,9 +4,13 @@
 //! to query parquet files and perform configurable sampling operations.
 
 pub mod config;
-pub mod error;
+pub mod error; 
 pub mod query_engine;
+pub mod otap_reconstructor;
 pub mod sampling_receiver;
+
+// TODO: Uncomment when we work on sampling algorithms in Phase 4
+// pub mod sampler_udf;
 // pub mod sampler_udf; // TODO: Fix and re-enable for weighted sampling
 
 // Sample code for UDF implementation - disabled until DataFusion is properly integrated
