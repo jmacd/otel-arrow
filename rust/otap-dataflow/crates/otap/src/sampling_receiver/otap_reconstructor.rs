@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::collections::HashSet;
 use arrow::record_batch::RecordBatch;
-use arrow::array::{Array, UInt32Array, Int64Array};
+use arrow::array::{Array, UInt32Array, UInt16Array, Int64Array};
 use arrow::datatypes::{Schema, Field, DataType};
 use arrow::compute::kernels::numeric::sub_wrapping;
 use arrow::compute::kernels::cast::cast;
@@ -89,6 +89,9 @@ impl OtapReconstructor {
         
         for (batch_idx, log_attrs_batch) in log_attributes_results.iter().enumerate() {
             debug!("Processing log_attrs batch {}: {} rows", batch_idx, log_attrs_batch.num_rows());
+            
+            // Analyze batch structure and sorting
+            self.debug_batch_analysis("log_attrs", log_attrs_batch);
             
             // Step 1: Extract unique parent_ids from log_attrs batch (A table)
             let parent_ids = self.extract_parent_ids_from_log_attrs(log_attrs_batch)?;
@@ -227,6 +230,12 @@ impl OtapReconstructor {
         let p_batches = match self.query_engine.execute_query(&logs_query).await {
             Ok(batches) => {
                 debug!("✅ Successfully queried {} log records", batches.iter().map(|b| b.num_rows()).sum::<usize>());
+                
+                // Analyze each logs batch
+                for (idx, batch) in batches.iter().enumerate() {
+                    self.debug_batch_analysis(&format!("logs_batch_{}", idx), batch);
+                }
+                
                 batches
             }
             Err(e) => {
@@ -253,6 +262,15 @@ impl OtapReconstructor {
         let mut logs = Logs::default();
         let total_rows = results.total_rows(); // Calculate before consuming results
         
+        // Use the minimum ID from log_attrs as global offset for all batches
+        // This ensures parent_id -> id relationships are preserved since they're aligned from JOIN queries
+        let global_offset = if !results.a_batches.is_empty() {
+            self.find_min_id_in_batch(&results.a_batches[0], "log_attrs")?
+        } else {
+            0 // Fallback if no log_attrs (shouldn't happen)
+        };
+        debug!("📊 Using global offset from log_attrs min ID: {}", global_offset);
+        
         // Set the 4 arrays following ArrowPayloadType mapping:
         // - LogAttrs (from A batches)
         // - Logs (from P batches) 
@@ -260,14 +278,25 @@ impl OtapReconstructor {
         // - ScopeAttrs (from S batches)
         
         if !results.a_batches.is_empty() {
-            // Merge A batches and set as LogAttrs
-            let merged_a = self.merge_batches(results.a_batches, "log_attrs")?;
-            logs.set(ArrowPayloadType::LogAttrs, merged_a);
+            // Merge A batches and set as LogAttrs - use global offset for consistent 0-origin IDs
+            let merged_a = self.merge_batches_with_global_offset(results.a_batches, "log_attrs", global_offset)?;
+            // Debug ID ranges after merging and transformation
+            self.debug_batch_id_ranges(&merged_a, "MERGED_log_attrs")?;
+            // Remove partition columns before OTAP output
+            let filtered_a = self.remove_partition_columns(&merged_a)?;
+            // Add PLAIN encoding metadata to prevent OTLP layer from assuming delta encoding
+            let plain_encoded_a = self.add_plain_encoding_metadata(&filtered_a, &["parent_id"])?;
+            logs.set(ArrowPayloadType::LogAttrs, plain_encoded_a);
         }
         
         if !results.p_batches.is_empty() {
-            let merged_p = self.merge_batches(results.p_batches, "logs")?;
-            logs.set(ArrowPayloadType::Logs, merged_p);
+            // Merge P batches and set as Logs - use same global offset to maintain parent_id relationships
+            let merged_p = self.merge_batches_with_global_offset(results.p_batches, "logs", global_offset)?;
+            // Debug ID ranges after merging and transformation
+            self.debug_batch_id_ranges(&merged_p, "MERGED_logs")?;
+            // Add PLAIN encoding metadata to prevent OTLP layer from assuming delta encoding
+            let plain_encoded_p = self.add_plain_encoding_metadata(&merged_p, &["id"])?;
+            logs.set(ArrowPayloadType::Logs, plain_encoded_p);
         }
         
         if !results.r_batches.is_empty() {
@@ -316,6 +345,35 @@ impl OtapReconstructor {
             })
     }
     
+    /// ✅ VECTORIZED: Merge batches with global offset for consistent ID transformation
+    /// This ensures parent_id relationships are preserved across related tables
+    fn merge_batches_with_global_offset(&self, batches: Vec<RecordBatch>, table_name: &str, global_offset: u32) -> Result<RecordBatch> {
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::new(Schema::new(Vec::<Field>::new()))));
+        }
+        
+        if batches.len() == 1 {
+            // Single batch - apply global offset for ID normalization
+            return self.transform_batch_ids_with_offset(batches.into_iter().next().unwrap(), table_name, global_offset);
+        }
+        
+        // Multiple batches - transform each one with global offset then concatenate
+        let mut transformed_batches = Vec::with_capacity(batches.len());
+        
+        for batch in batches {
+            let transformed = self.transform_batch_ids_with_offset(batch, table_name, global_offset)?;
+            transformed_batches.push(transformed);
+        }
+        
+        // ✅ VECTORIZED: Use Arrow's concat to efficiently merge transformed batches
+        let schema = transformed_batches[0].schema();
+        
+        arrow::compute::concat_batches(&schema, &transformed_batches)
+            .map_err(|e| SamplingReceiverError::ReconstructionError {
+                message: format!("Failed to merge {} batches with global offset: {}", table_name, e),
+            })
+    }
+    
     /// Transform ID columns in a batch using vectorized operations
     /// Also normalizes data types (Utf8View -> Utf8, BinaryView -> Binary) for OTAP compatibility
     fn transform_batch_ids(&self, batch: RecordBatch, table_name: &str) -> Result<RecordBatch> {
@@ -354,6 +412,88 @@ impl OtapReconstructor {
             })
     }
     
+    /// Transform ID columns in a batch using vectorized operations with a global offset
+    /// This preserves parent_id relationships across related batches
+    fn transform_batch_ids_with_offset(&self, batch: RecordBatch, table_name: &str, global_offset: u32) -> Result<RecordBatch> {
+        // Step 1: First normalize data types (Utf8View -> Utf8, BinaryView -> Binary)
+        let normalized_batch = self.normalize_batch_data_types(&batch)?;
+        
+        let mut new_columns = Vec::with_capacity(normalized_batch.num_columns());
+        let mut new_fields = Vec::with_capacity(normalized_batch.num_columns());
+        
+        for (field, column) in normalized_batch.schema().fields().iter().zip(normalized_batch.columns()) {
+            match field.name().as_str() {
+                "parent_id" | "id" if matches!(field.data_type(), DataType::UInt32) => {
+                    // ✅ VECTORIZED: Apply UInt32->UInt16 cast with global offset normalization
+                    let normalized_column = self.transform_id_column_vectorized(column, global_offset)?;
+                    new_columns.push(normalized_column);
+                    new_fields.push(Field::new(field.name(), DataType::UInt16, field.is_nullable()));
+                    
+                    debug!("🚀 Transformed {}.{} column: {} elements (UInt32->UInt16, global_offset={})", 
+                          table_name, field.name(), column.len(), global_offset);
+                }
+                _ => {
+                    // Keep other columns as-is
+                    new_columns.push(column.clone());
+                    new_fields.push(field.as_ref().clone());
+                }
+            }
+        }
+        
+        let new_schema = Arc::new(Schema::new(new_fields));
+        RecordBatch::try_new(new_schema, new_columns)
+            .map_err(|e| SamplingReceiverError::ReconstructionError {
+                message: format!("Failed to create transformed batch for {} with global offset: {}", table_name, e),
+            })
+    }
+    
+    /// Debug helper to show ID ranges in a batch
+    fn debug_batch_id_ranges(&self, batch: &RecordBatch, table_name: &str) -> Result<()> {
+        debug!("🔍 === ID Range Debug for {} ===", table_name);
+        debug!("   Batch has {} rows, {} columns", batch.num_rows(), batch.num_columns());
+        
+        // Check parent_id column if it exists
+        if let Some(parent_id_col) = batch.column_by_name("parent_id") {
+            if let Some(parent_id_array) = parent_id_col.as_any().downcast_ref::<UInt16Array>() {
+                if parent_id_array.len() > 0 {
+                    let min_parent = min(parent_id_array).unwrap_or(0);
+                    let max_parent = max(parent_id_array).unwrap_or(0);
+                    debug!("   parent_id (UInt16): min={}, max={}, count={}", min_parent, max_parent, parent_id_array.len());
+                }
+            } else if let Some(parent_id_array) = parent_id_col.as_any().downcast_ref::<UInt32Array>() {
+                if parent_id_array.len() > 0 {
+                    let min_parent = min(parent_id_array).unwrap_or(0);
+                    let max_parent = max(parent_id_array).unwrap_or(0);
+                    debug!("   parent_id (UInt32): min={}, max={}, count={}", min_parent, max_parent, parent_id_array.len());
+                }
+            } else {
+                debug!("   parent_id: unsupported data type {:?}", parent_id_col.data_type());
+            }
+        }
+        
+        // Check id column if it exists
+        if let Some(id_col) = batch.column_by_name("id") {
+            if let Some(id_array) = id_col.as_any().downcast_ref::<UInt16Array>() {
+                if id_array.len() > 0 {
+                    let min_id = min(id_array).unwrap_or(0);
+                    let max_id = max(id_array).unwrap_or(0);
+                    debug!("   id (UInt16): min={}, max={}, count={}", min_id, max_id, id_array.len());
+                }
+            } else if let Some(id_array) = id_col.as_any().downcast_ref::<UInt32Array>() {
+                if id_array.len() > 0 {
+                    let min_id = min(id_array).unwrap_or(0);
+                    let max_id = max(id_array).unwrap_or(0);
+                    debug!("   id (UInt32): min={}, max={}, count={}", min_id, max_id, id_array.len());
+                }
+            } else {
+                debug!("   id: unsupported data type {:?}", id_col.data_type());
+            }
+        }
+        
+        debug!("🔍 === End ID Range Debug ===");
+        Ok(())
+    }
+
     /// Find minimum ID in batch for normalization offset
     fn find_min_id_in_batch(&self, batch: &RecordBatch, table_name: &str) -> Result<u32> {
         // Look for parent_id first (most common), then id
@@ -482,6 +622,212 @@ impl OtapReconstructor {
             // No transformation needed, return original batch
             Ok(batch.clone())
         }
+    }
+    
+    /// Add COLUMN_ENCODING=PLAIN metadata to specified columns in a RecordBatch
+    /// This prevents the OTLP layer from assuming delta encoding for ID columns
+    fn add_plain_encoding_metadata(&self, batch: &RecordBatch, column_names: &[&str]) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let mut new_fields = Vec::new();
+        
+        for field in schema.fields() {
+            if column_names.contains(&field.name().as_str()) {
+                // Add COLUMN_ENCODING=PLAIN metadata to this field
+                let mut metadata = field.metadata().clone();
+                let _ = metadata.insert("COLUMN_ENCODING".to_string(), "PLAIN".to_string());
+                
+                let new_field = Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                    .with_metadata(metadata);
+                new_fields.push(new_field);
+                debug!("🏷️  Added COLUMN_ENCODING=PLAIN metadata to column '{}'", field.name());
+            } else {
+                // Keep original field unchanged
+                new_fields.push(field.as_ref().clone());
+            }
+        }
+        
+        let new_schema = Arc::new(Schema::new(new_fields));
+        let new_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())?;
+            
+        Ok(new_batch)
+    }
+    
+    /// Remove partition columns (currently hard-coded _part_id) from batch
+    /// Later this will be configurable like parquet_exporter and DataFusion Hive partitioning
+    fn remove_partition_columns(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let mut new_fields = Vec::new();
+        let mut new_columns = Vec::new();
+        
+        for (i, field) in schema.fields().iter().enumerate() {
+            // Hard-coded partition column filter - will be configurable later
+            if field.name() == "_part_id" {
+                debug!("🗑️  Removing partition column '{}'", field.name());
+                continue; // Skip partition columns
+            }
+            
+            // Keep non-partition columns
+            new_fields.push(field.as_ref().clone());
+            new_columns.push(batch.column(i).clone());
+        }
+        
+        let new_schema = Arc::new(Schema::new(new_fields));
+        let filtered_batch = RecordBatch::try_new(new_schema, new_columns)?;
+        
+        debug!("🧹 Filtered batch: {} → {} columns", 
+            batch.num_columns(), filtered_batch.num_columns());
+            
+        Ok(filtered_batch)
+    }
+    
+    /// Debug method to analyze sorting and ID ranges in batches  
+    fn debug_batch_analysis(&self, batch_name: &str, batch: &RecordBatch) {
+        debug!("🔍 ===== {} BATCH ANALYSIS =====", batch_name.to_uppercase());
+        debug!("🔍 {} batch: {} rows total", batch_name, batch.num_rows());
+        
+        // Check parent_id column (for log_attrs) - handle both UInt32 and UInt16
+        if let Some(parent_id_col) = batch.column_by_name("parent_id") {
+            if let Some(parent_id_array) = parent_id_col.as_any().downcast_ref::<UInt32Array>() {
+                if parent_id_array.len() > 0 {
+                    let min_parent = min(parent_id_array).unwrap_or(0);
+                    let max_parent = max(parent_id_array).unwrap_or(0);
+                    
+                    // Check if sorted
+                    let mut is_sorted = true;
+                    let mut prev_val = 0u32;
+                    for i in 0..parent_id_array.len() {
+                        let val = parent_id_array.value(i);
+                        if i > 0 && val < prev_val {
+                            is_sorted = false;
+                            break;
+                        }
+                        prev_val = val;
+                    }
+                    
+                    debug!("🔍 {} parent_id (UInt32): range [{}-{}], sorted: {}", 
+                        batch_name, min_parent, max_parent, is_sorted);
+                        
+                    // Show first few and last few values for debugging
+                    let show_count = std::cmp::min(5, parent_id_array.len());
+                    let first_vals: Vec<u32> = (0..show_count)
+                        .map(|i| parent_id_array.value(i))
+                        .collect();
+                    let last_start = parent_id_array.len().saturating_sub(show_count);
+                    let last_vals: Vec<u32> = (last_start..parent_id_array.len())
+                        .map(|i| parent_id_array.value(i))
+                        .collect();
+                    debug!("🔍 {} parent_id first values: {:?}, last values: {:?}", 
+                        batch_name, first_vals, last_vals);
+                }
+            } else if let Some(parent_id_array) = parent_id_col.as_any().downcast_ref::<UInt16Array>() {
+                if parent_id_array.len() > 0 {
+                    let min_parent = min(parent_id_array).unwrap_or(0);
+                    let max_parent = max(parent_id_array).unwrap_or(0);
+                    
+                    // Check if sorted
+                    let mut is_sorted = true;
+                    let mut prev_val = 0u16;
+                    for i in 0..parent_id_array.len() {
+                        let val = parent_id_array.value(i);
+                        if i > 0 && val < prev_val {
+                            is_sorted = false;
+                            break;
+                        }
+                        prev_val = val;
+                    }
+                    
+                    debug!("🔍 {} parent_id (UInt16): range [{}-{}], sorted: {}", 
+                        batch_name, min_parent, max_parent, is_sorted);
+                        
+                    // Show first few and last few values for debugging
+                    let show_count = std::cmp::min(5, parent_id_array.len());
+                    let first_vals: Vec<u16> = (0..show_count)
+                        .map(|i| parent_id_array.value(i))
+                        .collect();
+                    let last_start = parent_id_array.len().saturating_sub(show_count);
+                    let last_vals: Vec<u16> = (last_start..parent_id_array.len())
+                        .map(|i| parent_id_array.value(i))
+                        .collect();
+                    debug!("🔍 {} parent_id first values: {:?}, last values: {:?}", 
+                        batch_name, first_vals, last_vals);
+                }
+            }
+        }
+        
+        // Check id column (for logs) - handle both UInt32 and UInt16
+        if let Some(id_col) = batch.column_by_name("id") {
+            if let Some(id_array) = id_col.as_any().downcast_ref::<UInt32Array>() {
+                if id_array.len() > 0 {
+                    let min_id = min(id_array).unwrap_or(0);
+                    let max_id = max(id_array).unwrap_or(0);
+                    
+                    // Check if sorted
+                    let mut is_sorted = true;
+                    let mut prev_val = 0u32;
+                    for i in 0..id_array.len() {
+                        let val = id_array.value(i);
+                        if i > 0 && val < prev_val {
+                            is_sorted = false;
+                            break;
+                        }
+                        prev_val = val;
+                    }
+                    
+                    debug!("🔍 {} id (UInt32): range [{}-{}], sorted: {}", 
+                        batch_name, min_id, max_id, is_sorted);
+                        
+                    // Show first few and last few values for debugging
+                    let show_count = std::cmp::min(5, id_array.len());
+                    let first_vals: Vec<u32> = (0..show_count)
+                        .map(|i| id_array.value(i))
+                        .collect();
+                    let last_start = id_array.len().saturating_sub(show_count);
+                    let last_vals: Vec<u32> = (last_start..id_array.len())
+                        .map(|i| id_array.value(i))
+                        .collect();
+                    debug!("🔍 {} id first values: {:?}, last values: {:?}", 
+                        batch_name, first_vals, last_vals);
+                }
+            } else if let Some(id_array) = id_col.as_any().downcast_ref::<UInt16Array>() {
+                if id_array.len() > 0 {
+                    let min_id = min(id_array).unwrap_or(0);
+                    let max_id = max(id_array).unwrap_or(0);
+                    
+                    // Check if sorted
+                    let mut is_sorted = true;
+                    let mut prev_val = 0u16;
+                    for i in 0..id_array.len() {
+                        let val = id_array.value(i);
+                        if i > 0 && val < prev_val {
+                            is_sorted = false;
+                            break;
+                        }
+                        prev_val = val;
+                    }
+                    
+                    debug!("🔍 {} id (UInt16): range [{}-{}], sorted: {}", 
+                        batch_name, min_id, max_id, is_sorted);
+                        
+                    // Show first few and last few values for debugging
+                    let show_count = std::cmp::min(5, id_array.len());
+                    let first_vals: Vec<u16> = (0..show_count)
+                        .map(|i| id_array.value(i))
+                        .collect();
+                    let last_start = id_array.len().saturating_sub(show_count);
+                    let last_vals: Vec<u16> = (last_start..id_array.len())
+                        .map(|i| id_array.value(i))
+                        .collect();
+                    debug!("🔍 {} id first values: {:?}, last values: {:?}", 
+                        batch_name, first_vals, last_vals);
+                }
+            }
+        }
+        
+        // Show column names for reference
+        let schema = batch.schema();
+        let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        debug!("🔍 {} columns: {:?}", batch_name, column_names);
+        debug!("🔍 ===== END {} ANALYSIS =====", batch_name.to_uppercase());
     }
 }
 
