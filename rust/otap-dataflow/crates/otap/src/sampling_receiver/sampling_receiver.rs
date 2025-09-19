@@ -5,7 +5,7 @@
 
 use crate::sampling_receiver::{
     config::Config,
-    error::Result,
+    error::{Result, SamplingReceiverError},
     query_engine::DataFusionQueryEngine,
     otap_reconstructor::OtapReconstructor,
 };
@@ -130,8 +130,14 @@ impl SamplingReceiver {
         let reconstructor = self.ensure_otap_reconstructor().await?;
         let _related_data = reconstructor.get_related_data().await?; // This will be implemented
         
-        // Convert query results to OTAP records using the reconstructor
-        let otap_records = reconstructor.reconstruct_from_stream(query_results).await?;
+        // Convert query results to OTAP records using the reconstructor (now needs mutable access)
+        let otap_records = {
+            let mut_reconstructor = self.otap_reconstructor.as_mut()
+                .ok_or_else(|| SamplingReceiverError::ReconstructionError {
+                    message: "Reconstructor not initialized".to_string(),
+                })?;
+            mut_reconstructor.reconstruct_from_stream(query_results).await?
+        };
         
         info!("Successfully reconstructed {} OTAP records", otap_records.len());
         
@@ -155,7 +161,7 @@ impl SamplingReceiver {
         
         if results.is_empty() {
             error!("No data found in parquet files");
-            return Err(crate::sampling_receiver::error::SamplingReceiverError::config_error(
+            return Err(SamplingReceiverError::config_error(
                 "No data found in parquet files"
             ));
         }
