@@ -151,6 +151,7 @@ impl Default for Config {
 }
 
 /// Default pass-through query that returns actual log_attributes records for OTAP reconstruction
+/// LIMIT 65536 ensures we stay within UInt16 range after vectorized normalization (per streaming-separate-queries.md)
 pub fn default_passthrough_query() -> &'static str {
     r#"
     SELECT la.*
@@ -159,10 +160,12 @@ pub fn default_passthrough_query() -> &'static str {
     WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns})
       AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
     ORDER BY la.parent_id, la.key
+    LIMIT 65536
     "#
 }
 
 /// Default service-filtered query that returns log_attributes for a specific service
+/// LIMIT 65536 ensures we stay within UInt16 range after vectorized normalization (per streaming-separate-queries.md)
 pub fn default_service_filter_query() -> &'static str {
     r#"
     SELECT la.*
@@ -173,6 +176,7 @@ pub fn default_service_filter_query() -> &'static str {
       AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
       AND ra.str = '{service_name}'
     ORDER BY la.parent_id, la.key
+    LIMIT 65536
     "#
 }
 

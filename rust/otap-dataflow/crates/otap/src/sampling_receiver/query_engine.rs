@@ -13,7 +13,7 @@ use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTable
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::execution::context::SessionContext;
 use datafusion::datasource::TableProvider;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use object_store::local::LocalFileSystem;
 use std::sync::Arc;
 use url::Url;
@@ -115,13 +115,23 @@ impl DataFusionQueryEngine {
                     debug!("Successfully registered table: {}", table_type.table_name());
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to register table {} (directory: {}): {}. Skipping this table.",
-                        table_type.table_name(),
-                        table_type.directory_name(),
-                        e
-                    );
-                    // Continue with other tables - some might not exist in test data
+                    // Only allow resource_attrs and scope_attrs to fail (they don't exist in test data)
+                    if table_type.table_name() == "resource_attrs" || table_type.table_name() == "scope_attrs" {
+                        warn!(
+                            "Failed to register table {} (directory: {}): {}. Skipping this optional table.",
+                            table_type.table_name(),
+                            table_type.directory_name(),
+                            e
+                        );
+                    } else {
+                        error!(
+                            "❌ FATAL ERROR: Failed to register required table {} (directory: {}): {}",
+                            table_type.table_name(),
+                            table_type.directory_name(),
+                            e
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -390,8 +400,13 @@ impl DataFusionQueryEngine {
         debug!("Executing DataFusion query: {}", query);
 
         // Execute the query directly
+        debug!("🔄 Creating DataFrame from SQL...");
         let dataframe = self.context.sql(query).await?;
+        debug!("✅ DataFrame created successfully");
+        
+        debug!("🔄 Starting physical execution (collect)...");
         let batches = dataframe.collect().await?;
+        debug!("✅ Physical execution completed successfully");
 
         info!("Query executed successfully, returned {} batches", batches.len());
         

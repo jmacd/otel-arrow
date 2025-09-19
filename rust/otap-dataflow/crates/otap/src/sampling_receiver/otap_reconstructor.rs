@@ -12,7 +12,7 @@ use arrow::compute::kernels::numeric::sub_wrapping;
 use arrow::compute::kernels::cast::cast;
 use arrow::compute::{min, max};
 use datafusion::catalog::memory::MemTable;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::sampling_receiver::{
     config::Config,
@@ -101,13 +101,19 @@ impl OtapReconstructor {
             
             // Step 2: Create temporary MemTable with parent IDs for efficient filtering
             let temp_table_name = format!("batch_ids_{}", self.temp_table_counter);
+            debug!("📋 Created temporary table {} with {} parent IDs", temp_table_name, parent_ids.len());
             self.create_temp_id_table(&parent_ids, &temp_table_name).await?;
+            debug!("✅ Temporary table {} created successfully", temp_table_name);
             
             // Step 3: Execute separate queries for P, R, S tables using temp table
+            debug!("🔄 About to execute separate queries for tables A,P,R,S");
             let separate_results = self.query_tables_separately(&temp_table_name, log_attrs_batch).await?;
+            debug!("✅ Separate queries completed successfully");
             
             // Step 4: Build OTAP Logs structure with 4 separate arrays
+            debug!("🔄 Building OTAP Logs from separate query results");
             let otap_batch = self.build_otap_logs_from_separate_results(separate_results).await?;
+            debug!("✅ Built OTAP Logs with {} total rows across all tables", log_attrs_batch.num_rows());
             
             // Step 5: Clean up temporary table
             // Note: We'll add the actual cleanup after we implement the query engine context access
@@ -202,14 +208,38 @@ impl OtapReconstructor {
     /// Step 3: Query each table separately using temp ID table (following expert strategy)
     async fn query_tables_separately(
         &self, 
-        _temp_table_name: &str, 
+        temp_table_name: &str, 
         log_attrs_batch: &RecordBatch
     ) -> Result<SeparateQueryResults> {
-        // TODO: Implement separate queries for P, R, S tables
-        // For now, return the log_attrs batch we already have
+        debug!("🔍 Querying logs table to get primary records for parent IDs from {}", temp_table_name);
+        
+        // Extract unique parent IDs from log_attrs batch to query logs table
+        let parent_ids = self.extract_parent_ids_from_log_attrs(log_attrs_batch)?;
+        debug!("🔍 Need to fetch {} unique log records", parent_ids.len());
+        
+        // Query P table (logs) to get the actual log records
+        let logs_query = format!(
+            "SELECT l.* FROM logs l WHERE l.id IN ({})",
+            parent_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
+        );
+        
+        debug!("🔍 Executing logs query: {}", logs_query);
+        let p_batches = match self.query_engine.execute_query(&logs_query).await {
+            Ok(batches) => {
+                debug!("✅ Successfully queried {} log records", batches.iter().map(|b| b.num_rows()).sum::<usize>());
+                batches
+            }
+            Err(e) => {
+                warn!("⚠️  Failed to query logs table: {}", e);
+                vec![] // Continue without primary records
+            }
+        };
+        
+        // TODO: Implement R and S queries for resource_attrs and scope_attrs
+        
         Ok(SeparateQueryResults {
             a_batches: vec![log_attrs_batch.clone()], // A = log_attrs (what we started with)
-            p_batches: vec![], // P = logs (primary table) - TODO
+            p_batches, // P = logs (primary table) - now populated
             r_batches: vec![], // R = resource_attrs - TODO  
             s_batches: vec![], // S = scope_attrs - TODO
         })
@@ -257,22 +287,104 @@ impl OtapReconstructor {
     }
     
     /// Utility: Merge multiple batches into a single batch
+    /// ✅ VECTORIZED: Merge batches with ID normalization applied
+    /// Applies vectorized UInt32->UInt16 cast with offset to fit OTAP schema requirements
     fn merge_batches(&self, batches: Vec<RecordBatch>, table_name: &str) -> Result<RecordBatch> {
         if batches.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::new(Vec::<Field>::new()))));
         }
         
         if batches.len() == 1 {
-            return Ok(batches.into_iter().next().unwrap());
+            // Single batch - still need to apply ID normalization
+            return self.transform_batch_ids(batches.into_iter().next().unwrap(), table_name);
         }
         
-        // ✅ VECTORIZED: Use Arrow's concat to efficiently merge batches
-        let schema = batches[0].schema();
+        // Multiple batches - transform each one then concatenate
+        let mut transformed_batches = Vec::with_capacity(batches.len());
         
-        arrow::compute::concat_batches(&schema, &batches)
+        for batch in batches {
+            let transformed = self.transform_batch_ids(batch, table_name)?;
+            transformed_batches.push(transformed);
+        }
+        
+        // ✅ VECTORIZED: Use Arrow's concat to efficiently merge transformed batches
+        let schema = transformed_batches[0].schema();
+        
+        arrow::compute::concat_batches(&schema, &transformed_batches)
             .map_err(|e| SamplingReceiverError::ReconstructionError {
                 message: format!("Failed to merge {} batches: {}", table_name, e),
             })
+    }
+    
+    /// Transform ID columns in a batch using vectorized operations
+    /// Also normalizes data types (Utf8View -> Utf8, BinaryView -> Binary) for OTAP compatibility
+    fn transform_batch_ids(&self, batch: RecordBatch, table_name: &str) -> Result<RecordBatch> {
+        // Step 1: First normalize data types (Utf8View -> Utf8, BinaryView -> Binary)
+        let normalized_batch = self.normalize_batch_data_types(&batch)?;
+        
+        // Step 2: Then apply ID transformations (UInt32 -> UInt16)
+        let batch_offset = self.find_min_id_in_batch(&normalized_batch, table_name)?;
+        
+        let mut new_columns = Vec::with_capacity(normalized_batch.num_columns());
+        let mut new_fields = Vec::with_capacity(normalized_batch.num_columns());
+        
+        for (field, column) in normalized_batch.schema().fields().iter().zip(normalized_batch.columns()) {
+            match field.name().as_str() {
+                "parent_id" | "id" if matches!(field.data_type(), DataType::UInt32) => {
+                    // ✅ VECTORIZED: Apply UInt32->UInt16 cast with offset normalization
+                    let normalized_column = self.transform_id_column_vectorized(column, batch_offset)?;
+                    new_columns.push(normalized_column);
+                    new_fields.push(Field::new(field.name(), DataType::UInt16, field.is_nullable()));
+                    
+                    debug!("🚀 Transformed {}.{} column: {} elements (UInt32->UInt16, offset={})", 
+                          table_name, field.name(), column.len(), batch_offset);
+                }
+                _ => {
+                    // Keep other columns as-is
+                    new_columns.push(column.clone());
+                    new_fields.push(field.as_ref().clone());
+                }
+            }
+        }
+        
+        let new_schema = Arc::new(Schema::new(new_fields));
+        RecordBatch::try_new(new_schema, new_columns)
+            .map_err(|e| SamplingReceiverError::ReconstructionError {
+                message: format!("Failed to create transformed batch for {}: {}", table_name, e),
+            })
+    }
+    
+    /// Find minimum ID in batch for normalization offset
+    fn find_min_id_in_batch(&self, batch: &RecordBatch, table_name: &str) -> Result<u32> {
+        // Look for parent_id first (most common), then id
+        let id_column = batch.column_by_name("parent_id")
+            .or_else(|| batch.column_by_name("id"))
+            .ok_or_else(|| SamplingReceiverError::ReconstructionError {
+                message: format!("No parent_id or id column found in {} batch", table_name),
+            })?;
+            
+        if !matches!(id_column.data_type(), DataType::UInt32) {
+            return Ok(0); // No transformation needed for non-UInt32 columns
+        }
+        
+        // Cast to UInt32Array for the min operation
+        let id_u32_array = id_column
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| SamplingReceiverError::ReconstructionError {
+                message: format!("Failed to cast ID column to UInt32Array in {} batch", table_name),
+            })?;
+        
+        // ✅ VECTORIZED: Use Arrow compute to find minimum efficiently
+        let min_val = min(id_u32_array);
+            
+        match min_val {
+            Some(min_id) => {
+                debug!("📊 Found min ID in {} batch: {}", table_name, min_id);
+                Ok(min_id)
+            }
+            None => Ok(0), // All nulls or empty batch
+        }
     }
     
     /// ✅ VECTORIZED: Transform ID columns using Arrow compute kernels
@@ -289,11 +401,12 @@ impl OtapReconstructor {
             });
         }
 
-        // Create scalar for batch normalization
-        let offset_scalar = UInt32Array::from(vec![batch_offset]);
+        // Create scalar for batch normalization - need to create an array of the same length
+        let array_len = id_column.len();
+        let offset_array = UInt32Array::from(vec![batch_offset; array_len]);
         
         // ✅ VECTORIZED: Single operation on entire array (10x-100x faster than element-by-element)
-        let normalized_u32 = sub_wrapping(id_column, &offset_scalar)
+        let normalized_u32 = sub_wrapping(id_column, &offset_array)
             .map_err(|e| SamplingReceiverError::ReconstructionError {
                 message: format!("Vectorized ID subtraction failed: {}", e),
             })?;
@@ -322,6 +435,53 @@ impl OtapReconstructor {
         debug!("📋 Creating zero-copy slice: rows {}..{} from batch with {} rows", 
                start_row, start_row + num_rows, batch.num_rows());
         batch.slice(start_row, num_rows)
+    }
+    
+    /// Normalize Arrow data types by materializing View types to standard types for OTAP compatibility
+    /// This fixes the "Invalid List array data type" error where OTLP expects Utf8 but receives Utf8View
+    fn normalize_batch_data_types(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let mut new_columns = Vec::new();
+        let mut new_fields = Vec::new();
+        let mut needs_transformation = false;
+
+        // Check each column and materialize View types to standard types
+        for (i, field) in batch.schema().fields().iter().enumerate() {
+            let column = batch.column(i);
+            
+            match field.data_type() {
+                DataType::Utf8View => {
+                    // Materialize UTF8View to UTF8 for OTAP compatibility
+                    debug!("🔄 Materializing Utf8View column '{}' to Utf8", field.name());
+                    let materialized = cast(column, &DataType::Utf8)?;
+                    new_columns.push(materialized);
+                    new_fields.push(Field::new(field.name(), DataType::Utf8, field.is_nullable()));
+                    needs_transformation = true;
+                }
+                DataType::BinaryView => {
+                    // Materialize BinaryView to Binary for OTAP compatibility  
+                    debug!("🔄 Materializing BinaryView column '{}' to Binary", field.name());
+                    let materialized = cast(column, &DataType::Binary)?;
+                    new_columns.push(materialized);
+                    new_fields.push(Field::new(field.name(), DataType::Binary, field.is_nullable()));
+                    needs_transformation = true;
+                }
+                _ => {
+                    // Keep other columns as-is
+                    new_columns.push(column.clone());
+                    new_fields.push(field.as_ref().clone());
+                }
+            }
+        }
+
+        if needs_transformation {
+            let new_schema = Arc::new(Schema::new(new_fields));
+            let normalized_batch = RecordBatch::try_new(new_schema, new_columns)?;
+            debug!("✅ Normalized batch data types: {} rows, {} columns", normalized_batch.num_rows(), normalized_batch.num_columns());
+            Ok(normalized_batch)
+        } else {
+            // No transformation needed, return original batch
+            Ok(batch.clone())
+        }
     }
 }
 

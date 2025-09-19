@@ -218,15 +218,22 @@ impl SamplingReceiver {
         info!("Processing {} time windows sequentially", windows.len());
         
         for (i, (window_start_ns, window_end_ns)) in windows.iter().enumerate() {
-            info!("Processing window {}/{}: {} to {}", i + 1, windows.len(), window_start_ns, window_end_ns);
+            info!("🔄 Processing window {}/{}: {} to {}", i + 1, windows.len(), window_start_ns, window_end_ns);
+            debug!("📊 About to call process_time_window for window {}", i + 1);
             let records = self.process_time_window(*window_start_ns, *window_end_ns).await?;
+            info!("📋 process_time_window returned {} OTAP records for window {}", records.len(), i + 1);
             
             // Send records downstream
-            for record in records {
-                if let Err(e) = effect_handler.send_message(record).await {
-                    error!("Failed to send OTAP record downstream: {}", e);
+            info!("🚀 Emitting {} OTAP records for window {}/{}", records.len(), i + 1, windows.len());
+            for (record_idx, record) in records.iter().enumerate() {
+                debug!("📤 Sending OTAP record {}/{} to effect handler", record_idx + 1, records.len());
+                if let Err(e) = effect_handler.send_message(record.clone()).await {
+                    error!("❌ Failed to send OTAP record {} downstream: {}", record_idx + 1, e);
+                } else {
+                    debug!("✅ Successfully sent OTAP record {}/{}", record_idx + 1, records.len());
                 }
             }
+            info!("✅ Completed emission of {} OTAP records for window {}/{}", records.len(), i + 1, windows.len());
         }
         
         Ok(())
@@ -276,8 +283,11 @@ impl shared::Receiver<OtapPdata> for SamplingReceiver {
                             debug!("Successfully processed interval");
                         }
                         Err(e) => {
-                            error!("Error processing interval: {}", e);
-                            // Continue processing - don't exit on errors
+                            error!("❌ FATAL ERROR processing interval: {}", e);
+                            error!("❌ TERMINATING RECEIVER - NO SILENT FALLBACK");
+                            return Err(Error::InternalError { 
+                                message: format!("Sampling receiver error: {}", e)
+                            });
                         }
                     }
                 }
