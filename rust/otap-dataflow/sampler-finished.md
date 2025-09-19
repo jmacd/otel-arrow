@@ -249,4 +249,58 @@ Adaptive Threshold algorithms.
 
 #### Real sampling UDAF
 
+We studied how to implement a UDAF in DataFusion. With help from
+Copilot, we were able to identify many details about this code base.
 
+- [Sample UDAF function for "Algorithm R"](./crates/otap/src/sampling_receiver/sampler_udf.rs), untested
+- [Rust implementation of Bottom-K](./crates/bottom_krust/src/lib.rs)
+
+The basic logic for Bottom-K is shown below:
+
+```rust
+    /// Ingest a weighted record with deterministic randomness
+    pub fn ingest(&mut self, record: WeightedRecord<K>) {
+        let heap_record = HeapRecord {
+            key: record.key,
+            weight: record.weight,
+            randomness: record.randomness,
+        };
+        
+        if self.heap.len() < self.k + 1 {
+            // If we have space, just add it
+            self.heap.push(heap_record);
+        } else {
+            // If heap is full, check if new record has higher randomness than the minimum
+            if let Some(min_record) = self.heap.peek() {
+                if heap_record.randomness > min_record.randomness {
+                    // Replace the minimum with the new record
+                    self.heap.pop(); // Remove minimum
+                    self.heap.push(heap_record); // Add new record
+                }
+            }
+        }
+    }
+```
+
+I believe I have this right! More testing is needed.
+
+## Use of AI tools
+
+This project was carried out using Github Copilot, mostly using Claude
+4 Sonnet.
+
+Here are many of the machine-generated documents used to guide the
+effort:
+
+-[sampling-receiver-overview](./sampling-receiver-overview.md): How to get from the finished `parquet_receiver` prototype to the Datafusion-based sampling receiver
+-[sampler-implementation-plan](./sampler-implementation-plan.md): Establishes the basic form of a query for weighted sampling of OTAP
+-[arrow-compute-optimization-plan](./arrow-compute-optimization-plan.md): Which Arrow vector instructions we would use while reconstructing OTAP after finishing `parquet_receiver.md`
+-[streaming-separate-queries](./streaming-separate-queries.md): How to form the memory table containing the "IN" expression values for the Datafusion-based streaming merge.
+-[query-first-parquet-receiver](./query-first-parquet-receiver.md): How to replace the Parquet receiver's hard-coded logic with a partitioned Datafusion `ListingTable` provider.
+-[IMPLEMENTATION-JOURNAL](./IMPLEMENTATION-JOURNAL.md): A series of updates as we made progress.
+-[old_docs/parquet-receiver-design](./old_docs/parquet-receiver-design.md): The first step was to read Parquet files.
+-[old_docs/streaming-join-status](./old_docs/streaming-join-status.md): We had trouble at first merging OTAP data
+-[old_docs/parquet-receiver-implementation-phase1](./old_docs/parquet-receiver-implementation-phase1.md): We were very optimistic at this point
+-[old_docs/listingtable_ordering_analysis](./old_docs/listingtable_ordering_analysis.md): We did focused studies of Datafusion support
+-[old_docs/weighted_reservoir_sampling_design](./old_docs/weighted_reservoir_sampling_design.md): We studied how to implement weighted sampling in Datafusion
+-[large-output-debugging](./large-output-debugging.md): How to work with debugging data for the agent.

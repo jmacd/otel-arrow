@@ -1,6 +1,6 @@
 # Bottom-K Formula Refinement Summary
 
-## Current Status: June 26, 2025
+## Current Status: September 19, 2025
 
 ### Formula Correction Implemented
 
