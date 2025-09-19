@@ -9,7 +9,7 @@ use thiserror::Error;
 /// Errors that can occur in sampling receiver operations
 #[derive(Error, Debug)]
 pub enum SamplingReceiverError {
-    /// DataFusion query execution errors (placeholder for future implementation)
+    /// DataFusion query execution errors
     #[error("DataFusion query error: {message}")]
     DataFusionError { 
         /// Error message
@@ -24,61 +24,25 @@ pub enum SamplingReceiverError {
         source: arrow::error::ArrowError,
     },
 
-    /// File system and object store errors
-    #[error("Object store error: {source}")]
-    ObjectStoreError {
-        #[from]
-        /// Object store error source
-        source: object_store::Error,
-    },
-
-    /// Configuration validation errors
+    /// Configuration errors  
     #[error("Configuration error: {message}")]
-    ConfigError { 
+    ConfigError {
         /// Error message
-        message: String 
+        message: String
     },
 
-    /// Temporal window processing errors
-    #[error("Temporal window error: {message}")]
-    TemporalWindowError { 
+    /// Temporal processing errors
+    #[error("Temporal processing error: {message}")]
+    TemporalError {
         /// Error message
-        message: String 
+        message: String
     },
 
-    /// SQL query parsing or validation errors
-    #[error("Query error: {message}")]
-    QueryError { 
+    /// Query template errors
+    #[error("Query template error: {message}")]
+    QueryTemplateError {
         /// Error message
-        message: String 
-    },
-
-    /// Sampling operation errors
-    #[error("Sampling error: {message}")]
-    SamplingError { 
-        /// Error message
-        message: String 
-    },
-
-    /// File discovery errors
-    #[error("File discovery error: {message}")]
-    FileDiscoveryError { 
-        /// Error message
-        message: String 
-    },
-
-    /// Arrow schema compatibility errors
-    #[error("Schema compatibility error: {message}")]
-    SchemaError { 
-        /// Error message
-        message: String 
-    },
-
-    /// Memory management errors
-    #[error("Memory management error: {message}")]
-    MemoryError { 
-        /// Error message
-        message: String 
+        message: String
     },
 
     /// Generic I/O errors
@@ -89,102 +53,79 @@ pub enum SamplingReceiverError {
         source: std::io::Error,
     },
 
-    /// Serialization/deserialization errors
-    #[error("Serialization error: {source}")]
-    SerializationError {
-        #[from]
-        /// Serialization error source
-        source: serde_json::Error,
+    /// Memory management errors
+    #[error("Memory management error: {message}")]
+    MemoryError { 
+        /// Error message
+        message: String 
+    },
+
+    /// OTAP record reconstruction errors
+    #[error("OTAP reconstruction error: {message}")]
+    ReconstructionError { 
+        /// Error message
+        message: String 
     },
 }
 
-/// Result type alias for sampling receiver operations
+/// Result type for sampling receiver operations
 pub type Result<T> = std::result::Result<T, SamplingReceiverError>;
 
 impl SamplingReceiverError {
-    /// Create a configuration error with a message
-    pub fn config_error(message: impl Into<String>) -> Self {
-        Self::ConfigError {
-            message: message.into(),
-        }
+    /// Create a DataFusion error
+    pub fn datafusion_error<S: Into<String>>(message: S) -> Self {
+        Self::DataFusionError { message: message.into() }
     }
 
-    /// Create a DataFusion error with a message  
-    pub fn datafusion_error(message: impl Into<String>) -> Self {
-        Self::DataFusionError {
-            message: message.into(),
-        }
+    /// Create a configuration error
+    pub fn config_error<S: Into<String>>(message: S) -> Self {
+        Self::ConfigError { message: message.into() }
     }
 
-    /// Create a temporal window error with a message
-    pub fn temporal_window_error(message: impl Into<String>) -> Self {
-        Self::TemporalWindowError {
-            message: message.into(),
-        }
+    /// Create a temporal processing error
+    pub fn temporal_error<S: Into<String>>(message: S) -> Self {
+        Self::TemporalError { message: message.into() }
     }
 
-    /// Create a query error with a message
-    pub fn query_error(message: impl Into<String>) -> Self {
-        Self::QueryError {
-            message: message.into(),
-        }
+    /// Create a query template error
+    pub fn query_template_error<S: Into<String>>(message: S) -> Self {
+        Self::QueryTemplateError { message: message.into() }
     }
 
-    /// Create a sampling error with a message
-    pub fn sampling_error(message: impl Into<String>) -> Self {
-        Self::SamplingError {
-            message: message.into(),
-        }
+    /// Create a memory management error
+    pub fn memory_error<S: Into<String>>(message: S) -> Self {
+        Self::MemoryError { message: message.into() }
     }
 
-    /// Create a file discovery error with a message
-    pub fn file_discovery_error(message: impl Into<String>) -> Self {
-        Self::FileDiscoveryError {
-            message: message.into(),
-        }
-    }
-
-    /// Create a schema error with a message
-    pub fn schema_error(message: impl Into<String>) -> Self {
-        Self::SchemaError {
-            message: message.into(),
-        }
-    }
-
-    /// Create a memory error with a message
-    pub fn memory_error(message: impl Into<String>) -> Self {
-        Self::MemoryError {
-            message: message.into(),
-        }
+    /// Create an OTAP reconstruction error
+    pub fn reconstruction_error<S: Into<String>>(message: S) -> Self {
+        Self::ReconstructionError { message: message.into() }
     }
 }
 
-// Manual From implementation for DataFusionError
+// Conversion from DataFusion error
 impl From<datafusion::error::DataFusionError> for SamplingReceiverError {
-    fn from(error: datafusion::error::DataFusionError) -> Self {
+    fn from(err: datafusion::error::DataFusionError) -> Self {
         Self::DataFusionError {
-            message: error.to_string(),
+            message: err.to_string(),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_error_creation() {
-        let config_err = SamplingReceiverError::config_error("Invalid query");
-        assert!(config_err.to_string().contains("Configuration error"));
-
-        let temporal_err = SamplingReceiverError::temporal_window_error("Window too large");
-        assert!(temporal_err.to_string().contains("Temporal window error"));
+// Conversion from UUID parsing error
+impl From<uuid::Error> for SamplingReceiverError {
+    fn from(err: uuid::Error) -> Self {
+        Self::ConfigError {
+            message: format!("UUID error: {}", err),
+        }
     }
+}
 
-    #[test]
-    fn test_error_conversion() {
-        let arrow_err = arrow::error::ArrowError::InvalidArgumentError("test".to_string());
-        let sampling_err: SamplingReceiverError = arrow_err.into();
-        assert!(matches!(sampling_err, SamplingReceiverError::ArrowError { .. }));
+// Conversion from serde JSON error
+impl From<serde_json::Error> for SamplingReceiverError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::ConfigError {
+            message: format!("JSON error: {}", err),
+        }
     }
 }

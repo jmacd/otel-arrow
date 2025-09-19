@@ -11,7 +11,6 @@ use crate::sampling_receiver::{
 };
 use crate::{OTAP_RECEIVER_FACTORIES, pdata::OtapPdata};
 use async_trait::async_trait;
-use futures_util::stream;
 use linkme::distributed_slice;
 use log::{debug, error, info};
 use otap_df_config::node::NodeUserConfig;
@@ -157,7 +156,7 @@ impl SamplingReceiver {
         
         if results.is_empty() {
             error!("No data found in parquet files");
-            return Err(crate::sampling_receiver::error::SamplingReceiverError::file_discovery_error(
+            return Err(crate::sampling_receiver::error::SamplingReceiverError::config_error(
                 "No data found in parquet files"
             ));
         }
