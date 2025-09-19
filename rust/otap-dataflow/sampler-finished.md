@@ -121,6 +121,8 @@ the basic Parquet files and "reconstruct" them back into OTAP records
 data, from where they could pass through an OTAP-dataflow pipeline and
 be exported as OTAP streams or OTLP protobufs.
 
+[Link to Code directory](./crates/otap/src/parquet_receiver/mod.rs)
+
 This component:
 
 - Monitors the host filesystem for Parquet files using host file system
@@ -151,6 +153,8 @@ that we can use DataFusion to query OTAP data and then reassemble the
 results into OTAP batches, much like we did with Parquet directly,
 above.  However, in this case the DF query engine is able to apply its
 own optimizations.
+
+[Link to Code directory](./crates/otap/src/sampling_receiver/mod.rs)
 
 This component:
 
