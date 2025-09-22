@@ -6,9 +6,12 @@
 pub mod config;
 pub mod error;
 pub mod file_discovery;
+pub mod id_mapping;
 pub mod parquet_receiver;
-pub mod query_engine; 
-pub mod reconstruction;
+pub mod direct_stream_reader;
+pub mod direct_streaming_merger;
+/// Streaming coordinator for processing parquet data with direct object store access
+pub mod streaming_coordinator;
 
 // Re-export the main receiver and factory
 pub use parquet_receiver::{ParquetReceiver, PARQUET_RECEIVER_FACTORY, PARQUET_RECEIVER_URN};

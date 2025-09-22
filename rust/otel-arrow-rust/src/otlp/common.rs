@@ -516,6 +516,16 @@ impl SortedBatchCursor {
     pub fn finished(&self) -> bool {
         self.curr_index >= self.sorted_indices.len()
     }
+
+    /// Get current cursor position (for debugging)
+    pub fn get_position(&self) -> usize {
+        self.curr_index
+    }
+
+    /// Get total number of indices (for debugging)
+    pub fn get_total_indices(&self) -> usize {
+        self.sorted_indices.len()
+    }
 }
 
 /// This is used to initialize the [`SortedBatchCursor`]. It does this by sorting the IDs and then
@@ -637,14 +647,24 @@ impl BatchSorter {
         ids: &UInt16Array,
         cursor: &mut SortedBatchCursor,
     ) {
+        log::debug!("🔍 Initializing cursor for U16 ID column with {} rows", ids.len());
+        
         self.u16_ids.clear();
         self.u16_ids
             .extend(ids.values().iter().copied().enumerate());
 
+        log::debug!("   Found {} total ids (including nulls)", self.u16_ids.len());
+        if !self.u16_ids.is_empty() {
+            let sample: Vec<_> = self.u16_ids.iter().take(10).collect();
+            log::debug!("   Sample ids (before sort): {:?}", sample);
+        }
+
         if ids.null_count() == 0 {
+            log::debug!("   Fast path: no null IDs");
             // fast path, no null IDs
             self.u16_ids.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
         } else {
+            log::debug!("   Slow path: {} null IDs", ids.null_count());
             // sort nulls last
             self.u16_ids.sort_unstable_by(|(ia, a), (ib, b)| {
                 match (ids.is_valid(*ia), ids.is_valid(*ib)) {
@@ -656,9 +676,19 @@ impl BatchSorter {
             });
         }
 
+        if !self.u16_ids.is_empty() {
+            let sample: Vec<_> = self.u16_ids.iter().take(10).collect();
+            log::debug!("   Sample ids (after sort): {:?}", sample);
+            log::debug!("   ID range: {} to {}", 
+                self.u16_ids.first().map(|(_, id)| *id).unwrap_or(0),
+                self.u16_ids.last().map(|(_, id)| *id).unwrap_or(0));
+        }
+
         cursor
             .sorted_indices
             .extend(self.u16_ids.iter().map(|(i, _)| *i));
+            
+        log::debug!("   ✅ Cursor initialized with {} sorted indices", cursor.sorted_indices.len());
     }
 }
 
@@ -675,6 +705,8 @@ impl<'a> ChildIndexIter<'a> {
         parent_id_col: &'a UInt16Array,
         cursor: &'a mut SortedBatchCursor,
     ) -> Self {
+        log::debug!("🔎 ChildIndexIter::new for parent_id={}, cursor_pos={}, total_rows={}", 
+            parent_id, cursor.curr_index, cursor.sorted_indices.len());
         Self {
             parent_id,
             parent_id_col,
@@ -687,30 +719,41 @@ impl Iterator for ChildIndexIter<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let seeking_parent_id = self.parent_id;
+        log::debug!("      🔍 ChildIndexIter seeking parent_id={}", seeking_parent_id);
+        
         // advance the cursor until we either find the parent ID we're looking for, or pass it
         while !self.cursor.finished() {
             // safety: we've just checked that cursor is not finished
             let index = self.cursor.curr_index().expect("cursor not finished");
 
             if let Some(curr_parent_id) = self.parent_id_col.value_at(index) {
+                log::debug!("         Cursor index={}, curr_parent_id={}, seeking={}", 
+                    index, curr_parent_id, seeking_parent_id);
+                    
                 if curr_parent_id < self.parent_id {
+                    log::debug!("         curr_parent_id < seeking, advancing...");
                     self.cursor.advance();
                 }
 
                 if curr_parent_id == self.parent_id {
+                    log::debug!("         ✅ MATCH! Found parent_id={} at index={}", curr_parent_id, index);
                     self.cursor.advance();
                     return Some(index);
                 }
 
                 if curr_parent_id > self.parent_id {
+                    log::debug!("         curr_parent_id > seeking, stopping search");
                     return None;
                 }
             } else {
+                log::debug!("         Skipping null parent_id at index={}", index);
                 // skip the null values
                 self.cursor.advance();
             }
         }
 
+        log::debug!("      ❌ Cursor finished, no more matches for parent_id={}", seeking_parent_id);
         // we've iterated the cursor until the end and didn't find what we were looking for:
         None
     }

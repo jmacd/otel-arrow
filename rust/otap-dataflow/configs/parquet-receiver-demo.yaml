@@ -38,7 +38,7 @@ nodes:
           - noop_exporter
         dispatch_strategy: round_robin
     config:
-      verbosity: basic
+      verbosity: detailed
 
   # NoOp exporter to act as a sink
   noop_exporter:

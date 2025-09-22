@@ -436,15 +436,36 @@ impl LogsProtoBytesEncoder {
 
         if let Some(log_attrs) = logs_data_arrays.log_attrs.as_ref() {
             if let Some(id) = log_arrays.id.value_at(index) {
+                log::debug!("🔍 Processing log record at index={}, id={}", index, id);
+                log::debug!("   📊 Cursor state BEFORE: position={}, total_indices={}, finished={}",
+                    self.log_attrs_cursor.get_position(), 
+                    self.log_attrs_cursor.get_total_indices(),
+                    self.log_attrs_cursor.finished());
+                    
                 let attrs_index_iter =
                     ChildIndexIter::new(id, log_attrs.parent_id, &mut self.log_attrs_cursor);
+                let mut attr_count = 0;
                 for attr_index in attrs_index_iter {
+                    attr_count += 1;
                     proto_encode_len_delimited_unknown_size!(
                         LOG_RECORD_ATTRIBUTES,
                         encode_key_value(log_attrs, attr_index, result_buf)?,
                         result_buf
                     );
                 }
+                
+                log::debug!("   📊 Cursor state AFTER: position={}, total_indices={}, finished={}",
+                    self.log_attrs_cursor.get_position(), 
+                    self.log_attrs_cursor.get_total_indices(),
+                    self.log_attrs_cursor.finished());
+                    
+                if attr_count == 0 {
+                    log::debug!("   ⚠️ No attributes found for log record id={}", id);
+                } else {
+                    log::debug!("   ✅ Found {} attributes for log record id={}", attr_count, id);
+                }
+            } else {
+                log::debug!("   ❌ Log record at index={} has no ID (null)", index);
             }
         }
 
