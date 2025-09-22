@@ -23,7 +23,6 @@ use otel_arrow_rust::otap::{Logs, OtapArrowRecords, OtapBatchStore};
 use otel_arrow_rust::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
 /// Results from separate queries following streaming-separate-queries.md strategy
-/// A = log_attrs (complex query), P = logs (primary), R = resource_attrs, S = scope_attrs
 #[derive(Debug)]
 struct SeparateQueryResults {
     /// log_attrs results from complex query (A)
@@ -58,6 +57,14 @@ pub struct OtapReconstructor {
     temp_table_counter: usize,
 }
 
+/// Grouped data from flattened LEFT JOIN results
+struct GroupedFlattenedData {
+    /// Logs batch with unique log records (one per log)
+    logs: RecordBatch,
+    /// Log attributes batch (multiple rows per log, or empty for logs without attributes)
+    log_attrs: RecordBatch,
+}
+
 impl OtapReconstructor {
     /// Create a new OTAP reconstructor
     pub fn new(query_engine: Arc<DataFusionQueryEngine>, config: &Config) -> Self {
@@ -78,6 +85,7 @@ impl OtapReconstructor {
 
     /// Reconstruct OTAP records using separate queries strategy from streaming-separate-queries.md
     /// This follows the expert's approach: A=log_attrs, P=logs, R=resource_attrs, S=scope_attrs
+    /// Also adds synthetic sampling.adjusted_count attributes for logs without existing attributes
     pub async fn reconstruct_from_stream(
         &mut self, 
         log_attributes_results: Vec<RecordBatch>
@@ -723,14 +731,14 @@ impl OtapReconstructor {
         
         for field in schema.fields() {
             if column_names.contains(&field.name().as_str()) {
-                // Add COLUMN_ENCODING=PLAIN metadata to this field
+                // Add encoding=plain metadata to this field (using correct constants)
                 let mut metadata = field.metadata().clone();
-                let _ = metadata.insert("COLUMN_ENCODING".to_string(), "PLAIN".to_string());
+                let _ = metadata.insert("encoding".to_string(), "plain".to_string());
                 
                 let new_field = Field::new(field.name(), field.data_type().clone(), field.is_nullable())
                     .with_metadata(metadata);
                 new_fields.push(new_field);
-                debug!("🏷️  Added COLUMN_ENCODING=PLAIN metadata to column '{}'", field.name());
+                debug!("🏷️  Added encoding=plain metadata to column '{}'", field.name());
             } else {
                 // Keep original field unchanged
                 new_fields.push(field.as_ref().clone());

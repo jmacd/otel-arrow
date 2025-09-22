@@ -159,7 +159,7 @@ pub fn default_passthrough_query() -> &'static str {
     JOIN logs l ON l.id = la.parent_id AND la._part_id = l._part_id
     WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns})
       AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
-    ORDER BY la.parent_id, la.key
+    ORDER BY la._part_id, la.parent_id, la.key
     LIMIT 65536
     "#
 }

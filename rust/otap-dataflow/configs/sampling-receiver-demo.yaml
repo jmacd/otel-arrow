@@ -26,15 +26,49 @@ nodes:
         max_clock_drift: "1s"           # Minimal clock drift for testing
         max_file_duration: "5m"         # Allow for larger time spans in test files
       
-      # Pass-through query returning actual log_attributes records for OTAP reconstruction
-      # GROUP BY _part_id to process partitions separately and maintain alignment
+      # Query that ensures every sampled log has at least one attribute using UNION ALL approach
+      # This guarantees every log gets a sampling.adjusted_count attribute regardless of existing attributes
       query: |
-        SELECT la.*
-        FROM log_attrs la
-        JOIN logs l ON l.id = la.parent_id AND la._part_id = l._part_id
-        WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns})
-          AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
-        ORDER BY la._part_id, la.parent_id, la.key
+        WITH filtered_logs AS (
+          SELECT l.id, l._part_id
+          FROM logs l
+          WHERE l.time_unix_nano >= to_timestamp_nanos({window_start_ns})
+            AND l.time_unix_nano < to_timestamp_nanos({window_end_ns})
+        ),
+        original_attrs AS (
+          SELECT 
+            la.parent_id,
+            la.key,
+            la.type,
+            la.str,
+            la.int,
+            la.double,
+            la.bool,
+            la.bytes,
+            la.ser as array_val,
+            la._part_id
+          FROM log_attrs la
+          JOIN filtered_logs fl ON la.parent_id = fl.id AND la._part_id = fl._part_id
+        ),
+        synthetic_attrs AS (
+          SELECT 
+            fl.id as parent_id,
+            'sampling.adjusted_count' as key,
+            CAST(1 as tinyint unsigned) as type,
+            '1.0' as str,
+            NULL as int,
+            NULL as double,
+            NULL as bool,
+            NULL as bytes,
+            NULL as array_val,
+            fl._part_id
+          FROM filtered_logs fl
+        )
+        SELECT * FROM original_attrs
+        UNION ALL
+        SELECT * FROM synthetic_attrs
+        ORDER BY _part_id, parent_id, key
+        LIMIT 100
       
       # Performance tuning - conservative settings for testing
       performance:
