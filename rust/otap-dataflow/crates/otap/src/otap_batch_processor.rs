@@ -12,129 +12,128 @@ use otap_df_config::error::Error as ConfigError;
 use otap_df_config::experimental::SignalType;
 use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::config::ProcessorConfig;
+use otap_df_engine::control::NodeControlMsg;
 use otap_df_engine::error::Error as EngineError;
 use otap_df_engine::local::processor as local;
 use otap_df_engine::message::Message;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::processor::ProcessorWrapper;
+use otap_df_telemetry::instrument::Counter;
+use otap_df_telemetry::metrics::MetricSet;
+use otap_df_telemetry_macros::metric_set;
+use otel_arrow_rust::otap::OtapArrowRecords;
+use otel_arrow_rust::otap::batching::make_output_batches;
 use serde::Deserialize;
 use serde_json::Value;
 use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
-// Telemetry metrics
-pub mod metrics;
-use crate::otap_batch_processor::metrics::OtapBatchProcessorMetrics;
-use otap_df_engine::control::NodeControlMsg;
-use otap_df_telemetry::metrics::MetricSet;
-// For optional conversion during flush/partitioning
-use otel_arrow_rust::otap::OtapArrowRecords;
-use otel_arrow_rust::otap::batching::make_output_batches;
 
 /// URN for the OTAP batch processor
 pub const OTAP_BATCH_PROCESSOR_URN: &str = "urn:otap:processor:batch";
 
 /// Default configuration values (parity-aligned as we confirm Go defaults)
 pub const DEFAULT_SEND_BATCH_SIZE: usize = 8192;
-/// Default upper bound on batch size used to chunk oversized inputs (in number of items).
-/// See Config::send_batch_max_size for normalization semantics.
-pub const DEFAULT_SEND_BATCH_MAX_SIZE: usize = 0; // 0 means unlimited (OTLP parity)
+
 /// Timeout in milliseconds for periodic flush
 pub const DEFAULT_TIMEOUT_MS: u64 = 200;
 
-/// Semantic constants (avoid magic numbers)
-/// Minimum allowed send_batch_size
-pub const MIN_SEND_BATCH_SIZE: usize = 1;
-/// Sentinel meaning: no upper limit for max size (Go parity)
-pub const FOLLOW_SEND_BATCH_SIZE_SENTINEL: usize = 0;
-/// Minimum allowed metadata cardinality limit when specified
-pub const MIN_METADATA_CARDINALITY_LIMIT: usize = 1;
-/// Minimum increment to apply when counting items for size calculations
-pub const MIN_ITEM_INCREMENT: usize = 1;
-
 /// Log messages
 const LOG_MSG_SHUTTING_DOWN: &str = "OTAP batch processor shutting down";
-const LOG_MSG_DROP_EMPTY: &str = "OTAP batch processor: dropping empty OTAP record (0 rows)";
 const LOG_MSG_DROP_CONVERSION_FAILED: &str =
     "OTAP batch processor: dropping message: OTAP conversion failed";
 const LOG_MSG_BATCHING_FAILED_PREFIX: &str = "OTAP batch processor: low-level batching failed for";
 const LOG_MSG_BATCHING_FAILED_SUFFIX: &str = "; dropping";
 
-/// Signal label constants (avoid repeated string literals)
-const SIG_LOGS: &str = "logs";
-const SIG_METRICS: &str = "metrics";
-const SIG_TRACES: &str = "traces";
-
 /// Configuration for the OTAP batch processor (parity with Go batchprocessor)
+///
+/// TODO these are currently modeled on the legacy batch processor. we want
+/// to emulate the new exporterhelper batch sender.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Flush current batch when this count is reached.
-    /// When set to 0, the batch size is ignored and data will be sent immediately
-    /// subject only to send_batch_max_size (OTLP parity).
-    #[serde(default = "default_send_batch_size_opt")]
-    pub send_batch_size: Option<usize>,
-    /// Hard cap for splitting very large inputs.
-    /// Go behavior: 0 means no upper limit; missing defaults to 0 (unlimited).
+    /// Flush current batch when this count is reached (min).
+    #[serde(default = "default_send_batch_size")]
+    pub send_batch_size: Option<NonZeroUsize>,
+    /// Flush current batch when this count is reached (max).
     #[serde(default = "default_send_batch_max_size")]
-    pub send_batch_max_size: usize,
-    /// Flush non-empty batches on this interval.
-    #[serde(with = "humantime_serde", default = "default_timeout_duration_opt")]
+    pub send_batch_max_size: Option<NonZeroUsize>,
+    /// Flush non-empty batches on this interval, which may be 0 for
+    /// immediate flush or None for no timeout.
+    #[serde(with = "humantime_serde", default = "default_timeout_duration")]
     pub timeout: Option<Duration>,
-    /// Optional metadata partitioning keys (resource/scope/attribute names). Not yet supported.
-    /// ToDo: Support metadata-aware batching.
-    #[serde(default)]
-    pub metadata_keys: Vec<String>,
-    /// Optional limit on the number of distinct metadata-based groups this processor will track.
-    ///
-    /// Note: This is currently a no-op because grouping by metadata_keys has not yet been
-    /// implemented. When grouping lands, this will cap the number of concurrent groups and the
-    /// overflow strategy will be documented. Not yet supported.
-    /// ToDo: Support metadata-aware batching
-    #[serde(default)]
-    pub metadata_cardinality_limit: Option<usize>,
 }
 
-fn default_send_batch_size_opt() -> Option<usize> {
-    Some(DEFAULT_SEND_BATCH_SIZE)
+fn default_send_batch_size() -> Option<NonZeroUsize> {
+    NonZeroUsize::new(DEFAULT_SEND_BATCH_SIZE)
 }
 
-fn default_send_batch_max_size() -> usize {
-    FOLLOW_SEND_BATCH_SIZE_SENTINEL // normalized in from_config
+fn default_send_batch_max_size() -> Option<NonZeroUsize> {
+    None
 }
 
-fn default_timeout_duration_opt() -> Option<Duration> {
+fn default_timeout_duration() -> Option<Duration> {
     Some(Duration::from_millis(DEFAULT_TIMEOUT_MS))
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            send_batch_size: default_send_batch_size_opt(),
+            send_batch_size: default_send_batch_size(),
             send_batch_max_size: default_send_batch_max_size(),
-            timeout: default_timeout_duration_opt(),
-            metadata_keys: Vec::new(),
-            metadata_cardinality_limit: None,
+            timeout: default_timeout_duration(),
         }
     }
+}
+
+impl Config {
+    /// Validates the configuration.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.send_batch_size.or(self.send_batch_max_size).is_none() {
+            return Err(ConfigError::InvalidUserConfig {
+                error: "send_batch_max_size or send_batch_size must be set".into(),
+            });
+        }
+
+        if let Some(max_size) = self.send_batch_max_size {
+            if let Some(batch_size) = self.send_batch_size {
+                if max_size < batch_size {
+                    return Err(ConfigError::InvalidUserConfig {
+                        error: format!(
+                            "send_batch_max_size ({}) must be >= send_batch_size ({}) or unset",
+                            max_size, batch_size,
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Per-signal state
+#[derive(Default)]
+struct BatchSignals {
+    logs: SignalBuffer,
+    metrics: SignalBuffer,
+    traces: SignalBuffer,
+}
+
+/// Per-signal buffer state
+#[derive(Default)]
+struct SignalBuffer {
+    pending: Vec<OtapArrowRecords>,
+
+    /// A count defined by batch_length(), number of spans, log records, or metric data points.
+    items: usize,
 }
 
 /// Local (!Send) OTAP batch processor
 pub struct OtapBatchProcessor {
     config: Config,
-    // Per-signal buffers of convertible OTAP records
-    current_logs: Vec<OtapArrowRecords>,
-    current_metrics: Vec<OtapArrowRecords>,
-    current_traces: Vec<OtapArrowRecords>,
-    // Running row counts per signal for size triggers
-    rows_logs: usize,
-    rows_metrics: usize,
-    rows_traces: usize,
-    // Tracks whether a size/max threshold was crossed since the last input for each signal.
-    // Used to decide whether a timer tick should flush that signal (OTLP parity semantics).
-    dirty_logs: bool,
-    dirty_metrics: bool,
-    dirty_traces: bool,
-    // Internal telemetry
+    signals: BatchSignals,
+    lower_limit: NonZeroUsize,
     metrics: MetricSet<OtapBatchProcessorMetrics>,
 }
 
@@ -145,27 +144,68 @@ enum FlushReason {
     Shutdown,
 }
 
-/// Decide whether to request splitting from upstream batching.
-/// Returns Some(max) only when a split is needed and safe, otherwise None.
-fn requested_split_max(input: &[OtapArrowRecords], max_val: usize) -> Option<NonZeroU64> {
-    // Workaround: avoid splitting a single record until upstream bug is fixed.
-    // Also avoid requesting split when total rows fit within max.
-    let total_rows: usize = input.iter().map(|r| r.batch_length()).sum();
-    if total_rows <= max_val || input.len() <= 1 {
-        None
-    } else {
-        NonZeroU64::new(max_val as u64)
-    }
+/// Minimal, essential metrics for the OTAP batch processor, plus observability for
+/// timer flush decisions.
+#[metric_set(name = "otap.processor.batch")]
+#[derive(Debug, Default, Clone)]
+pub struct OtapBatchProcessorMetrics {
+    /// Total items consumed for logs signal
+    #[metric(unit = "{item}")]
+    consumed_items_logs: Counter<u64>,
+    /// Total items consumed for metrics signal
+    #[metric(unit = "{item}")]
+    consumed_items_metrics: Counter<u64>,
+    /// Total items consumed for traces signal
+    #[metric(unit = "{item}")]
+    consumed_items_traces: Counter<u64>,
+
+    /// Number of flushes triggered by size threshold (all signals)
+    #[metric(unit = "{flush}")]
+    flushes_size: Counter<u64>,
+    /// Number of flushes triggered by timer (all signals)
+    #[metric(unit = "{flush}")]
+    flushes_timer: Counter<u64>,
+    /// Number of flushes triggered by shutdown (all signals)
+    #[metric(unit = "{flush}")]
+    flushes_shutdown: Counter<u64>,
+
+    /// Number of messages dropped due to conversion failures
+    #[metric(unit = "{msg}")]
+    dropped_conversion: Counter<u64>,
+    /// Number of batching errors encountered
+    #[metric(unit = "{error}")]
+    batching_errors: Counter<u64>,
+    /// Number of empty records dropped
+    #[metric(unit = "{msg}")]
+    dropped_empty_records: Counter<u64>,
+
+    /// Number of split requests issued to upstream batching
+    #[metric(unit = "{event}")]
+    split_requests: Counter<u64>,
+
+    /// Timer-triggered flushes that were performed for logs
+    #[metric(unit = "{flush}")]
+    timer_flush_performed_logs: Counter<u64>,
+    /// Timer-triggered flushes that were performed for metrics
+    #[metric(unit = "{flush}")]
+    timer_flush_performed_metrics: Counter<u64>,
+    /// Timer-triggered flushes that were performed for traces
+    #[metric(unit = "{flush}")]
+    timer_flush_performed_traces: Counter<u64>,
+}
+
+fn nzu_to_nz64(nz: NonZeroUsize) -> NonZeroU64 {
+    NonZeroU64::new(nz.get() as u64).expect("nonzero")
 }
 
 async fn log_batching_failed(
     effect: &mut local::EffectHandler<OtapPdata>,
-    signal: &str,
+    signal: SignalType,
     err: &impl std::fmt::Display,
 ) {
     effect
         .info(&format!(
-            "{LOG_MSG_BATCHING_FAILED_PREFIX} {signal}: {err}{LOG_MSG_BATCHING_FAILED_SUFFIX}"
+            "{LOG_MSG_BATCHING_FAILED_PREFIX} {signal:?}: {err}{LOG_MSG_BATCHING_FAILED_SUFFIX}"
         ))
         .await;
 }
@@ -178,43 +218,25 @@ impl OtapBatchProcessor {
         cfg: &Value,
         metrics: MetricSet<OtapBatchProcessorMetrics>,
     ) -> Result<Self, ConfigError> {
-        let mut config: Config =
+        let config: Config =
             serde_json::from_value(cfg.clone()).map_err(|e| ConfigError::InvalidUserConfig {
                 error: format!("invalid OTAP batch processor config: {e}"),
             })?;
 
-        // Basic validation/normalization
-        if config.send_batch_max_size != 0 {
-            if let Some(s) = config.send_batch_size {
-                if s != 0 && config.send_batch_max_size < s {
-                    return Err(ConfigError::InvalidUserConfig {
-                        error: format!(
-                            "invalid OTAP batch processor config: send_batch_max_size ({}) must be >= send_batch_size ({}) or 0 (unlimited)",
-                            config.send_batch_max_size, s
-                        ),
-                    });
-                }
-            }
-        }
+        // This checks that if both are present, max_size >= batch_size, and
+        // that at least one is present so that lower_limit is valid below.
+        config.validate()?;
 
-        if let Some(limit) = config.metadata_cardinality_limit {
-            if limit < MIN_METADATA_CARDINALITY_LIMIT {
-                config.metadata_cardinality_limit = Some(MIN_METADATA_CARDINALITY_LIMIT);
-            }
-        }
+        let lower_limit = config
+            .send_batch_max_size
+            .or(config.send_batch_size)
+            .expect("valid");
 
         Ok(OtapBatchProcessor {
             config,
-            current_logs: Vec::new(),
-            current_metrics: Vec::new(),
-            current_traces: Vec::new(),
-            rows_logs: 0,
-            rows_metrics: 0,
-            rows_traces: 0,
-            dirty_logs: false,
-            dirty_metrics: false,
-            dirty_traces: false,
-            metrics,
+            signals: BatchSignals::default(),
+            lower_limit,
+            metrics: metrics,
         })
     }
 
@@ -240,311 +262,148 @@ impl OtapBatchProcessor {
         effect: &mut local::EffectHandler<OtapPdata>,
         reason: FlushReason,
     ) -> Result<(), EngineError> {
-        self.flush_logs(effect, reason).await?;
-        self.flush_metrics(effect, reason).await?;
-        self.flush_traces(effect, reason).await
+        self.flush_signal_impl(SignalType::Logs, effect, reason)
+            .await?;
+        self.flush_signal_impl(SignalType::Metrics, effect, reason)
+            .await?;
+        self.flush_signal_impl(SignalType::Traces, effect, reason)
+            .await
     }
 
-    fn inc_flushes(&mut self, reason: FlushReason) {
+    /// Helper to process incoming signal data with generic batching logic
+    async fn process_signal_impl(
+        &mut self,
+        signal: SignalType,
+        effect: &mut local::EffectHandler<OtapPdata>,
+        rec: OtapArrowRecords,
+    ) -> Result<(), EngineError> {
+        let items = rec.batch_length();
+
+        if items == 0 {
+            self.metrics.dropped_empty_records.inc();
+            return Ok(());
+        }
+
+        // Increment consumed_items for the appropriate signal
+        match signal {
+            SignalType::Logs => self.metrics.consumed_items_logs.add(items as u64),
+            SignalType::Metrics => self.metrics.consumed_items_metrics.add(items as u64),
+            SignalType::Traces => self.metrics.consumed_items_traces.add(items as u64),
+        }
+
+        let buffer = match signal {
+            SignalType::Logs => &mut self.signals.logs,
+            SignalType::Metrics => &mut self.signals.metrics,
+            SignalType::Traces => &mut self.signals.traces,
+        };
+
+        buffer.items += items;
+        buffer.pending.push(rec);
+        println!("push {items} to {}", buffer.items);
+
+        if buffer.items >= self.lower_limit.get() {
+            println!("flushing...");
+            self.flush_signal_impl(signal, effect, FlushReason::Size)
+                .await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Generic flush implementation for any signal type
+    async fn flush_signal_impl(
+        &mut self,
+        signal: SignalType,
+        effect: &mut local::EffectHandler<OtapPdata>,
+        reason: FlushReason,
+    ) -> Result<(), EngineError> {
+        let buffer = match signal {
+            SignalType::Logs => &mut self.signals.logs,
+            SignalType::Metrics => &mut self.signals.metrics,
+            SignalType::Traces => &mut self.signals.traces,
+        };
+
+        println!("flushing with {}", buffer.items);
+        buffer.items = 0;
+
+        let input = std::mem::take(&mut buffer.pending);
+        if input.is_empty() {
+            return Ok(());
+        }
+
         match reason {
             FlushReason::Size => self.metrics.flushes_size.inc(),
             FlushReason::Timer => self.metrics.flushes_timer.inc(),
             FlushReason::Shutdown => self.metrics.flushes_shutdown.inc(),
         }
-    }
 
-    async fn flush_logs(
-        &mut self,
-        effect: &mut local::EffectHandler<OtapPdata>,
-        reason: FlushReason,
-    ) -> Result<(), EngineError> {
-        // Only return early if there is nothing buffered for this signal at all
-        if self.current_logs.is_empty() {
-            return Ok(());
-        }
-        let input = std::mem::take(&mut self.current_logs);
-        if !input.is_empty() {
-            self.inc_flushes(reason);
+        if let Some(upper_limit) = self.config.send_batch_max_size {
+            self.metrics.split_requests.inc();
+            println!("flushing with upper limit {}", upper_limit);
+            let mut output_batches = match make_output_batches(
+                signal.to_record_tag(),
+                input,
+                Some(nzu_to_nz64(upper_limit)),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.metrics.batching_errors.inc();
+                    log_batching_failed(effect, signal, &e).await;
+                    return Err(EngineError::InternalError {
+                        message: e.to_string(),
+                    });
+                }
+            };
 
-            let max_val = self.config.send_batch_max_size;
-            if max_val <= MIN_SEND_BATCH_SIZE {
-                // Bypass upstream splitter for degenerate max; just forward each record
+            for batch in &output_batches {
+                println!("got batch size {}", batch.batch_length());
+            }
+
+            // If size-triggered and we requested splitting (max is Some), re-buffer the last partial
+            // output if it is smaller than the configured max. Timer/Shutdown flush everything.
+            if reason == FlushReason::Size && !output_batches.is_empty() {
+                if let Some(last_items) = output_batches.last().map(|last| last.batch_length()) {
+                    println!("lowerl {}", self.lower_limit.get());
+                    println!("last_items {}", last_items);
+                    if last_items < self.lower_limit.get() {
+                        println!("rebuffer!");
+                        let remainder = output_batches.pop().expect("last exists");
+                        buffer.items = last_items;
+                        buffer.pending.push(remainder);
+                    }
+                }
+            }
+
+            for records in output_batches {
+                let pdata = OtapPdata::new_todo_context(records.into());
+                effect.send_message(pdata).await?;
+            }
+        } else {
+            // No split requested (safe path)
+            if input.len() > 1 {
+                // Coalesce upstream only when there are multiple records to merge
+                let output_batches = match make_output_batches(signal.to_record_tag(), input, None)
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.metrics.batching_errors.inc();
+                        log_batching_failed(effect, signal, &e).await;
+                        Vec::new()
+                    }
+                };
+                for records in output_batches {
+                    let pdata = OtapPdata::new_todo_context(records.into());
+                    effect.send_message(pdata).await?;
+                }
+            } else {
+                // Single record: forward as-is (avoids upstream edge-cases)
                 for records in input {
                     let pdata = OtapPdata::new_todo_context(records.into());
                     effect.send_message(pdata).await?;
                 }
-                // Always reset counter in the degenerate path
-                self.rows_logs = 0;
-                if reason == FlushReason::Size {
-                    // Fully drained; no remainder -> not eligible for timer-based flush
-                    self.dirty_logs = false;
-                    self.metrics.dirty_cleared_logs.inc();
-                }
-            } else {
-                // Avoid upstream splitter where unnecessary or unsafe (see requested_split_max)
-                let max = requested_split_max(&input, max_val);
-                if let Some(max_nz) = max {
-                    self.metrics.split_requests.inc();
-                    let mut output_batches = match make_output_batches(Some(max_nz), input) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            self.metrics.batching_errors.inc();
-                            log_batching_failed(effect, SIG_LOGS, &e).await;
-                            Vec::new()
-                        }
-                    };
-
-                    // If size-triggered and we requested splitting (max is Some), re-buffer the last partial
-                    // output if it is smaller than the configured max. Timer/Shutdown flush everything.
-                    let mut rebuffered = false;
-                    if reason == FlushReason::Size && !output_batches.is_empty() {
-                        if let Some(last) = output_batches.last() {
-                            let last_rows = last.batch_length();
-                            if last_rows < max_val {
-                                let remainder = output_batches.pop().expect("last exists");
-                                self.rows_logs = last_rows;
-                                self.current_logs.push(remainder);
-                                rebuffered = true;
-                            }
-                        }
-                    }
-
-                    for records in output_batches {
-                        let pdata = OtapPdata::new_todo_context(records.into());
-                        effect.send_message(pdata).await?;
-                    }
-
-                    if !rebuffered {
-                        self.rows_logs = 0;
-                    }
-                    if reason == FlushReason::Size {
-                        // Set timer eligibility based on whether a remainder was kept
-                        self.dirty_logs = rebuffered;
-                        if !rebuffered {
-                            self.metrics.dirty_cleared_logs.inc();
-                        }
-                    }
-                } else {
-                    // No split requested (safe path)
-                    if input.len() > 1 {
-                        // Coalesce upstream only when there are multiple records to merge
-                        let output_batches = match make_output_batches(None, input) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                self.metrics.batching_errors.inc();
-                                log_batching_failed(effect, SIG_LOGS, &e).await;
-                                Vec::new()
-                            }
-                        };
-                        for records in output_batches {
-                            let pdata = OtapPdata::new_todo_context(records.into());
-                            effect.send_message(pdata).await?;
-                        }
-                    } else {
-                        // Single record: forward as-is (avoids upstream edge-cases)
-                        for records in input {
-                            let pdata = OtapPdata::new_todo_context(records.into());
-                            effect.send_message(pdata).await?;
-                        }
-                    }
-                    self.rows_logs = 0;
-                    if reason == FlushReason::Size {
-                        // Fully drained in no-split path
-                        self.dirty_logs = false;
-                    }
-                }
             }
         }
-        Ok(())
-    }
 
-    async fn flush_metrics(
-        &mut self,
-        effect: &mut local::EffectHandler<OtapPdata>,
-        reason: FlushReason,
-    ) -> Result<(), EngineError> {
-        if self.current_metrics.is_empty() {
-            return Ok(());
-        }
-        let input = std::mem::take(&mut self.current_metrics);
-        if !input.is_empty() {
-            self.inc_flushes(reason);
-            let max_val = self.config.send_batch_max_size;
-            if max_val <= MIN_SEND_BATCH_SIZE {
-                for records in input {
-                    let pdata = OtapPdata::new_todo_context(records.into());
-                    effect.send_message(pdata).await?;
-                }
-                self.rows_metrics = 0;
-                if reason == FlushReason::Size {
-                    self.dirty_metrics = false;
-                }
-            } else {
-                let max = requested_split_max(&input, max_val);
-                if let Some(max_nz) = max {
-                    self.metrics.split_requests.inc();
-                    let mut output_batches = match make_output_batches(Some(max_nz), input) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            self.metrics.batching_errors.inc();
-                            log_batching_failed(effect, SIG_METRICS, &e).await;
-                            Vec::new()
-                        }
-                    };
-
-                    let mut rebuffered = false;
-                    if reason == FlushReason::Size && !output_batches.is_empty() {
-                        if let Some(last) = output_batches.last() {
-                            let last_rows = last.batch_length();
-                            if last_rows < max_val {
-                                let remainder = output_batches.pop().expect("last exists");
-                                self.rows_metrics = last_rows;
-                                self.current_metrics.push(remainder);
-                                rebuffered = true;
-                            }
-                        }
-                    }
-
-                    for records in output_batches {
-                        let pdata = OtapPdata::new_todo_context(records.into());
-                        effect.send_message(pdata).await?;
-                    }
-
-                    if !rebuffered {
-                        self.rows_metrics = 0;
-                    }
-                    if reason == FlushReason::Size {
-                        self.dirty_metrics = rebuffered;
-                        if !rebuffered {
-                            self.metrics.dirty_cleared_metrics.inc();
-                        }
-                    }
-                } else {
-                    // No split requested (safe path)
-                    if input.len() > 1 {
-                        // Coalesce upstream only when there are multiple records to merge
-                        let output_batches = match make_output_batches(None, input) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                self.metrics.batching_errors.inc();
-                                log_batching_failed(effect, SIG_METRICS, &e).await;
-                                Vec::new()
-                            }
-                        };
-                        for records in output_batches {
-                            let pdata = OtapPdata::new_todo_context(records.into());
-                            effect.send_message(pdata).await?;
-                        }
-                    } else {
-                        // Single record: forward as-is
-                        for records in input {
-                            let pdata = OtapPdata::new_todo_context(records.into());
-                            effect.send_message(pdata).await?;
-                        }
-                    }
-                    self.rows_metrics = 0;
-                    if reason == FlushReason::Size {
-                        self.dirty_metrics = false;
-                        self.metrics.dirty_cleared_metrics.inc();
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn flush_traces(
-        &mut self,
-        effect: &mut local::EffectHandler<OtapPdata>,
-        reason: FlushReason,
-    ) -> Result<(), EngineError> {
-        if self.current_traces.is_empty() {
-            return Ok(());
-        }
-        let input = std::mem::take(&mut self.current_traces);
-        if !input.is_empty() {
-            self.inc_flushes(reason);
-            let max_val = self.config.send_batch_max_size;
-            if max_val <= MIN_SEND_BATCH_SIZE {
-                for records in input {
-                    let pdata = OtapPdata::new_todo_context(records.into());
-                    effect.send_message(pdata).await?;
-                }
-                self.rows_traces = 0;
-                if reason == FlushReason::Size {
-                    self.dirty_traces = false;
-                }
-            } else {
-                let max = requested_split_max(&input, max_val);
-                if let Some(max_nz) = max {
-                    self.metrics.split_requests.inc();
-                    let mut output_batches = match make_output_batches(Some(max_nz), input) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            self.metrics.batching_errors.inc();
-                            log_batching_failed(effect, SIG_TRACES, &e).await;
-                            Vec::new()
-                        }
-                    };
-
-                    let mut rebuffered = false;
-                    if reason == FlushReason::Size && !output_batches.is_empty() {
-                        if let Some(last) = output_batches.last() {
-                            let last_rows = last.batch_length();
-                            if last_rows < max_val {
-                                let remainder = output_batches.pop().expect("last exists");
-                                self.rows_traces = last_rows;
-                                self.current_traces.push(remainder);
-                                rebuffered = true;
-                            }
-                        }
-                    }
-
-                    for records in output_batches {
-                        let pdata = OtapPdata::new_todo_context(records.into());
-                        effect.send_message(pdata).await?;
-                    }
-
-                    if !rebuffered {
-                        self.rows_traces = 0;
-                    }
-                    if reason == FlushReason::Size {
-                        self.dirty_traces = rebuffered;
-                        if !rebuffered {
-                            self.metrics.dirty_cleared_traces.inc();
-                        }
-                    }
-                } else {
-                    // No split requested (safe path)
-                    if input.len() > 1 {
-                        // Coalesce upstream only when there are multiple records to merge
-                        let output_batches = match make_output_batches(None, input) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                self.metrics.batching_errors.inc();
-                                log_batching_failed(effect, SIG_TRACES, &e).await;
-                                Vec::new()
-                            }
-                        };
-                        for records in output_batches {
-                            let pdata = OtapPdata::new_todo_context(records.into());
-                            effect.send_message(pdata).await?;
-                        }
-                    } else {
-                        // Single record: forward as-is
-                        for records in input {
-                            let pdata = OtapPdata::new_todo_context(records.into());
-                            effect.send_message(pdata).await?;
-                        }
-                    }
-                    self.rows_traces = 0;
-                    if reason == FlushReason::Size {
-                        self.dirty_traces = false;
-                        self.metrics.dirty_cleared_traces.inc();
-                    }
-                }
-            }
-        }
         Ok(())
     }
 }
@@ -580,29 +439,20 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                 match ctrl {
                     NodeControlMsg::TimerTick { .. } => {
                         // Flush on timer only when thresholds were crossed and buffers are non-empty (unchanged behavior)
-                        if self.dirty_logs && !self.current_logs.is_empty() {
+                        if !self.signals.logs.pending.is_empty() {
                             self.metrics.timer_flush_performed_logs.inc();
-                            self.flush_logs(effect, FlushReason::Timer).await?;
-                            self.dirty_logs = false;
-                            self.metrics.dirty_cleared_logs.inc();
-                        } else {
-                            self.metrics.timer_flush_skipped_logs.inc();
+                            self.flush_signal_impl(SignalType::Logs, effect, FlushReason::Timer)
+                                .await?;
                         }
-                        if self.dirty_metrics && !self.current_metrics.is_empty() {
+                        if !self.signals.metrics.pending.is_empty() {
                             self.metrics.timer_flush_performed_metrics.inc();
-                            self.flush_metrics(effect, FlushReason::Timer).await?;
-                            self.dirty_metrics = false;
-                            self.metrics.dirty_cleared_metrics.inc();
-                        } else {
-                            self.metrics.timer_flush_skipped_metrics.inc();
+                            self.flush_signal_impl(SignalType::Metrics, effect, FlushReason::Timer)
+                                .await?;
                         }
-                        if self.dirty_traces && !self.current_traces.is_empty() {
+                        if !self.signals.traces.pending.is_empty() {
                             self.metrics.timer_flush_performed_traces.inc();
-                            self.flush_traces(effect, FlushReason::Timer).await?;
-                            self.dirty_traces = false;
-                            self.metrics.dirty_cleared_traces.inc();
-                        } else {
-                            self.metrics.timer_flush_skipped_traces.inc();
+                            self.flush_signal_impl(SignalType::Traces, effect, FlushReason::Timer)
+                                .await?;
                         }
                         Ok(())
                     }
@@ -627,134 +477,18 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                 }
             }
             Message::PData(request) => {
-                let max = self.config.send_batch_max_size;
                 let signal_type = request.signal_type();
 
                 // TODO(#498): Use the context
                 let (_ctx, data) = request.into_parts();
 
                 match OtapArrowRecords::try_from(data) {
-                    Ok(rec) => {
-                        let rows = rec.batch_length();
-                        // Per-signal policy: drop zero-row; pre-flush if exceeding max; append rows; flush on max or send_batch_size.
-                        match &rec {
-                            OtapArrowRecords::Logs(_) => {
-                                if rows == 0 {
-                                    self.metrics.dropped_empty_records.inc();
-                                    effect.info(LOG_MSG_DROP_EMPTY).await;
-                                    Ok(())
-                                } else {
-                                    self.metrics.consumed_items_logs.add(rows as u64);
-                                    // Pre-append: flush if the incoming record would exceed max.
-                                    if max > FOLLOW_SEND_BATCH_SIZE_SENTINEL
-                                        && self.rows_logs + rows > max
-                                    {
-                                        // Would exceed max: mark as threshold-crossed and flush current
-                                        self.metrics.dirty_set_logs.inc();
-                                        self.dirty_logs = true;
-                                        self.flush_logs(effect, FlushReason::Size).await?;
-                                    }
-                                    self.rows_logs += rows;
-                                    self.current_logs.push(rec);
-                                    // Post-append: flush when we hit the boundary exactly (>= max),
-                                    // and also honor send_batch_size as a trigger (0 => immediate).
-                                    if (max > FOLLOW_SEND_BATCH_SIZE_SENTINEL
-                                        && self.rows_logs >= max)
-                                        || matches!(self.config.send_batch_size, Some(s) if self.rows_logs >= s)
-                                        || matches!(self.config.send_batch_size, Some(0))
-                                    {
-                                        // Threshold crossed: mark dirty and flush by size
-                                        self.metrics.dirty_set_logs.inc();
-                                        self.dirty_logs = true;
-                                        self.flush_logs(effect, FlushReason::Size).await
-                                    } else {
-                                        Ok(())
-                                    }
-                                }
-                            }
-                            OtapArrowRecords::Metrics(_) => {
-                                if rows == 0 {
-                                    self.metrics.dropped_empty_records.inc();
-                                    effect.info(LOG_MSG_DROP_EMPTY).await;
-                                    Ok(())
-                                } else {
-                                    self.metrics.consumed_items_metrics.add(rows as u64);
-                                    // Pre-append: flush if the incoming record would exceed max.
-                                    if max > FOLLOW_SEND_BATCH_SIZE_SENTINEL
-                                        && self.rows_metrics + rows > max
-                                    {
-                                        self.metrics.dirty_set_metrics.inc();
-                                        self.dirty_metrics = true;
-                                        self.flush_metrics(effect, FlushReason::Size).await?;
-                                    }
-                                    self.rows_metrics += rows;
-                                    self.current_metrics.push(rec);
-                                    // Post-append: flush on boundary equality (>= max) and
-                                    // honor send_batch_size as a trigger (0 => immediate).
-                                    if (max > FOLLOW_SEND_BATCH_SIZE_SENTINEL
-                                        && self.rows_metrics >= max)
-                                        || matches!(self.config.send_batch_size, Some(s) if self.rows_metrics >= s)
-                                        || matches!(self.config.send_batch_size, Some(0))
-                                    {
-                                        self.metrics.dirty_set_metrics.inc();
-                                        self.dirty_metrics = true;
-                                        self.flush_metrics(effect, FlushReason::Size).await
-                                    } else {
-                                        Ok(())
-                                    }
-                                }
-                            }
-                            OtapArrowRecords::Traces(_) => {
-                                if rows == 0 {
-                                    self.metrics.dropped_empty_records.inc();
-                                    effect.info(LOG_MSG_DROP_EMPTY).await;
-                                    Ok(())
-                                } else {
-                                    self.metrics.consumed_items_traces.add(rows as u64);
-                                    // Pre-append: flush if the incoming record would exceed max.
-                                    if max > FOLLOW_SEND_BATCH_SIZE_SENTINEL
-                                        && self.rows_traces + rows > max
-                                    {
-                                        self.metrics.dirty_set_traces.inc();
-                                        self.dirty_traces = true;
-                                        self.flush_traces(effect, FlushReason::Size).await?;
-                                    }
-                                    self.rows_traces += rows;
-                                    self.current_traces.push(rec);
-                                    // Post-append: flush on boundary equality (>= max) and
-                                    // honor send_batch_size as a trigger (0 => immediate).
-                                    if (max > FOLLOW_SEND_BATCH_SIZE_SENTINEL
-                                        && self.rows_traces >= max)
-                                        || matches!(self.config.send_batch_size, Some(s) if self.rows_traces >= s)
-                                        || matches!(self.config.send_batch_size, Some(0))
-                                    {
-                                        self.metrics.dirty_set_traces.inc();
-                                        self.dirty_traces = true;
-                                        self.flush_traces(effect, FlushReason::Size).await
-                                    } else {
-                                        Ok(())
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    Ok(rec) => self.process_signal_impl(signal_type, effect, rec).await,
                     Err(_) => {
                         // Conversion failed: log and drop (TODO: Nack)
                         self.metrics.dropped_conversion.inc();
-                        match signal_type {
-                            SignalType::Logs => {
-                                effect.info(LOG_MSG_DROP_CONVERSION_FAILED).await;
-                                Ok(())
-                            }
-                            SignalType::Traces => {
-                                effect.info(LOG_MSG_DROP_CONVERSION_FAILED).await;
-                                Ok(())
-                            }
-                            SignalType::Metrics => {
-                                effect.info(LOG_MSG_DROP_CONVERSION_FAILED).await;
-                                Ok(())
-                            }
-                        }
+                        effect.info(LOG_MSG_DROP_CONVERSION_FAILED).await;
+                        Ok(())
                     }
                 }
             }
@@ -784,9 +518,9 @@ mod test_helpers {
     use otel_arrow_rust::proto::opentelemetry::logs::v1::{
         LogRecord, LogsData, ResourceLogs, ScopeLogs, SeverityNumber,
     };
-    use otel_arrow_rust::proto::opentelemetry::metrics::v1::{
-        Gauge, Metric, MetricsData, NumberDataPoint, ResourceMetrics, ScopeMetrics,
-    };
+    // use otel_arrow_rust::proto::opentelemetry::metrics::v1::{
+    //     Gauge, Metric, MetricsData, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+    // };
     use otel_arrow_rust::proto::opentelemetry::resource::v1::Resource;
     use otel_arrow_rust::proto::opentelemetry::trace::v1::status::StatusCode;
     use otel_arrow_rust::proto::opentelemetry::trace::v1::{
@@ -811,25 +545,25 @@ mod test_helpers {
         crate::encoder::encode_spans_otap_batch(&traces).expect("encode traces")
     }
 
-    pub(super) fn one_metric_record() -> OtapArrowRecords {
-        // Minimal metrics: one Gauge with one NumberDataPoint
-        let md = MetricsData::new(vec![
-            ResourceMetrics::build(Resource::default())
-                .scope_metrics(vec![
-                    ScopeMetrics::build(InstrumentationScope::new("lib"))
-                        .metrics(vec![
-                            Metric::build_gauge(
-                                "g",
-                                Gauge::new(vec![NumberDataPoint::build_double(0u64, 1.0).finish()]),
-                            )
-                            .finish(),
-                        ])
-                        .finish(),
-                ])
-                .finish(),
-        ]);
-        crate::encoder::encode_metrics_otap_batch(&md).expect("encode metrics")
-    }
+    // pub(super) fn one_metric_record() -> OtapArrowRecords {
+    //     // Minimal metrics: one Gauge with one NumberDataPoint
+    //     let md = MetricsData::new(vec![
+    //         ResourceMetrics::build(Resource::default())
+    //             .scope_metrics(vec![
+    //                 ScopeMetrics::build(InstrumentationScope::new("lib"))
+    //                     .metrics(vec![
+    //                         Metric::build_gauge(
+    //                             "g",
+    //                             Gauge::new(vec![NumberDataPoint::build_double(0u64, 1.0).finish()]),
+    //                         )
+    //                         .finish(),
+    //                     ])
+    //                     .finish(),
+    //             ])
+    //             .finish(),
+    //     ]);
+    //     crate::encoder::encode_metrics_otap_batch(&md).expect("encode metrics")
+    // }
 
     pub(super) fn logs_record_with_n_entries(n: usize) -> OtapArrowRecords {
         let logs: Vec<LogRecord> = (0..n)
@@ -866,11 +600,12 @@ mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::test_helpers::{
-        from_config, logs_record_with_n_entries, one_metric_record, one_trace_record,
+        from_config,
+        logs_record_with_n_entries,
+        // one_metric_record,
+        one_trace_record,
     };
     use super::*;
-    use super::{Config, OTAP_BATCH_PROCESSOR_URN, OtapBatchProcessor};
-    use crate::otap_batch_processor::metrics::OtapBatchProcessorMetrics;
     use crate::pdata::{OtapPdata, OtlpProtoBytes};
     use otap_df_config::PipelineGroupId;
     use otap_df_config::PipelineId;
@@ -885,7 +620,7 @@ mod tests {
     use otap_df_engine::testing::test_node;
     use otap_df_telemetry::registry::MetricsRegistryHandle;
     use otel_arrow_rust::otap::OtapArrowRecords;
-    use otel_arrow_rust::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+    // use otel_arrow_rust::proto::opentelemetry::arrow::v1::ArrowPayloadType;
     use serde_json::json;
     use std::collections::HashMap;
     use std::collections::HashSet;
@@ -910,7 +645,9 @@ mod tests {
         let mut nuc = NodeUserConfig::with_user_config(
             NodeKind::Processor,
             OTAP_BATCH_PROCESSOR_URN.into(),
-            serde_json::json!({}),
+            serde_json::json!({
+                "batch_send_size": "1000",
+            }),
         );
         let mut dests: HashSet<otap_df_config::NodeId> = HashSet::new();
         let _ = dests.insert("exporter".into());
@@ -1099,20 +836,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_with_metadata_and_max() {
-        let cfg = json!({
-            "send_batch_size": 3,
-            "send_batch_max_size": 5,
-            "timeout": "250ms",
-            "metadata_keys": ["service.name", "telemetry.sdk.name"]
-        });
-        let processor_config = ProcessorConfig::new("otap_batch_test2");
-        let node = test_node(processor_config.name.clone());
-        let result = from_config(node, &cfg, &processor_config);
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn test_timeout_go_style_string() {
         let cfg = json!({
             "send_batch_size": 3,
@@ -1122,34 +845,6 @@ mod tests {
         let node = test_node(processor_config.name.clone());
         let result = from_config(node, &cfg, &processor_config);
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_config_with_cardinality_limit() {
-        let cfg = json!({
-            "send_batch_size": 4,
-            "send_batch_max_size": 10,
-            "timeout": "250ms",
-            "metadata_keys": ["service.name"],
-            "metadata_cardinality_limit": 100
-        });
-        let processor_config = ProcessorConfig::new("otap_batch_test_card");
-        let node = test_node(processor_config.name.clone());
-        let res = from_config(node, &cfg, &processor_config);
-        assert!(res.is_ok());
-        // Ensure deserialization keeps the value
-        let mut parsed: Config = serde_json::from_value(cfg).unwrap();
-        assert_eq!(parsed.metadata_cardinality_limit, Some(100));
-        // Normalize zero to one
-        parsed.metadata_cardinality_limit = Some(0);
-        // Simulate normalization by re-running from_config path
-        let cfg2 = serde_json::json!({
-            "metadata_cardinality_limit": 0
-        });
-        let proc_cfg = ProcessorConfig::new("norm");
-        let node = test_node(proc_cfg.name.clone());
-        let wrapper_res = from_config(node, &cfg2, &proc_cfg);
-        assert!(wrapper_res.is_ok());
     }
 
     #[test]
@@ -1286,10 +981,11 @@ mod tests {
         validation.validate(|_vctx| async move {});
     }
     #[test]
-    fn test_max_zero_means_unlimited_and_missing_ok() {
+    fn test_max_unset_ok() {
+        // Null means unlimited
         let cfg = json!({
             "send_batch_size": 7,
-            "send_batch_max_size": 0,
+            "send_batch_max_size": Value::Null,
             "timeout": "200ms"
         });
         let proc_cfg = ProcessorConfig::new("norm-max");
@@ -1297,13 +993,13 @@ mod tests {
         let res = from_config(node.clone(), &cfg, &proc_cfg);
         assert!(res.is_ok());
 
-        // Missing max -> defaults to unlimited (0)
-        let cfg2 = json!({
+        // Missing max means unlimited
+        let cfg = json!({
             "send_batch_size": 9,
             "timeout": "200ms"
         });
-        let res2 = from_config(node, &cfg2, &proc_cfg);
-        assert!(res2.is_ok());
+        let res = from_config(node, &cfg, &proc_cfg);
+        assert!(res.is_ok());
     }
 
     #[test]
@@ -1423,57 +1119,6 @@ mod tests {
         });
 
         validation.validate(|_vctx| async move {});
-    }
-
-    // Test constants for batching smoke tests
-    #[test]
-    #[ignore = "upstream-batching-bug"]
-    // NOTE: Validates cross-signal partitioning and expected row totals.
-    fn test_make_output_batches_partitions_and_splits() {
-        // Build mixed input: 3 traces (1 row each), 2 metrics (1 dp each), interleaved
-        let input = vec![
-            one_trace_record(),
-            one_metric_record(),
-            one_trace_record(),
-            one_metric_record(),
-            one_trace_record(),
-        ];
-
-        // Request no split to validate partitioning only
-        let outputs = make_output_batches(None, input).expect("batching ok");
-
-        // Expect 2 outputs: one metrics (2 rows), one traces (3 rows)
-        let mut metrics_batches = 0usize;
-        let mut traces_batches = 0usize;
-        let mut total_metrics_rows = 0usize;
-        let mut total_traces_rows = 0usize;
-
-        for out in &outputs {
-            match out {
-                OtapArrowRecords::Metrics(_) => {
-                    metrics_batches += 1;
-                    let rb = out
-                        .get(ArrowPayloadType::UnivariateMetrics)
-                        .expect("metrics rb");
-                    assert!(rb.num_rows() > 0, "metrics batch must be non-empty");
-                    total_metrics_rows += rb.num_rows();
-                }
-                OtapArrowRecords::Traces(_) => {
-                    traces_batches += 1;
-                    let rb = out.get(ArrowPayloadType::Spans).expect("spans rb");
-                    assert!(rb.num_rows() > 0, "traces batch must be non-empty");
-                    total_traces_rows += rb.num_rows();
-                }
-                OtapArrowRecords::Logs(_) => {
-                    panic!("unexpected logs batch in outputs");
-                }
-            }
-        }
-
-        assert_eq!(metrics_batches, 1, "expected one metrics output");
-        assert_eq!(traces_batches, 1, "expected one traces output");
-        assert_eq!(total_metrics_rows, 2, "expected two metric rows total");
-        assert_eq!(total_traces_rows, 3, "expected three trace rows total");
     }
 
     // TODO: Add a positive-path test that simulates a size-triggered split leaving

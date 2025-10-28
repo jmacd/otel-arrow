@@ -9,6 +9,7 @@
 use crate::NodeId;
 use crate::error::Error;
 use crate::node::NodeKind;
+use otel_arrow_rust::otap::OtapArrowRecordTag;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -51,6 +52,17 @@ pub enum SignalType {
     Metrics,
     /// Signal representing a stream of logs.
     Logs,
+}
+
+impl SignalType {
+    /// TODO This return type below will become this type, this is a bridge.
+    pub fn to_record_tag(self) -> OtapArrowRecordTag {
+        match self {
+            Self::Logs => OtapArrowRecordTag::Logs,
+            Self::Metrics => OtapArrowRecordTag::Metrics,
+            Self::Traces => OtapArrowRecordTag::Traces,
+        }
+    }
 }
 
 /// A node in the pipeline

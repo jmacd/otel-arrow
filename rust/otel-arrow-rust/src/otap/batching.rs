@@ -5,41 +5,37 @@
 //!
 //!
 
-use super::{OtapArrowRecords, error::Result, groups::RecordsGroup};
+use super::{OtapArrowRecordTag, OtapArrowRecords, error::Result, groups::RecordsGroup};
 use std::num::NonZeroU64;
 
 /// merge and combine batches to the appropriate size
+/// error if not the same signal type.
 pub fn make_output_batches(
-    max_output_batch: Option<NonZeroU64>,
+    signal: OtapArrowRecordTag,
     records: Vec<OtapArrowRecords>,
+    max_size: Option<NonZeroU64>,
 ) -> Result<Vec<OtapArrowRecords>> {
-    // We have to deal with three complications here:
+    // We have to deal with two complications here:
     // * batches that are too small
     // * batches that are too big
-    // * cases where we have different types (logs/metrics/traces) intermingled
+    // We presume batches are a single type at this level.
+    // We do not specify sort order.
+    // Note otap_batch_processor does this.
 
-    // We deal with the last issue first, by splitting the input into three lists of the appropriate
-    // types.
-    let [mut logs, mut metrics, mut traces] = RecordsGroup::split_by_type(records);
-
-    if let Some(max_output_batch) = max_output_batch {
-        logs = logs.split(max_output_batch)?;
-        metrics = metrics.split(max_output_batch)?;
-        traces = traces.split(max_output_batch)?;
+    for r in records.iter() {
+        println!("batch input {}", r.batch_length());
     }
-    logs = logs.concatenate(max_output_batch)?;
-    metrics = metrics.concatenate(max_output_batch)?;
-    traces = traces.concatenate(max_output_batch)?;
 
-    let mut result = Vec::new();
-    result.extend(logs.into_otap_arrow_records());
-    result.extend(metrics.into_otap_arrow_records());
-    result.extend(traces.into_otap_arrow_records());
+    let mut records = match signal {
+        OtapArrowRecordTag::Logs => RecordsGroup::separate_logs(records),
+        OtapArrowRecordTag::Metrics => RecordsGroup::separate_metrics(records),
+        OtapArrowRecordTag::Traces => RecordsGroup::separate_traces(records),
+    }?;
 
-    // By splitting into 3 different lists, we've probably scrambled the ordering. We can't really
-    // fix that problem in a general sense because each `OtapArrowRecords` will contain many rows ot
-    // different times, but we can improve matters slightly by sorting on the smallest record time.
+    if let Some(limit) = max_size {
+        records = records.split(limit)?;
+    }
+    records = records.concatenate(max_size)?;
 
-    // FIXME: sort here
-    Ok(result)
+    Ok(records.into_otap_arrow_records())
 }

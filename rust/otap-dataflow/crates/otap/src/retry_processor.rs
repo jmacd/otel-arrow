@@ -35,9 +35,11 @@ use otap_df_telemetry::instrument::Counter;
 use otap_df_telemetry::metrics::MetricSet;
 use otap_df_telemetry_macros::metric_set;
 use serde::{Deserialize, Serialize};
-use serde_with::{DurationSecondsWithFrac, formats::Flexible, serde_as};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+
+// TODO: Switch Duration parsing to serde_humantime like in the batch processor.
+use serde_with::{DurationSecondsWithFrac, formats::Flexible, serde_as};
 
 /// URN for the RetryProcessor processor
 pub const RETRY_PROCESSOR_URN: &str = "urn:otel:retry:processor";

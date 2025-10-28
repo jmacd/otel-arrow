@@ -38,8 +38,9 @@ pub enum OtapArrowRecords {
     Traces(Traces),
 }
 
+/// Same as / TODO: merge with otap-dataflow SignalType
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum OtapArrowRecordTag {
+pub enum OtapArrowRecordTag {
     /// Logs data
     Logs,
     /// Metrics data
@@ -94,6 +95,8 @@ impl OtapArrowRecords {
     }
 
     /// Fetch the number of items as defined by the batching system
+    /// TODO: rename this num_items(); also, the second match inside
+    /// batch_length() appears unnecessary from this perspective.
     #[must_use]
     pub fn batch_length(&self) -> usize {
         match self {
