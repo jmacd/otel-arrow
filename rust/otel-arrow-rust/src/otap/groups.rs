@@ -276,31 +276,40 @@ fn generic_split<const N: usize>(
         #[allow(clippy::needless_range_loop)]
         for i in 0..N {
             if let Some(rb) = std::mem::take(&mut batches[i]) {
+                println!("schema is {:?}", rb.schema());
                 let rb = sort_record_batch(rb, HowToSort::SortByParentIdAndId)?;
                 batches[i] = Some(rb);
             }
         }
     }
 
+    println!("OK ready to split primary");
+
     // Next, split the primary table
     let primary_offset = POSITION_LOOKUP[primary_payload as usize];
-    let mut result = Vec::with_capacity(
-        batches
-            .iter()
-            .map(batch_length)
-            .map(|l| l as u64)
-            .sum::<u64>()
-            .div_ceil(max_size.get()) as usize,
-    );
+    let input_count = batches
+        .iter()
+        .map(batch_length)
+        .map(|l| l as u64)
+        .sum::<u64>();
+
+    let mut result = Vec::with_capacity(input_count.div_ceil(max_size.get()) as usize);
     // SAFETY: on 32-bit archs, `as` conversion from u64 to usize can be wrong for values >=
     // u32::MAX, but we don't care about those cases because if they happen we'll only fail to avoid
     // a reallocation.
+    println!(
+        "batch count {}: {}: {}",
+        result.capacity(),
+        input_count,
+        max_size
+    );
 
     let splits = if N == Metrics::COUNT {
         split_metric_batches(max_size, &batches)?
     } else {
         split_non_metric_batches(max_size, &batches)?
     };
+    println!("splits.len {}", splits.len());
     let groups = splits.into_iter().chunk_by(|(batch_index, _)| *batch_index);
     let mut splits = Vec::new();
     let mut lengths = Vec::new();
@@ -815,6 +824,11 @@ fn sort_record_batch(rb: RecordBatch, how: HowToSort) -> Result<RecordBatch> {
         .column_with_name(consts::PARENT_ID)
         .map(|pair| pair.0);
 
+    println!(
+        "HERE {:?} {:?} {:?}",
+        id_column_index, parent_id_column_index, schema
+    );
+
     use arrow::compute::{SortColumn, SortOptions, take};
     let options = Some(SortOptions {
         descending: false,
@@ -844,25 +858,35 @@ fn sort_record_batch(rb: RecordBatch, how: HowToSort) -> Result<RecordBatch> {
                     options,
                 }]
             }
+            (_, None, None) => {
+                smallvec::smallvec![]
+            }
             (_, b, c) => {
                 panic!("confused at {b:?} {c:?}");
             }
         };
 
-    // safety: [`sort_to_indices`] will only return an error if the passed columns aren't supported
-    // by either row converter or arrow's sort kernel, both of which should be OK for Id columns.
-    let indices = sort_to_indices(&sort_columns).expect("can sort IDs");
-    let input_was_already_sorted = indices.values().is_sorted();
-    let columns = if input_was_already_sorted {
-        // Don't bother with take if the input was already sorted as we need.
+    println!("OK so far");
+
+    let columns = if sort_columns.is_empty() {
         columns
     } else {
-        columns
-            .iter()
-            .map(|c| take(c.as_ref(), &indices, None))
-            .collect::<arrow::error::Result<Vec<_>>>()
-            .context(error::BatchingSnafu)?
+        // safety: [`sort_to_indices`] will only return an error if the passed columns aren't supported
+        // by either row converter or arrow's sort kernel, both of which should be OK for Id columns.
+        let indices = sort_to_indices(&sort_columns).expect("can sort IDs");
+        let input_was_already_sorted = indices.values().is_sorted();
+        if input_was_already_sorted {
+            // Don't bother with take if the input was already sorted as we need.
+            columns
+        } else {
+            columns
+                .iter()
+                .map(|c| take(c.as_ref(), &indices, None))
+                .collect::<arrow::error::Result<Vec<_>>>()
+                .context(error::BatchingSnafu)?
+        }
     };
+    println!("and done?");
 
     RecordBatch::try_new(schema, columns).context(error::BatchingSnafu)
 }
