@@ -54,7 +54,7 @@ pub enum RecordsGroup {
 impl RecordsGroup {
     /// Convert a sequence of `OtapArrowRecords` into three `RecordsGroup` objects
     #[must_use]
-    fn separate_by_type(records: Vec<OtapArrowRecords>) -> [Self; 3] {
+    pub fn separate_by_type(records: Vec<OtapArrowRecords>) -> [Self; 3] {
         let log_count = tag_count(&records, OtapArrowRecordTag::Logs);
         let mut log_records = Vec::with_capacity(log_count);
 
@@ -297,11 +297,12 @@ fn generic_split<const N: usize>(
     // SAFETY: on 32-bit archs, `as` conversion from u64 to usize can be wrong for values >=
     // u32::MAX, but we don't care about those cases because if they happen we'll only fail to avoid
     // a reallocation.
-    println!(
-        "batch count {}: {}: {}",
-        result.capacity(),
+    eprintln!(
+        "  Split planning: {} input batches, total_count={}, max_size={}, capacity={}",
+        batches.len(),
         input_count,
-        max_size
+        max_size,
+        result.capacity()
     );
 
     let splits = if N == Metrics::COUNT {
@@ -309,7 +310,10 @@ fn generic_split<const N: usize>(
     } else {
         split_non_metric_batches(max_size, &batches)?
     };
-    println!("splits.len {}", splits.len());
+    eprintln!("  Split returned {} ranges:", splits.len());
+    for (idx, (batch_index, range)) in splits.iter().enumerate() {
+        eprintln!("    Range[{}]: batch[{}] rows {}..{}", idx, batch_index, range.start, range.end);
+    }
     let groups = splits.into_iter().chunk_by(|(batch_index, _)| *batch_index);
     let mut splits = Vec::new();
     let mut lengths = Vec::new();
@@ -335,7 +339,10 @@ fn generic_split<const N: usize>(
                 original_length,
                 split_primary.iter().map(|rb| rb.num_rows()).sum::<usize>()
             );
-            let ids = IDSeqs::from_col(IDColumn::extract(&rb, consts::ID)?, &lengths);
+            let ids = match IDColumn::extract(&rb, consts::ID)? {
+                Some(id_col) => IDSeqs::from_col(id_col, &lengths),
+                None => IDSeqs::from_row_indices(&lengths),
+            };
 
             // use ids to split the child tables: call split_child_record_batch
             let new_batch_count = split_primary.len();
@@ -365,9 +372,9 @@ fn generic_split<const N: usize>(
         assert_eq!(batches, &[const { None }; N]);
     }
 
-    println!("num batches after split {}", result.len());
-    for batch in &result {
-        println!("split batch size {}", batch_length(batch));
+    eprintln!("=== Split complete: {} output batches ===", result.len());
+    for (idx, batch) in result.iter().enumerate() {
+        eprintln!("  Split batch[{}]: batch_length={}", idx, batch_length(batch));
     }
 
     Ok(result)
@@ -427,13 +434,13 @@ enum IDColumn<'rb> {
 }
 
 impl<'rb> IDColumn<'rb> {
-    fn extract(input: &'rb RecordBatch, column_name: &'static str) -> Result<IDColumn<'rb>> {
-        use snafu::OptionExt;
-        let id = input
-            .column_by_name(column_name)
-            .context(error::ColumnNotFoundSnafu { name: column_name })?;
+    fn extract(input: &'rb RecordBatch, column_name: &'static str) -> Result<Option<IDColumn<'rb>>> {
+        let id = match input.column_by_name(column_name) {
+            Some(col) => col,
+            None => return Ok(None),
+        };
 
-        Self::from_array(column_name, id)
+        Self::from_array(column_name, id).map(Some)
     }
 
     fn from_array(column_name: &'static str, id: &'rb dyn Array) -> Result<IDColumn<'rb>> {
@@ -479,6 +486,42 @@ impl IDSeqs {
         match ids {
             IDColumn::U16(array) => Self::from_generic_array(array, lengths),
             IDColumn::U32(array) => Self::from_generic_array(array, lengths),
+        }
+    }
+
+    /// Generate implicit ID ranges from row indices when ID column is missing.
+    /// This is used for logs batches where the ID column is optional and omitted
+    /// when no log attributes exist.
+    fn from_row_indices(lengths: &[usize]) -> Self {
+        let total_rows: usize = lengths.iter().sum();
+        
+        // Use u16 if total rows fit, otherwise u32
+        if total_rows <= u16::MAX as usize {
+            let mut ranges = Vec::with_capacity(lengths.len());
+            let mut start: u16 = 0;
+            for &length in lengths {
+                if length > 0 {
+                    let end = start + length as u16 - 1;
+                    ranges.push(Some(start..=end));
+                    start = end + 1;
+                } else {
+                    ranges.push(None);
+                }
+            }
+            Self::RangeU16(ranges)
+        } else {
+            let mut ranges = Vec::with_capacity(lengths.len());
+            let mut start: u32 = 0;
+            for &length in lengths {
+                if length > 0 {
+                    let end = start + length as u32 - 1;
+                    ranges.push(Some(start..=end));
+                    start = end + 1;
+                } else {
+                    ranges.push(None);
+                }
+            }
+            Self::RangeU32(ranges)
         }
     }
 
@@ -558,6 +601,15 @@ impl IDSeqs {
             .map(|rb| IDColumn::extract(rb, column_name))
             .collect();
         let ids = ids?;
+        
+        // Check if all IDs are None (missing column case) 
+        if ids.iter().all(|id| id.is_none()) {
+            // Use row indices as implicit IDs
+            return Ok(Self::from_row_indices(&lengths));
+        }
+        
+        // Unwrap all the Some values - they should all be Some at this point
+        let ids: Vec<IDColumn<'_>> = ids.into_iter().map(|id| id.expect("checked above")).collect();
         let concatenated_array = match ids.first().expect("there should be at least one input") {
             IDColumn::U16(_) => {
                 let mut refs = Vec::with_capacity(lengths.len());
@@ -591,7 +643,8 @@ impl IDSeqs {
     }
 
     fn split_child_record_batch(&self, input: &RecordBatch) -> Result<Vec<Option<RecordBatch>>> {
-        let id = IDColumn::extract(input, consts::PARENT_ID)?;
+        let id = IDColumn::extract(input, consts::PARENT_ID)?
+            .expect("PARENT_ID should always be present in child tables");
         Ok(match (self, id) {
             (IDSeqs::RangeU16(id_ranges), IDColumn::U16(parent_ids)) => {
                 Self::generic_split_child_record_batch(id_ranges, parent_ids, input)
@@ -739,11 +792,10 @@ fn split_metric_batches<const N: usize>(
 
         let batch_len = batch_length(batches);
         if batch_len <= batch_size {
-            // We know that this batch is too small to split, so don't bother computing
-            // `cumulative_child_counts`.
+            // We know that this batch is too small to split, pass it through as-is
+            result.push((batch_index, 0..metric_length));
             batch_size -= batch_len;
             if batch_size == 0 {
-                result.push((batch_index, 0..metric_length));
                 batch_size = max_size;
             }
         } else {
@@ -851,6 +903,14 @@ fn sort_record_batch(rb: RecordBatch, how: HowToSort) -> Result<RecordBatch> {
                     },
                 ]
             }
+            (SortById, Some(_parent_id), Some(id)) => {
+                // When sorting by ID only, prefer the id column  
+                let id_values = columns[id].clone();
+                smallvec::smallvec![SortColumn {
+                    values: id_values,
+                    options,
+                }]
+            }
             (_, None, Some(id)) => {
                 let id_values = columns[id].clone();
                 smallvec::smallvec![SortColumn {
@@ -858,11 +918,16 @@ fn sort_record_batch(rb: RecordBatch, how: HowToSort) -> Result<RecordBatch> {
                     options,
                 }]
             }
+            (_, Some(parent_id), None) => {
+                // Metrics datapoint tables have parent_id but no id
+                let parent_id_values = columns[parent_id].clone();
+                smallvec::smallvec![SortColumn {
+                    values: parent_id_values,
+                    options,
+                }]
+            }
             (_, None, None) => {
                 smallvec::smallvec![]
-            }
-            (_, b, c) => {
-                panic!("confused at {b:?} {c:?}");
             }
         };
 
@@ -903,11 +968,17 @@ fn generic_concatenate<const N: usize>(
 
     let mut current = Vec::new();
     let mut current_batch_length = 0;
-    println!("have batches {}", batches.len());
+    eprintln!("\n=== generic_concatenate: {} input batches (array size: {}) ===", batches.len(), N);
 
-    for batch in batches {
+    for (idx, batch) in batches.into_iter().enumerate() {
         let size = batch_length(&batch);
-        println!("batch size {}", size);
+        eprintln!("  Input batch[{}]: batch_length={}", idx, size);
+        // Show which positions have data
+        for (pos, rb) in batch.iter().enumerate() {
+            if let Some(rb) = rb {
+                eprintln!("    Position[{}]: {} rows", pos, rb.num_rows());
+            }
+        }
         current_batch_length += size;
         current.push(batch);
 
@@ -915,7 +986,7 @@ fn generic_concatenate<const N: usize>(
             .map(|max_size| current_batch_length as u64 >= max_size.get())
             .unwrap_or(false);
         if emit_new_batch {
-            println!("emit case");
+            eprintln!("  → Emit: accumulated_length={} >= max_size={:?}", current_batch_length, max_size);
             reindex(&mut current, allowed_payloads)?;
             result.push(generic_schemaless_concatenate(&mut current)?);
             current_batch_length = 0;
@@ -924,12 +995,12 @@ fn generic_concatenate<const N: usize>(
             }
             current.clear();
         } else {
-            println!("push case");
+            eprintln!("  → Accumulate: total_length={}", current_batch_length);
         }
     }
 
     if !current.is_empty() {
-        println!("leftover case");
+        eprintln!("  → Leftover: {} batches with total_length={}", current.len(), current_batch_length);
 
         reindex(&mut current, allowed_payloads)?;
         result.push(generic_schemaless_concatenate(&mut current)?);
@@ -937,10 +1008,16 @@ fn generic_concatenate<const N: usize>(
             assert_eq!(batches, &[const { None }; N]);
         }
     }
-    println!("num batches after concatenate {}", result.len());
+    eprintln!("=== Concatenation complete: {} output batches ===", result.len());
 
-    for batch in &result {
-        println!("concat batch size {}", batch_length(batch));
+    for (idx, batch) in result.iter().enumerate() {
+        let len = batch_length(batch);
+        eprintln!("  Output batch[{}]: batch_length={}", idx, len);
+        for (pos, rb) in batch.iter().enumerate() {
+            if let Some(rb) = rb {
+                eprintln!("    Position[{}]: {} rows", pos, rb.num_rows());
+            }
+        }
     }
 
     Ok(result)
@@ -949,7 +1026,7 @@ fn generic_concatenate<const N: usize>(
 fn generic_schemaless_concatenate<const N: usize>(
     batches: &mut [[Option<RecordBatch>; N]],
 ) -> Result<[Option<RecordBatch>; N]> {
-    println!("generic: {} ({})", batches.len(), N);
+    eprintln!("  → Schemaless concat: {} input batch arrays (size={})", batches.len(), N);
     unify(batches)?;
     let mut result = [const { None }; N];
     for i in 0..N {
@@ -961,7 +1038,8 @@ fn generic_schemaless_concatenate<const N: usize>(
             );
 
             let num_rows = select(batches, i).map(RecordBatch::num_rows).sum();
-            println!("num_rows schemaless {num_rows}");
+            let input_count = select(batches, i).count();
+            eprintln!("    Position[{}]: concatenating {} batches → {} total rows", i, input_count, num_rows);
             let mut batcher = arrow::compute::BatchCoalescer::new(schema.clone(), num_rows);
             for row in batches.iter_mut() {
                 if let Some(rb) = row[i].take() {
@@ -1007,29 +1085,27 @@ fn reindex<const N: usize>(
     batches: &mut [[Option<RecordBatch>; N]],
     allowed_payloads: &[ArrowPayloadType],
 ) -> Result<()> {
-    println!("reindex with {} inputs", batches.len());
-    for batch in batches.iter() {
-        println!("reindex in {}", batch_length(batch));
+    eprintln!("  → Reindexing {} batch arrays", batches.len());
+    for (idx, batch) in batches.iter().enumerate() {
+        eprintln!("    Batch[{}]: batch_length={}", idx, batch_length(batch));
     }
     let mut starting_ids: [u32; N] = [0; N];
     for payload in allowed_payloads {
         let child_payloads = child_payload_types(*payload);
         if !child_payloads.is_empty() {
-            println!("here reindex {}", batches.len());
             for batches in batches.iter_mut() {
                 let parent_offset = POSITION_LOOKUP[*payload as usize];
                 let parent = batches[parent_offset].take();
-                println!("here OK");
                 if let Some(mut parent) = parent {
-                    println!("meyybe");
                     let parent_starting_offset = starting_ids[parent_offset];
 
                     // When `parent` has both ID and PARENT_ID columns, resort by ID. Why? Because
                     // the reindexing code requires that the input be sorted. For all these cases,
                     // we've already reindexed by PARENT_ID in an earlier iteration of this loop.
-                    if parent.column_by_name(consts::PARENT_ID).is_some()
-                        && parent.column_by_name(consts::ID).is_some()
-                    {
+                    let has_parent_id = parent.column_by_name(consts::PARENT_ID).is_some();
+                    let has_id = parent.column_by_name(consts::ID).is_some();
+                    if has_parent_id && has_id {
+                        eprintln!("      Sorting position[{}] by ID (has both ID and PARENT_ID)", parent_offset);
                         parent = sort_record_batch(parent, HowToSort::SortById)?;
                     }
 
@@ -1069,7 +1145,13 @@ fn reindex_record_batch(
     column_name: &'static str,
     mut next_starting_id: u32,
 ) -> Result<(RecordBatch, u32)> {
-    let id = IDColumn::extract(&rb, column_name)?;
+    let id = match IDColumn::extract(&rb, column_name)? {
+        Some(id) => id,
+        None => {
+            // No ID column to reindex, return as-is
+            return Ok((rb, next_starting_id));
+        }
+    };
 
     let maybe_new_ids = match id {
         IDColumn::U16(array) => IDRange::<u16>::reindex_column(array, next_starting_id)?,
@@ -3102,7 +3184,7 @@ mod test {
 
     #[test]
     fn test_simple_split_logs() {
-        let [logs, _, _] = RecordsGroup::split_by_type(vec![make_logs()]);
+        let [logs, _, _] = RecordsGroup::separate_by_type(vec![make_logs()]);
         let original_logs = logs.clone();
         let split = logs.split(NonZeroU64::new(2).unwrap()).unwrap();
         assert_eq!(split.len(), 2);
@@ -3110,7 +3192,7 @@ mod test {
         assert_eq!(a.batch_length(), 2);
         assert_eq!(b.batch_length(), 1);
 
-        let [logs, _, _] = RecordsGroup::split_by_type(vec![a, b]);
+        let [logs, _, _] = RecordsGroup::separate_by_type(vec![a, b]);
         let logs2 = logs.clone();
         let merged = logs.concatenate(Some(NonZeroU64::new(4).unwrap())).unwrap();
         let merged2 = logs2.concatenate(None).unwrap();
@@ -3175,7 +3257,7 @@ mod test {
     #[test]
     fn test_simple_split_traces() {
         let input = make_traces();
-        let [_, _, traces] = RecordsGroup::split_by_type(vec![make_traces().clone()]);
+        let [_, _, traces] = RecordsGroup::separate_by_type(vec![make_traces().clone()]);
         let split = traces.split(NonZeroU64::new(2).unwrap()).unwrap();
 
         let otap_batches = match split {
@@ -3270,7 +3352,7 @@ mod test {
     // underflow when calculating the splits.
     #[test]
     fn test_simple_split_metrics() {
-        let [_, metrics, _] = RecordsGroup::split_by_type(vec![make_metrics()]);
+        let [_, metrics, _] = RecordsGroup::separate_by_type(vec![make_metrics()]);
 
         let split = metrics.split(NonZeroU64::new(2).unwrap()).unwrap();
         assert_eq!(
