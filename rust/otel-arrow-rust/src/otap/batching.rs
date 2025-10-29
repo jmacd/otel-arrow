@@ -18,13 +18,9 @@ pub fn make_output_batches(
     // We have to deal with two complications here:
     // * batches that are too small
     // * batches that are too big
-    // We presume batches are a single type at this level.
+    // We presume batches are a single type at this level, note
+    // that otap_batch_processor separates the signals itself.
     // We do not specify sort order.
-    // Note otap_batch_processor does this.
-
-    for r in records.iter() {
-        println!("batch input {}", r.batch_length());
-    }
 
     let mut records = match signal {
         OtapArrowRecordTag::Logs => RecordsGroup::separate_logs(records),

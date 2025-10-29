@@ -333,8 +333,10 @@ impl OtapBatchProcessor {
             SignalType::Traces => &mut self.signals.traces,
         };
 
-        eprintln!("\n=== Flushing {:?}: reason={:?}, items={} ===", signal, reason, buffer.items);
-        let total_items = buffer.items;
+        eprintln!(
+            "\n=== Flushing {:?}: reason={:?}, items={} ===",
+            signal, reason, buffer.items
+        );
         buffer.items = 0;
 
         let input = std::mem::take(&mut buffer.pending);
@@ -355,7 +357,10 @@ impl OtapBatchProcessor {
 
         if let Some(upper_limit) = self.config.send_batch_max_size {
             self.metrics.split_requests.inc();
-            eprintln!("  Calling make_output_batches with upper_limit={}", upper_limit);
+            eprintln!(
+                "  Calling make_output_batches with upper_limit={}",
+                upper_limit
+            );
             let mut output_batches = match make_output_batches(
                 signal.to_record_tag(),
                 input,
@@ -371,7 +376,10 @@ impl OtapBatchProcessor {
                 }
             };
 
-            eprintln!("  make_output_batches returned {} batches", output_batches.len());
+            eprintln!(
+                "  make_output_batches returned {} batches",
+                output_batches.len()
+            );
             for (idx, batch) in output_batches.iter().enumerate() {
                 eprintln!("    Output[{}]: batch_length={}", idx, batch.batch_length());
             }
@@ -381,7 +389,10 @@ impl OtapBatchProcessor {
             if reason == FlushReason::Size && !output_batches.is_empty() {
                 if let Some(last_items) = output_batches.last().map(|last| last.batch_length()) {
                     let threshold = self.lower_limit.get();
-                    eprintln!("  Checking rebuffer: last_items={} vs threshold={}", last_items, threshold);
+                    eprintln!(
+                        "  Checking rebuffer: last_items={} vs threshold={}",
+                        last_items, threshold
+                    );
                     if last_items < threshold {
                         eprintln!("  → Rebuffering last batch: {} < {}", last_items, threshold);
                         let remainder = output_batches.pop().expect("last exists");
@@ -462,8 +473,12 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                         if !self.signals.logs.pending.is_empty() {
                             if self.signals.logs.items >= self.lower_limit.get() {
                                 self.metrics.timer_flush_performed_logs.inc();
-                                self.flush_signal_impl(SignalType::Logs, effect, FlushReason::Timer)
-                                    .await?;
+                                self.flush_signal_impl(
+                                    SignalType::Logs,
+                                    effect,
+                                    FlushReason::Timer,
+                                )
+                                .await?;
                             } else {
                                 self.metrics.timer_flush_skipped_logs.inc();
                             }
@@ -471,8 +486,12 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                         if !self.signals.metrics.pending.is_empty() {
                             if self.signals.metrics.items >= self.lower_limit.get() {
                                 self.metrics.timer_flush_performed_metrics.inc();
-                                self.flush_signal_impl(SignalType::Metrics, effect, FlushReason::Timer)
-                                    .await?;
+                                self.flush_signal_impl(
+                                    SignalType::Metrics,
+                                    effect,
+                                    FlushReason::Timer,
+                                )
+                                .await?;
                             } else {
                                 self.metrics.timer_flush_skipped_metrics.inc();
                             }
@@ -480,8 +499,12 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                         if !self.signals.traces.pending.is_empty() {
                             if self.signals.traces.items >= self.lower_limit.get() {
                                 self.metrics.timer_flush_performed_traces.inc();
-                                self.flush_signal_impl(SignalType::Traces, effect, FlushReason::Timer)
-                                    .await?;
+                                self.flush_signal_impl(
+                                    SignalType::Traces,
+                                    effect,
+                                    FlushReason::Timer,
+                                )
+                                .await?;
                             } else {
                                 self.metrics.timer_flush_skipped_traces.inc();
                             }
@@ -632,10 +655,7 @@ mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::test_helpers::{
-        from_config,
-        logs_record_with_n_entries,
-        one_metric_record,
-        one_trace_record,
+        from_config, logs_record_with_n_entries, one_metric_record, one_trace_record,
     };
     use super::*;
     use crate::pdata::{OtapPdata, OtlpProtoBytes};
@@ -1239,15 +1259,15 @@ mod tests {
             ctx.process(Message::PData(pdata1))
                 .await
                 .expect("process metric 1");
-            
+
             let pdata2 = OtapPdata::new_default(one_metric_record().into());
             ctx.process(Message::PData(pdata2))
                 .await
                 .expect("process metric 2");
-            
+
             let emitted = ctx.drain_pdata().await;
             assert_eq!(emitted.len(), 1, "metrics should flush at threshold");
-            
+
             // Verify the batched output is metrics
             let first = emitted.into_iter().next().unwrap().payload();
             let first_rec: OtapArrowRecords = first.try_into().unwrap();
