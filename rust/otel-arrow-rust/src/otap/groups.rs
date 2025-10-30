@@ -886,45 +886,53 @@ fn sort_record_batch(rb: RecordBatch, how: HowToSort) -> Result<RecordBatch> {
 
 // Code for merging batches (concatenation)
 // *************************************************************************************************
+#[derive(Default)]
+struct Concat<const N: usize> {
+    output: Vec<[Option<RecordBatch>; N]>,
+    accum: Vec<[Option<RecordBatch>; N]>,
+    size: usize,
+}
 
 fn generic_concatenate<const N: usize>(
     batches: Vec<[Option<RecordBatch>; N]>,
     allowed_payloads: &[ArrowPayloadType],
     max_output_batch: Option<NonZeroU64>,
 ) -> Result<Vec<[Option<RecordBatch>; N]>> {
-    let mut result = Vec::new();
-
-    let mut current = Vec::new();
-    let mut current_batch_length = 0;
+    let mut concat = Concat::default();
 
     for batch in batches.into_iter() {
         let size = batch_length(&batch);
-        current_batch_length += size;
-        current.push(batch);
 
-        let emit_new_batch = max_output_batch
-            .map(|max_output_batch| current_batch_length as u64 >= max_output_batch.get())
-            .unwrap_or(false);
-        if emit_new_batch {
-            reindex(&mut current, allowed_payloads)?;
-            result.push(generic_schemaless_concatenate(&mut current)?);
-            current_batch_length = 0;
-            for batch in current.iter() {
-                assert_eq!(batch, &[const { None }; N]);
-            }
-            current.clear();
+        concat.size += size;
+        concat.accum.push(batch);
+
+        if max_output_batch.map_or(false, |max_output_batch| {
+            concat.size as u64 >= max_output_batch.get()
+        }) {
+            concat.emit(allowed_payloads)?;
         }
     }
 
-    if !current.is_empty() {
-        reindex(&mut current, allowed_payloads)?;
-        result.push(generic_schemaless_concatenate(&mut current)?);
-        for batches in current.iter() {
-            assert_eq!(batches, &[const { None }; N]);
-        }
-    }
+    concat.emit(allowed_payloads)?;
 
-    Ok(result)
+    Ok(concat.output)
+}
+
+impl<const N: usize> Concat<N> {
+    fn emit(&mut self, allowed_payloads: &[ArrowPayloadType]) -> Result<()> {
+        if self.accum.is_empty() {
+            return Ok(());
+        }
+        reindex(&mut self.accum, allowed_payloads)?;
+        self.output
+            .push(generic_schemaless_concatenate(&mut self.accum)?);
+        for batch in self.accum.iter() {
+            assert_eq!(batch, &[const { None }; N]);
+        }
+        self.size = 0;
+        self.accum.clear();
+        Ok(())
+    }
 }
 
 fn generic_schemaless_concatenate<const N: usize>(

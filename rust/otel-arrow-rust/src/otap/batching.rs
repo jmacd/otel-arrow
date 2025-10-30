@@ -13,7 +13,7 @@ use std::num::NonZeroU64;
 pub fn make_output_batches(
     signal: OtapArrowRecordTag,
     records: Vec<OtapArrowRecords>,
-    max_size: Option<NonZeroU64>,
+    max_output_batch: Option<NonZeroU64>,
 ) -> Result<Vec<OtapArrowRecords>> {
     // We have to deal with two complications here:
     // * batches that are too small
@@ -28,10 +28,10 @@ pub fn make_output_batches(
         OtapArrowRecordTag::Traces => RecordsGroup::separate_traces(records),
     }?;
 
-    if let Some(limit) = max_size {
+    if let Some(limit) = max_output_batch {
         records = records.split(limit)?;
     }
-    records = records.concatenate(max_size)?;
+    records = records.concatenate(max_output_batch)?;
 
     Ok(records.into_otap_arrow_records())
 }
