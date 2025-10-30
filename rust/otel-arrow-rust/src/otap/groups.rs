@@ -318,10 +318,6 @@ fn generic_split<const N: usize>(
                 original_length,
                 split_primary.iter().map(|rb| rb.num_rows()).sum::<usize>()
             );
-            // Get or synthesize the ID column.
-            let ids = IDColumn::extract(&rb, consts::ID)?
-                .map(|id_col| IDSeqs::from_col(id_col, &lengths))
-                .unwrap_or(IDSeqs::from_row_indices(&lengths));
 
             // use ids to split the child tables: call split_child_record_batch
             let new_batch_count = split_primary.len();
@@ -334,13 +330,19 @@ fn generic_split<const N: usize>(
             for (i, split_primary) in split_primary.drain(..).enumerate() {
                 new_batch[i][primary_offset] = Some(split_primary);
             }
-            for payload in allowed_payloads
-                .iter()
-                .filter(|payload| **payload != primary_payload)
-                .copied()
-            {
-                generic_split_helper(batches, payload, primary_payload, &ids, new_batch)?;
+
+            // Only process child tables if the primary has an ID column
+            if let Some(id_col) = IDColumn::extract(&rb, consts::ID)? {
+                let ids = IDSeqs::from_col(id_col, &lengths);
+                for payload in allowed_payloads
+                    .iter()
+                    .filter(|payload| **payload != primary_payload)
+                    .copied()
+                {
+                    generic_split_helper(batches, payload, primary_payload, &ids, new_batch)?;
+                }
             }
+            // If no ID column exists, there can't be child tables with PARENT_ID references
         } else {
             panic!("expected to have primary for every group");
         }
@@ -463,42 +465,6 @@ impl IDSeqs {
         }
     }
 
-    /// Generate implicit ID ranges from row indices when ID column is missing.
-    /// This is used for logs batches where the ID column is optional and omitted
-    /// when no log attributes exist.
-    fn from_row_indices(lengths: &[usize]) -> Self {
-        let total_rows: usize = lengths.iter().sum();
-
-        // Use u16 if total rows fit, otherwise u32
-        if total_rows <= u16::MAX as usize {
-            let mut ranges = Vec::with_capacity(lengths.len());
-            let mut start: u16 = 0;
-            for &length in lengths {
-                if length > 0 {
-                    let end = start + length as u16 - 1;
-                    ranges.push(Some(start..=end));
-                    start = end + 1;
-                } else {
-                    ranges.push(None);
-                }
-            }
-            Self::RangeU16(ranges)
-        } else {
-            let mut ranges = Vec::with_capacity(lengths.len());
-            let mut start: u32 = 0;
-            for &length in lengths {
-                if length > 0 {
-                    let end = start + length as u32 - 1;
-                    ranges.push(Some(start..=end));
-                    start = end + 1;
-                } else {
-                    ranges.push(None);
-                }
-            }
-            Self::RangeU32(ranges)
-        }
-    }
-
     fn from_generic_array<ArrowPrimitive>(
         array: &PrimitiveArray<ArrowPrimitive>,
         lengths: &[usize],
@@ -576,16 +542,10 @@ impl IDSeqs {
             .collect();
         let ids = ids?;
 
-        // Check if all IDs are None (missing column case)
-        if ids.iter().all(|id| id.is_none()) {
-            // Use row indices as implicit IDs
-            return Ok(Self::from_row_indices(&lengths));
-        }
-
-        // Unwrap all the Some values - they should all be Some at this point
+        // All inputs should have ID columns at this point (added by reindexing if missing)
         let ids: Vec<IDColumn<'_>> = ids
             .into_iter()
-            .map(|id| id.expect("checked above"))
+            .map(|id| id.expect("ID column should exist after reindexing"))
             .collect();
         let concatenated_array = match ids.first().expect("there should be at least one input") {
             IDColumn::U16(_) => {
