@@ -8,30 +8,22 @@
 use super::{OtapArrowRecordTag, OtapArrowRecords, error::Result, groups::RecordsGroup};
 use std::num::NonZeroU64;
 
-/// merge and combine batches to the appropriate size
-/// error if not the same signal type.
+/// Rebatch records to the appropriate size in a single pass.
+/// Returns error if not the same signal type.
 pub fn make_output_batches(
     signal: OtapArrowRecordTag,
     records: Vec<OtapArrowRecords>,
     max_output_batch: Option<NonZeroU64>,
 ) -> Result<Vec<OtapArrowRecords>> {
-    // We have to deal with two complications here:
-    // * batches that are too small
-    // * batches that are too big
-    // We presume batches are a single type at this level, note
-    // that otap_batch_processor separates the signals itself.
-    // We do not specify sort order.
-
-    let mut records = match signal {
+    // Separate by signal type and rebatch in one pass
+    let records = match signal {
         OtapArrowRecordTag::Logs => RecordsGroup::separate_logs(records),
         OtapArrowRecordTag::Metrics => RecordsGroup::separate_metrics(records),
         OtapArrowRecordTag::Traces => RecordsGroup::separate_traces(records),
     }?;
 
-    if let Some(limit) = max_output_batch {
-        records = records.split(limit)?;
-    }
-    records = records.concatenate(max_output_batch)?;
+    // Rebatch: iterate through inputs once, building maximally-full output batches
+    let rebatched = records.rebatch(max_output_batch)?;
 
-    Ok(records.into_otap_arrow_records())
+    Ok(rebatched.into_otap_arrow_records())
 }
