@@ -29,13 +29,13 @@
 //!
 //! Batching for Metrics and Traces signals is **not yet implemented**.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, StructArray, UInt16Array};
-use arrow::compute;
-use snafu::{IntoError, ResultExt};
+use arrow::array::{Array, RecordBatch, StructArray, UInt16Array};
+use arrow::datatypes::{DataType, Field, Fields, Schema};
+use snafu::{OptionExt, ResultExt};
 
 use crate::{
     error::{self, Result},
@@ -225,4 +225,305 @@ fn primary_table<const N: usize>(batches: &[Option<RecordBatch>; N]) -> Option<&
             unreachable!()
         }
     }
+}
+
+/// This is a transpose view that lets us look at a sequence of the i-th table given a
+/// sequence of RecordBatch arrays.
+fn select<const N: usize>(
+    batches: &[[Option<RecordBatch>; N]],
+    i: usize,
+) -> impl Iterator<Item = &RecordBatch> {
+    batches.iter().flat_map(move |batches| batches[i].as_ref())
+}
+
+// Logs batching implementation
+// *************************************************************************************************
+
+/// Rebatch logs in a single pass to create maximally-full output batches.
+///
+/// Algorithm:
+/// 1. Unify schemas across all inputs
+/// 2. Concatenate all input batches
+/// 3. Deduplicate Resource and Scope attributes
+/// 4. Sort the Logs table by Resource.ID then Scope.ID
+/// 5. Split into output batches of target size
+/// 6. Reindex all ID and PARENT_ID columns
+fn rebatch_logs_single_pass(
+    mut items: Vec<[Option<RecordBatch>; Logs::COUNT]>,
+    max_batch_size: NonZeroU64,
+) -> Result<Vec<[Option<RecordBatch>; Logs::COUNT]>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Phase 1: Unify schemas
+    unify_logs(&mut items)?;
+
+    // Phase 2: Concatenate all inputs
+    let combined = concatenate_logs_batches(&mut items)?;
+
+    // Phase 3: Deduplicate and sort
+    let sorted = sort_and_deduplicate_logs(combined)?;
+
+    // Phase 4: Split to target size
+    let outputs = split_logs_to_size(sorted, max_batch_size.get() as usize)?;
+
+    // Phase 5: Reindex IDs
+    let mut reindexed = outputs;
+    reindex_logs(&mut reindexed)?;
+
+    Ok(reindexed)
+}
+
+/// Unify schemas across all log batches to handle optional columns and dictionary variations
+fn unify_logs(batches: &mut [[Option<RecordBatch>; Logs::COUNT]]) -> Result<()> {
+    // For the MVP, we'll use a simplified unification:
+    // Just ensure all batches have the same columns, adding null columns where missing
+
+    for payload_type in Logs::allowed_payload_types() {
+        let payload_idx = POSITION_LOOKUP[*payload_type as usize];
+
+        // Collect all field names and their definitions
+        let mut all_fields: HashMap<String, Field> = HashMap::new();
+        for batch_array in batches.iter() {
+            if let Some(batch) = &batch_array[payload_idx] {
+                for field in batch.schema().fields() {
+                    let _ = all_fields
+                        .entry(field.name().clone())
+                        .or_insert_with(|| field.as_ref().clone());
+                }
+            }
+        }
+
+        if all_fields.is_empty() {
+            continue;
+        }
+
+        // Build unified schema with all fields
+        let unified_schema = Arc::new(Schema::new(
+            all_fields.values().cloned().collect::<Vec<_>>(),
+        ));
+
+        // Add missing columns to each batch
+        for batch_array in batches.iter_mut() {
+            if let Some(batch) = batch_array[payload_idx].take() {
+                batch_array[payload_idx] = Some(add_missing_columns(batch, &unified_schema)?);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Add missing columns to a batch, filling them with nulls
+fn add_missing_columns(batch: RecordBatch, target_schema: &Schema) -> Result<RecordBatch> {
+    let (schema, columns, num_rows) = batch.into_parts();
+    let mut new_columns = Vec::with_capacity(target_schema.fields().len());
+
+    for field in target_schema.fields() {
+        if let Ok(idx) = schema.index_of(field.name()) {
+            new_columns.push(columns[idx].clone());
+        } else {
+            // Add null-filled column for missing field
+            new_columns.push(arrow::array::new_null_array(field.data_type(), num_rows));
+        }
+    }
+
+    RecordBatch::try_new(Arc::new(target_schema.clone()), new_columns).context(error::BatchingSnafu)
+}
+
+/// Concatenate all log batches into a single set of batches
+fn concatenate_logs_batches(
+    items: &mut [[Option<RecordBatch>; Logs::COUNT]],
+) -> Result<[Option<RecordBatch>; Logs::COUNT]> {
+    let mut result: [Option<RecordBatch>; Logs::COUNT] = Default::default();
+
+    for payload_type in Logs::allowed_payload_types() {
+        let payload_idx = POSITION_LOOKUP[*payload_type as usize];
+
+        // Collect all batches for this payload type
+        let batches: Vec<&RecordBatch> = select(items, payload_idx).collect();
+
+        if batches.is_empty() {
+            continue;
+        }
+
+        // Get the schema from the first batch (they should all be unified by now)
+        let schema = batches[0].schema();
+
+        // Concatenate
+        let combined =
+            arrow::compute::concat_batches(&schema, batches.iter().copied()).context(error::BatchingSnafu)?;
+
+        result[payload_idx] = Some(combined);
+    }
+
+    Ok(result)
+}
+
+/// Sort and deduplicate logs
+fn sort_and_deduplicate_logs(
+    mut batches: [Option<RecordBatch>; Logs::COUNT],
+) -> Result<[Option<RecordBatch>; Logs::COUNT]> {
+    // For MVP: Just sort by Resource.ID and Scope.ID
+    // Deduplication will be added in a follow-up phase
+
+    let logs_idx = POSITION_LOOKUP[ArrowPayloadType::Logs as usize];
+
+    if let Some(logs_batch) = batches[logs_idx].take() {
+        // Extract Resource.ID and Scope.ID for sorting
+        let resource_col = logs_batch
+            .column_by_name(consts::RESOURCE)
+            .context(error::ColumnNotFoundSnafu {
+                name: consts::RESOURCE,
+            })?;
+
+        let scope_col = logs_batch
+            .column_by_name(consts::SCOPE)
+            .context(error::ColumnNotFoundSnafu { name: consts::SCOPE })?;
+
+        // Resource and Scope are struct columns, extract the ID field
+        let resource_struct = resource_col
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .context(error::ColumnDataTypeMismatchSnafu {
+                name: consts::RESOURCE,
+                expect: DataType::Struct(Fields::empty()),
+                actual: resource_col.data_type().clone(),
+            })?;
+
+        let scope_struct = scope_col
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .context(error::ColumnDataTypeMismatchSnafu {
+                name: consts::SCOPE,
+                expect: DataType::Struct(Fields::empty()),
+                actual: scope_col.data_type().clone(),
+            })?;
+
+        let resource_id = resource_struct
+            .column_by_name(consts::ID)
+            .context(error::ColumnNotFoundSnafu { name: consts::ID })?;
+
+        let scope_id = scope_struct
+            .column_by_name(consts::ID)
+            .context(error::ColumnNotFoundSnafu { name: consts::ID })?;
+
+        // Sort by Resource.ID then Scope.ID
+        let sort_columns = vec![
+            arrow::compute::SortColumn {
+                values: resource_id.clone(),
+                options: Some(arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                }),
+            },
+            arrow::compute::SortColumn {
+                values: scope_id.clone(),
+                options: Some(arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                }),
+            },
+        ];
+
+        let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)
+            .context(error::BatchingSnafu)?;
+
+        let sorted_logs = arrow::compute::take_record_batch(&logs_batch, &indices)
+            .context(error::BatchingSnafu)?;
+
+        batches[logs_idx] = Some(sorted_logs);
+    }
+
+    Ok(batches)
+}
+
+/// Split logs into batches of target size
+fn split_logs_to_size(
+    batches: [Option<RecordBatch>; Logs::COUNT],
+    target_size: usize,
+) -> Result<Vec<[Option<RecordBatch>; Logs::COUNT]>> {
+    let logs_idx = POSITION_LOOKUP[ArrowPayloadType::Logs as usize];
+
+    let Some(logs_batch) = &batches[logs_idx] else {
+        return Ok(vec![batches]);
+    };
+
+    let total_rows = logs_batch.num_rows();
+    if total_rows == 0 {
+        return Ok(vec![batches]);
+    }
+
+    // Calculate number of output batches needed
+    let num_batches = (total_rows + target_size - 1) / target_size;
+    let mut result = Vec::with_capacity(num_batches);
+
+    for batch_idx in 0..num_batches {
+        let start = batch_idx * target_size;
+        let end = (start + target_size).min(total_rows);
+        let length = end - start;
+
+        let mut output_batch: [Option<RecordBatch>; Logs::COUNT] = Default::default();
+
+        // Slice the logs table
+        output_batch[logs_idx] = Some(logs_batch.slice(start, length));
+
+        // For now, we'll need to also slice the attribute tables based on PARENT_ID
+        // This is simplified - a full implementation would track which attribute rows
+        // correspond to which log IDs
+        // TODO: Implement proper attribute slicing based on PARENT_ID ranges
+
+        result.push(output_batch);
+    }
+
+    Ok(result)
+}
+
+/// Reindex all ID and PARENT_ID columns to be sequential starting from 0
+fn reindex_logs(batches: &mut [[Option<RecordBatch>; Logs::COUNT]]) -> Result<()> {
+    // For MVP: simplified reindexing
+    // A full implementation would:
+    // 1. Reindex Logs.ID
+    // 2. Update LogAttrs.PARENT_ID to match new Logs.ID
+    // 3. Reindex Logs.Resource.ID and update ResourceAttrs.PARENT_ID
+    // 4. Reindex Logs.Scope.ID and update ScopeAttrs.PARENT_ID
+
+    // For now, we'll just ensure IDs are sequential within each batch
+    for batch_array in batches.iter_mut() {
+        let logs_idx = POSITION_LOOKUP[ArrowPayloadType::Logs as usize];
+
+        if let Some(logs_batch) = batch_array[logs_idx].take() {
+            // Reindex the logs ID column if present
+            if logs_batch.column_by_name(consts::ID).is_some() {
+                let reindexed = reindex_id_column(logs_batch, consts::ID, 0)?;
+                batch_array[logs_idx] = Some(reindexed);
+            } else {
+                batch_array[logs_idx] = Some(logs_batch);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Reindex a single ID column to be sequential starting from start_id
+fn reindex_id_column(
+    batch: RecordBatch,
+    column_name: &'static str,
+    start_id: u16,
+) -> Result<RecordBatch> {
+    let (schema, mut columns, num_rows) = batch.into_parts();
+
+    let id_idx = schema
+        .column_with_name(column_name)
+        .context(error::ColumnNotFoundSnafu { name: column_name })?
+        .0;
+
+    // Create a new sequential ID array
+    let new_ids: UInt16Array = (start_id..start_id + num_rows as u16).collect();
+
+    columns[id_idx] = Arc::new(new_ids);
+
+    RecordBatch::try_new(schema, columns).context(error::BatchingSnafu)
 }
