@@ -1,6 +1,7 @@
 # OTel-Arrow Rust batching design
 
-(Josh MacDonald, Oct 31, 2025)
+HUMAN AUTHORED, AGENTS DO NOT MODIFY
+Josh MacDonald, Oct 31, 2025
 
 ## Background
 
@@ -94,8 +95,11 @@ operation so that items cannot persist across residual payloads.
 
 We expect the user to pass in multiple output-batch-sizes of data at
 once, because this presents an opportunity to rebatch efficiently, and
-we expect the user to limit this sensibly, knowing we will assemble the
-whole batch, sort it somehow, then rebatch it.
+we expect the user to limit this sensibly, knowing we will assemble
+the whole batch, sort it somehow, then rebatch it.
+
+Sorting reduces fan-out in an aggregation pipeline, that is why it is
+important to let the user set a batching policy.
 
 #### Sort by TraceID
 
@@ -120,7 +124,7 @@ compression downstream.
 
 #### Sorting by event name
 
-Place events of the same name together.
+Place events of the same name together. 
 
 #### Batching by time bucket, distinct value, etc. (FUTURE WORK)
 
@@ -137,7 +141,11 @@ resource, scope, and so on. This will be left as future work.
 
 We will do research in the Arrow codebase for this project. 
 
+### Research topics
+
 NOTE! The arrow-rs repository is checked-out in `./arrow-rs` for reference.
+
+
 
 About dictionaries in Arrow
 
@@ -152,3 +160,99 @@ About vectors: what do we materialize, do we use indirection?
 About attribute sets: need primitives
 
 About test harness: need assert.Equiv.
+
+## Prompts
+
+### About grouping in Arrow
+
+I am doing more research on ./arrow-rs with respect to our batching
+project. I would like to know about hash-based join techniques for
+deduplicating and aggregating record batches. In the actual setup, we
+will have several RecordBatch values input, they will each have a
+subset or full set of columns for attribute key-values in OTAP, so the
+structure is like [PARENT_ID, KEY(dictionary), Option<int>,
+Option<f64>, Option<String(dictionary)>, ...]. We will want to
+identify across batches the case where PARENT_IDs have the same exact
+set of keys/values, in which case they can be deduplicated.
+
+Parent IDs can have different cardinality, those with 1 key:value, 2
+key:value, 3 ... and up.
+
+I know that Arrow has support for group-by and can copy the
+column-oriented struct into a row-oriented encoding for grouping and
+related tasks. I imagine we will compute one data structure that we
+can sort and compare, then build a Vec<Map<input_parent_id,
+output_parent_id>>with the deduplicated mapping, a vector with index
+matching the input batches, so a Map for each input to the output
+parent_id: the map could be a Vec for dense mappings, likely, or a
+HashMap for spare mappings.
+
+Please summarize the tools and techniques we'll take advantage of in arrow-rs
+in a new file.
+
+#### Reply
+
+docs/ARROW_GROUPING_DEDUPLICATION.md
+
+### About sort-order in OTAP
+
+Considering the sort order question, please investigate the
+otel-arrow-rust/**/*.rs sources for how we encode information about
+sort order, when we know it.
+
+docs/SORT_ORDER_ENCODING.md
+
+### About consecutive rows
+
+Is there support in Arrow for making Eq and PartialEq-bound values
+from consecutive Rows? If I have a ResourceAttrs table and sort by
+PARENT_ID and KEY, then I can partition by PARENT_ID and the
+concatenation of KEY, VALUE Rows i.e., the sequence of adjacent Row
+values w/ the same PARENT_ID are the thing that makes resources
+unique. We would want a consecutive-row type which the underlying
+representation has as a contiguous [u8] underneath the abstraction.
+
+#### Reply
+
+Basically, no, but yielded algorithm development:
+
+docs/ARROW_GROUPING_DEDUPLICATION.md
+
+### About schema unification
+
+I want to study otap-dataflow/**/*.rs and otel-arrow-rust/**/*.rs for
+existing patterns about schema unification. We will have to address
+the fact for example that one batch of attributes may contain only a
+i64 column and another may contain only f64, while some will be mixed
+and contain the other columns. We will need to construct the unified
+schema as we batch.
+
+#### Reply
+
+docs/SCHEMA_UNIFICATION_PATTERNS.md
+
+### About original groups.rs implementation
+
+docs/BATCHING_COMPARISON.md
+
+## Implementation plan
+
+Note `otel-arrow-rust/src/otap/groups.rs` has been reduced to just the
+public API for batching, `otel-arrow-rust/src/otap/groups_old.rs` is
+the original implementation, and `otel-arrow-rust/src/otap/groups_v1.rs` 
+was an early attempt of mine to start from scratch.
+
+We will start with a minimum viable implementation with no
+configuration parameters other than the size limit, which already
+exists in the API. We will form one primary table, then sort by two
+columns: Logs.Resource.ID then Logs.Scope.ID, then split into batches
+and re-assemble the child tables.
+
+For the child tables, we have Resource and Scope (shared) and LogAttrs
+(exclusive). We will deduplicate the shared tables, if present. 
+
+We will keep the `select()`, `unify()` and `reindex()` support as wel
+as `IDSeq` and reusable portions described in BATCHING_COMPARISON.md
+
+
+
