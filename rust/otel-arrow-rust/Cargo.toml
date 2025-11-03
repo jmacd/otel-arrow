@@ -66,6 +66,8 @@ tokio-stream = "0.1.17"
 criterion = { version = "0.7" }
 arrow-schema = "56.0.0"
 pretty_assertions = "1.4.1"
+otap-df-otap = { path = "../otap-dataflow/crates/otap", default-features = false }
+otap-df-pdata = { path = "../otap-dataflow/crates/pdata", default-features = false }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

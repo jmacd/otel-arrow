@@ -47,6 +47,9 @@ use crate::{
     schema::consts,
 };
 
+#[cfg(test)]
+mod tests;
+
 /// A sequence of OtapArrowRecords that all share exactly the same tag.
 /// Maintains invariant: primary table for each batch is not None and has more than zero records.
 #[derive(Clone, Debug, PartialEq)]
