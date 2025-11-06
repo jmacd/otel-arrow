@@ -46,8 +46,8 @@ use std::sync::Arc;
 // Geneva uploader dependencies
 use geneva_uploader::AuthMethod;
 use geneva_uploader::client::{GenevaClient, GenevaClientConfig};
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
+use otap_df_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message as ProstMessage;
 
 // Use crate-relative paths since we're now a module within otap
