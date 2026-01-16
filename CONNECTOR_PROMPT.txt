@@ -1,0 +1,14 @@
+We are interested in a kind of "connector" crate that will connect an
+OTAP dataflow pipeline to another consume through shared memory queues
+or channels. We are interested in consume the OTLP bytes payload
+representation; if the exporter receives the OTAP representation it
+will convert to the other type. The consumer on the other side of a
+thread boundary will pull data from the channel, process it, and
+return a success or failure status.
+
+We will use a local exporter component (not shared); we will use a
+flume bounded channel for the communication between exporter running
+in the thread-per-core engine runtime and the consumer which runs in
+its own thread. The consumer is likely to be using FFI, and will will
+have an interface that returns opaque FFI-friendly identifiers to
+associate requests and responses.

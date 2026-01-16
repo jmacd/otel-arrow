@@ -52,6 +52,10 @@ pub mod noop_exporter;
 /// An error-exporter returns a static error.
 pub mod error_exporter;
 
+/// Connector exporter that bridges OTAP pipelines to external consumers via channels.
+/// Sends OTLP bytes through flume channels for FFI-compatible cross-thread communication.
+pub mod connector_exporter;
+
 /// Experimental exporters and processors
 #[cfg(any(
     feature = "experimental-exporters",
