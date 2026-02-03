@@ -17,6 +17,7 @@ use async_trait::async_trait;
 pub use otap_df_config::NodeId;
 use otap_df_config::PortName;
 use otap_df_config::{SignalFormat, SignalType};
+use otap_df_engine::component_metrics::Instrumented;
 use otap_df_engine::error::{Error, TypedError};
 #[allow(deprecated)]
 use otap_df_engine::{
@@ -274,6 +275,12 @@ impl OtapPdata {
         self.payload.num_items()
     }
 
+    /// Returns the number of bytes in the payload, if known.
+    #[must_use]
+    pub fn num_bytes(&self) -> Option<usize> {
+        self.payload.num_bytes()
+    }
+
     /// Enable testing Ack/Nack without an effect handler. Consumes,
     /// modifies and returns self.
     #[cfg(test)]
@@ -314,9 +321,61 @@ impl OtapPdata {
     }
 }
 
+/// Implementation of [`Instrumented`] for [`OtapPdata`] to enable automatic
+/// component metrics recording in the pipeline engine.
+impl Instrumented for OtapPdata {
+    fn num_items(&self) -> u64 {
+        OtapPdata::num_items(self) as u64
+    }
+
+    fn num_bytes(&self) -> Option<u64> {
+        OtapPdata::num_bytes(self).map(|b| b as u64)
+    }
+}
+
 /* -------- Producer effect handler extensions (shared, local) -------- */
 /* Note: ProducerEffectHandlerExtension is deprecated. Use SendWithSubscriptionLocalExtension
    or SendWithSubscriptionSharedExtension instead. These impls are kept for backward compatibility. */
+
+/// Records produced items/bytes metrics for successfully sent data.
+///
+/// This is called after a successful send to record RFC-aligned component metrics.
+#[inline]
+fn record_produced(num_items: u64, num_bytes: Option<u64>) {
+    if let Some(handle) = otap_df_engine::entity_context::current_component_metrics() {
+        handle.record_produced(num_items, num_bytes);
+    }
+}
+
+/// Records consumed items/bytes with success outcome (Ack).
+///
+/// Called when a component successfully processes and acknowledges input data.
+#[inline]
+fn record_consumed_success(num_items: u64, num_bytes: Option<u64>) {
+    if let Some(handle) = otap_df_engine::entity_context::current_component_metrics() {
+        handle.record_consumed_success(num_items, num_bytes);
+    }
+}
+
+/// Records consumed items/bytes with failure outcome (non-permanent Nack).
+///
+/// Called when processing input data results in a transient failure.
+#[inline]
+fn record_consumed_failure(num_items: u64, num_bytes: Option<u64>) {
+    if let Some(handle) = otap_df_engine::entity_context::current_component_metrics() {
+        handle.record_consumed_failure(num_items, num_bytes);
+    }
+}
+
+/// Records consumed items/bytes with refused outcome (permanent Nack).
+///
+/// Called when input data is refused (e.g., backpressure, dropped).
+#[inline]
+fn record_consumed_refused(num_items: u64, num_bytes: Option<u64>) {
+    if let Some(handle) = otap_df_engine::entity_context::current_component_metrics() {
+        handle.record_consumed_refused(num_items, num_bytes);
+    }
+}
 
 #[allow(deprecated)]
 #[async_trait(?Send)]
@@ -374,9 +433,17 @@ impl SendWithSubscriptionLocalExtension<OtapPdata>
         interests: Interests,
         calldata: CallData,
     ) -> Result<(), TypedError<OtapPdata>> {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.processor_id().index);
-        self.send_message(data).await
+        let result = self.send_message(data).await;
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     fn try_send_message_subscribed(
@@ -385,9 +452,17 @@ impl SendWithSubscriptionLocalExtension<OtapPdata>
         interests: Interests,
         calldata: CallData,
     ) -> Result<(), TypedError<OtapPdata>> {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.processor_id().index);
-        self.try_send_message(data)
+        let result = self.try_send_message(data);
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     async fn send_message_subscribed_to<P>(
@@ -400,9 +475,17 @@ impl SendWithSubscriptionLocalExtension<OtapPdata>
     where
         P: Into<PortName> + Send + 'static,
     {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.processor_id().index);
-        self.send_message_to(port, data).await
+        let result = self.send_message_to(port, data).await;
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     fn try_send_message_subscribed_to<P>(
@@ -415,9 +498,17 @@ impl SendWithSubscriptionLocalExtension<OtapPdata>
     where
         P: Into<PortName> + Send + 'static,
     {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.processor_id().index);
-        self.try_send_message_to(port, data)
+        let result = self.try_send_message_to(port, data);
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 }
 
@@ -431,9 +522,17 @@ impl SendWithSubscriptionLocalExtension<OtapPdata>
         interests: Interests,
         calldata: CallData,
     ) -> Result<(), TypedError<OtapPdata>> {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.receiver_id().index);
-        self.send_message(data).await
+        let result = self.send_message(data).await;
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     fn try_send_message_subscribed(
@@ -442,9 +541,17 @@ impl SendWithSubscriptionLocalExtension<OtapPdata>
         interests: Interests,
         calldata: CallData,
     ) -> Result<(), TypedError<OtapPdata>> {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.receiver_id().index);
-        self.try_send_message(data)
+        let result = self.try_send_message(data);
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     async fn send_message_subscribed_to<P>(
@@ -457,9 +564,17 @@ impl SendWithSubscriptionLocalExtension<OtapPdata>
     where
         P: Into<PortName> + Send + 'static,
     {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.receiver_id().index);
-        self.send_message_to(port, data).await
+        let result = self.send_message_to(port, data).await;
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     fn try_send_message_subscribed_to<P>(
@@ -472,9 +587,17 @@ impl SendWithSubscriptionLocalExtension<OtapPdata>
     where
         P: Into<PortName> + Send + 'static,
     {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.receiver_id().index);
-        self.try_send_message_to(port, data)
+        let result = self.try_send_message_to(port, data);
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 }
 
@@ -490,9 +613,17 @@ impl SendWithSubscriptionSharedExtension<OtapPdata>
         interests: Interests,
         calldata: CallData,
     ) -> Result<(), TypedError<OtapPdata>> {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.processor_id().index);
-        self.send_message(data).await
+        let result = self.send_message(data).await;
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     fn try_send_message_subscribed(
@@ -501,9 +632,17 @@ impl SendWithSubscriptionSharedExtension<OtapPdata>
         interests: Interests,
         calldata: CallData,
     ) -> Result<(), TypedError<OtapPdata>> {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.processor_id().index);
-        self.try_send_message(data)
+        let result = self.try_send_message(data);
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     async fn send_message_subscribed_to<P>(
@@ -516,9 +655,17 @@ impl SendWithSubscriptionSharedExtension<OtapPdata>
     where
         P: Into<PortName> + Send + 'static,
     {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.processor_id().index);
-        self.send_message_to(port, data).await
+        let result = self.send_message_to(port, data).await;
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     fn try_send_message_subscribed_to<P>(
@@ -531,9 +678,17 @@ impl SendWithSubscriptionSharedExtension<OtapPdata>
     where
         P: Into<PortName> + Send + 'static,
     {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.processor_id().index);
-        self.try_send_message_to(port, data)
+        let result = self.try_send_message_to(port, data);
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 }
 
@@ -547,9 +702,17 @@ impl SendWithSubscriptionSharedExtension<OtapPdata>
         interests: Interests,
         calldata: CallData,
     ) -> Result<(), TypedError<OtapPdata>> {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.receiver_id().index);
-        self.send_message(data).await
+        let result = self.send_message(data).await;
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     fn try_send_message_subscribed(
@@ -558,9 +721,17 @@ impl SendWithSubscriptionSharedExtension<OtapPdata>
         interests: Interests,
         calldata: CallData,
     ) -> Result<(), TypedError<OtapPdata>> {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.receiver_id().index);
-        self.try_send_message(data)
+        let result = self.try_send_message(data);
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     async fn send_message_subscribed_to<P>(
@@ -573,9 +744,17 @@ impl SendWithSubscriptionSharedExtension<OtapPdata>
     where
         P: Into<PortName> + Send + 'static,
     {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.receiver_id().index);
-        self.send_message_to(port, data).await
+        let result = self.send_message_to(port, data).await;
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 
     fn try_send_message_subscribed_to<P>(
@@ -588,9 +767,17 @@ impl SendWithSubscriptionSharedExtension<OtapPdata>
     where
         P: Into<PortName> + Send + 'static,
     {
+        // Capture metrics before sending (data is moved)
+        let num_items = data.num_items() as u64;
+        let num_bytes = data.num_bytes().map(|b| b as u64);
+
         data.context
             .subscribe_or_update(interests, calldata, self.receiver_id().index);
-        self.try_send_message_to(port, data)
+        let result = self.try_send_message_to(port, data);
+        if result.is_ok() {
+            record_produced(num_items, num_bytes);
+        }
+        result
     }
 }
 
@@ -601,10 +788,24 @@ impl ConsumerEffectHandlerExtension<OtapPdata>
     for otap_df_engine::local::processor::EffectHandler<OtapPdata>
 {
     async fn notify_ack(&self, ack: AckMsg<OtapPdata>) -> Result<(), Error> {
+        // Record consumed with success outcome before routing
+        let num_items = ack.accepted.num_items() as u64;
+        let num_bytes = ack.accepted.num_bytes().map(|b| b as u64);
+        record_consumed_success(num_items, num_bytes);
+
         self.route_ack(ack, Context::next_ack).await
     }
 
     async fn notify_nack(&self, nack: NackMsg<OtapPdata>) -> Result<(), Error> {
+        // Record consumed with failure or refused outcome based on permanent flag
+        let num_items = nack.refused.num_items() as u64;
+        let num_bytes = nack.refused.num_bytes().map(|b| b as u64);
+        if nack.permanent {
+            record_consumed_refused(num_items, num_bytes);
+        } else {
+            record_consumed_failure(num_items, num_bytes);
+        }
+
         self.route_nack(nack, Context::next_nack).await
     }
 }
@@ -614,10 +815,24 @@ impl ConsumerEffectHandlerExtension<OtapPdata>
     for otap_df_engine::local::exporter::EffectHandler<OtapPdata>
 {
     async fn notify_ack(&self, ack: AckMsg<OtapPdata>) -> Result<(), Error> {
+        // Record consumed with success outcome before routing
+        let num_items = ack.accepted.num_items() as u64;
+        let num_bytes = ack.accepted.num_bytes().map(|b| b as u64);
+        record_consumed_success(num_items, num_bytes);
+
         self.route_ack(ack, Context::next_ack).await
     }
 
     async fn notify_nack(&self, nack: NackMsg<OtapPdata>) -> Result<(), Error> {
+        // Record consumed with failure or refused outcome based on permanent flag
+        let num_items = nack.refused.num_items() as u64;
+        let num_bytes = nack.refused.num_bytes().map(|b| b as u64);
+        if nack.permanent {
+            record_consumed_refused(num_items, num_bytes);
+        } else {
+            record_consumed_failure(num_items, num_bytes);
+        }
+
         self.route_nack(nack, Context::next_nack).await
     }
 }
@@ -627,10 +842,24 @@ impl ConsumerEffectHandlerExtension<OtapPdata>
     for otap_df_engine::shared::processor::EffectHandler<OtapPdata>
 {
     async fn notify_ack(&self, ack: AckMsg<OtapPdata>) -> Result<(), Error> {
+        // Record consumed with success outcome before routing
+        let num_items = ack.accepted.num_items() as u64;
+        let num_bytes = ack.accepted.num_bytes().map(|b| b as u64);
+        record_consumed_success(num_items, num_bytes);
+
         self.route_ack(ack, Context::next_ack).await
     }
 
     async fn notify_nack(&self, nack: NackMsg<OtapPdata>) -> Result<(), Error> {
+        // Record consumed with failure or refused outcome based on permanent flag
+        let num_items = nack.refused.num_items() as u64;
+        let num_bytes = nack.refused.num_bytes().map(|b| b as u64);
+        if nack.permanent {
+            record_consumed_refused(num_items, num_bytes);
+        } else {
+            record_consumed_failure(num_items, num_bytes);
+        }
+
         self.route_nack(nack, Context::next_nack).await
     }
 }
@@ -640,10 +869,24 @@ impl ConsumerEffectHandlerExtension<OtapPdata>
     for otap_df_engine::shared::exporter::EffectHandler<OtapPdata>
 {
     async fn notify_ack(&self, ack: AckMsg<OtapPdata>) -> Result<(), Error> {
+        // Record consumed with success outcome before routing
+        let num_items = ack.accepted.num_items() as u64;
+        let num_bytes = ack.accepted.num_bytes().map(|b| b as u64);
+        record_consumed_success(num_items, num_bytes);
+
         self.route_ack(ack, Context::next_ack).await
     }
 
     async fn notify_nack(&self, nack: NackMsg<OtapPdata>) -> Result<(), Error> {
+        // Record consumed with failure or refused outcome based on permanent flag
+        let num_items = nack.refused.num_items() as u64;
+        let num_bytes = nack.refused.num_bytes().map(|b| b as u64);
+        if nack.permanent {
+            record_consumed_refused(num_items, num_bytes);
+        } else {
+            record_consumed_failure(num_items, num_bytes);
+        }
+
         self.route_nack(nack, Context::next_nack).await
     }
 }

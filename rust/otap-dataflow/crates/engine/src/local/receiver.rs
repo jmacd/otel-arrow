@@ -323,6 +323,22 @@ impl<PData> EffectHandler<PData> {
         self.core.report_metrics(metrics)
     }
 
+    /// Reports RFC-aligned component metrics (produced/consumed items) to the metrics reporter.
+    ///
+    /// Call this method during CollectTelemetry handling to include component metrics
+    /// in the telemetry export. The component metrics are automatically recorded during
+    /// `send_message_subscribed` calls and Ack/Nack handling.
+    pub fn report_component_metrics(
+        &mut self,
+        metrics_reporter: &mut MetricsReporter,
+    ) -> Result<(), TelemetryError> {
+        if let Some(handle) = crate::entity_context::current_component_metrics() {
+            handle.report(metrics_reporter)
+        } else {
+            Ok(())
+        }
+    }
+
     // More methods will be added in the future as needed.
 }
 

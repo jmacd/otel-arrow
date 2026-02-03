@@ -4,6 +4,7 @@
 //! Set of runtime pipeline configuration structures used by the engine and derived from the pipeline configuration.
 
 use crate::channel_metrics::ChannelMetricsHandle;
+use crate::component_metrics::{ComponentMetricsHandle, Instrumented};
 use crate::context::PipelineContext;
 use crate::control::{
     ControlSenders, Controllable, NodeControlMsg, PipelineCtrlMsgReceiver, PipelineCtrlMsgSender,
@@ -18,6 +19,7 @@ use otap_df_config::DeployedPipelineKey;
 use otap_df_config::pipeline::PipelineConfig;
 use otap_df_telemetry::event::ObservedEventReporter;
 use otap_df_telemetry::reporter::MetricsReporter;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use tokio::runtime::Builder;
 use tokio::task::LocalSet;
@@ -62,7 +64,7 @@ impl PipeNode {
     }
 }
 
-impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
+impl<PData: 'static + Debug + Clone + Instrumented> RuntimePipeline<PData> {
     /// Creates a new `RuntimePipeline` from the given pipeline configuration and nodes.
     #[must_use]
     pub(crate) fn new(
@@ -129,6 +131,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
         // ToDo create an optimized version of FuturesUnordered that can be used for !Send, !Sync tasks
         let mut futures = FuturesUnordered::new();
         let mut control_senders = ControlSenders::default();
+        let mut component_metrics: HashMap<usize, ComponentMetricsHandle> = HashMap::new();
 
         // Spawn node tasks and register their control senders, scoping telemetry where available.
         for exporter in exporters {
@@ -142,6 +145,10 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             let telemetry_guard = exporter.take_telemetry_guard();
             let node_entity_key = telemetry_guard.as_ref().map(|t| t.entity_key());
             let telemetry_handle = telemetry_guard.as_ref().map(|t| t.handle());
+            // Collect component metrics handle for this node
+            if let Some(handle) = telemetry_handle.as_ref().and_then(|h| h.component_metrics()) {
+                let _ = component_metrics.insert(node_id.index, handle);
+            }
             let pipeline_ctrl_msg_tx = pipeline_ctrl_msg_tx.clone();
             let effect_metrics_reporter = metrics_reporter.clone();
             let final_metrics_reporter = metrics_reporter.clone();
@@ -179,6 +186,10 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             let telemetry_guard = processor.take_telemetry_guard();
             let node_entity_key = telemetry_guard.as_ref().map(|t| t.entity_key());
             let telemetry_handle = telemetry_guard.as_ref().map(|t| t.handle());
+            // Collect component metrics handle for this node
+            if let Some(handle) = telemetry_handle.as_ref().and_then(|h| h.component_metrics()) {
+                let _ = component_metrics.insert(node_id.index, handle);
+            }
             let pipeline_ctrl_msg_tx = pipeline_ctrl_msg_tx.clone();
             let metrics_reporter = metrics_reporter.clone();
             let fut = async move {
@@ -212,6 +223,10 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             let telemetry_guard = receiver.take_telemetry_guard();
             let node_entity_key = telemetry_guard.as_ref().map(|t| t.entity_key());
             let telemetry_handle = telemetry_guard.as_ref().map(|t| t.handle());
+            // Collect component metrics handle for this node
+            if let Some(handle) = telemetry_handle.as_ref().and_then(|h| h.component_metrics()) {
+                let _ = component_metrics.insert(node_id.index, handle);
+            }
             let pipeline_ctrl_msg_tx = pipeline_ctrl_msg_tx.clone();
             let effect_metrics_reporter = metrics_reporter.clone();
             let final_metrics_reporter = metrics_reporter.clone();
@@ -251,6 +266,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
                 metrics_reporter,
                 internal_telemetry,
                 channel_metrics,
+                component_metrics,
             );
             manager.run().await
         }));

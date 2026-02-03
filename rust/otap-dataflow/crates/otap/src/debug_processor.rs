@@ -293,6 +293,8 @@ impl local::Processor<OtapPdata> for DebugProcessor {
                         mut metrics_reporter,
                     } => {
                         _ = metrics_reporter.report(&mut self.metrics);
+                        // Report RFC-aligned component metrics
+                        _ = effect_handler.report_component_metrics(&mut metrics_reporter);
                     }
                     _ => {}
                 }

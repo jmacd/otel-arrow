@@ -286,8 +286,8 @@ impl OtapPayloadHelpers for OtlpProtoBytes {
                     .sum()
             }
             Self::ExportMetricsRequest(_bytes) => {
-                // Metrics view is not implemented yet
-                panic!("ToDo")
+                // TODO: Metrics view is not implemented yet, return 0 for now
+                0
             }
         }
     }

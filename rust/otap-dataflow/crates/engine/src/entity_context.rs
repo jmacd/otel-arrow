@@ -13,6 +13,12 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::rc::Rc;
 
+use crate::component_metrics::{
+    ComponentMetricsHandle, ComponentMetricsState, ConsumedFailureMetrics,
+    ConsumedRefusedMetrics, ConsumedSuccessMetrics, LocalComponentMetricsHandle, ProducedMetrics,
+    ProducedFailureMetrics, ProducedRefusedMetrics, ProducedSuccessMetrics,
+};
+
 thread_local! {
     /// Defined when building a pipeline to associate telemetry with the pipeline entity.
     /// Present for the pipeline lifetime.
@@ -67,6 +73,9 @@ pub(crate) struct NodeTaskContext {
     entity_key: Option<EntityKey>,
     input_channel_key: Option<EntityKey>,
     output_channel_keys: Vec<(PortName, EntityKey)>,
+
+    /// Component metrics for RFC-aligned instrumentation.
+    component_metrics: Option<ComponentMetricsHandle>,
 }
 
 impl NodeTaskContext {
@@ -76,11 +85,14 @@ impl NodeTaskContext {
         input_channel_key: Option<EntityKey>,
         output_channel_keys: Vec<(PortName, EntityKey)>,
     ) -> Self {
+        let component_metrics =
+            telemetry_handle.as_ref().and_then(|h| h.component_metrics());
         Self {
             entity_key,
             telemetry_handle,
             input_channel_key,
             output_channel_keys,
+            component_metrics,
         }
     }
 }
@@ -122,6 +134,18 @@ pub fn node_output_channel_key(port: &str) -> Option<EntityKey> {
                 .find(|(name, _)| name.as_ref() == port)
                 .map(|(_, key)| *key)
         })
+        .ok()
+        .flatten()
+}
+
+/// Returns the component metrics handle for the current task, if set.
+///
+/// Used by OTAP instrumentation to record produced/consumed item counts with outcomes.
+#[inline]
+#[must_use]
+pub fn current_component_metrics() -> Option<ComponentMetricsHandle> {
+    NODE_TASK_CONTEXT
+        .try_with(|ctx| ctx.component_metrics.clone())
         .ok()
         .flatten()
 }
@@ -184,6 +208,7 @@ struct NodeTelemetryState {
     input_channel_key: Option<EntityKey>,
     output_channel_keys: Vec<(PortName, EntityKey)>,
     control_channel_key: Option<EntityKey>,
+    component_metrics: Option<LocalComponentMetricsHandle>,
     cleaned: bool,
 }
 
@@ -198,6 +223,7 @@ impl NodeTelemetryHandle {
                 input_channel_key: None,
                 output_channel_keys: Vec::new(),
                 control_channel_key: None,
+                component_metrics: None,
                 cleaned: false,
             })),
         }
@@ -267,6 +293,72 @@ impl NodeTelemetryHandle {
     /// Read output channel entity keys for task-local scoping.
     pub(crate) fn output_channel_keys(&self) -> Vec<(PortName, EntityKey)> {
         self.state.borrow().output_channel_keys.clone()
+    }
+
+    /// Registers RFC-aligned component metrics (produced/consumed items with outcome).
+    ///
+    /// This creates and tracks metrics for:
+    /// - `produced.items` / `produced.bytes` (forward path on send)
+    /// - `produced.success/failure/refused` (return path outcomes for producer)
+    /// - `consumed.items` / `consumed.bytes` with success/failure/refused outcomes
+    pub(crate) fn register_component_metrics(&self) -> ComponentMetricsHandle {
+        let entity_key = self.state.borrow().entity_key;
+
+        // Register all metric sets for this node entity
+        let produced = self
+            .registry
+            .register_metric_set_for_entity::<ProducedMetrics>(entity_key);
+        let produced_success = self
+            .registry
+            .register_metric_set_for_entity::<ProducedSuccessMetrics>(entity_key);
+        let produced_failure = self
+            .registry
+            .register_metric_set_for_entity::<ProducedFailureMetrics>(entity_key);
+        let produced_refused = self
+            .registry
+            .register_metric_set_for_entity::<ProducedRefusedMetrics>(entity_key);
+        let consumed_success = self
+            .registry
+            .register_metric_set_for_entity::<ConsumedSuccessMetrics>(entity_key);
+        let consumed_failure = self
+            .registry
+            .register_metric_set_for_entity::<ConsumedFailureMetrics>(entity_key);
+        let consumed_refused = self
+            .registry
+            .register_metric_set_for_entity::<ConsumedRefusedMetrics>(entity_key);
+
+        // Track metric sets for cleanup
+        self.track_metric_set(produced.metric_set_key());
+        self.track_metric_set(produced_success.metric_set_key());
+        self.track_metric_set(produced_failure.metric_set_key());
+        self.track_metric_set(produced_refused.metric_set_key());
+        self.track_metric_set(consumed_success.metric_set_key());
+        self.track_metric_set(consumed_failure.metric_set_key());
+        self.track_metric_set(consumed_refused.metric_set_key());
+
+        // Create state and handle
+        let state = ComponentMetricsState::new(
+            produced,
+            produced_success,
+            produced_failure,
+            produced_refused,
+            consumed_success,
+            consumed_failure,
+            consumed_refused,
+        );
+        let handle = Rc::new(RefCell::new(state));
+        self.state.borrow_mut().component_metrics = Some(handle.clone());
+
+        ComponentMetricsHandle::Local(handle)
+    }
+
+    /// Returns a clone of the component metrics handle, if registered.
+    pub(crate) fn component_metrics(&self) -> Option<ComponentMetricsHandle> {
+        self.state
+            .borrow()
+            .component_metrics
+            .as_ref()
+            .map(|h| ComponentMetricsHandle::Local(h.clone()))
     }
 
     /// Unregister tracked metric sets and entities; safe to call once.

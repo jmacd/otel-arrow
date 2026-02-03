@@ -11,6 +11,7 @@
 //! Note 2: Other pipeline control messages can be added in the future, but currently only timers
 //! are supported.
 
+use crate::component_metrics::{ComponentMetricsHandle, Instrumented};
 use crate::context::PipelineContext;
 use crate::control::{ControlSenders, NodeControlMsg, PipelineControlMsg, PipelineCtrlMsgReceiver};
 use crate::error::Error;
@@ -195,12 +196,14 @@ pub struct PipelineCtrlMsgManager<PData> {
     metrics_reporter: MetricsReporter,
     /// Channel metrics handles for periodic reporting.
     channel_metrics: Vec<crate::channel_metrics::ChannelMetricsHandle>,
+    /// Component metrics handles indexed by node_id for recording produced outcomes.
+    component_metrics: HashMap<usize, ComponentMetricsHandle>,
 
     /// Flags controlling capture of internal engine metrics.
     telemetry: TelemetrySettings,
 }
 
-impl<PData> PipelineCtrlMsgManager<PData> {
+impl<PData: Instrumented> PipelineCtrlMsgManager<PData> {
     /// Creates a new PipelineCtrlMsgManager.
     #[must_use]
     pub(crate) fn new(
@@ -212,6 +215,7 @@ impl<PData> PipelineCtrlMsgManager<PData> {
         metrics_reporter: MetricsReporter,
         internal_telemetry: TelemetrySettings,
         channel_metrics: Vec<crate::channel_metrics::ChannelMetricsHandle>,
+        component_metrics: HashMap<usize, ComponentMetricsHandle>,
     ) -> Self {
         Self {
             pipeline_key,
@@ -224,6 +228,7 @@ impl<PData> PipelineCtrlMsgManager<PData> {
             event_reporter,
             metrics_reporter,
             channel_metrics,
+            component_metrics,
             telemetry: internal_telemetry,
         }
     }
@@ -376,9 +381,25 @@ impl<PData> PipelineCtrlMsgManager<PData> {
                             }
                         }
                         PipelineControlMsg::DeliverAck { node_id, ack } => {
+                            // Record produced success outcome for the recipient node
+                            if let Some(handle) = self.component_metrics.get(&node_id) {
+                                let num_items = ack.accepted.num_items();
+                                let num_bytes = ack.accepted.num_bytes();
+                                handle.record_produced_success(num_items, num_bytes);
+                            }
                             self.send(node_id, NodeControlMsg::Ack(ack)).await;
                         }
                         PipelineControlMsg::DeliverNack { node_id, nack } => {
+                            // Record produced failure/refused outcome for the recipient node
+                            if let Some(handle) = self.component_metrics.get(&node_id) {
+                                let num_items = nack.refused.num_items();
+                                let num_bytes = nack.refused.num_bytes();
+                                if nack.permanent {
+                                    handle.record_produced_refused(num_items, num_bytes);
+                                } else {
+                                    handle.record_produced_failure(num_items, num_bytes);
+                                }
+                            }
                             self.send(node_id, NodeControlMsg::Nack(nack)).await;
                         }
                     }
@@ -546,7 +567,7 @@ mod tests {
         )
     }
 
-    fn setup_test_manager<PData>() -> (
+    fn setup_test_manager<PData: Instrumented>() -> (
         PipelineCtrlMsgManager<PData>,
         crate::control::PipelineCtrlMsgSender<PData>,
         HashMap<usize, Receiver<NodeControlMsg<PData>>>,
@@ -605,6 +626,7 @@ mod tests {
             metrics_reporter,
             pipeline_config.pipeline_settings().telemetry.clone(),
             Vec::new(),
+            HashMap::new(),
         );
         (
             manager,
@@ -1048,6 +1070,7 @@ mod tests {
                     metrics_reporter,
                     TelemetrySettings::default(),
                     Vec::new(),
+                    HashMap::new(),
                 );
                 let duration = Duration::from_millis(50);
 

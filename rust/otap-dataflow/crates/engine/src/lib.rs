@@ -49,6 +49,7 @@ pub mod receiver;
 mod attributes;
 mod channel_metrics;
 mod channel_mode;
+pub mod component_metrics;
 pub mod config;
 pub mod context;
 pub mod control;
@@ -406,7 +407,7 @@ pub struct PipelineFactory<PData: 'static + Clone> {
     exporter_factories: &'static [ExporterFactory<PData>],
 }
 
-impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
+impl<PData: 'static + Clone + Debug + component_metrics::Instrumented> PipelineFactory<PData> {
     /// Creates a new factory registry with the given factory slices.
     #[must_use]
     pub const fn new(
@@ -626,6 +627,10 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         let node_entity_key = base_ctx.register_node_entity();
         let node_telemetry_handle =
             NodeTelemetryHandle::new(base_ctx.metrics_registry(), node_entity_key);
+
+        // Register RFC-aligned component metrics (produced/consumed with outcomes)
+        let _ = node_telemetry_handle.register_component_metrics();
+
         // Create the guard before any fallible work so failed builds still clean up.
         let mut node_guard = Some(NodeTelemetryGuard::new(node_telemetry_handle.clone()));
         build_state.register_node(
@@ -1450,7 +1455,7 @@ struct HyperEdgeWiring<PData> {
 
 impl<PData> HyperEdgeWiring<PData>
 where
-    PData: 'static + Clone + Debug,
+    PData: 'static + Clone + Debug + component_metrics::Instrumented,
 {
     fn apply(
         self,
@@ -1586,7 +1591,7 @@ impl ResolvedHyperEdgeRuntime {
         core_id: usize,
     ) -> Result<HyperEdgeWiring<PData>, Error>
     where
-        PData: 'static + Clone + Debug,
+        PData: 'static + Clone + Debug + component_metrics::Instrumented,
     {
         let channel_id = self.channel_id();
         let ResolvedHyperEdgeRuntime {
