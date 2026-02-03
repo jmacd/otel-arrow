@@ -18,9 +18,11 @@ pub use otap_df_config::NodeId;
 use otap_df_config::PortName;
 use otap_df_config::{SignalFormat, SignalType};
 use otap_df_engine::error::{Error, TypedError};
+#[allow(deprecated)]
 use otap_df_engine::{
     ConsumerEffectHandlerExtension, Interests, MessageSourceLocalEffectHandlerExtension,
     MessageSourceSharedEffectHandlerExtension, ProducerEffectHandlerExtension,
+    SendWithSubscriptionLocalExtension, SendWithSubscriptionSharedExtension,
     control::{AckMsg, CallData, NackMsg},
 };
 use otap_df_pdata::OtapPayload;
@@ -56,6 +58,42 @@ impl Context {
         }
         self.stack.push(Frame {
             interests,
+            node_id,
+            calldata,
+        });
+    }
+
+    /// Subscribe or update an existing subscription for the same node.
+    ///
+    /// If the top of the stack already has a frame for this node_id, the frame
+    /// is updated: interests are merged (OR'd) and calldata is replaced.
+    /// Otherwise, a new frame is pushed.
+    ///
+    /// This enables a single frame to serve both component-specific subscriptions
+    /// (with custom calldata) and auto-instrumentation, avoiding duplicate frames.
+    pub(crate) fn subscribe_or_update(
+        &mut self,
+        interests: Interests,
+        calldata: CallData,
+        node_id: usize,
+    ) {
+        // Check if the top of the stack already belongs to this node
+        if let Some(last) = self.stack.last_mut() {
+            if last.node_id == node_id {
+                // Merge interests and update calldata
+                last.interests |= interests;
+                last.calldata = calldata;
+                return;
+            }
+        }
+
+        // Otherwise, push a new frame (inheriting RETURN_DATA from predecessor)
+        let mut merged_interests = interests;
+        if let Some(last) = self.stack.last() {
+            merged_interests |= last.interests & Interests::RETURN_DATA;
+        }
+        self.stack.push(Frame {
+            interests: merged_interests,
             node_id,
             calldata,
         });
@@ -277,7 +315,10 @@ impl OtapPdata {
 }
 
 /* -------- Producer effect handler extensions (shared, local) -------- */
+/* Note: ProducerEffectHandlerExtension is deprecated. Use SendWithSubscriptionLocalExtension
+   or SendWithSubscriptionSharedExtension instead. These impls are kept for backward compatibility. */
 
+#[allow(deprecated)]
 #[async_trait(?Send)]
 impl ProducerEffectHandlerExtension<OtapPdata>
     for otap_df_engine::local::processor::EffectHandler<OtapPdata>
@@ -288,6 +329,7 @@ impl ProducerEffectHandlerExtension<OtapPdata>
     }
 }
 
+#[allow(deprecated)]
 #[async_trait(?Send)]
 impl ProducerEffectHandlerExtension<OtapPdata>
     for otap_df_engine::local::receiver::EffectHandler<OtapPdata>
@@ -298,6 +340,7 @@ impl ProducerEffectHandlerExtension<OtapPdata>
     }
 }
 
+#[allow(deprecated)]
 #[async_trait(?Send)]
 impl ProducerEffectHandlerExtension<OtapPdata>
     for otap_df_engine::shared::processor::EffectHandler<OtapPdata>
@@ -308,6 +351,7 @@ impl ProducerEffectHandlerExtension<OtapPdata>
     }
 }
 
+#[allow(deprecated)]
 #[async_trait(?Send)]
 impl ProducerEffectHandlerExtension<OtapPdata>
     for otap_df_engine::shared::receiver::EffectHandler<OtapPdata>
@@ -315,6 +359,238 @@ impl ProducerEffectHandlerExtension<OtapPdata>
     fn subscribe_to(&self, int: Interests, ctx: CallData, data: &mut OtapPdata) {
         data.context
             .subscribe_to(int, ctx, self.receiver_id().index)
+    }
+}
+
+/* -------- SendWithSubscription extensions (local) -------- */
+
+#[async_trait(?Send)]
+impl SendWithSubscriptionLocalExtension<OtapPdata>
+    for otap_df_engine::local::processor::EffectHandler<OtapPdata>
+{
+    async fn send_message_subscribed(
+        &self,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.context
+            .subscribe_or_update(interests, calldata, self.processor_id().index);
+        self.send_message(data).await
+    }
+
+    fn try_send_message_subscribed(
+        &self,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.context
+            .subscribe_or_update(interests, calldata, self.processor_id().index);
+        self.try_send_message(data)
+    }
+
+    async fn send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        data.context
+            .subscribe_or_update(interests, calldata, self.processor_id().index);
+        self.send_message_to(port, data).await
+    }
+
+    fn try_send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        data.context
+            .subscribe_or_update(interests, calldata, self.processor_id().index);
+        self.try_send_message_to(port, data)
+    }
+}
+
+#[async_trait(?Send)]
+impl SendWithSubscriptionLocalExtension<OtapPdata>
+    for otap_df_engine::local::receiver::EffectHandler<OtapPdata>
+{
+    async fn send_message_subscribed(
+        &self,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.context
+            .subscribe_or_update(interests, calldata, self.receiver_id().index);
+        self.send_message(data).await
+    }
+
+    fn try_send_message_subscribed(
+        &self,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.context
+            .subscribe_or_update(interests, calldata, self.receiver_id().index);
+        self.try_send_message(data)
+    }
+
+    async fn send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        data.context
+            .subscribe_or_update(interests, calldata, self.receiver_id().index);
+        self.send_message_to(port, data).await
+    }
+
+    fn try_send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        data.context
+            .subscribe_or_update(interests, calldata, self.receiver_id().index);
+        self.try_send_message_to(port, data)
+    }
+}
+
+/* -------- SendWithSubscription extensions (shared) -------- */
+
+#[async_trait]
+impl SendWithSubscriptionSharedExtension<OtapPdata>
+    for otap_df_engine::shared::processor::EffectHandler<OtapPdata>
+{
+    async fn send_message_subscribed(
+        &self,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.context
+            .subscribe_or_update(interests, calldata, self.processor_id().index);
+        self.send_message(data).await
+    }
+
+    fn try_send_message_subscribed(
+        &self,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.context
+            .subscribe_or_update(interests, calldata, self.processor_id().index);
+        self.try_send_message(data)
+    }
+
+    async fn send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        data.context
+            .subscribe_or_update(interests, calldata, self.processor_id().index);
+        self.send_message_to(port, data).await
+    }
+
+    fn try_send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        data.context
+            .subscribe_or_update(interests, calldata, self.processor_id().index);
+        self.try_send_message_to(port, data)
+    }
+}
+
+#[async_trait]
+impl SendWithSubscriptionSharedExtension<OtapPdata>
+    for otap_df_engine::shared::receiver::EffectHandler<OtapPdata>
+{
+    async fn send_message_subscribed(
+        &self,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.context
+            .subscribe_or_update(interests, calldata, self.receiver_id().index);
+        self.send_message(data).await
+    }
+
+    fn try_send_message_subscribed(
+        &self,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.context
+            .subscribe_or_update(interests, calldata, self.receiver_id().index);
+        self.try_send_message(data)
+    }
+
+    async fn send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        data.context
+            .subscribe_or_update(interests, calldata, self.receiver_id().index);
+        self.send_message_to(port, data).await
+    }
+
+    fn try_send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        data.context
+            .subscribe_or_update(interests, calldata, self.receiver_id().index);
+        self.try_send_message_to(port, data)
     }
 }
 
@@ -1192,5 +1468,82 @@ mod test {
 
         let result = Context::next_nack(nack);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_context_subscribe_or_update_pushes_new_frame() {
+        let mut context = Context::default();
+
+        // First subscription for node 1
+        context.subscribe_or_update(Interests::ACKS, smallvec::smallvec![1u64.into()], 1);
+        assert_eq!(context.stack.len(), 1);
+        assert_eq!(context.stack[0].node_id, 1);
+        assert_eq!(context.stack[0].interests, Interests::ACKS);
+
+        // Subscription for different node 2 - should push new frame
+        context.subscribe_or_update(Interests::NACKS, smallvec::smallvec![2u64.into()], 2);
+        assert_eq!(context.stack.len(), 2);
+        assert_eq!(context.stack[1].node_id, 2);
+        assert_eq!(context.stack[1].interests, Interests::NACKS);
+    }
+
+    #[test]
+    fn test_context_subscribe_or_update_updates_existing_frame() {
+        let mut context = Context::default();
+
+        // First subscription for node 1 with ACKS
+        context.subscribe_or_update(Interests::ACKS, smallvec::smallvec![1u64.into()], 1);
+        assert_eq!(context.stack.len(), 1);
+        assert_eq!(context.stack[0].interests, Interests::ACKS);
+
+        // Second subscription for same node 1 with NACKS - should merge, not push
+        context.subscribe_or_update(Interests::NACKS, smallvec::smallvec![2u64.into()], 1);
+        assert_eq!(context.stack.len(), 1); // Still only 1 frame
+        assert_eq!(context.stack[0].node_id, 1);
+        // Interests should be merged (ACKS | NACKS)
+        assert!(context.stack[0].interests.contains(Interests::ACKS));
+        assert!(context.stack[0].interests.contains(Interests::NACKS));
+        // Calldata should be updated to the new value
+        let calldata_val: u64 = context.stack[0].calldata[0].into();
+        assert_eq!(calldata_val, 2);
+    }
+
+    #[test]
+    fn test_context_subscribe_or_update_only_updates_top_frame() {
+        let mut context = Context::default();
+
+        // Node 1 subscribes
+        context.subscribe_or_update(Interests::ACKS, smallvec::smallvec![1u64.into()], 1);
+        // Node 2 subscribes (becomes top)
+        context.subscribe_or_update(Interests::NACKS, smallvec::smallvec![2u64.into()], 2);
+        assert_eq!(context.stack.len(), 2);
+
+        // Node 1 tries to update again - but it's not at top, so new frame is pushed
+        context.subscribe_or_update(
+            Interests::RETURN_DATA,
+            smallvec::smallvec![3u64.into()],
+            1,
+        );
+        assert_eq!(context.stack.len(), 3);
+        assert_eq!(context.stack[2].node_id, 1);
+        assert_eq!(context.stack[2].interests, Interests::RETURN_DATA);
+    }
+
+    #[test]
+    fn test_context_subscribe_or_update_inherits_return_data() {
+        let mut context = Context::default();
+
+        // Node 1 subscribes with RETURN_DATA
+        context.subscribe_or_update(
+            Interests::ACKS | Interests::RETURN_DATA,
+            smallvec::smallvec![1u64.into()],
+            1,
+        );
+
+        // Node 2 subscribes without RETURN_DATA explicitly - should inherit it
+        context.subscribe_or_update(Interests::NACKS, smallvec::smallvec![2u64.into()], 2);
+
+        assert!(context.stack[1].interests.contains(Interests::RETURN_DATA));
+        assert!(context.stack[1].interests.contains(Interests::NACKS));
     }
 }

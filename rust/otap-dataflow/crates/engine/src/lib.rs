@@ -196,10 +196,122 @@ pub struct Interests: u8 {
 }
 
 /// Effect handler extensions for producers specific to data type.
+///
+/// # Deprecated
+/// This trait is deprecated in favor of [`SendWithSubscriptionLocalExtension`] and
+/// [`SendWithSubscriptionSharedExtension`], which unify subscription with sending.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use SendWithSubscriptionLocalExtension or SendWithSubscriptionSharedExtension instead"
+)]
 #[async_trait(?Send)]
 pub trait ProducerEffectHandlerExtension<PData> {
     /// Subscribe to a set of interests.
     fn subscribe_to(&self, int: Interests, ctx: CallData, data: &mut PData);
+}
+
+/// Effect handler extension for sending with subscription (local, non-Send variant).
+///
+/// This trait unifies the subscribe_to + send_message pattern into a single operation.
+/// Components use this to receive Ack/Nack notifications with their provided calldata.
+///
+/// # Frame Reuse Behavior
+///
+/// If the current node already has a subscription frame at the top of the context stack,
+/// that frame is updated (interests are merged via OR, calldata is replaced) rather than
+/// pushing a new frame. This enables:
+/// - Component subscriptions and auto-instrumentation to share a single frame
+/// - Avoiding duplicate frames for the same node in retry scenarios
+/// - Efficient Ack/Nack routing with consolidated subscription state
+#[async_trait(?Send)]
+pub trait SendWithSubscriptionLocalExtension<PData> {
+    /// Send data with explicit subscription for Ack/Nack callbacks.
+    ///
+    /// If this node already has a frame at the top of the stack, it is updated
+    /// (interests merged, calldata replaced). Otherwise, a new frame is pushed.
+    async fn send_message_subscribed(
+        &self,
+        data: PData,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<PData>>;
+
+    /// Try-send variant for backpressure handling.
+    fn try_send_message_subscribed(
+        &self,
+        data: PData,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<PData>>;
+
+    /// Send to specific port with subscription.
+    async fn send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        data: PData,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<PData>>
+    where
+        P: Into<PortName> + Send + 'static;
+
+    /// Try-send to specific port with subscription.
+    fn try_send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        data: PData,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<PData>>
+    where
+        P: Into<PortName> + Send + 'static;
+}
+
+/// Effect handler extension for sending with subscription (shared, Send variant).
+///
+/// This trait unifies the subscribe_to + send_message pattern into a single operation
+/// for use in Send contexts (e.g., `tokio::spawn`).
+///
+/// See [`SendWithSubscriptionLocalExtension`] for frame reuse behavior details.
+#[async_trait]
+pub trait SendWithSubscriptionSharedExtension<PData: Send + 'static> {
+    /// Send data with explicit subscription for Ack/Nack callbacks.
+    async fn send_message_subscribed(
+        &self,
+        data: PData,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<PData>>;
+
+    /// Try-send variant for backpressure handling.
+    fn try_send_message_subscribed(
+        &self,
+        data: PData,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<PData>>;
+
+    /// Send to specific port with subscription.
+    async fn send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        data: PData,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<PData>>
+    where
+        P: Into<PortName> + Send + 'static;
+
+    /// Try-send to specific port with subscription.
+    fn try_send_message_subscribed_to<P>(
+        &self,
+        port: P,
+        data: PData,
+        interests: Interests,
+        calldata: CallData,
+    ) -> Result<(), TypedError<PData>>
+    where
+        P: Into<PortName> + Send + 'static;
 }
 
 /// Effect handler extensions for consumers specific to data type.
