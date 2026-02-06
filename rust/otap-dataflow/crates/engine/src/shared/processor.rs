@@ -31,7 +31,7 @@
 //! To ensure scalability, the pipeline engine will start multiple instances of the same pipeline
 //! in parallel on different cores, each with its own processor instance.
 
-use crate::control::{AckMsg, NackMsg};
+use crate::control::{AckMsg, NackMsg, PipelineCtrlMsgSender};
 use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
 use crate::error::{Error, TypedError};
 use crate::message::Message;
@@ -293,6 +293,18 @@ impl<PData> EffectHandler<PData> {
         }
     }
 
+    /// Sets the pipeline control message sender for this effect handler.
+    ///
+    /// Primarily used by tests and manual harnesses that construct an EffectHandler directly;
+    /// the engine wiring sets this automatically in `prepare_runtime`.
+    pub fn set_pipeline_ctrl_msg_sender(
+        &mut self,
+        pipeline_ctrl_msg_sender: PipelineCtrlMsgSender<PData>,
+    ) {
+        self.core
+            .set_pipeline_ctrl_msg_sender(pipeline_ctrl_msg_sender);
+    }
+
     // More methods will be added in the future as needed.
 }
 
@@ -302,8 +314,8 @@ mod tests {
     use super::*;
     use crate::shared::message::SharedSender;
     use crate::testing::test_node;
-    use otap_df_channel::error::SendError;
     use MetricsReporter;
+    use otap_df_channel::error::SendError;
     use std::collections::HashMap;
 
     #[test]

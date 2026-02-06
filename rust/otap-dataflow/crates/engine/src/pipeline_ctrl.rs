@@ -17,7 +17,7 @@ use crate::control::{ControlSenders, NodeControlMsg, PipelineControlMsg, Pipelin
 use crate::error::Error;
 use crate::pipeline_metrics::PipelineMetricsMonitor;
 use otap_df_config::DeployedPipelineKey;
-use otap_df_config::pipeline::TelemetrySettings;
+use otap_df_config::settings::TelemetrySettings;
 use otap_df_telemetry::event::{EngineEvent, ErrorSummary, ObservedEventReporter};
 use otap_df_telemetry::reporter::MetricsReporter;
 use otap_df_telemetry::{otel_debug, otel_warn};
@@ -604,6 +604,7 @@ mod tests {
             pipeline_group_id.clone(),
             pipeline_id.clone(),
             core_id,
+            1, // num_cores
             thread_id,
         );
 
@@ -1052,6 +1053,7 @@ mod tests {
                     pipeline_group_id.clone(),
                     pipeline_id.clone(),
                     core_id,
+                    1, // num_cores
                     thread_id,
                 );
                 let pipeline_entity_key = pipeline_context.register_pipeline_entity();

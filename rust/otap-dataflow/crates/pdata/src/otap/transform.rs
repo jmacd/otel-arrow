@@ -31,6 +31,7 @@ use crate::otlp::attributes::{AttributeValueType, parent_id::ParentId};
 use crate::schema::consts::{self, metadata};
 use crate::schema::{get_field_metadata, update_field_metadata};
 
+pub mod concatenate;
 pub mod transport_optimize;
 
 pub fn remove_delta_encoding<T>(
@@ -434,12 +435,6 @@ where
                         materialized_parent_ids[batch_idx] = curr_parent_id;
                         batch_idx += 1;
                     }
-                }
-
-                // handle any remaining non-delta values after last delta range ...
-                // just read the last value if there are any remaining
-                if batch_idx <= eq_range_end {
-                    curr_parent_id = materialized_parent_ids[eq_range_end];
                 }
             }
         }

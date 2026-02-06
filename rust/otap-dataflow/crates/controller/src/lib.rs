@@ -257,6 +257,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + Instrumented> Cont
                     &quota.core_allocation,
                 )?;
 
+                let num_cores = requested_cores.len();
                 for core_id in requested_cores {
                     let pipeline_key = DeployedPipelineKey {
                         pipeline_group_id: pipeline_group_id.clone(),
@@ -278,6 +279,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + Instrumented> Cont
                         pipeline_group_id.clone(),
                         pipeline_id.clone(),
                         core_id.id,
+                        num_cores,
                         thread_id,
                     );
                     let metrics_reporter = metrics_reporter.clone();
@@ -577,6 +579,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + Instrumented> Cont
             its_key.pipeline_group_id.clone(),
             its_key.pipeline_id.clone(),
             its_key.core_id,
+            1, // Internal telemetry pipeline runs on a single core
             0, // TODO: we do not have a thread_id
         );
 

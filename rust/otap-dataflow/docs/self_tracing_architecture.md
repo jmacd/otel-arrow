@@ -2,7 +2,7 @@
 
 This documents the choices available in the internal logging
 configuration object in
-`otap_df_config::pipeline::service::telemetry::logs`. See the
+`otap_df_config::settings::telemetry::logs`. See the
 [internal telemetry crate's README](../crates/telemetry/README.md) for
 the motivation behind this configuration as well as for a description
 of the internal metrics pipeline.
@@ -279,7 +279,7 @@ nodes:
 # Internal telemetry pipeline nodes
 internal:
   kind: receiver
-  plugin_urn: "urn:otel:otlp:telemetry:receiver"
+  plugin_urn: "urn:otel:internal_telemetry:receiver"
   out_ports:
     out_port:
       destinations:

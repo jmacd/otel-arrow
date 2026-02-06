@@ -49,6 +49,9 @@ pub mod filter_processor;
 /// Implementation of a noop exporter that acts as a exporter placeholder
 pub mod noop_exporter;
 
+/// Fan-out processor to clone data to multiple downstream outputs.
+pub mod fanout_processor;
+
 /// An error-exporter returns a static error.
 pub mod error_exporter;
 
@@ -114,6 +117,9 @@ pub mod tls_utils;
 
 /// Console exporter similar using built-in OTLP-bytes formatting.
 pub mod console_exporter;
+
+/// Durable buffer processor for crash-resilient buffering via Quiver
+pub mod durable_buffer_processor;
 
 /// Factory for OTAP-based pipeline
 #[pipeline_factory(OTAP, OtapPdata)]
