@@ -21,8 +21,7 @@ use data_engine_kql_parser::{KqlParser, Parser};
 use linkme::distributed_slice;
 use otap_df_config::{SignalType, error::Error as ConfigError, node::NodeUserConfig};
 use otap_df_engine::{
-    ConsumerEffectHandlerExtension, Interests, MessageSourceLocalEffectHandlerExtension,
-    ProcessorFactory, ProducerEffectHandlerExtension,
+    ConsumerEffectHandlerExtension, Interests, ProcessorFactory, ProducerEffectHandlerExtension,
     config::ProcessorConfig,
     context::PipelineContext,
     control::{AckMsg, NackMsg, NodeControlMsg},
@@ -185,7 +184,7 @@ impl TransformProcessor {
             // routed somewhere else, so we don't need to juggle any inbound/outbound contexts
             // and we can just handle the batch normally.
             let pdata = OtapPdata::new(inbound_context, default_otap_batch.into());
-            effect_handler.send_message_with_source_node(pdata).await?;
+            effect_handler.send_message(pdata).await?;
             return Ok(());
         }
 
@@ -233,7 +232,7 @@ impl TransformProcessor {
                 &mut pdata,
             );
         }
-        effect_handler.send_message_with_source_node(pdata).await?;
+        effect_handler.send_message(pdata).await?;
 
         // handle any batches that need to be forwarded to a specific out_port thanks to invocation
         // of a "route_to" operator call
@@ -282,9 +281,7 @@ impl TransformProcessor {
                 );
             }
 
-            effect_handler
-                .send_message_with_source_node_to(port_name, pdata)
-                .await?;
+            effect_handler.send_message_to(port_name, pdata).await?;
         }
 
         Ok(())
@@ -385,7 +382,7 @@ impl Processor<OtapPdata> for TransformProcessor {
                 if !self.should_process(&payload) {
                     // skip handling this pdata
                     effect_handler
-                        .send_message_with_source_node(OtapPdata::new(context, payload))
+                        .send_message(OtapPdata::new(context, payload))
                         .await?;
                 } else {
                     let mut otap_batch: OtapArrowRecords = payload.try_into()?;

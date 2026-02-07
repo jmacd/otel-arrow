@@ -14,13 +14,11 @@
 //! This functionality is exposed through various traits implemented by effect handlers.
 
 use async_trait::async_trait;
-pub use otap_df_config::NodeId;
-use otap_df_config::PortName;
 use otap_df_config::{SignalFormat, SignalType};
-use otap_df_engine::error::{Error, TypedError};
+use otap_df_engine::error::Error;
+pub use otap_df_engine::node::NodeId;
 use otap_df_engine::{
-    ConsumerEffectHandlerExtension, Interests, MessageSourceLocalEffectHandlerExtension,
-    MessageSourceSharedEffectHandlerExtension, ProducerEffectHandlerExtension,
+    ConsumerEffectHandlerExtension, Interests, ProducerEffectHandlerExtension,
     control::{AckMsg, CallData, NackMsg},
 };
 use otap_df_pdata::OtapPayload;
@@ -28,7 +26,6 @@ use otap_df_pdata::OtapPayload;
 /// Context for OTAP requests
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Context {
-    source_node: Option<NodeId>,
     stack: Vec<Frame>,
 }
 
@@ -38,7 +35,6 @@ impl Context {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            source_node: None,
             stack: Vec::with_capacity(capacity),
         }
     }
@@ -50,10 +46,19 @@ impl Context {
         calldata: CallData,
         node_id: usize,
     ) {
-        if let Some(last) = self.stack.last() {
+        if let Some(last) = self.stack.last_mut() {
             // Inherit the preceding frame's RETURN_DATA bit
             interests |= last.interests & Interests::RETURN_DATA;
+
+            // Check if the top of the stack already belongs to this node
+            if last.node_id == node_id {
+                // Merge interests and update calldata
+                last.interests |= interests;
+                last.calldata = calldata;
+                return;
+            }
         }
+
         self.stack.push(Frame {
             interests,
             node_id,
@@ -123,15 +128,10 @@ impl Context {
         !self.stack.is_empty()
     }
 
-    /// Set the source node for this context.
-    pub fn set_source_node(&mut self, node: Option<NodeId>) {
-        self.source_node = node;
-    }
-
     /// Get the source node for this context.
     #[must_use]
-    pub fn source_node(&self) -> Option<NodeId> {
-        self.source_node.clone()
+    pub fn source_node(&self) -> Option<usize> {
+        self.stack.last().map(|f| f.node_id)
     }
 }
 
@@ -162,6 +162,7 @@ impl OtapPdata {
     #[cfg(test)]
     pub fn new_default(payload: OtapPayload) -> Self {
         Self {
+            // @@@
             context: Context::default(),
             payload,
         }
@@ -169,6 +170,7 @@ impl OtapPdata {
 
     /// New OtapData with payload using TODO(#1098) context. This is
     /// a definite problem. See issue #1098.
+    /// @@@
     #[must_use]
     pub fn new_todo_context(payload: OtapPayload) -> Self {
         Self {
@@ -263,15 +265,9 @@ impl OtapPdata {
         self.context.current_calldata()
     }
 
-    /// update the source node
-    pub fn add_source_node(mut self, node_id: Option<NodeId>) -> Self {
-        self.context.set_source_node(node_id);
-        self
-    }
-
     /// return the source node field
     #[must_use]
-    pub fn get_source_node(&self) -> Option<NodeId> {
+    pub fn get_source_node(&self) -> Option<usize> {
         self.context.source_node()
     }
 }
@@ -372,187 +368,146 @@ impl ConsumerEffectHandlerExtension<OtapPdata>
     }
 }
 
-/* --------  effect handler extensions (shared, local) -------- */
+// /* --------  effect handler extensions (shared, local) -------- */
+// #[async_trait(?Send)]
+// impl MessageSourceLocalEffectHandlerExtension<OtapPdata>
+//     for otap_df_engine::local::processor::EffectHandler<OtapPdata>
+// {
+//     async fn send_message(&self, data: OtapPdata) -> Result<(), TypedError<OtapPdata>> {
+//         let data = data.add_source_node(Some(self.processor_id().name));
+//         self.send_message(data).await
+//     }
 
-#[async_trait(?Send)]
-impl MessageSourceLocalEffectHandlerExtension<OtapPdata>
-    for otap_df_engine::local::processor::EffectHandler<OtapPdata>
-{
-    async fn send_message_with_source_node(
-        &self,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>> {
-        let data = data.add_source_node(Some(self.processor_id().name));
-        self.send_message(data).await
-    }
+//     fn try_send_message(&self, data: OtapPdata) -> Result<(), TypedError<OtapPdata>> {
+//         let data = data.add_source_node(Some(self.processor_id().name));
+//         self.try_send_message(data)
+//     }
 
-    fn try_send_message_with_source_node(
-        &self,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>> {
-        let data = data.add_source_node(Some(self.processor_id().name));
-        self.try_send_message(data)
-    }
+//     async fn send_message_to<P>(
+//         &self,
+//         port: P,
+//         data: OtapPdata,
+//     ) -> Result<(), TypedError<OtapPdata>>
+//     where
+//         P: Into<PortName> + Send + 'static,
+//     {
+//         let data = data.add_source_node(Some(self.processor_id().name));
+//         self.send_message_to(port, data).await
+//     }
 
-    async fn send_message_with_source_node_to<P>(
-        &self,
-        port: P,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>>
-    where
-        P: Into<PortName> + Send + 'static,
-    {
-        let data = data.add_source_node(Some(self.processor_id().name));
-        self.send_message_to(port, data).await
-    }
+//     fn try_send_message_to<P>(&self, port: P, data: OtapPdata) -> Result<(), TypedError<OtapPdata>>
+//     where
+//         P: Into<PortName> + Send + 'static,
+//     {
+//         let data = data.add_source_node(Some(self.processor_id().name));
+//         self.try_send_message_to(port, data)
+//     }
+// }
 
-    fn try_send_message_with_source_node_to<P>(
-        &self,
-        port: P,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>>
-    where
-        P: Into<PortName> + Send + 'static,
-    {
-        let data = data.add_source_node(Some(self.processor_id().name));
-        self.try_send_message_to(port, data)
-    }
-}
+// #[async_trait(?Send)]
+// impl MessageSourceLocalEffectHandlerExtension<OtapPdata>
+//     for otap_df_engine::local::receiver::EffectHandler<OtapPdata>
+// {
+//     async fn send_message(&self, data: OtapPdata) -> Result<(), TypedError<OtapPdata>> {
+//         let data = data.add_source_node(Some(self.receiver_id().name));
+//         self.send_message(data).await
+//     }
 
-#[async_trait(?Send)]
-impl MessageSourceLocalEffectHandlerExtension<OtapPdata>
-    for otap_df_engine::local::receiver::EffectHandler<OtapPdata>
-{
-    async fn send_message_with_source_node(
-        &self,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>> {
-        let data = data.add_source_node(Some(self.receiver_id().name));
-        self.send_message(data).await
-    }
+//     fn try_send_message(&self, data: OtapPdata) -> Result<(), TypedError<OtapPdata>> {
+//         let data = data.add_source_node(Some(self.receiver_id().name));
+//         self.try_send_message(data)
+//     }
 
-    fn try_send_message_with_source_node(
-        &self,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>> {
-        let data = data.add_source_node(Some(self.receiver_id().name));
-        self.try_send_message(data)
-    }
+//     async fn send_message_to<P>(
+//         &self,
+//         port: P,
+//         data: OtapPdata,
+//     ) -> Result<(), TypedError<OtapPdata>>
+//     where
+//         P: Into<PortName> + Send,
+//     {
+//         let data = data.add_source_node(Some(self.receiver_id().name));
+//         self.send_message_to(port, data).await
+//     }
 
-    async fn send_message_with_source_node_to<P>(
-        &self,
-        port: P,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>>
-    where
-        P: Into<PortName> + Send,
-    {
-        let data = data.add_source_node(Some(self.receiver_id().name));
-        self.send_message_to(port, data).await
-    }
+//     fn try_send_message_to<P>(&self, port: P, data: OtapPdata) -> Result<(), TypedError<OtapPdata>>
+//     where
+//         P: Into<PortName> + Send,
+//     {
+//         let data = data.add_source_node(Some(self.receiver_id().name));
+//         self.try_send_message_to(port, data)
+//     }
+// }
 
-    fn try_send_message_with_source_node_to<P>(
-        &self,
-        port: P,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>>
-    where
-        P: Into<PortName> + Send,
-    {
-        let data = data.add_source_node(Some(self.receiver_id().name));
-        self.try_send_message_to(port, data)
-    }
-}
+// #[async_trait]
+// impl MessageSourceSharedEffectHandlerExtension<OtapPdata>
+//     for otap_df_engine::shared::processor::EffectHandler<OtapPdata>
+// {
+//     async fn send_message(&self, data: OtapPdata) -> Result<(), TypedError<OtapPdata>> {
+//         let data = data.add_source_node(Some(self.processor_id().name));
+//         self.send_message(data).await
+//     }
 
-#[async_trait]
-impl MessageSourceSharedEffectHandlerExtension<OtapPdata>
-    for otap_df_engine::shared::processor::EffectHandler<OtapPdata>
-{
-    async fn send_message_with_source_node(
-        &self,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>> {
-        let data = data.add_source_node(Some(self.processor_id().name));
-        self.send_message(data).await
-    }
+//     fn try_send_message(&self, data: OtapPdata) -> Result<(), TypedError<OtapPdata>> {
+//         let data = data.add_source_node(Some(self.processor_id().name));
+//         self.try_send_message(data)
+//     }
 
-    fn try_send_message_with_source_node(
-        &self,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>> {
-        let data = data.add_source_node(Some(self.processor_id().name));
-        self.try_send_message(data)
-    }
+//     async fn send_message_to<P>(
+//         &self,
+//         port: P,
+//         data: OtapPdata,
+//     ) -> Result<(), TypedError<OtapPdata>>
+//     where
+//         P: Into<PortName> + Send + 'static,
+//     {
+//         let data = data.add_source_node(Some(self.processor_id().name));
+//         self.send_message_to(port, data).await
+//     }
 
-    async fn send_message_with_source_node_to<P>(
-        &self,
-        port: P,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>>
-    where
-        P: Into<PortName> + Send + 'static,
-    {
-        let data = data.add_source_node(Some(self.processor_id().name));
-        self.send_message_to(port, data).await
-    }
+//     fn try_send_message_to<P>(&self, port: P, data: OtapPdata) -> Result<(), TypedError<OtapPdata>>
+//     where
+//         P: Into<PortName> + Send + 'static,
+//     {
+//         let data = data.add_source_node(Some(self.processor_id().name));
+//         self.try_send_message_to(port, data)
+//     }
+// }
 
-    fn try_send_message_with_source_node_to<P>(
-        &self,
-        port: P,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>>
-    where
-        P: Into<PortName> + Send + 'static,
-    {
-        let data = data.add_source_node(Some(self.processor_id().name));
-        self.try_send_message_to(port, data)
-    }
-}
+// #[async_trait]
+// impl MessageSourceSharedEffectHandlerExtension<OtapPdata>
+//     for otap_df_engine::shared::receiver::EffectHandler<OtapPdata>
+// {
+//     async fn send_message(&self, data: OtapPdata) -> Result<(), TypedError<OtapPdata>> {
+//         let data = data.add_source_node(Some(self.receiver_id().name));
+//         self.send_message(data).await
+//     }
 
-#[async_trait]
-impl MessageSourceSharedEffectHandlerExtension<OtapPdata>
-    for otap_df_engine::shared::receiver::EffectHandler<OtapPdata>
-{
-    async fn send_message_with_source_node(
-        &self,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>> {
-        let data = data.add_source_node(Some(self.receiver_id().name));
-        self.send_message(data).await
-    }
+//     fn try_send_message(&self, data: OtapPdata) -> Result<(), TypedError<OtapPdata>> {
+//         let data = data.add_source_node(Some(self.receiver_id().name));
+//         self.try_send_message(data)
+//     }
 
-    fn try_send_message_with_source_node(
-        &self,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>> {
-        let data = data.add_source_node(Some(self.receiver_id().name));
-        self.try_send_message(data)
-    }
+//     async fn send_message_to<P>(
+//         &self,
+//         port: P,
+//         data: OtapPdata,
+//     ) -> Result<(), TypedError<OtapPdata>>
+//     where
+//         P: Into<PortName> + Send + 'static,
+//     {
+//         let data = data.add_source_node(Some(self.receiver_id().name));
+//         self.send_message_to(port, data).await
+//     }
 
-    async fn send_message_with_source_node_to<P>(
-        &self,
-        port: P,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>>
-    where
-        P: Into<PortName> + Send + 'static,
-    {
-        let data = data.add_source_node(Some(self.receiver_id().name));
-        self.send_message_to(port, data).await
-    }
-
-    fn try_send_message_with_source_node_to<P>(
-        &self,
-        port: P,
-        data: OtapPdata,
-    ) -> Result<(), TypedError<OtapPdata>>
-    where
-        P: Into<PortName> + Send + 'static,
-    {
-        let data = data.add_source_node(Some(self.receiver_id().name));
-        self.try_send_message_to(port, data)
-    }
-}
+//     fn try_send_message_to<P>(&self, port: P, data: OtapPdata) -> Result<(), TypedError<OtapPdata>>
+//     where
+//         P: Into<PortName> + Send + 'static,
+//     {
+//         let data = data.add_source_node(Some(self.receiver_id().name));
+//         self.try_send_message_to(port, data)
+//     }
+// }
 
 #[cfg(test)]
 mod test {
@@ -579,7 +534,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn shared_receiver_send_with_source_node() {
+    async fn shared_receiver_send() {
         let (tx, mut rx) = mpsc::channel::<OtapPdata>(4);
         let mut senders = HashMap::new();
         let _ = senders.insert("out".into(), SharedSender::mpsc(tx));
@@ -598,17 +553,14 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .send_message_with_source_node(pdata)
-            .await
-            .expect("send ok");
+        handler.send_message(pdata).await.expect("send ok");
 
         let sent = rx.recv().await.expect("message received");
         assert_eq!(sent.get_source_node(), Some("recv_node".into()));
     }
 
     #[tokio::test]
-    async fn shared_processor_send_with_source_node() {
+    async fn shared_processor_send() {
         let (tx, mut rx) = mpsc::channel::<OtapPdata>(4);
         let mut senders = HashMap::new();
         let _ = senders.insert("out".into(), SharedSender::mpsc(tx));
@@ -625,10 +577,7 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .send_message_with_source_node(pdata)
-            .await
-            .expect("send ok");
+        handler.send_message(pdata).await.expect("send ok");
 
         let sent = rx.recv().await.expect("message received");
         assert_eq!(sent.get_source_node(), Some("proc_node".into()));
@@ -654,10 +603,7 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .send_message_with_source_node_to("b", pdata)
-            .await
-            .expect("send ok");
+        handler.send_message_to("b", pdata).await.expect("send ok");
 
         assert!(a_rx.try_recv().is_err());
         let sent = b_rx.recv().await.expect("message received");
@@ -686,10 +632,7 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .send_message_with_source_node_to("b", pdata)
-            .await
-            .expect("send ok");
+        handler.send_message_to("b", pdata).await.expect("send ok");
 
         assert!(a_rx.try_recv().is_err());
         let sent = b_rx.recv().await.expect("message received");
@@ -714,9 +657,7 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .try_send_message_with_source_node(pdata)
-            .expect("try_send ok");
+        handler.try_send_message(pdata).expect("try_send ok");
 
         let sent = rx.try_recv().expect("message received");
         assert_eq!(sent.get_source_node(), Some("proc_node".into()));
@@ -743,7 +684,7 @@ mod test {
 
         let pdata = create_test_pdata();
         handler
-            .try_send_message_with_source_node_to("b", pdata)
+            .try_send_message_to("b", pdata)
             .expect("try_send ok");
 
         assert!(a_rx.try_recv().is_err());
@@ -774,7 +715,7 @@ mod test {
 
         let pdata = create_test_pdata();
         handler
-            .try_send_message_with_source_node_to("b", pdata)
+            .try_send_message_to("b", pdata)
             .expect("try_send ok");
 
         assert!(a_rx.try_recv().is_err());
@@ -783,7 +724,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn local_processor_send_with_source_node() {
+    async fn local_processor_send() {
         let (tx, rx) = LocalChannel::<OtapPdata>::new(4);
         let mut senders = HashMap::new();
         let _ = senders.insert("out".into(), Sender::Local(LocalSender::mpsc(tx)));
@@ -800,10 +741,7 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .send_message_with_source_node(pdata)
-            .await
-            .expect("send ok");
+        handler.send_message(pdata).await.expect("send ok");
 
         let sent = rx.recv().await.expect("message received");
         assert_eq!(sent.get_source_node(), Some("proc_local".into()));
@@ -829,10 +767,7 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .send_message_with_source_node_to("b", pdata)
-            .await
-            .expect("send ok");
+        handler.send_message_to("b", pdata).await.expect("send ok");
 
         assert!(a_rx.try_recv().is_err());
         let sent = b_rx.recv().await.expect("message received");
@@ -840,7 +775,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn local_processor_try_send_with_source_node() {
+    async fn local_processor_try_send() {
         let (tx, rx) = LocalChannel::<OtapPdata>::new(1);
         let mut senders = HashMap::new();
         let _ = senders.insert("out".into(), Sender::Local(LocalSender::mpsc(tx)));
@@ -857,9 +792,7 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .try_send_message_with_source_node(pdata)
-            .expect("try_send ok");
+        handler.try_send_message(pdata).expect("try_send ok");
 
         let sent = rx.try_recv().expect("message received");
         assert_eq!(sent.get_source_node(), Some("proc_local".into()));
@@ -886,7 +819,7 @@ mod test {
 
         let pdata = create_test_pdata();
         handler
-            .try_send_message_with_source_node_to("b", pdata)
+            .try_send_message_to("b", pdata)
             .expect("try_send ok");
 
         assert!(a_rx.try_recv().is_err());
@@ -917,7 +850,7 @@ mod test {
 
         let pdata = create_test_pdata();
         handler
-            .try_send_message_with_source_node_to("b", pdata)
+            .try_send_message_to("b", pdata)
             .expect("try_send ok");
 
         assert!(a_rx.try_recv().is_err());
@@ -926,7 +859,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn local_receiver_send_with_source_node() {
+    async fn local_receiver_send() {
         let (tx, rx) = LocalChannel::<OtapPdata>::new(2);
         let mut senders = HashMap::new();
         let _ = senders.insert("out".into(), Sender::Local(LocalSender::mpsc(tx)));
@@ -945,10 +878,7 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .send_message_with_source_node(pdata)
-            .await
-            .expect("send ok");
+        handler.send_message(pdata).await.expect("send ok");
 
         let sent = rx.recv().await.expect("message received");
         assert_eq!(sent.get_source_node(), Some("recv_local".into()));
@@ -976,10 +906,7 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .send_message_with_source_node_to("b", pdata)
-            .await
-            .expect("send ok");
+        handler.send_message_to("b", pdata).await.expect("send ok");
 
         assert!(a_rx.try_recv().is_err());
         let sent = b_rx.recv().await.expect("message received");
@@ -987,7 +914,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn local_receiver_try_send_with_source_node() {
+    async fn local_receiver_try_send() {
         let (tx, rx) = LocalChannel::<OtapPdata>::new(1);
         let mut senders = HashMap::new();
         let _ = senders.insert("out".into(), Sender::Local(LocalSender::mpsc(tx)));
@@ -1006,9 +933,7 @@ mod test {
         );
 
         let pdata = create_test_pdata();
-        handler
-            .try_send_message_with_source_node(pdata)
-            .expect("try_send ok");
+        handler.try_send_message(pdata).expect("try_send ok");
 
         let sent = rx.try_recv().expect("message received");
         assert_eq!(sent.get_source_node(), Some("recv_local".into()));

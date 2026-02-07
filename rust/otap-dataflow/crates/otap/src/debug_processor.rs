@@ -18,6 +18,7 @@ use linkme::distributed_slice;
 use otap_df_config::PortName;
 use otap_df_config::error::Error as ConfigError;
 use otap_df_config::node::NodeUserConfig;
+use otap_df_engine::ConsumerEffectHandlerExtension;
 use otap_df_engine::config::ProcessorConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{CallData, NodeControlMsg};
@@ -26,7 +27,6 @@ use otap_df_engine::local::processor as local;
 use otap_df_engine::message::Message;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::processor::ProcessorWrapper;
-use otap_df_engine::{ConsumerEffectHandlerExtension, MessageSourceLocalEffectHandlerExtension};
 use otap_df_engine::{Interests, ProducerEffectHandlerExtension};
 use otap_df_pdata::OtlpProtoBytes;
 use otap_df_pdata::proto::opentelemetry::{
@@ -311,14 +311,10 @@ impl local::Processor<OtapPdata> for DebugProcessor {
                 if let Some(ports) = main_ports {
                     for port in ports {
                         // Note each clone has its own clone of the context.
-                        effect_handler
-                            .send_message_with_source_node_to(port, pdata.clone())
-                            .await?;
+                        effect_handler.send_message_to(port, pdata.clone()).await?;
                     }
                 } else {
-                    effect_handler
-                        .send_message_with_source_node(pdata.clone())
-                        .await?;
+                    effect_handler.send_message(pdata.clone()).await?;
                 }
 
                 let (_context, payload) = pdata.into_parts();

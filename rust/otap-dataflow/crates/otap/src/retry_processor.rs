@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use linkme::distributed_slice;
 use otap_df_config::SignalType;
 use otap_df_config::{error::Error as ConfigError, node::NodeUserConfig};
-use otap_df_engine::MessageSourceLocalEffectHandlerExtension;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::{
     ConsumerEffectHandlerExtension, Interests, ProcessorFactory, ProducerEffectHandlerExtension,
@@ -575,7 +574,7 @@ impl RetryProcessor {
         num_items: u64,
     ) -> Result<(), Error> {
         let signal = data.signal_type();
-        match effect_handler.send_message_with_source_node(data).await {
+        match effect_handler.send_message(data).await {
             Ok(()) => {
                 // Request control flows downstream.
                 Ok(())
