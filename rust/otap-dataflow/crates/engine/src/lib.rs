@@ -49,6 +49,7 @@ use std::{
 
 pub mod error;
 pub mod exporter;
+pub mod extension;
 pub mod message;
 pub mod processor;
 pub mod receiver;
@@ -561,6 +562,14 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         }
 
         self.validate_connection_wiring_contracts(&config)?;
+
+        // Create extensions and populate the capability map.
+        // Extensions must be built before nodes so capabilities are available
+        // during node factory calls.
+        if !config.extensions().is_empty() {
+            let extensions = extension::build_extensions(config.extensions())?;
+            pipeline_ctx.set_extensions(Arc::new(extensions));
+        }
 
         let channel_metrics_enabled = telemetry_policy.channel_metrics >= MetricLevel::Basic;
 

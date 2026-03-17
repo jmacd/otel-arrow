@@ -21,6 +21,8 @@ pub mod engine;
 /// Environment variable substitution for raw config text.
 pub mod env_substitution;
 pub mod error;
+/// Extension configuration types.
+pub mod extension;
 pub mod health;
 pub mod node;
 /// Node type URN value object.

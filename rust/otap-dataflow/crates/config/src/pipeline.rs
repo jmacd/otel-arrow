@@ -5,6 +5,7 @@
 pub mod telemetry;
 
 use crate::error::{Context, Error, HyperEdgeSpecDetails};
+use crate::extension::ExtensionConfig;
 use crate::node::{NodeKind, NodeUserConfig};
 use crate::policy::Policies;
 use crate::{Description, NodeId, NodeUrn, PipelineGroupId, PipelineId, PortName};
@@ -51,6 +52,21 @@ pub struct PipelineConfig {
     /// the main pipeline graph.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     connections: Vec<PipelineConnection>,
+
+    /// Optional extension instances providing shared capabilities to nodes.
+    ///
+    /// Extensions are created and registered before any node factories run,
+    /// so capabilities are available during node construction.
+    ///
+    /// ```yaml
+    /// extensions:
+    ///   my_auth:
+    ///     type: bearer-token
+    ///     config:
+    ///       token: "secret"
+    /// ```
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    extensions: HashMap<String, ExtensionConfig>,
 }
 
 const fn default_pipeline_type() -> PipelineType {
@@ -496,6 +512,12 @@ impl PipelineConfig {
         self.connections.iter()
     }
 
+    /// Returns the extension configurations declared in this pipeline.
+    #[must_use]
+    pub fn extensions(&self) -> &HashMap<String, ExtensionConfig> {
+        &self.extensions
+    }
+
     /// Creates a consuming iterator over the nodes in the pipeline.
     pub fn node_into_iter(self) -> impl Iterator<Item = (NodeId, Arc<NodeUserConfig>)> {
         self.nodes.into_iter()
@@ -591,6 +613,7 @@ impl PipelineConfig {
             policies,
             nodes,
             connections,
+            extensions: HashMap::new(),
         }
     }
 
@@ -1169,6 +1192,7 @@ impl PipelineConfigBuilder {
                 connections: built_connections,
                 policies: None,
                 r#type: pipeline_type,
+                extensions: HashMap::new(),
             };
 
             spec.canonicalize_plugin_urns(&pipeline_group_id, &pipeline_id)?;

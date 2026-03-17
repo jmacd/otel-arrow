@@ -323,6 +323,31 @@ pub enum Error {
         plugin_urn: NodeUrn,
     },
 
+    /// Required extension capability not found.
+    #[error("Extension capability `{capability}` not found — no extension registered it")]
+    ExtensionNotFound {
+        /// The trait name of the missing capability.
+        capability: String,
+    },
+
+    /// Unknown extension type in config.
+    #[error("Unknown extension type `{type_name}` for instance `{name}`")]
+    UnknownExtension {
+        /// Config key for this extension instance.
+        name: String,
+        /// The type name that was not found in any factory.
+        type_name: String,
+    },
+
+    /// Extension factory failed to create an instance.
+    #[error("Failed to create extension `{name}`: {error}")]
+    ExtensionCreateError {
+        /// Config key for this extension instance.
+        name: String,
+        /// The underlying error message.
+        error: String,
+    },
+
     /// Unknown node.
     #[error("Unknown node `{node}`")]
     UnknownNode {
@@ -503,6 +528,9 @@ impl Error {
             Error::SpmcSharedNotSupported { .. } => "SpmcSharedNotSupported",
             Error::TooManyNodes {} => "TooManyNodes",
             Error::UnknownExporter { .. } => "UnknownExporter",
+            Error::ExtensionNotFound { .. } => "ExtensionNotFound",
+            Error::UnknownExtension { .. } => "UnknownExtension",
+            Error::ExtensionCreateError { .. } => "ExtensionCreateError",
             Error::UnknownNode { .. } => "UnknownNode",
             Error::UnknownOutputPort { .. } => "UnknownOutputPort",
             Error::UnknownProcessor { .. } => "UnknownProcessor",
