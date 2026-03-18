@@ -9,7 +9,7 @@ use crate::attributes::{
     PipelineAttributeSet, config_map_to_telemetry,
 };
 use crate::entity_context::{current_node_telemetry_handle, node_entity_key};
-use crate::extension::Extensions;
+use crate::extension::Capabilities;
 use crate::node::NodeId as EngineNodeId;
 use otap_df_config::node::NodeKind;
 use otap_df_config::pipeline::telemetry::TelemetryAttribute;
@@ -133,7 +133,7 @@ pub struct PipelineContext {
     /// ToDo: Make PipelineContext generic over a TopicSet type to avoid dynamic typing here.
     topic_set: Option<Arc<dyn Any + Send + Sync>>,
     /// Shared extension capabilities populated during pipeline build.
-    extensions: Arc<Extensions>,
+    capabilities: Arc<Capabilities>,
 }
 
 impl ControllerContext {
@@ -217,7 +217,7 @@ impl PipelineContext {
             internal_telemetry: None,
             node_names: Arc::new(HashMap::new()),
             topic_set: None,
-            extensions: Arc::new(Extensions::new()),
+            capabilities: Arc::new(Capabilities::new()),
         }
     }
 
@@ -282,20 +282,20 @@ impl PipelineContext {
     ///
     /// Called during pipeline build after all extensions have been created
     /// and registered.
-    pub fn set_extensions(&mut self, extensions: Arc<Extensions>) {
-        self.extensions = extensions;
+    pub fn set_capabilities(&mut self, capabilities: Arc<Capabilities>) {
+        self.capabilities = capabilities;
     }
 
-    /// Returns the shared extension capabilities.
+    /// Returns the per-node resolved capabilities.
     ///
     /// Node factories use this to look up capabilities during construction:
     ///
     /// ```ignore
-    /// let auth = pipeline_ctx.extensions().require::<dyn BearerTokenProvider>()?;
+    /// let auth = pipeline_ctx.capabilities().require_shared::<dyn AuthCheck>()?;
     /// ```
     #[must_use]
-    pub fn extensions(&self) -> &Extensions {
-        &self.extensions
+    pub fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
     }
 
     /// Returns the pipeline-scoped topic set, if one was injected.
@@ -559,7 +559,7 @@ impl PipelineContext {
             internal_telemetry: None,
             node_names: self.node_names.clone(),
             topic_set: self.topic_set.clone(),
-            extensions: self.extensions.clone(),
+            capabilities: self.capabilities.clone(),
         }
     }
 }

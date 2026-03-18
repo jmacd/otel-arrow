@@ -563,13 +563,15 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
 
         self.validate_connection_wiring_contracts(&config)?;
 
-        // Create extensions and populate the capability map.
+        // Create extensions and build the capability registry.
         // Extensions must be built before nodes so capabilities are available
         // during node factory calls.
-        if !config.extensions().is_empty() {
-            let extensions = extension::build_extensions(config.extensions())?;
-            pipeline_ctx.set_extensions(Arc::new(extensions));
-        }
+        let extension_registry = if !config.extensions().is_empty() {
+            Some(extension::build_extension_registry(config.extensions())?)
+        } else {
+            None
+        };
+
 
         let channel_metrics_enabled = telemetry_policy.channel_metrics >= MetricLevel::Basic;
 
@@ -620,12 +622,20 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         for (name, node_config) in config.node_iter() {
             let node_kind = node_config.kind();
             let node_id = node_ids.get(name).expect("allocated in first pass").clone();
-            let base_ctx = pipeline_ctx.with_node_context(
+            let mut base_ctx = pipeline_ctx.with_node_context(
                 name.clone(),
                 node_config.r#type.clone(),
                 node_kind,
                 node_config.identity_attributes(),
             );
+
+            // Resolve per-node capabilities from bindings + extension registry.
+            if !node_config.capabilities.is_empty() {
+                if let Some(ref registry) = extension_registry {
+                    let caps = registry.resolve(&node_config.capabilities)?;
+                    base_ctx.set_capabilities(Arc::new(caps));
+                }
+            }
 
             match node_kind {
                 otap_df_config::node::NodeKind::Receiver => {

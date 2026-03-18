@@ -75,6 +75,16 @@ pub struct NodeUserConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entity: Option<NodeEntity>,
+
+    /// Capability bindings mapping capability names to extension instance names.
+    ///
+    /// ```yaml
+    /// capabilities:
+    ///   auth_check: oidc_auth_main
+    ///   dataset_lookup: file_storage
+    /// ```
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub capabilities: HashMap<String, String>,
 }
 
 /// Node kinds
@@ -121,6 +131,7 @@ impl NodeUserConfig {
             default_output: None,
             entity: None,
             config: Value::Null,
+            capabilities: HashMap::new(),
         }
     }
 
@@ -137,6 +148,7 @@ impl NodeUserConfig {
             outputs: Vec::new(),
             default_output: None,
             config: Value::Null,
+            capabilities: HashMap::new(),
         }
     }
 
@@ -153,6 +165,7 @@ impl NodeUserConfig {
             outputs: Vec::new(),
             default_output: None,
             config: Value::Null,
+            capabilities: HashMap::new(),
         }
     }
 
@@ -166,6 +179,7 @@ impl NodeUserConfig {
             outputs: Vec::new(),
             default_output: None,
             config: user_config,
+            capabilities: HashMap::new(),
         }
     }
 
