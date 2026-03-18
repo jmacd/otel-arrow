@@ -34,23 +34,31 @@
 //! | [`ExtensionRegistry`] | per pipeline | all instances, keyed by instance name |
 //! | [`Capabilities`] | **per node** | resolved from the node's bindings + registry |
 //!
-//! # Shared vs Local capabilities
+//! # Extension scoping
 //!
-//! Because the engine runs **one `build()` call per core**, capabilities
-//! come in two flavours:
+//! Extension authors declare a **scope** for each capability that determines
+//! its lifecycle.  This is orthogonal to node locality (Local/Shared nodes):
 //!
-//! | Kind | Stored as | Per-core semantics |
-//! |------|-----------|---------------------|
-//! | **Shared** | `Arc<dyn Trait>` | Same instance on every core |
-//! | **Local** | Factory `Fn() → Box<dyn Trait>` | Factory called once per core |
+//! | Scope | Stored as | Lifecycle |
+//! |-------|-----------|-----------|
+//! | **Engine** | `Arc<dyn Trait>` | Single instance for the entire engine, shared across all cores |
+//! | **Pipeline** | Factory `Fn() → Box<dyn Trait>` | One instance per pipeline build (per core) |
+//!
+//! The cross product of extension scope × node locality determines the
+//! ownership pattern at the node:
+//!
+//! | Extension scope \ Node kind | **Shared node** | **Local node** |
+//! |-----------------------------|-----------------|----------------|
+//! | **Engine** (`Arc`) | `Arc<dyn T>` | `Arc<dyn T>` |
+//! | **Pipeline** (factory) | `Box<dyn T>` (must be `Send`) | `Rc<RefCell<Box<dyn T>>>` (may be `!Send`) |
 //!
 //! ## Registration (extension author)
 //!
 //! ```ignore
 //! impl Extension for OidcAuth {
 //!     fn register(&self, caps: &mut InstanceCapabilities) {
-//!         // Shared — one Arc for all cores:
-//!         caps.set_shared::<dyn AuthCheck>("auth_check", Arc::new(self.clone()));
+//!         // Engine-scoped — one Arc for all cores:
+//!         caps.set_engine_scoped::<dyn AuthCheck>("auth_check", Arc::new(self.clone()));
 //!     }
 //! }
 //! ```
@@ -58,8 +66,13 @@
 //! ## Retrieval (node factory)
 //!
 //! ```ignore
+//! // Engine-scoped capability:
 //! let auth: &Arc<dyn AuthCheck> =
-//!     pipeline_ctx.capabilities().require_shared::<dyn AuthCheck>()?;
+//!     pipeline_ctx.capabilities().require_engine::<dyn AuthCheck>()?;
+//!
+//! // Pipeline-scoped capability (created fresh per pipeline build):
+//! let pool: Box<dyn ConnectionPool> =
+//!     pipeline_ctx.capabilities().require_pipeline::<dyn ConnectionPool>()?;
 //! ```
 //!
 //! # Lifecycle
@@ -87,25 +100,27 @@ use std::sync::Arc;
 pub use otap_df_config::extension::ExtensionConfig;
 
 // ---------------------------------------------------------------------------
-// CapabilitySlot — shared instance vs per-core factory
+// CapabilitySlot — engine-scoped instance vs pipeline-scoped factory
 // ---------------------------------------------------------------------------
 
-/// How a single capability is provided: either a shared pre-built instance
-/// or a factory that creates one instance per core.
+/// How a single capability is provided, determined by extension scope.
+///
+/// See the [module docs](self) for the full scoping × locality matrix.
 #[derive(Clone)]
 enum CapabilitySlot {
-    /// A single shared instance wrapped in `Arc<dyn Trait>`, erased to
-    /// `Arc<dyn Any + Send + Sync>`.  All cores share the same `Arc`.
-    Shared(Arc<dyn Any + Send + Sync>),
+    /// Engine-scoped: a single instance wrapped in `Arc<dyn Trait>`, erased
+    /// to `Arc<dyn Any + Send + Sync>`.  Shared across all cores/pipelines.
+    Engine(Arc<dyn Any + Send + Sync>),
 
-    /// A factory closure that produces one `Box<dyn Trait>` per core.
+    /// Pipeline-scoped: a factory closure that produces one `Box<dyn Trait>`
+    /// per pipeline build (per core).
     ///
     /// The factory is behind `Arc` so the slot is cheaply cloneable across
     /// the per-node `Capabilities` maps produced during resolution.
     ///
     /// The factory itself is `Send + Sync`; produced instances may be
     /// `!Send` — each is used only on the core thread that called it.
-    Local {
+    Pipeline {
         factory: Arc<dyn Fn() -> Box<dyn Any> + Send + Sync>,
     },
 }
@@ -113,8 +128,8 @@ enum CapabilitySlot {
 impl fmt::Debug for CapabilitySlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Shared(_) => write!(f, "Shared(..)"),
-            Self::Local { .. } => write!(f, "Local {{ factory }}"),
+            Self::Engine(_) => write!(f, "Engine(..)"),
+            Self::Pipeline { .. } => write!(f, "Pipeline {{ factory }}"),
         }
     }
 }
@@ -155,12 +170,13 @@ impl InstanceCapabilities {
         }
     }
 
-    /// Registers a shared capability — one `Arc` instance for all cores.
+    /// Registers an engine-scoped capability — one `Arc` instance shared
+    /// across all cores and pipeline builds.
     ///
     /// ```ignore
-    /// caps.set_shared::<dyn AuthCheck>("auth_check", Arc::new(self.clone()));
+    /// caps.set_engine_scoped::<dyn AuthCheck>("auth_check", Arc::new(self.clone()));
     /// ```
-    pub fn set_shared<T: ?Sized + Send + Sync + 'static>(
+    pub fn set_engine_scoped<T: ?Sized + Send + Sync + 'static>(
         &mut self,
         capability_name: &str,
         value: Arc<T>,
@@ -169,30 +185,34 @@ impl InstanceCapabilities {
             capability_name.to_owned(),
             RegistryEntry {
                 type_id: TypeId::of::<T>(),
-                slot: CapabilitySlot::Shared(Arc::new(value) as Arc<dyn Any + Send + Sync>),
+                slot: CapabilitySlot::Engine(Arc::new(value) as Arc<dyn Any + Send + Sync>),
             },
         );
     }
 
-    /// Registers a per-core capability factory.
+    /// Registers a pipeline-scoped capability factory.
     ///
     /// The factory closure is `Send + Sync` (stored in `Arc`).  Each call
-    /// to [`Capabilities::create_local`] invokes it to produce a fresh
-    /// `Box<dyn Trait>` for that core.
+    /// to [`Capabilities::create_pipeline`] invokes it to produce a fresh
+    /// `Box<dyn Trait>` for that pipeline build.
+    ///
+    /// When a Local node consumes this, the result is typically wrapped in
+    /// `Rc<RefCell<…>>` — enabling `!Send` capability instances on the
+    /// single-threaded per-core runtime.
     ///
     /// ```ignore
     /// let cfg = self.config.clone();
-    /// caps.set_local::<dyn ConnectionPool>("connection_pool", move || {
+    /// caps.set_pipeline_scoped::<dyn ConnectionPool>("connection_pool", move || {
     ///     Box::new(Pool::new(&cfg))
     /// });
     /// ```
-    pub fn set_local<T, F>(&mut self, capability_name: &str, factory: F)
+    pub fn set_pipeline_scoped<T, F>(&mut self, capability_name: &str, factory: F)
     where
         T: ?Sized + 'static,
         F: Fn() -> Box<T> + Send + Sync + 'static,
     {
         // Double-box: Box<dyn Trait> → Box<dyn Any> for type erasure.
-        // Recovered in `Capabilities::create_local` via downcast.
+        // Recovered in `Capabilities::create_pipeline` via downcast.
         let wrapper: Arc<dyn Fn() -> Box<dyn Any> + Send + Sync> = Arc::new(move || {
             let instance: Box<T> = factory();
             Box::new(instance) as Box<dyn Any>
@@ -201,7 +221,7 @@ impl InstanceCapabilities {
             capability_name.to_owned(),
             RegistryEntry {
                 type_id: TypeId::of::<T>(),
-                slot: CapabilitySlot::Local { factory: wrapper },
+                slot: CapabilitySlot::Pipeline { factory: wrapper },
             },
         );
     }
@@ -317,7 +337,7 @@ impl fmt::Debug for ExtensionRegistry {
 ///
 /// ```ignore
 /// let auth: &Arc<dyn AuthCheck> =
-///     pipeline_ctx.capabilities().require_shared::<dyn AuthCheck>()?;
+///     pipeline_ctx.capabilities().require_engine::<dyn AuthCheck>()?;
 /// ```
 pub struct Capabilities {
     map: HashMap<TypeId, CapabilitySlot>,
@@ -332,64 +352,64 @@ impl Capabilities {
         }
     }
 
-    // -- Shared (cross-core) capabilities ----------------------------------
+    // -- Engine-scoped capabilities ----------------------------------------
 
-    /// Retrieves a shared capability, returning `None` if absent or if the
-    /// capability was registered as local.
+    /// Retrieves an engine-scoped capability, returning `None` if absent or
+    /// if the capability was registered as pipeline-scoped.
     #[must_use]
-    pub fn get_shared<T: ?Sized + Send + Sync + 'static>(&self) -> Option<&Arc<T>> {
+    pub fn get_engine<T: ?Sized + Send + Sync + 'static>(&self) -> Option<&Arc<T>> {
         match self.map.get(&TypeId::of::<T>())? {
-            CapabilitySlot::Shared(arc) => {
+            CapabilitySlot::Engine(arc) => {
                 // arc is Arc<dyn Any + Send + Sync>, holding Arc<dyn Trait>.
                 // Downcast the inner Any to Arc<T>.
                 arc.downcast_ref::<Arc<T>>()
             }
-            CapabilitySlot::Local { .. } => None,
+            CapabilitySlot::Pipeline { .. } => None,
         }
     }
 
-    /// Like [`get_shared`](Self::get_shared) but returns an error when the
+    /// Like [`get_engine`](Self::get_engine) but returns an error when the
     /// capability is missing.
-    pub fn require_shared<T: ?Sized + Send + Sync + 'static>(&self) -> Result<&Arc<T>, Error> {
-        self.get_shared::<T>()
+    pub fn require_engine<T: ?Sized + Send + Sync + 'static>(&self) -> Result<&Arc<T>, Error> {
+        self.get_engine::<T>()
             .ok_or_else(|| Error::ExtensionNotFound {
                 capability: type_name::<T>().to_owned(),
             })
     }
 
-    // -- Local (per-core) capabilities -------------------------------------
+    // -- Pipeline-scoped capabilities --------------------------------------
 
-    /// Creates a new per-core instance of a local capability.
+    /// Creates a new instance of a pipeline-scoped capability.
     ///
     /// Each call invokes the factory registered via
-    /// [`InstanceCapabilities::set_local`].  Returns `None` if the
-    /// capability was not registered or was registered as shared.
+    /// [`InstanceCapabilities::set_pipeline_scoped`].  Returns `None` if
+    /// the capability was not registered or was registered as engine-scoped.
     ///
-    /// The caller typically wraps the result for sharing among nodes on the
-    /// same core:
+    /// For Local nodes, the caller typically wraps the result for sharing
+    /// among nodes on the same core:
     ///
     /// ```ignore
     /// let pool: Box<dyn ConnectionPool> =
-    ///     capabilities.create_local::<dyn ConnectionPool>()?;
+    ///     capabilities.create_pipeline::<dyn ConnectionPool>()?;
     /// let pool = Rc::new(RefCell::new(pool));
     /// ```
     #[must_use]
-    pub fn create_local<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
+    pub fn create_pipeline<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
         match self.map.get(&TypeId::of::<T>())? {
-            CapabilitySlot::Local { factory } => {
+            CapabilitySlot::Pipeline { factory } => {
                 let any: Box<dyn Any> = factory();
-                // Reverse the double-box from set_local:
+                // Reverse the double-box from set_pipeline_scoped:
                 // Box<dyn Any> → Box<Box<dyn Trait>> → Box<dyn Trait>
                 any.downcast::<Box<T>>().ok().map(|bb| *bb)
             }
-            CapabilitySlot::Shared(_) => None,
+            CapabilitySlot::Engine(_) => None,
         }
     }
 
-    /// Like [`create_local`](Self::create_local) but returns an error when
-    /// the capability is missing.
-    pub fn require_local<T: ?Sized + 'static>(&self) -> Result<Box<T>, Error> {
-        self.create_local::<T>()
+    /// Like [`create_pipeline`](Self::create_pipeline) but returns an error
+    /// when the capability is missing.
+    pub fn require_pipeline<T: ?Sized + 'static>(&self) -> Result<Box<T>, Error> {
+        self.create_pipeline::<T>()
             .ok_or_else(|| Error::ExtensionNotFound {
                 capability: type_name::<T>().to_owned(),
             })
@@ -412,19 +432,19 @@ impl Default for Capabilities {
 
 impl fmt::Debug for Capabilities {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let shared = self
+        let engine = self
             .map
             .values()
-            .filter(|s| matches!(s, CapabilitySlot::Shared(_)))
+            .filter(|s| matches!(s, CapabilitySlot::Engine(_)))
             .count();
-        let local = self
+        let pipeline = self
             .map
             .values()
-            .filter(|s| matches!(s, CapabilitySlot::Local { .. }))
+            .filter(|s| matches!(s, CapabilitySlot::Pipeline { .. }))
             .count();
         f.debug_struct("Capabilities")
-            .field("shared", &shared)
-            .field("local", &local)
+            .field("engine", &engine)
+            .field("pipeline", &pipeline)
             .finish()
     }
 }
@@ -444,9 +464,10 @@ impl fmt::Debug for Capabilities {
 pub trait Extension: Send + Sync {
     /// Populate `caps` with the capabilities this extension provides.
     ///
-    /// Use [`InstanceCapabilities::set_shared`] for capabilities shared
-    /// across all cores, or [`InstanceCapabilities::set_local`] for
-    /// capabilities that need one independent instance per core.
+    /// Use [`InstanceCapabilities::set_engine_scoped`] for capabilities
+    /// that live for the entire engine lifetime (shared across all cores),
+    /// or [`InstanceCapabilities::set_pipeline_scoped`] for capabilities
+    /// that get one independent instance per pipeline build.
     fn register(&self, caps: &mut InstanceCapabilities);
 }
 

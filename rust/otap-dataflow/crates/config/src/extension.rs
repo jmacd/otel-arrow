@@ -3,9 +3,9 @@
 
 //! Extension configuration types.
 //!
-//! Extensions are pipeline-scoped components that provide shared capabilities
-//! (e.g. authentication, enrichment) to nodes.  They are declared in the
-//! pipeline config alongside nodes and connections.
+//! Extensions are components that provide capabilities (e.g. authentication,
+//! enrichment) to nodes.  They are declared in the pipeline config alongside
+//! nodes and connections.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

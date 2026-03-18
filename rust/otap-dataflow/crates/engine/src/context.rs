@@ -291,7 +291,7 @@ impl PipelineContext {
     /// Node factories use this to look up capabilities during construction:
     ///
     /// ```ignore
-    /// let auth = pipeline_ctx.capabilities().require_shared::<dyn AuthCheck>()?;
+    /// let auth = pipeline_ctx.capabilities().require_engine::<dyn AuthCheck>()?;
     /// ```
     #[must_use]
     pub fn capabilities(&self) -> &Capabilities {
