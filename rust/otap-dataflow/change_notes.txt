@@ -1,7 +1,0 @@
-Terrible: Leave the name as-is
-
--    create: |pipeline: PipelineContext,
-+    create: |node_ctx: NodeContext<'_>,
-
--            AzureMonitorExporter::new(pipeline_ctx, cfg).map_err(|e| {
-+            AzureMonitorExporter::new(node_ctx.into_pipeline_ctx(), cfg).map_err(|e| {
