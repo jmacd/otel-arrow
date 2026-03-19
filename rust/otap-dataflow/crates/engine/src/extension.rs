@@ -97,7 +97,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-pub use otap_df_config::extension::ExtensionConfig;
+pub use otap_df_config::{CapabilityId, NodeId, extension::ExtensionConfig};
 
 // ---------------------------------------------------------------------------
 // CapabilitySlot — engine-scoped instance vs pipeline-scoped factory
@@ -158,7 +158,7 @@ struct RegistryEntry {
 /// bindings, e.g. `"auth_check"`).  Each entry also records the `TypeId`
 /// of the trait so the per-node [`Capabilities`] map can be keyed by type.
 pub struct InstanceCapabilities {
-    entries: HashMap<String, RegistryEntry>,
+    entries: HashMap<CapabilityId, RegistryEntry>,
 }
 
 impl InstanceCapabilities {
@@ -178,11 +178,11 @@ impl InstanceCapabilities {
     /// ```
     pub fn set_engine_scoped<T: ?Sized + Send + Sync + 'static>(
         &mut self,
-        capability_name: &str,
+        capability_name: CapabilityId,
         value: Arc<T>,
     ) {
         let _prev = self.entries.insert(
-            capability_name.to_owned(),
+            capability_name,
             RegistryEntry {
                 type_id: TypeId::of::<T>(),
                 slot: CapabilitySlot::Engine(Arc::new(value) as Arc<dyn Any + Send + Sync>),
@@ -206,7 +206,7 @@ impl InstanceCapabilities {
     ///     Box::new(Pool::new(&cfg))
     /// });
     /// ```
-    pub fn set_pipeline_scoped<T, F>(&mut self, capability_name: &str, factory: F)
+    pub fn set_pipeline_scoped<T, F>(&mut self, capability_name: CapabilityId, factory: F)
     where
         T: ?Sized + 'static,
         F: Fn() -> Box<T> + Send + Sync + 'static,
@@ -218,7 +218,7 @@ impl InstanceCapabilities {
             Box::new(instance) as Box<dyn Any>
         });
         let _prev = self.entries.insert(
-            capability_name.to_owned(),
+            capability_name,
             RegistryEntry {
                 type_id: TypeId::of::<T>(),
                 slot: CapabilitySlot::Pipeline { factory: wrapper },
@@ -228,8 +228,8 @@ impl InstanceCapabilities {
 
     /// Returns the capability names registered by this instance.
     #[must_use]
-    pub fn capability_names(&self) -> Vec<&str> {
-        self.entries.keys().map(String::as_str).collect()
+    pub fn capability_names(&self) -> Vec<CapabilityId> {
+        self.entries.keys().cloned().collect()
     }
 }
 
@@ -257,7 +257,7 @@ impl fmt::Debug for InstanceCapabilities {
 /// via `Arc`).  Used to resolve per-node [`Capabilities`] from the node's
 /// config bindings.
 pub struct ExtensionRegistry {
-    instances: HashMap<String, InstanceCapabilities>,
+    instances: HashMap<NodeId, InstanceCapabilities>,
 }
 
 impl ExtensionRegistry {
@@ -270,7 +270,7 @@ impl ExtensionRegistry {
     }
 
     /// Inserts an extension instance's capabilities.
-    pub fn insert(&mut self, instance_name: String, caps: InstanceCapabilities) {
+    pub fn insert(&mut self, instance_name: NodeId, caps: InstanceCapabilities) {
         let _prev = self.instances.insert(instance_name, caps);
     }
 
@@ -279,7 +279,7 @@ impl ExtensionRegistry {
     ///
     /// `bindings` maps capability name → extension instance name (from the
     /// node's `capabilities` config section).
-    pub fn resolve(&self, bindings: &HashMap<String, String>) -> Result<Capabilities, Error> {
+    pub fn resolve(&self, bindings: &HashMap<CapabilityId, NodeId>) -> Result<Capabilities, Error> {
         let mut caps = Capabilities::new();
 
         for (cap_name, instance_name) in bindings {
@@ -293,16 +293,15 @@ impl ExtensionRegistry {
                         ),
                     })?;
 
-            let entry =
-                instance
-                    .entries
-                    .get(cap_name)
-                    .ok_or_else(|| Error::ExtensionNotFound {
-                        capability: format!(
-                            "capability `{cap_name}` not provided by \
+            let entry = instance
+                .entries
+                .get(cap_name)
+                .ok_or_else(|| Error::ExtensionNotFound {
+                    capability: format!(
+                        "capability `{cap_name}` not provided by \
                              extension instance `{instance_name}`"
-                        ),
-                    })?;
+                    ),
+                })?;
 
             let _prev = caps.map.insert(entry.type_id, entry.slot.clone());
         }
@@ -534,7 +533,7 @@ pub fn get_extension_factory_map() -> &'static HashMap<&'static str, &'static Ex
 /// 3. Call `extension.register(&mut instance_caps)`.
 /// 4. Insert the instance into the registry under its config key.
 pub fn build_extension_registry(
-    extension_configs: &HashMap<String, ExtensionConfig>,
+    extension_configs: &HashMap<NodeId, ExtensionConfig>,
 ) -> Result<ExtensionRegistry, Error> {
     let factory_map = get_extension_factory_map();
     let mut registry = ExtensionRegistry::new();
@@ -544,12 +543,12 @@ pub fn build_extension_registry(
             factory_map
                 .get(ext_cfg.r#type.as_str())
                 .ok_or_else(|| Error::UnknownExtension {
-                    name: instance_name.clone(),
+                    name: instance_name.to_string(),
                     type_name: ext_cfg.r#type.clone(),
                 })?;
 
         let ext = (factory.create)(&ext_cfg.config).map_err(|e| Error::ExtensionCreateError {
-            name: instance_name.clone(),
+            name: instance_name.to_string(),
             error: e.to_string(),
         })?;
 

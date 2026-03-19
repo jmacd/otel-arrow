@@ -9,7 +9,7 @@
 //! A node can expose multiple named output ports.
 
 use crate::pipeline::telemetry::{AttributeValue, TelemetryAttribute};
-use crate::{Description, NodeUrn, PortName};
+use crate::{CapabilityId, Description, NodeId, NodeUrn, PortName};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,7 +84,7 @@ pub struct NodeUserConfig {
     ///   dataset_lookup: file_storage
     /// ```
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub capabilities: HashMap<String, String>,
+    pub capabilities: HashMap<CapabilityId, NodeId>,
 }
 
 /// Node kinds

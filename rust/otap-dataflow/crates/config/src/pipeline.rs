@@ -66,7 +66,7 @@ pub struct PipelineConfig {
     ///       token: "secret"
     /// ```
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    extensions: HashMap<String, ExtensionConfig>,
+    extensions: HashMap<NodeId, ExtensionConfig>,
 }
 
 const fn default_pipeline_type() -> PipelineType {
@@ -514,7 +514,7 @@ impl PipelineConfig {
 
     /// Returns the extension configurations declared in this pipeline.
     #[must_use]
-    pub fn extensions(&self) -> &HashMap<String, ExtensionConfig> {
+    pub fn extensions(&self) -> &HashMap<NodeId, ExtensionConfig> {
         &self.extensions
     }
 

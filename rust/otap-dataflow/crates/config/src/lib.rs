@@ -90,6 +90,9 @@ pub type Description = Cow<'static, str>;
 /// Note: Not using core_affinity::CoreId directly to avoid dependency leakage in this public API
 pub type CoreId = usize;
 
+/// The id of a capability known by the engine.
+pub type CapabilityId = Cow<'static, str>;
+
 /// Unique key for identifying a pipeline within a pipeline group.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct PipelineKey {
