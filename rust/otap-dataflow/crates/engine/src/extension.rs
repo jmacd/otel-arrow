@@ -127,7 +127,7 @@ impl fmt::Debug for CapabilitySlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Engine(_) => write!(f, "Engine(..)"),
-            Self::Pipeline { .. } => write!(f, "Pipeline {{ factory }}"),
+            Self::Pipeline(_) => write!(f, "Pipeline(..)"),
         }
     }
 }
