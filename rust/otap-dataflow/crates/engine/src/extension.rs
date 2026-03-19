@@ -120,9 +120,7 @@ enum CapabilitySlot {
     ///
     /// The factory itself is `Send + Sync`; produced instances may be
     /// `!Send` — each is used only on the core thread that called it.
-    Pipeline {
-        factory: Arc<dyn Fn() -> Box<dyn Any> + Send + Sync>,
-    },
+    Pipeline(Arc<dyn Fn() -> Box<dyn Any> + Send + Sync>),
 }
 
 impl fmt::Debug for CapabilitySlot {
@@ -221,7 +219,7 @@ impl InstanceCapabilities {
             capability_name,
             RegistryEntry {
                 type_id: TypeId::of::<T>(),
-                slot: CapabilitySlot::Pipeline { factory: wrapper },
+                slot: CapabilitySlot::Pipeline(wrapper),
             },
         );
     }
@@ -395,7 +393,7 @@ impl Capabilities {
     #[must_use]
     pub fn create_pipeline<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
         match self.map.get(&TypeId::of::<T>())? {
-            CapabilitySlot::Pipeline { factory } => {
+            CapabilitySlot::Pipeline(factory) => {
                 let any: Box<dyn Any> = factory();
                 // Reverse the double-box from set_pipeline_scoped:
                 // Box<dyn Any> → Box<Box<dyn Trait>> → Box<dyn Trait>
