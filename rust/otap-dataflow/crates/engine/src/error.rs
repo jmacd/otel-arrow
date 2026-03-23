@@ -348,6 +348,15 @@ pub enum Error {
         error: String,
     },
 
+    /// Extension background task failed during startup or execution.
+    #[error("Extension `{name}` background task failed: {error}")]
+    ExtensionStartError {
+        /// Config key for this extension instance.
+        name: String,
+        /// The underlying error message.
+        error: String,
+    },
+
     /// Unknown node.
     #[error("Unknown node `{node}`")]
     UnknownNode {
@@ -531,6 +540,7 @@ impl Error {
             Error::ExtensionNotFound { .. } => "ExtensionNotFound",
             Error::UnknownExtension { .. } => "UnknownExtension",
             Error::ExtensionCreateError { .. } => "ExtensionCreateError",
+            Error::ExtensionStartError { .. } => "ExtensionStartError",
             Error::UnknownNode { .. } => "UnknownNode",
             Error::UnknownOutputPort { .. } => "UnknownOutputPort",
             Error::UnknownProcessor { .. } => "UnknownProcessor",

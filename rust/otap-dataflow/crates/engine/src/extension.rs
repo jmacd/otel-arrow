@@ -86,6 +86,8 @@
 //!    registry to produce a per-node [`Capabilities`].
 //! 6. The resolved [`Capabilities`] is set on [`PipelineContext`] before
 //!    calling the node factory.
+//! 7. During `run_forever`, each extension's [`Extension::start`] future
+//!    is spawned on the per-core local runtime alongside node tasks.
 //!
 //! [`PipelineConfig`]: otap_df_config::pipeline::PipelineConfig
 //! [`PipelineContext`]: crate::context::PipelineContext
@@ -95,6 +97,8 @@ use linkme::distributed_slice;
 use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 pub use otap_df_config::{CapabilityId, NodeId, extension::ExtensionConfig};
@@ -451,13 +455,17 @@ impl fmt::Debug for Capabilities {
 // ---------------------------------------------------------------------------
 
 /// An extension that registers one or more capabilities into an
-/// [`InstanceCapabilities`] map.
+/// [`InstanceCapabilities`] map and may run background tasks.
 ///
-/// Extensions are sync-only: the `register` method runs during pipeline
-/// build (before any async runtime is involved).  If an extension needs
-/// to perform async initialization (e.g. fetching a token), it should
-/// spawn its own background task internally and expose a sync read
-/// interface (e.g. via `Arc<watch::Receiver<T>>`).
+/// Extensions are created during pipeline build (before any async runtime
+/// is involved).  The [`register`](Self::register) method runs synchronously
+/// to populate capabilities.
+///
+/// Extensions that need async work (e.g. periodic token refresh, JWKS
+/// fetching, cache warming) override [`start`](Self::start) to return a
+/// future that is spawned on the per-core local runtime alongside node
+/// tasks.  When the pipeline shuts down, the spawned future is cancelled
+/// (dropped).
 pub trait Extension: Send + Sync {
     /// Populate `caps` with the capabilities this extension provides.
     ///
@@ -466,6 +474,26 @@ pub trait Extension: Send + Sync {
     /// or [`InstanceCapabilities::set_pipeline_scoped`] for capabilities
     /// that get one independent instance per pipeline build.
     fn register(&self, caps: &mut InstanceCapabilities);
+
+    /// Start background tasks for this extension.
+    ///
+    /// Called once per pipeline build on the per-core async runtime.  The
+    /// returned future is spawned as a local task and runs for the lifetime
+    /// of the pipeline.  When the pipeline shuts down the task is cancelled
+    /// (dropped).
+    ///
+    /// The default implementation completes immediately (no background work).
+    ///
+    /// # Ownership
+    ///
+    /// The returned future is `'static` — implementations should clone or
+    /// move whatever shared state they need (e.g. `Arc<…>`) into the
+    /// future rather than borrowing `&self`.
+    fn start(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -523,7 +551,8 @@ pub fn get_extension_factory_map() -> &'static HashMap<&'static str, &'static Ex
 }
 
 /// Creates all extension instances declared in config and returns an
-/// [`ExtensionRegistry`] ready for per-node resolution.
+/// [`ExtensionRegistry`] ready for per-node resolution together with the
+/// live extension instances (needed for calling [`Extension::start`] later).
 ///
 /// For each entry in `extension_configs`:
 /// 1. Look up the [`ExtensionFactory`] by type name.
@@ -532,9 +561,10 @@ pub fn get_extension_factory_map() -> &'static HashMap<&'static str, &'static Ex
 /// 4. Insert the instance into the registry under its config key.
 pub fn build_extension_registry(
     extension_configs: &HashMap<NodeId, ExtensionConfig>,
-) -> Result<ExtensionRegistry, Error> {
+) -> Result<(ExtensionRegistry, Vec<(NodeId, Box<dyn Extension>)>), Error> {
     let factory_map = get_extension_factory_map();
     let mut registry = ExtensionRegistry::new();
+    let mut extensions = Vec::with_capacity(extension_configs.len());
 
     for (instance_name, ext_cfg) in extension_configs {
         let factory =
@@ -553,7 +583,228 @@ pub fn build_extension_registry(
         let mut instance_caps = InstanceCapabilities::new();
         ext.register(&mut instance_caps);
         registry.insert(instance_name.clone(), instance_caps);
+        extensions.push((instance_name.clone(), ext));
     }
 
-    Ok(registry)
+    Ok((registry, extensions))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // -- Test capability trait ------------------------------------------------
+
+    trait GreetCapability: Send + Sync {
+        fn greet(&self) -> &str;
+    }
+
+    // -- Minimal extension (no background work) -------------------------------
+
+    struct NoOpExtension;
+
+    impl Extension for NoOpExtension {
+        fn register(&self, _caps: &mut InstanceCapabilities) {}
+        // Uses default start() — completes immediately.
+    }
+
+    // -- Extension with an engine-scoped capability ---------------------------
+
+    struct HelloExtension {
+        message: String,
+    }
+
+    impl GreetCapability for HelloExtension {
+        fn greet(&self) -> &str {
+            &self.message
+        }
+    }
+
+    impl Extension for HelloExtension {
+        fn register(&self, caps: &mut InstanceCapabilities) {
+            caps.set_engine_scoped::<dyn GreetCapability>(
+                "greet".into(),
+                Arc::new(HelloExtension {
+                    message: self.message.clone(),
+                }),
+            );
+        }
+    }
+
+    // -- Extension with a background task -------------------------------------
+
+    struct BackgroundExtension {
+        started: Arc<AtomicBool>,
+    }
+
+    impl Extension for BackgroundExtension {
+        fn register(&self, _caps: &mut InstanceCapabilities) {}
+
+        fn start(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>>>
+        {
+            let started = Arc::clone(&self.started);
+            Box::pin(async move {
+                started.store(true, Ordering::SeqCst);
+                // Simulate long-running background task.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                Ok(())
+            })
+        }
+    }
+
+    // -- Extension whose start() fails ----------------------------------------
+
+    struct FailingStartExtension;
+
+    impl Extension for FailingStartExtension {
+        fn register(&self, _caps: &mut InstanceCapabilities) {}
+
+        fn start(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>>>
+        {
+            Box::pin(async { Err("JWKS endpoint unreachable".into()) })
+        }
+    }
+
+    // -- Tests ----------------------------------------------------------------
+
+    #[test]
+    fn default_start_completes_immediately() {
+        let ext = NoOpExtension;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(ext.start());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn engine_scoped_capability_round_trip() {
+        let ext = HelloExtension {
+            message: "hello".into(),
+        };
+        let mut caps = InstanceCapabilities::new();
+        ext.register(&mut caps);
+
+        let mut registry = ExtensionRegistry::new();
+        registry.insert("hello_ext".into(), caps);
+
+        let mut bindings = HashMap::new();
+        let _ = bindings.insert("greet".into(), "hello_ext".into());
+
+        let resolved = registry.resolve(&bindings).unwrap();
+        let cap = resolved.require_engine::<dyn GreetCapability>().unwrap();
+        assert_eq!(cap.greet(), "hello");
+    }
+
+    #[test]
+    fn pipeline_scoped_capability_produces_distinct_instances() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let mut caps = InstanceCapabilities::new();
+        caps.set_pipeline_scoped::<dyn GreetCapability, _>("greet".into(), move || {
+            let n = cc.fetch_add(1, Ordering::SeqCst);
+            Box::new(HelloExtension {
+                message: format!("hello-{n}"),
+            })
+        });
+
+        let mut registry = ExtensionRegistry::new();
+        registry.insert("factory_ext".into(), caps);
+
+        let mut bindings = HashMap::new();
+        let _ = bindings.insert("greet".into(), "factory_ext".into());
+
+        let resolved = registry.resolve(&bindings).unwrap();
+        let a = resolved.require_pipeline::<dyn GreetCapability>().unwrap();
+        let b = resolved.require_pipeline::<dyn GreetCapability>().unwrap();
+        assert_eq!(a.greet(), "hello-0");
+        assert_eq!(b.greet(), "hello-1");
+    }
+
+    #[test]
+    fn resolve_missing_instance_returns_error() {
+        let registry = ExtensionRegistry::new();
+        let mut bindings = HashMap::new();
+        let _ = bindings.insert("greet".into(), "nonexistent".into());
+
+        let err = registry.resolve(&bindings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nonexistent"), "error: {msg}");
+    }
+
+    #[test]
+    fn resolve_missing_capability_returns_error() {
+        let caps = InstanceCapabilities::new(); // no capabilities registered
+        let mut registry = ExtensionRegistry::new();
+        registry.insert("empty_ext".into(), caps);
+
+        let mut bindings = HashMap::new();
+        let _ = bindings.insert("greet".into(), "empty_ext".into());
+
+        let err = registry.resolve(&bindings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("greet"), "error: {msg}");
+    }
+
+    #[test]
+    fn background_extension_start_runs() {
+        let started = Arc::new(AtomicBool::new(false));
+        let ext = BackgroundExtension {
+            started: Arc::clone(&started),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        // Spawn the extension's start future; give it a tick to set the flag.
+        rt.block_on(local.run_until(async {
+            let handle = tokio::task::spawn_local(ext.start());
+            tokio::task::yield_now().await;
+            assert!(started.load(Ordering::SeqCst));
+            handle.abort();
+        }));
+    }
+
+    #[test]
+    fn failing_start_propagates_error() {
+        let ext = FailingStartExtension;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(ext.start());
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("unreachable"),
+            "expected JWKS error message"
+        );
+    }
+
+    #[test]
+    fn capabilities_is_empty_when_no_bindings() {
+        let caps = Capabilities::new();
+        assert!(caps.is_empty());
+    }
+
+    #[test]
+    fn instance_capabilities_lists_names() {
+        let mut caps = InstanceCapabilities::new();
+        caps.set_engine_scoped::<dyn GreetCapability>(
+            "greet".into(),
+            Arc::new(HelloExtension {
+                message: "hi".into(),
+            }),
+        );
+        let names = caps.capability_names();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].as_ref(), "greet");
+    }
 }

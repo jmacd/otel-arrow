@@ -13,11 +13,13 @@ use crate::control::{
 };
 use crate::entity_context::{NodeTaskContext, NodeTelemetryHandle, instrument_with_node_context};
 use crate::error::{Error, TypedError};
+use crate::extension::Extension;
 use crate::node::{Node, NodeDefs, NodeId, NodeType, NodeWithPDataReceiver, NodeWithPDataSender};
 use crate::pipeline_ctrl::{NodeMetricHandles, PipelineCtrlMsgManager};
 use crate::terminal_state::TerminalState;
 use crate::{exporter::ExporterWrapper, processor::ProcessorWrapper, receiver::ReceiverWrapper};
 use otap_df_config::DeployedPipelineKey;
+use otap_df_config::NodeId as ConfigNodeId;
 use otap_df_config::pipeline::PipelineConfig;
 use otap_df_config::policy::TelemetryPolicy;
 use otap_df_telemetry::event::ObservedEventReporter;
@@ -98,6 +100,9 @@ pub struct RuntimePipeline<PData: Debug> {
     channel_metrics: Vec<ChannelMetricsHandle>,
     /// Flags controlling pipeline-internal metrics collection/reporting.
     telemetry_policy: TelemetryPolicy,
+    /// Live extension instances whose [`Extension::start`] futures are
+    /// spawned during [`run_forever`](Self::run_forever).
+    extensions: Vec<(ConfigNodeId, Box<dyn Extension>)>,
 }
 
 fn report_terminal_metrics(metrics_reporter: &MetricsReporter, terminal_state: TerminalState) {
@@ -129,6 +134,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
         exporters: Vec<ExporterWrapper<PData>>,
         nodes: NodeDefs<PData, PipeNode>,
         telemetry_policy: TelemetryPolicy,
+        extensions: Vec<(ConfigNodeId, Box<dyn Extension>)>,
     ) -> Self {
         Self {
             config,
@@ -138,6 +144,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             nodes,
             channel_metrics: Default::default(),
             telemetry_policy,
+            extensions,
         }
     }
 
@@ -180,6 +187,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable> RuntimePipeli
             nodes: _nodes,
             channel_metrics,
             telemetry_policy,
+            extensions,
         } = self;
 
         let metric_level = telemetry_policy.channel_metrics;
@@ -326,6 +334,20 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable> RuntimePipeli
             } else {
                 futures.push(local_tasks.spawn_local(fut));
             }
+        }
+
+        // Spawn extension background tasks.  Each extension's `start()`
+        // returns a future that is driven for the pipeline's lifetime and
+        // cancelled (dropped) on shutdown.
+        for (ext_name, ext) in extensions {
+            let ext_name_owned = ext_name.to_string();
+            let fut = ext.start();
+            futures.push(local_tasks.spawn_local(async move {
+                fut.await.map_err(|e| Error::ExtensionStartError {
+                    name: ext_name_owned,
+                    error: e.to_string(),
+                })
+            }));
         }
 
         // Build the per-node metric handles table indexed by node_id.

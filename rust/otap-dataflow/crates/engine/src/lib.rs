@@ -566,12 +566,12 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         // Create extensions and build the capability registry.
         // Extensions must be built before nodes so capabilities are available
         // during node factory calls.
-        let extension_registry = if !config.extensions().is_empty() {
-            Some(extension::build_extension_registry(config.extensions())?)
+        let (extension_registry, extensions) = if !config.extensions().is_empty() {
+            let (registry, exts) = extension::build_extension_registry(config.extensions())?;
+            (Some(registry), exts)
         } else {
-            None
+            (None, Vec::new())
         };
-
 
         let channel_metrics_enabled = telemetry_policy.channel_metrics >= MetricLevel::Basic;
 
@@ -724,6 +724,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             exporters,
             nodes,
             telemetry_policy,
+            extensions,
         );
         let wirings = edges
             .into_iter()
