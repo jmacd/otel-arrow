@@ -389,6 +389,7 @@ fn system_info() -> String {
 
     format!(
         "System Information:
+  Version: {}
   Available CPU cores: {}
   Available memory: {:.2} GB / {:.2} GB
   Build mode: {}
@@ -400,6 +401,7 @@ Available Component URNs:
   Exporters: {}
 
 Example configuration files can be found in the configs/ directory.{}",
+        otap_df_engine::version::version(),
         available_cores,
         available_memory_gb,
         total_memory_gb,

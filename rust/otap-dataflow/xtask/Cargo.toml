@@ -17,5 +17,8 @@ tonic-prost-build = { workspace = true, features = ["cleanup-markdown"] }
 prost-build = { workspace = true }
 otap-df-pdata-otlp-model = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }

@@ -77,6 +77,7 @@ pub mod shared;
 pub mod terminal_state;
 pub mod testing;
 pub mod topic;
+pub mod version;
 pub mod wiring_contract;
 
 /// Trait for factory types that expose a name.

@@ -57,7 +57,7 @@ struct HeartbeatRow {
 
 #[inline]
 fn default_heartbeat_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    otap_df_engine::version::version().to_string()
 }
 
 #[inline]

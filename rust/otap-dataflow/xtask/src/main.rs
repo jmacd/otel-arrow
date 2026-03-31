@@ -19,6 +19,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
+mod build_env;
 mod diagnostics;
 mod genproto;
 mod structure_check;
@@ -111,6 +112,7 @@ fn check_all(options: CheckOptions) -> anyhow::Result<()> {
         .diagnostics
         .then(diagnostics::DiagnosticsCollector::new);
 
+    build_env::sync()?;
     run_structure_step(diagnostics.as_mut())?;
     format_all(diagnostics.as_mut())?;
     clippy_all(options, diagnostics.as_mut())?;
@@ -124,6 +126,7 @@ fn check_all(options: CheckOptions) -> anyhow::Result<()> {
 }
 
 fn quick_check() -> anyhow::Result<()> {
+    build_env::sync()?;
     structure_check::run()?;
     format_all(None)?;
     clippy_quick()?;
@@ -132,6 +135,7 @@ fn quick_check() -> anyhow::Result<()> {
 }
 
 fn check_benches() -> anyhow::Result<()> {
+    build_env::sync()?;
     clippy_benches()?;
     compile_benches()?;
     Ok(())
