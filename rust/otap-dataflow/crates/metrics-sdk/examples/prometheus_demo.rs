@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use otap_df_config::SignalType;
 use otap_df_config::policy::MetricLevel;
+use otap_df_metrics_sdk::accumulator::{EntityKey, MetricIdentity};
 use otap_df_metrics_sdk::dimension::Outcome;
 use otap_df_metrics_sdk::prometheus::PrometheusExporter;
 use otap_df_telemetry::self_metrics::generated::{
@@ -73,11 +74,14 @@ impl SimulatedNode {
     }
 }
 
+const SCHEMA_KEY: &str = "pipeline.node";
+
 #[tokio::main]
 async fn main() {
     let level = MetricLevel::Normal;
     let schema = precomputed_schema(level).expect("Normal level should produce a schema");
-    let exporter = PrometheusExporter::new(schema.clone());
+    let exporter = PrometheusExporter::new();
+    exporter.register_schema(SCHEMA_KEY, schema.clone());
 
     // Create simulated pipeline nodes
     let mut nodes = vec![
@@ -86,6 +90,14 @@ async fn main() {
         SimulatedNode::new("otlp_exporter", level),
         SimulatedNode::new("filter_processor", level),
     ];
+
+    // In production, each node gets a distinct EntityKey from the
+    // telemetry registry. For this demo, we use a single default key
+    // and aggregate across all nodes.
+    let identity = MetricIdentity {
+        schema_key: SCHEMA_KEY,
+        entity_key: EntityKey::default(),
+    };
 
     let exporter_for_server = exporter.clone();
 
@@ -151,7 +163,7 @@ async fn main() {
         let builder = schema.data_points_builder();
         match builder.build_int_values(start_time, now, &all_values) {
             Ok(dp_batch) => {
-                if let Err(e) = exporter.ingest_delta(&dp_batch) {
+                if let Err(e) = exporter.ingest_delta(identity, &dp_batch) {
                     eprintln!("ingest error: {e}");
                 }
             }

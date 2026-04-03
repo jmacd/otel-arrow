@@ -7,16 +7,15 @@
 //! It replaces the OTel SDK → `opentelemetry-prometheus` export chain
 //! with a single Arrow-native component.
 
-use std::sync::Arc;
-
 use arrow::array::RecordBatch;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use parking_lot::RwLock;
+use std::sync::Arc;
 
-use crate::accumulator::{CumulativeAccumulator, CumulativeSnapshot};
+use crate::accumulator::{CumulativeAccumulator, MetricIdentity};
 use crate::openmetrics::format_openmetrics;
 use crate::precomputed::PrecomputedMetricSchema;
 
@@ -31,39 +30,44 @@ pub struct PrometheusExporter {
 }
 
 impl PrometheusExporter {
-    /// Create a new exporter with the given precomputed schema.
+    /// Create a new empty exporter.
     #[must_use]
-    pub fn new(schema: PrecomputedMetricSchema) -> Self {
+    pub fn new() -> Self {
         Self {
-            state: Arc::new(RwLock::new(CumulativeAccumulator::new(schema))),
+            state: Arc::new(RwLock::new(CumulativeAccumulator::new())),
         }
     }
 
-    /// Ingest a delta NumberDataPoints batch.
-    ///
-    /// This is called from the ITS collection path on each telemetry tick.
-    pub fn ingest_delta(&self, delta_dp: &RecordBatch) -> Result<(), arrow::error::ArrowError> {
-        self.state.write().ingest_delta(delta_dp)
+    /// Register a schema for a given schema key.
+    pub fn register_schema(
+        &self,
+        schema_key: &'static str,
+        schema: PrecomputedMetricSchema,
+    ) {
+        self.state.write().register_schema(schema_key, schema);
     }
 
-    /// Get a snapshot of the current cumulative state.
-    ///
-    /// Returns `None` if no deltas have been ingested yet.
-    #[must_use]
-    pub fn snapshot(&self) -> Option<CumulativeSnapshot> {
-        self.state.read().snapshot()
+    /// Ingest a delta NumberDataPoints batch for a specific identity.
+    pub fn ingest_delta(
+        &self,
+        identity: MetricIdentity,
+        delta_dp: &RecordBatch,
+    ) -> Result<(), arrow::error::ArrowError> {
+        self.state.write().ingest_delta(identity, delta_dp)
     }
 
     /// Format the current cumulative state as OpenMetrics text.
     #[must_use]
     pub fn format_metrics(&self) -> String {
-        match self.snapshot() {
-            Some(snap) => format_openmetrics(&snap),
-            None => "# EOF\n".to_string(),
+        let entries = self.state.read().snapshot();
+        if entries.is_empty() {
+            "# EOF\n".to_string()
+        } else {
+            format_openmetrics(&entries)
         }
     }
 
-    /// Build an axum Router that serves `/metrics` (or a custom path).
+    /// Build an axum Router that serves `/metrics`.
     pub fn router(self) -> axum::Router {
         axum::Router::new()
             .route("/metrics", get(metrics_handler))
@@ -71,10 +75,13 @@ impl PrometheusExporter {
     }
 }
 
+impl Default for PrometheusExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Axum handler for GET /metrics.
-///
-/// Clones the current cumulative batch (cheap — ref-counted buffers),
-/// formats as OpenMetrics text, and returns the response.
 async fn metrics_handler(State(exporter): State<PrometheusExporter>) -> impl IntoResponse {
     let body = exporter.format_metrics();
     (
@@ -90,58 +97,52 @@ async fn metrics_handler(State(exporter): State<PrometheusExporter>) -> impl Int
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accumulator::EntityKey;
     use crate::precomputed::CounterMetricDef;
 
-    fn test_exporter() -> PrometheusExporter {
-        let schema = PrecomputedMetricSchema::new(
-            &[CounterMetricDef {
-                name: "test.counter",
-                unit: "{item}",
-                description: "A test counter",
-                num_points: 3,
-                point_attributes: &[
-                    ("outcome", "success"),
-                    ("outcome", "failure"),
-                    ("outcome", "refused"),
-                ],
-                attrs_per_point: 1,
-            }],
-        )
-        .unwrap();
-        PrometheusExporter::new(schema)
+    const TEST_SCHEMA: &str = "test.consumer";
+
+    fn test_schema() -> PrecomputedMetricSchema {
+        PrecomputedMetricSchema::new(&[CounterMetricDef {
+            name: "test.counter",
+            unit: "{item}",
+            description: "A test counter",
+            num_points: 3,
+            point_attributes: &[
+                ("outcome", "success"),
+                ("outcome", "failure"),
+                ("outcome", "refused"),
+            ],
+            attrs_per_point: 1,
+        }])
+        .unwrap()
+    }
+
+    fn test_id() -> MetricIdentity {
+        MetricIdentity {
+            schema_key: TEST_SCHEMA,
+            entity_key: EntityKey::default(),
+        }
     }
 
     #[test]
     fn empty_exporter_returns_eof() {
-        let exporter = test_exporter();
+        let exporter = PrometheusExporter::new();
         let text = exporter.format_metrics();
         assert_eq!(text.trim(), "# EOF");
     }
 
     #[test]
     fn ingest_and_format() {
-        let exporter = test_exporter();
-        let schema = PrecomputedMetricSchema::new(
-            &[CounterMetricDef {
-                name: "test.counter",
-                unit: "{item}",
-                description: "A test counter",
-                num_points: 3,
-                point_attributes: &[
-                    ("outcome", "success"),
-                    ("outcome", "failure"),
-                    ("outcome", "refused"),
-                ],
-                attrs_per_point: 1,
-            }],
-        )
-        .unwrap();
+        let schema = test_schema();
+        let exporter = PrometheusExporter::new();
+        exporter.register_schema(TEST_SCHEMA, schema.clone());
 
         let delta = schema
             .data_points_builder()
             .build_int_values(1_000_000_000, 2_000_000_000, &[100, 5, 2])
             .unwrap();
-        exporter.ingest_delta(&delta).unwrap();
+        exporter.ingest_delta(test_id(), &delta).unwrap();
 
         let text = exporter.format_metrics();
         assert!(text.contains("test_counter_total{outcome=\"success\"} 100"));
@@ -151,25 +152,13 @@ mod tests {
 
     #[test]
     fn accumulates_across_deltas() {
-        let exporter = test_exporter();
-        let schema = PrecomputedMetricSchema::new(
-            &[CounterMetricDef {
-                name: "test.counter",
-                unit: "{item}",
-                description: "A test counter",
-                num_points: 3,
-                point_attributes: &[
-                    ("outcome", "success"),
-                    ("outcome", "failure"),
-                    ("outcome", "refused"),
-                ],
-                attrs_per_point: 1,
-            }],
-        )
-        .unwrap();
+        let schema = test_schema();
+        let exporter = PrometheusExporter::new();
+        exporter.register_schema(TEST_SCHEMA, schema.clone());
 
         exporter
             .ingest_delta(
+                test_id(),
                 &schema
                     .data_points_builder()
                     .build_int_values(1_000_000_000, 2_000_000_000, &[10, 5, 2])
@@ -178,6 +167,7 @@ mod tests {
             .unwrap();
         exporter
             .ingest_delta(
+                test_id(),
                 &schema
                     .data_points_builder()
                     .build_int_values(1_000_000_000, 3_000_000_000, &[3, 1, 0])
@@ -189,36 +179,5 @@ mod tests {
         assert!(text.contains("test_counter_total{outcome=\"success\"} 13"));
         assert!(text.contains("test_counter_total{outcome=\"failure\"} 6"));
         assert!(text.contains("test_counter_total{outcome=\"refused\"} 2"));
-    }
-
-    #[test]
-    fn clone_shares_state() {
-        let exporter = test_exporter();
-        let clone = exporter.clone();
-        let schema = PrecomputedMetricSchema::new(
-            &[CounterMetricDef {
-                name: "test.counter",
-                unit: "{item}",
-                description: "A test counter",
-                num_points: 3,
-                point_attributes: &[
-                    ("outcome", "success"),
-                    ("outcome", "failure"),
-                    ("outcome", "refused"),
-                ],
-                attrs_per_point: 1,
-            }],
-        )
-        .unwrap();
-
-        let delta = schema
-            .data_points_builder()
-            .build_int_values(1_000_000_000, 2_000_000_000, &[7, 3, 1])
-            .unwrap();
-        exporter.ingest_delta(&delta).unwrap();
-
-        // Clone should see the same data
-        let text = clone.format_metrics();
-        assert!(text.contains("test_counter_total{outcome=\"success\"} 7"));
     }
 }

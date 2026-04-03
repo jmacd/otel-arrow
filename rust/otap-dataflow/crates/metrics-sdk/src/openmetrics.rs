@@ -1,6 +1,6 @@
 //! OpenMetrics exposition format formatter.
 //!
-//! Reads OTAP Arrow metric batches (from a [`CumulativeSnapshot`]) and
+//! Reads OTAP Arrow metric batches (from a [`CumulativeEntry`]) and
 //! produces OpenMetrics text format output suitable for Prometheus scraping.
 
 use std::fmt::Write;
@@ -8,24 +8,40 @@ use std::fmt::Write;
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{Int64Type, UInt8Type, UInt16Type, UInt32Type};
 
-use crate::accumulator::CumulativeSnapshot;
+use crate::accumulator::CumulativeEntry;
 
-/// Format a cumulative snapshot as OpenMetrics text.
+/// Format cumulative entries as OpenMetrics text.
 ///
-/// Walks the metrics rows, correlates data points by parent_id, and
+/// Walks all entries, correlates data points by parent_id, and
 /// resolves dimension attributes to produce standard OpenMetrics
-/// exposition format.
+/// exposition format. Entries from the same schema but different
+/// entities produce separate metric lines.
 #[must_use]
-pub fn format_openmetrics(snapshot: &CumulativeSnapshot) -> String {
+pub fn format_openmetrics(entries: &[CumulativeEntry]) -> String {
     let mut out = String::with_capacity(4096);
-    let metrics = &snapshot.metrics_batch;
-    let data_points = &snapshot.data_points_batch;
-    let attrs = &snapshot.attrs_batch;
+
+    if entries.is_empty() {
+        write_eof(&mut out);
+        return out;
+    }
+
+    for entry in entries {
+        format_entry(&mut out, entry);
+    }
+
+    write_eof(&mut out);
+    out
+}
+
+/// Format a single cumulative entry.
+fn format_entry(out: &mut String, entry: &CumulativeEntry) {
+    let metrics = &entry.metrics_batch;
+    let data_points = &entry.data_points_batch;
+    let attrs = &entry.attrs_batch;
 
     let num_metrics = metrics.num_rows();
     if num_metrics == 0 {
-        write_eof(&mut out);
-        return out;
+        return;
     }
 
     // Extract metric-level columns
@@ -108,9 +124,6 @@ pub fn format_openmetrics(snapshot: &CumulativeSnapshot) -> String {
         // Blank line between metric families
         let _ = writeln!(out);
     }
-
-    write_eof(&mut out);
-    out
 }
 
 fn write_eof(out: &mut String) {
@@ -251,40 +264,47 @@ fn get_optional_i64_column(batch: &RecordBatch, name: &str) -> Option<arrow::arr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accumulator::CumulativeAccumulator;
+    use crate::accumulator::{CumulativeAccumulator, MetricIdentity, EntityKey};
     use crate::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
 
+    const TEST_SCHEMA: &str = "test.consumer";
+
     fn test_schema() -> PrecomputedMetricSchema {
-        PrecomputedMetricSchema::new(
-            &[CounterMetricDef {
-                name: "node.consumer.items",
-                unit: "{item}",
-                description: "Items consumed by this node.",
-                num_points: 3,
-                point_attributes: &[
-                    ("outcome", "success"),
-                    ("outcome", "failure"),
-                    ("outcome", "refused"),
-                ],
-                attrs_per_point: 1,
-            }],
-        )
+        PrecomputedMetricSchema::new(&[CounterMetricDef {
+            name: "node.consumer.items",
+            unit: "{item}",
+            description: "Items consumed by this node.",
+            num_points: 3,
+            point_attributes: &[
+                ("outcome", "success"),
+                ("outcome", "failure"),
+                ("outcome", "refused"),
+            ],
+            attrs_per_point: 1,
+        }])
         .unwrap()
+    }
+
+    fn test_id() -> MetricIdentity {
+        MetricIdentity {
+            schema_key: TEST_SCHEMA,
+            entity_key: EntityKey::default(),
+        }
     }
 
     #[test]
     fn format_basic_counter() {
         let schema = test_schema();
-        let mut acc = CumulativeAccumulator::new(schema.clone());
+        let mut acc = CumulativeAccumulator::new();
+        acc.register_schema(TEST_SCHEMA, schema.clone());
 
         let delta = schema
             .data_points_builder()
             .build_int_values(1_000_000_000, 2_000_000_000, &[100, 5, 2])
             .unwrap();
-        acc.ingest_delta(&delta).unwrap();
+        acc.ingest_delta(test_id(), &delta).unwrap();
 
-        let snap = acc.snapshot().unwrap();
-        let text = format_openmetrics(&snap);
+        let text = format_openmetrics(&acc.snapshot());
 
         assert!(text.contains("# HELP node_consumer_items Items consumed by this node."));
         assert!(text.contains("# TYPE node_consumer_items counter"));
@@ -298,9 +318,11 @@ mod tests {
     #[test]
     fn format_accumulated_values() {
         let schema = test_schema();
-        let mut acc = CumulativeAccumulator::new(schema.clone());
+        let mut acc = CumulativeAccumulator::new();
+        acc.register_schema(TEST_SCHEMA, schema.clone());
 
         acc.ingest_delta(
+            test_id(),
             &schema
                 .data_points_builder()
                 .build_int_values(1_000_000_000, 2_000_000_000, &[10, 5, 2])
@@ -308,6 +330,7 @@ mod tests {
         )
         .unwrap();
         acc.ingest_delta(
+            test_id(),
             &schema
                 .data_points_builder()
                 .build_int_values(1_000_000_000, 3_000_000_000, &[3, 1, 0])
@@ -315,8 +338,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap = acc.snapshot().unwrap();
-        let text = format_openmetrics(&snap);
+        let text = format_openmetrics(&acc.snapshot());
 
         assert!(text.contains("node_consumer_items_total{outcome=\"success\"} 13"));
         assert!(text.contains("node_consumer_items_total{outcome=\"failure\"} 6"));
@@ -325,43 +347,45 @@ mod tests {
 
     #[test]
     fn format_empty_snapshot() {
-        let text = format_openmetrics(&CumulativeSnapshot {
-            metrics_batch: RecordBatch::new_empty(arrow::datatypes::Schema::empty().into()),
-            attrs_batch: RecordBatch::new_empty(arrow::datatypes::Schema::empty().into()),
-            data_points_batch: RecordBatch::new_empty(arrow::datatypes::Schema::empty().into()),
-        });
+        let text = format_openmetrics(&[]);
         assert_eq!(text.trim(), "# EOF");
     }
 
     #[test]
     fn format_two_dimension_counter() {
-        let schema = PrecomputedMetricSchema::new(
-            &[CounterMetricDef {
-                name: "node.consumer.items",
-                unit: "{item}",
-                description: "Items consumed.",
-                num_points: 6,
-                point_attributes: &[
-                    ("outcome", "success"),
-                    ("signal", "logs"),
-                    ("outcome", "success"),
-                    ("signal", "traces"),
-                    ("outcome", "failure"),
-                    ("signal", "logs"),
-                    ("outcome", "failure"),
-                    ("signal", "traces"),
-                    ("outcome", "refused"),
-                    ("signal", "logs"),
-                    ("outcome", "refused"),
-                    ("signal", "traces"),
-                ],
-                attrs_per_point: 2,
-            }],
-        )
+        let schema_key = "test.2d";
+        let schema = PrecomputedMetricSchema::new(&[CounterMetricDef {
+            name: "node.consumer.items",
+            unit: "{item}",
+            description: "Items consumed.",
+            num_points: 6,
+            point_attributes: &[
+                ("outcome", "success"),
+                ("signal", "logs"),
+                ("outcome", "success"),
+                ("signal", "traces"),
+                ("outcome", "failure"),
+                ("signal", "logs"),
+                ("outcome", "failure"),
+                ("signal", "traces"),
+                ("outcome", "refused"),
+                ("signal", "logs"),
+                ("outcome", "refused"),
+                ("signal", "traces"),
+            ],
+            attrs_per_point: 2,
+        }])
         .unwrap();
-        let mut acc = CumulativeAccumulator::new(schema.clone());
+
+        let mut acc = CumulativeAccumulator::new();
+        acc.register_schema(schema_key, schema.clone());
+        let id = MetricIdentity {
+            schema_key,
+            entity_key: EntityKey::default(),
+        };
 
         acc.ingest_delta(
+            id,
             &schema
                 .data_points_builder()
                 .build_int_values(1_000_000_000, 2_000_000_000, &[10, 20, 3, 4, 1, 0])
@@ -369,8 +393,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap = acc.snapshot().unwrap();
-        let text = format_openmetrics(&snap);
+        let text = format_openmetrics(&acc.snapshot());
 
         assert!(text.contains("node_consumer_items_total{outcome=\"success\",signal=\"logs\"} 10"));
         assert!(
