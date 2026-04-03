@@ -27,4 +27,8 @@ pub enum Error {
     /// Error during configuration of a component.
     #[error("Configuration error: {0}")]
     ConfigurationError(String),
+
+    /// Error during OTAP metric encoding.
+    #[error("Metric encoding error: {0}")]
+    MetricEncoding(String),
 }

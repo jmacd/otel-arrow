@@ -134,6 +134,7 @@ impl PrecomputedMetricSchema {
     /// Used by the bridge module which builds the metrics and attrs
     /// batches directly from `MetricsDescriptor` rather than from
     /// `CounterMetricDef`.
+    #[must_use]
     pub fn from_parts(
         metrics_batch: RecordBatch,
         attrs_batch: RecordBatch,

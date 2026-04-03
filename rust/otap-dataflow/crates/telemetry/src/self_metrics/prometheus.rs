@@ -43,6 +43,19 @@ impl PrometheusExporter {
         self.state.write().register_schema(schema_key, schema);
     }
 
+    /// Register a schema only if the given schema_key hasn't been
+    /// registered yet.
+    pub fn register_schema_if_needed(
+        &self,
+        schema_key: &'static str,
+        schema: PrecomputedMetricSchema,
+    ) {
+        let mut state = self.state.write();
+        if !state.has_schema(schema_key) {
+            state.register_schema(schema_key, schema);
+        }
+    }
+
     /// Ingest a delta NumberDataPoints batch for a specific identity.
     pub fn ingest_delta(
         &self,

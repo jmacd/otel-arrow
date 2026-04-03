@@ -168,6 +168,22 @@ impl TelemetryRegistryHandle {
         self.visit_metrics_and_reset_with_zeroes(f, false);
     }
 
+    /// Like [`visit_metrics_and_reset`](Self::visit_metrics_and_reset)
+    /// but also passes the `EntityKey` for each metric set.
+    pub fn visit_metrics_and_reset_with_entity<F>(&self, f: F)
+    where
+        for<'a> F: FnMut(
+            EntityKey,
+            &'static MetricsDescriptor,
+            &'a dyn AttributeSetHandler,
+            MetricsIterator<'a>,
+        ),
+    {
+        let mut reg = self.registry.lock();
+        let TelemetryRegistry { entities, metrics } = &mut *reg;
+        metrics.visit_metrics_and_reset_with_entity(entities, f);
+    }
+
     /// Visits metric sets, yields a zero-alloc iterator
     /// of (MetricsField, value), then resets the values to zero.
     /// Retains zero-valued metrics if `keep_all_zeroes` is true.

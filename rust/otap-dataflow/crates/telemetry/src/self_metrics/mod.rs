@@ -13,6 +13,7 @@ pub mod accumulator;
 pub mod assembly;
 pub mod bridge;
 pub mod collector;
+pub mod metrics_tap;
 pub mod openmetrics;
 pub mod precomputed;
 pub mod prometheus;

@@ -47,8 +47,7 @@ pub fn descriptor_to_schema(
         metrics_builder.append_name(field.name.as_bytes());
         metrics_builder.append_description(field.brief.as_bytes());
         metrics_builder.append_unit(field.unit.as_bytes());
-        metrics_builder
-            .append_aggregation_temporality(field_aggregation_temporality(field));
+        metrics_builder.append_aggregation_temporality(field_aggregation_temporality(field));
         metrics_builder.append_is_monotonic(field_is_monotonic(field));
 
         // Resource and scope: one shared resource (id=0) and one
@@ -78,9 +77,7 @@ pub fn descriptor_to_schema(
 /// Build a `ResourceAttrs` child batch from key-value pairs.
 ///
 /// All rows have `parent_id = 0` (single resource).
-pub fn build_resource_attrs(
-    attrs: &[(&str, &str)],
-) -> Result<RecordBatch, ArrowError> {
+pub fn build_resource_attrs(attrs: &[(&str, &str)]) -> Result<RecordBatch, ArrowError> {
     let mut builder = AttributesRecordBatchBuilder::<u16>::new();
 
     for (key, value) in attrs {
@@ -137,6 +134,7 @@ pub fn build_scope_attrs_from_entity(
 ///
 /// Each value is mapped to `i64` for the NumberDataPoints `int_value`
 /// column. F64 values are truncated. Mmsc snapshots use the sum.
+#[must_use]
 pub fn snapshot_to_int_values(values: &[MetricValue]) -> Vec<i64> {
     values
         .iter()
@@ -152,6 +150,7 @@ pub fn snapshot_to_int_values(values: &[MetricValue]) -> Vec<i64> {
 ///
 /// Each value is mapped to `f64` for the NumberDataPoints `double_value`
 /// column.
+#[must_use]
 pub fn snapshot_to_double_values(values: &[MetricValue]) -> Vec<f64> {
     values
         .iter()
@@ -164,11 +163,13 @@ pub fn snapshot_to_double_values(values: &[MetricValue]) -> Vec<f64> {
 }
 
 /// Returns true if all values in the snapshot are zero.
+#[must_use]
 pub fn snapshot_all_zeros(values: &[MetricValue]) -> bool {
     values.iter().all(|v| v.is_zero())
 }
 
 /// Whether the descriptor's fields are all integer-typed.
+#[must_use]
 pub fn descriptor_is_all_int(desc: &MetricsDescriptor) -> bool {
     desc.metrics
         .iter()
@@ -279,7 +280,7 @@ mod tests {
     fn snapshot_to_int_values_mixed() {
         let values = vec![
             MetricValue::U64(42),
-            MetricValue::F64(3.14),
+            MetricValue::F64(1.5),
             MetricValue::Mmsc(crate::instrument::MmscSnapshot {
                 min: 1.0,
                 max: 10.0,
@@ -288,7 +289,7 @@ mod tests {
             }),
         ];
         let ints = snapshot_to_int_values(&values);
-        assert_eq!(ints, vec![42, 3, 55]);
+        assert_eq!(ints, vec![42, 1, 55]);
     }
 
     #[test]
@@ -302,7 +303,10 @@ mod tests {
 
     #[test]
     fn build_resource_attrs_basic() {
-        let attrs = [("service.name", "otap-dataflow"), ("service.version", "0.1")];
+        let attrs = [
+            ("service.name", "otap-dataflow"),
+            ("service.version", "0.1"),
+        ];
         let batch = build_resource_attrs(&attrs).expect("should build");
         assert_eq!(batch.num_rows(), 2);
     }

@@ -71,6 +71,12 @@ impl CumulativeAccumulator {
         let _ = self.schemas.insert(schema_key, schema);
     }
 
+    /// Returns true if a schema with the given key has been registered.
+    #[must_use]
+    pub fn has_schema(&self, schema_key: &str) -> bool {
+        self.schemas.contains_key(schema_key)
+    }
+
     /// Ingest a delta NumberDataPoints batch for a specific identity.
     ///
     /// Adds the delta's int_value column pointwise to the cumulative
