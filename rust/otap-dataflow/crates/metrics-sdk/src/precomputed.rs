@@ -40,6 +40,7 @@ pub struct CounterMetricDef {
 ///
 /// These batches are built once at init time and reused on every
 /// collection tick. Only the NumberDataPoints table changes per tick.
+#[derive(Clone)]
 pub struct PrecomputedMetricSchema {
     /// The metrics table (one row per counter).
     metrics_batch: RecordBatch,

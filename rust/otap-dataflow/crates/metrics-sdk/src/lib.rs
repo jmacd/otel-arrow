@@ -5,6 +5,7 @@
 //! - [`PrecomputedMetricSchema`] for init-time Arrow batch construction
 //! - [`CounterDataPointsBuilder`] for runtime data point encoding
 
+pub mod accumulator;
 pub mod assembly;
 pub mod collectable;
 pub mod collector;
