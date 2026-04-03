@@ -107,7 +107,6 @@ mod tests {
                 ],
                 attrs_per_point: 1,
             }],
-            "test",
         )
         .unwrap();
         MetricsEncoder::new(schema, 1_000_000_000)

@@ -81,7 +81,6 @@ struct DimCtx {
 #[derive(Debug, Serialize)]
 struct TemplateCtx {
     metrics: Vec<MetricCtx>,
-    scope_name: String,
     level_defs: Vec<LevelDefCtx>,
 }
 
@@ -157,7 +156,7 @@ fn build_point_attributes(dims: &[DimensionRef]) -> Vec<Vec<(String, String)>> {
 }
 
 /// Build template context from a resolved schema.
-fn build_context(schema: &ResolvedSchema, scope_name: &str) -> TemplateCtx {
+fn build_context(schema: &ResolvedSchema) -> TemplateCtx {
     let mut metrics = Vec::new();
     let level_order = ["basic", "normal", "detailed"];
 
@@ -310,7 +309,6 @@ fn build_context(schema: &ResolvedSchema, scope_name: &str) -> TemplateCtx {
 
     TemplateCtx {
         metrics,
-        scope_name: scope_name.to_string(),
         level_defs,
     }
 }
@@ -320,14 +318,13 @@ pub fn generate(
     schema_path: &Path,
     template_dir: &Path,
     output_path: &Path,
-    scope_name: &str,
 ) -> Result<()> {
     // Parse schema
     let schema_file = SchemaFile::from_file(schema_path).context("failed to parse schema YAML")?;
     let resolved = schema_file.resolve().context("failed to resolve schema")?;
 
     // Build template context
-    let ctx = build_context(&resolved, scope_name);
+    let ctx = build_context(&resolved);
 
     // Load and render template
     let template_path = template_dir.join("counter_set.rs.j2");
@@ -367,7 +364,6 @@ pub fn run() -> Result<()> {
             &schema_path,
             &template_dir,
             &output_path,
-            "otap-df-telemetry",
         )?;
     } else {
         println!("No schema found at: {}", schema_path.display());

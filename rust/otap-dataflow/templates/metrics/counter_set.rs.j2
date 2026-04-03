@@ -1,7 +1,6 @@
 {# Counter metric set generated code.
    Context variables:
    - metrics: list of metric definitions
-   - scope_name: instrumentation scope name
    Each metric has: metric_name, rust_name, brief, unit, instrument, levels
    Each level has: name, dimensions, total_points, counter_array_type
    Each dimension has: attr_name, rust_type, values
@@ -119,5 +118,5 @@ pub fn precomputed_schema(level: MetricLevel) -> Option<PrecomputedMetricSchema>
 {% endfor %}
     };
 
-    PrecomputedMetricSchema::new(&defs, "{{ scope_name }}").ok()
+    PrecomputedMetricSchema::new(&defs).ok()
 }

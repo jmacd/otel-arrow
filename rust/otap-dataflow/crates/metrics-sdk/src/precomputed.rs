@@ -54,7 +54,13 @@ pub struct PrecomputedMetricSchema {
 
 impl PrecomputedMetricSchema {
     /// Build the precomputed schema from a list of counter metric definitions.
-    pub fn new(metrics: &[CounterMetricDef], scope_name: &str) -> Result<Self, ArrowError> {
+    ///
+    /// The resulting metrics batch contains only metric identity columns
+    /// (id, type, name, description, unit, temporality, monotonic).
+    /// Resource and scope are intentionally omitted — they are contextual
+    /// and assembled at the receiver/export boundary, mirroring how ITS
+    /// logs carry scope via EntityKey and resource via configuration.
+    pub fn new(metrics: &[CounterMetricDef]) -> Result<Self, ArrowError> {
         let mut metrics_builder = MetricsRecordBatchBuilder::new();
         let mut attrs_builder = AttributesRecordBatchBuilder::<u32>::new();
         let mut parent_ids: Vec<u16> = Vec::new();
@@ -63,7 +69,7 @@ impl PrecomputedMetricSchema {
         for (metric_idx, def) in metrics.iter().enumerate() {
             let metric_id = metric_idx as u16;
 
-            // Metrics table row
+            // Metrics table row: metric identity only, no resource/scope.
             metrics_builder.append_id(metric_id);
             metrics_builder.append_metric_type(MetricType::Sum as u8);
             metrics_builder.append_name(def.name.as_bytes());
@@ -73,20 +79,16 @@ impl PrecomputedMetricSchema {
                 .append_aggregation_temporality(Some(AggregationTemporality::Delta as i32));
             metrics_builder.append_is_monotonic(Some(true));
 
-            // Resource: single shared resource, id=0.
-            // schema_url and dropped_attributes_count are omitted —
-            // schema_url is deprecated and attributes are never dropped
-            // with codegen'd schemas.
+            // Resource and scope: append only the id field so the
+            // StructArray builders produce valid (non-empty) arrays.
+            // All other resource/scope fields (schema_url, attributes,
+            // name, version) are contextual and assembled at the
+            // receiver/export boundary — mirroring how ITS logs carry
+            // scope via EntityKey and resource via configuration.
             metrics_builder.resource.append_id(Some(0));
-
-            // Scope: id + name only. Version and dropped_attributes_count
-            // are omitted for the same reasons.
             metrics_builder.scope.append_id(Some(0));
-            metrics_builder
-                .scope
-                .append_name(Some(scope_name.as_bytes()));
 
-            // Data points and their attributes
+            // Data points and their dimension attributes
             for point_idx in 0..def.num_points {
                 parent_ids.push(metric_id);
 
@@ -212,7 +214,7 @@ mod tests {
         }];
 
         let schema =
-            PrecomputedMetricSchema::new(&metrics, "test-scope").expect("should build schema");
+            PrecomputedMetricSchema::new(&metrics).expect("should build schema");
 
         assert_eq!(schema.total_points(), 3);
         assert_eq!(schema.metrics_batch().num_rows(), 1);
@@ -243,7 +245,7 @@ mod tests {
         }];
 
         let schema =
-            PrecomputedMetricSchema::new(&metrics, "test-scope").expect("should build schema");
+            PrecomputedMetricSchema::new(&metrics).expect("should build schema");
 
         assert_eq!(schema.total_points(), 9);
         assert_eq!(schema.metrics_batch().num_rows(), 1);
@@ -267,7 +269,7 @@ mod tests {
         }];
 
         let schema =
-            PrecomputedMetricSchema::new(&metrics, "test-scope").expect("should build schema");
+            PrecomputedMetricSchema::new(&metrics).expect("should build schema");
         let builder = schema.data_points_builder();
 
         let start_time = 1_000_000_000i64;

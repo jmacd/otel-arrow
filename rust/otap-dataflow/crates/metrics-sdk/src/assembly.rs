@@ -59,7 +59,7 @@ mod tests {
         }];
 
         let schema =
-            PrecomputedMetricSchema::new(&metrics, "test-scope").expect("should build schema");
+            PrecomputedMetricSchema::new(&metrics).expect("should build schema");
         let builder = schema.data_points_builder();
 
         let dp_batch = builder

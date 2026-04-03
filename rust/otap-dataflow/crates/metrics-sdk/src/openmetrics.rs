@@ -221,7 +221,11 @@ fn get_string_column(batch: &RecordBatch, name: &str) -> Vec<String> {
         .as_any()
         .downcast_ref::<arrow::array::DictionaryArray<UInt8Type>>()
     {
-        if let Some(values) = dict.values().as_any().downcast_ref::<arrow::array::StringArray>() {
+        if let Some(values) = dict
+            .values()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+        {
             return (0..len)
                 .map(|i| {
                     if dict.is_null(i) {
@@ -240,7 +244,11 @@ fn get_string_column(batch: &RecordBatch, name: &str) -> Vec<String> {
         .as_any()
         .downcast_ref::<arrow::array::DictionaryArray<UInt16Type>>()
     {
-        if let Some(values) = dict.values().as_any().downcast_ref::<arrow::array::StringArray>() {
+        if let Some(values) = dict
+            .values()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+        {
             return (0..len)
                 .map(|i| {
                     if dict.is_null(i) {
@@ -259,20 +267,14 @@ fn get_string_column(batch: &RecordBatch, name: &str) -> Vec<String> {
 }
 
 /// Get an optional Int64 column by name.
-fn get_optional_i64_column(
-    batch: &RecordBatch,
-    name: &str,
-) -> Option<arrow::array::Int64Array> {
+fn get_optional_i64_column(batch: &RecordBatch, name: &str) -> Option<arrow::array::Int64Array> {
     let idx = batch.schema().index_of(name).ok()?;
     let col = batch.column(idx);
     Some(col.as_primitive::<Int64Type>().clone())
 }
 
 /// Get an optional Float64 column by name.
-fn get_optional_f64_column(
-    batch: &RecordBatch,
-    name: &str,
-) -> Option<arrow::array::Float64Array> {
+fn get_optional_f64_column(batch: &RecordBatch, name: &str) -> Option<arrow::array::Float64Array> {
     let idx = batch.schema().index_of(name).ok()?;
     let col = batch.column(idx);
     Some(col.as_primitive::<Float64Type>().clone())
@@ -298,7 +300,6 @@ mod tests {
                 ],
                 attrs_per_point: 1,
             }],
-            "test",
         )
         .unwrap()
     }
@@ -359,9 +360,7 @@ mod tests {
         let text = format_openmetrics(&CumulativeSnapshot {
             metrics_batch: RecordBatch::new_empty(arrow::datatypes::Schema::empty().into()),
             attrs_batch: RecordBatch::new_empty(arrow::datatypes::Schema::empty().into()),
-            data_points_batch: RecordBatch::new_empty(
-                arrow::datatypes::Schema::empty().into(),
-            ),
+            data_points_batch: RecordBatch::new_empty(arrow::datatypes::Schema::empty().into()),
         });
         assert_eq!(text.trim(), "# EOF");
     }
@@ -390,7 +389,6 @@ mod tests {
                 ],
                 attrs_per_point: 2,
             }],
-            "test",
         )
         .unwrap();
         let mut acc = CumulativeAccumulator::new(schema.clone());
@@ -398,11 +396,7 @@ mod tests {
         acc.ingest_delta(
             &schema
                 .data_points_builder()
-                .build_int_values(
-                    1_000_000_000,
-                    2_000_000_000,
-                    &[10, 20, 3, 4, 1, 0],
-                )
+                .build_int_values(1_000_000_000, 2_000_000_000, &[10, 20, 3, 4, 1, 0])
                 .unwrap(),
         )
         .unwrap();
@@ -410,14 +404,10 @@ mod tests {
         let snap = acc.snapshot().unwrap();
         let text = format_openmetrics(&snap);
 
-        assert!(
-            text.contains("node_consumer_items_total{outcome=\"success\",signal=\"logs\"} 10")
-        );
+        assert!(text.contains("node_consumer_items_total{outcome=\"success\",signal=\"logs\"} 10"));
         assert!(
             text.contains("node_consumer_items_total{outcome=\"success\",signal=\"traces\"} 20")
         );
-        assert!(
-            text.contains("node_consumer_items_total{outcome=\"failure\",signal=\"logs\"} 3")
-        );
+        assert!(text.contains("node_consumer_items_total{outcome=\"failure\",signal=\"logs\"} 3"));
     }
 }

@@ -106,7 +106,6 @@ mod tests {
                 ],
                 attrs_per_point: 1,
             }],
-            "test",
         )
         .unwrap();
         PrometheusExporter::new(schema)
@@ -135,7 +134,6 @@ mod tests {
                 ],
                 attrs_per_point: 1,
             }],
-            "test",
         )
         .unwrap();
 
@@ -167,7 +165,6 @@ mod tests {
                 ],
                 attrs_per_point: 1,
             }],
-            "test",
         )
         .unwrap();
 
@@ -211,7 +208,6 @@ mod tests {
                 ],
                 attrs_per_point: 1,
             }],
-            "test",
         )
         .unwrap();
 

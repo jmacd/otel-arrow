@@ -91,8 +91,7 @@ impl CumulativeAccumulator {
                 // Update time_unix_nano from delta (latest timestamp wins)
                 cols[ndp_cols::TIME] = Arc::clone(delta_dp.column(ndp_cols::TIME));
 
-                self.cumulative_dp =
-                    Some(RecordBatch::try_new(cumulative.schema(), cols)?);
+                self.cumulative_dp = Some(RecordBatch::try_new(cumulative.schema(), cols)?);
             }
         }
         Ok(())
@@ -133,10 +132,7 @@ pub struct CumulativeSnapshot {
 /// Handles the case where both arrays may have nulls (e.g., int_value is
 /// null when double_value is used, and vice versa). Null + Null = Null,
 /// Null + X = X, X + Null = X.
-fn add_nullable_numeric(
-    cumulative: &ArrayRef,
-    delta: &ArrayRef,
-) -> Result<ArrayRef, ArrowError> {
+fn add_nullable_numeric(cumulative: &ArrayRef, delta: &ArrayRef) -> Result<ArrayRef, ArrowError> {
     // If both are entirely null, return as-is
     if cumulative.null_count() == cumulative.len() && delta.null_count() == delta.len() {
         return Ok(Arc::clone(cumulative));
@@ -159,8 +155,8 @@ fn add_nullable_numeric(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Float64Array, Int64Array};
     use crate::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
+    use arrow::array::{Array, Float64Array, Int64Array};
 
     fn test_schema() -> PrecomputedMetricSchema {
         PrecomputedMetricSchema::new(
@@ -176,7 +172,6 @@ mod tests {
                 ],
                 attrs_per_point: 1,
             }],
-            "test",
         )
         .unwrap()
     }
@@ -217,10 +212,8 @@ mod tests {
 
         acc.ingest_delta(&build_delta(&schema, &[10, 5, 2]))
             .unwrap();
-        acc.ingest_delta(&build_delta(&schema, &[3, 1, 0]))
-            .unwrap();
-        acc.ingest_delta(&build_delta(&schema, &[7, 0, 1]))
-            .unwrap();
+        acc.ingest_delta(&build_delta(&schema, &[3, 1, 0])).unwrap();
+        acc.ingest_delta(&build_delta(&schema, &[7, 0, 1])).unwrap();
 
         let snap = acc.snapshot().unwrap();
         let int_col = snap
@@ -266,8 +259,7 @@ mod tests {
         let schema = test_schema();
         let mut acc = CumulativeAccumulator::new(schema.clone());
 
-        acc.ingest_delta(&build_delta(&schema, &[1, 2, 3]))
-            .unwrap();
+        acc.ingest_delta(&build_delta(&schema, &[1, 2, 3])).unwrap();
 
         let snap = acc.snapshot().unwrap();
         // Metrics table: 1 metric
@@ -285,8 +277,7 @@ mod tests {
 
         acc.ingest_delta(&build_delta(&schema, &[10, 5, 2]))
             .unwrap();
-        acc.ingest_delta(&build_delta(&schema, &[3, 1, 0]))
-            .unwrap();
+        acc.ingest_delta(&build_delta(&schema, &[3, 1, 0])).unwrap();
 
         let snap = acc.snapshot().unwrap();
         let dbl_col = snap

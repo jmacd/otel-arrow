@@ -120,7 +120,7 @@ mod tests {
             ],
             attrs_per_point: 1,
         }];
-        PrecomputedMetricSchema::new(&metrics, "test").unwrap()
+        PrecomputedMetricSchema::new(&metrics).unwrap()
     }
 
     #[test]
