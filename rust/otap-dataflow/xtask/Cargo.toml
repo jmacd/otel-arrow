@@ -10,8 +10,10 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+minijinja = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml = { workspace = true }
 toml = { workspace = true }
 tonic-prost-build = { workspace = true, features = ["cleanup-markdown"] }
 prost-build = { workspace = true }

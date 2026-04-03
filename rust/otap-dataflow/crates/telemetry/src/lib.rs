@@ -57,6 +57,8 @@ pub mod semconv;
 /// Tokio tracing subscriber initialization.
 pub mod tracing_init;
 
+pub mod self_metrics;
+
 // Re-export tracing setup types for per-thread subscriber configuration.
 pub use tracing_init::TracingSetup;
 
