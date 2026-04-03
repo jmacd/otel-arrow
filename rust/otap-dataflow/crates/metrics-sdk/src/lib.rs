@@ -12,3 +12,4 @@ pub mod collector;
 pub mod dimension;
 pub mod openmetrics;
 pub mod precomputed;
+pub mod prometheus;

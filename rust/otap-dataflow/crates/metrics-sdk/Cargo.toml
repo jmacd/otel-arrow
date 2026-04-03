@@ -16,6 +16,9 @@ otap-df-pdata = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+axum = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
