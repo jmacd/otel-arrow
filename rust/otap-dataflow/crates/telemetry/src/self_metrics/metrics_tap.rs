@@ -41,6 +41,7 @@ use crate::self_metrics::prometheus::PrometheusExporter;
 struct CachedSchema {
     schema: PrecomputedMetricSchema,
     scope_attrs: RecordBatch,
+    accumulation_modes: Vec<bridge::AccumulationMode>,
 }
 
 /// An assembled OTAP metrics payload ready for pipeline injection.
@@ -158,8 +159,8 @@ impl MetricsTap {
                     None => return,
                 };
 
-                // Build delta NumberDataPoints.
-                let int_values = bridge::snapshot_to_int_values(&values);
+                // Build delta NumberDataPoints with Mmsc expansion.
+                let int_values = bridge::expand_snapshot(descriptor, &values);
                 let dp_batch = match cached.schema.data_points_builder().build_int_values_i64(
                     self.start_time_nanos,
                     time_nanos,
@@ -176,7 +177,7 @@ impl MetricsTap {
                     }
                 };
 
-                // Feed Prometheus accumulator.
+                // Feed Prometheus accumulator with per-point modes.
                 let identity = MetricIdentity {
                     schema_key: descriptor.name,
                     entity_key,
@@ -186,11 +187,15 @@ impl MetricsTap {
                 self.prometheus
                     .register_schema_if_needed(descriptor.name, cached.schema.clone());
 
-                if let Err(e) = self.prometheus.ingest_delta(identity, &dp_batch) {
+                if let Err(e) = self.prometheus.ingest_with_modes(
+                    identity,
+                    &dp_batch,
+                    &cached.accumulation_modes,
+                ) {
                     tracing::warn!(
                         error = %e,
                         descriptor = descriptor.name,
-                        "Failed to ingest delta into Prometheus accumulator"
+                        "Failed to ingest into Prometheus accumulator"
                     );
                 }
 
@@ -216,14 +221,15 @@ impl MetricsTap {
         descriptor: &'static MetricsDescriptor,
         attrs: &dyn AttributeSetHandler,
     ) -> Result<CachedSchema, Error> {
-        let schema = bridge::descriptor_to_schema(descriptor)
+        let desc_schema = bridge::descriptor_to_schema(descriptor)
             .map_err(|e| Error::MetricEncoding(e.to_string()))?;
         let scope_attrs = bridge::build_scope_attrs_from_entity(attrs)
             .map_err(|e| Error::MetricEncoding(e.to_string()))?;
 
         Ok(CachedSchema {
-            schema,
+            schema: desc_schema.schema,
             scope_attrs,
+            accumulation_modes: desc_schema.accumulation_modes,
         })
     }
 

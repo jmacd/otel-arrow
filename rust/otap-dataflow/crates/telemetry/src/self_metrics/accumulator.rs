@@ -108,6 +108,60 @@ impl CumulativeAccumulator {
         Ok(())
     }
 
+    /// Ingest a batch with per-data-point accumulation modes.
+    ///
+    /// Each element in `modes` specifies whether the corresponding data
+    /// point should be accumulated (Add) or replaced (Replace).
+    /// This supports mixed metric types (counters + gauges) in one batch.
+    pub fn ingest_with_modes(
+        &mut self,
+        identity: MetricIdentity,
+        delta_dp: &RecordBatch,
+        modes: &[crate::self_metrics::bridge::AccumulationMode],
+    ) -> Result<(), ArrowError> {
+        use crate::self_metrics::bridge::AccumulationMode;
+
+        match self.state.get(&identity) {
+            None => {
+                let _ = self.state.insert(identity, delta_dp.clone());
+            }
+            Some(cumulative) => {
+                let mut cols: Vec<ArrayRef> = cumulative.columns().to_vec();
+
+                let cum_arr = cumulative
+                    .column(ndp_cols::INT_VALUE)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("int_value should be Int64Array");
+                let delta_arr = delta_dp
+                    .column(ndp_cols::INT_VALUE)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("int_value should be Int64Array");
+
+                // Build merged values: add for Add mode, replace for Replace mode.
+                let merged: Vec<i64> = (0..cum_arr.len())
+                    .map(|i| {
+                        let mode = modes.get(i).copied().unwrap_or(AccumulationMode::Add);
+                        match mode {
+                            AccumulationMode::Add => cum_arr.value(i) + delta_arr.value(i),
+                            AccumulationMode::Replace => delta_arr.value(i),
+                        }
+                    })
+                    .collect();
+
+                cols[ndp_cols::INT_VALUE] =
+                    Arc::new(arrow::array::Int64Array::from(merged)) as ArrayRef;
+                cols[ndp_cols::TIME] = Arc::clone(delta_dp.column(ndp_cols::TIME));
+
+                let _ = self
+                    .state
+                    .insert(identity, RecordBatch::try_new(cumulative.schema(), cols)?);
+            }
+        }
+        Ok(())
+    }
+
     /// Get a snapshot of the current cumulative state.
     ///
     /// Returns a list of `(identity, snapshot)` entries for all

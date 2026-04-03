@@ -49,6 +49,7 @@ fn format_entry(out: &mut String, entry: &CumulativeEntry) {
     let metric_names = get_string_column(metrics, "name");
     let metric_units = get_string_column(metrics, "unit");
     let metric_descs = get_string_column(metrics, "description");
+    let metric_types = get_u8_column(metrics, "metric_type");
 
     // Extract data point columns
     let dp_parent_ids = get_u16_column(data_points, "parent_id");
@@ -60,23 +61,35 @@ fn format_entry(out: &mut String, entry: &CumulativeEntry) {
     let attr_keys = get_string_column(attrs, "key");
     let attr_str_values = get_string_column(attrs, "str");
 
+    // MetricType::Sum = 2, MetricType::Gauge = 1 (from OTAP proto)
+    const METRIC_TYPE_GAUGE: u8 = 1;
+    const METRIC_TYPE_SUM: u8 = 2;
+
     // For each metric, emit TYPE/UNIT/HELP + data points
     for m_row in 0..num_metrics {
         let metric_id = metric_ids[m_row];
         let name = &metric_names[m_row];
         let unit = &metric_units[m_row];
         let desc = &metric_descs[m_row];
+        let metric_type = metric_types.get(m_row).copied().unwrap_or(METRIC_TYPE_SUM);
 
         // OpenMetrics metric name: replace dots with underscores
         let om_name = name.replace('.', "_");
+
+        // Determine Prometheus type and name suffix.
+        let (prom_type, suffix) = match metric_type {
+            METRIC_TYPE_GAUGE => ("gauge", ""),
+            METRIC_TYPE_SUM => ("counter", "_total"),
+            _ => ("gauge", ""),
+        };
 
         // HELP line
         if !desc.is_empty() {
             let _ = writeln!(out, "# HELP {om_name} {desc}");
         }
 
-        // TYPE line (counters only for now)
-        let _ = writeln!(out, "# TYPE {om_name} counter");
+        // TYPE line
+        let _ = writeln!(out, "# TYPE {om_name} {prom_type}");
 
         // UNIT line
         if !unit.is_empty() {
@@ -114,10 +127,10 @@ fn format_entry(out: &mut String, entry: &CumulativeEntry) {
 
             // Emit the metric line
             if labels.is_empty() {
-                let _ = writeln!(out, "{om_name}_total {value}");
+                let _ = writeln!(out, "{om_name}{suffix} {value}");
             } else {
                 let label_str = labels.join(",");
-                let _ = writeln!(out, "{om_name}_total{{{label_str}}} {value}");
+                let _ = writeln!(out, "{om_name}{suffix}{{{label_str}}} {value}");
             }
         }
 
@@ -128,6 +141,28 @@ fn format_entry(out: &mut String, entry: &CumulativeEntry) {
 
 fn write_eof(out: &mut String) {
     let _ = writeln!(out, "# EOF");
+}
+
+/// Get a UInt8 column by name, handling dictionary encoding.
+fn get_u8_column(batch: &RecordBatch, name: &str) -> Vec<u8> {
+    let idx = match batch.schema().index_of(name) {
+        Ok(i) => i,
+        Err(_) => return vec![0; batch.num_rows()],
+    };
+    let col = batch.column(idx);
+
+    if let Ok(casted) = arrow::compute::cast(col, &arrow::datatypes::DataType::UInt8) {
+        return casted
+            .as_primitive::<UInt8Type>()
+            .iter()
+            .map(|v| v.unwrap_or(0))
+            .collect();
+    }
+
+    col.as_primitive::<UInt8Type>()
+        .iter()
+        .map(|v| v.unwrap_or(0))
+        .collect()
 }
 
 /// Get a UInt16 column by name, handling dictionary encoding.

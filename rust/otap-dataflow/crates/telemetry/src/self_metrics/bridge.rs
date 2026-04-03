@@ -28,50 +28,98 @@ use crate::descriptor::{
 use crate::metrics::MetricValue;
 use crate::self_metrics::precomputed::PrecomputedMetricSchema;
 
+/// Whether a data point value should be added to the cumulative
+/// state or replace it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccumulationMode {
+    /// Pointwise add (delta counters, Mmsc sum/count).
+    Add,
+    /// Replace with latest value (gauges, cumulative counters, Mmsc min/max).
+    Replace,
+}
+
+/// Result of building a precomputed schema from a descriptor.
+pub struct DescriptorSchema {
+    /// The precomputed OTAP schema.
+    pub schema: PrecomputedMetricSchema,
+    /// Per-data-point accumulation mode (same length as total_points).
+    pub accumulation_modes: Vec<AccumulationMode>,
+}
+
 /// Build a [`PrecomputedMetricSchema`] from an existing `MetricsDescriptor`.
 ///
-/// Each field in the descriptor becomes one metric row and one data
-/// point. Resource and scope IDs are set to `Some(0)` — the caller
-/// must provide matching `ResourceAttrs` and `ScopeAttrs` child batches.
-pub fn descriptor_to_schema(
-    desc: &MetricsDescriptor,
-) -> Result<PrecomputedMetricSchema, ArrowError> {
+/// Each non-Mmsc field becomes one metric row and one data point.
+/// Each Mmsc field expands to 4 metrics: `_min` (gauge), `_max` (gauge),
+/// `_sum` (counter), `_count` (counter), matching the admin endpoint.
+///
+/// Resource and scope IDs are set to `Some(0)` — the caller must
+/// provide matching `ResourceAttrs` and `ScopeAttrs` child batches.
+pub fn descriptor_to_schema(desc: &MetricsDescriptor) -> Result<DescriptorSchema, ArrowError> {
     let mut metrics_builder = MetricsRecordBatchBuilder::new();
-    let mut parent_ids: Vec<u16> = Vec::with_capacity(desc.metrics.len());
+    let mut parent_ids: Vec<u16> = Vec::new();
+    let mut accumulation_modes: Vec<AccumulationMode> = Vec::new();
+    let mut metric_id: u16 = 0;
 
-    for (idx, field) in desc.metrics.iter().enumerate() {
-        let metric_id = idx as u16;
+    for field in desc.metrics.iter() {
+        match field.instrument {
+            Instrument::Mmsc => {
+                // Expand Mmsc into 4 separate metrics.
+                let sub_metrics = [
+                    (format!("{}.min", field.name), MetricType::Gauge, None, None, AccumulationMode::Replace),
+                    (format!("{}.max", field.name), MetricType::Gauge, None, None, AccumulationMode::Replace),
+                    (format!("{}.sum", field.name), MetricType::Sum, Some(AggregationTemporality::Cumulative as i32), Some(true), AccumulationMode::Add),
+                    (format!("{}.count", field.name), MetricType::Sum, Some(AggregationTemporality::Cumulative as i32), Some(true), AccumulationMode::Add),
+                ];
 
-        metrics_builder.append_id(metric_id);
-        metrics_builder.append_metric_type(instrument_to_metric_type(field) as u8);
-        metrics_builder.append_name(field.name.as_bytes());
-        metrics_builder.append_description(field.brief.as_bytes());
-        metrics_builder.append_unit(field.unit.as_bytes());
-        metrics_builder.append_aggregation_temporality(field_aggregation_temporality(field));
-        metrics_builder.append_is_monotonic(field_is_monotonic(field));
+                for (name, metric_type, temporality, monotonic, mode) in &sub_metrics {
+                    metrics_builder.append_id(metric_id);
+                    metrics_builder.append_metric_type(*metric_type as u8);
+                    metrics_builder.append_name(name.as_bytes());
+                    metrics_builder.append_description(field.brief.as_bytes());
+                    metrics_builder.append_unit(field.unit.as_bytes());
+                    metrics_builder.append_aggregation_temporality(*temporality);
+                    metrics_builder.append_is_monotonic(*monotonic);
+                    metrics_builder.resource.append_id(Some(0));
+                    metrics_builder.scope.append_id(Some(0));
 
-        // Resource and scope: one shared resource (id=0) and one
-        // shared scope (id=0) for the entire metric set.
-        metrics_builder.resource.append_id(Some(0));
-        metrics_builder.scope.append_id(Some(0));
+                    parent_ids.push(metric_id);
+                    accumulation_modes.push(*mode);
+                    metric_id += 1;
+                }
+            }
+            _ => {
+                metrics_builder.append_id(metric_id);
+                metrics_builder.append_metric_type(instrument_to_metric_type(field) as u8);
+                metrics_builder.append_name(field.name.as_bytes());
+                metrics_builder.append_description(field.brief.as_bytes());
+                metrics_builder.append_unit(field.unit.as_bytes());
+                metrics_builder.append_aggregation_temporality(field_aggregation_temporality(field));
+                metrics_builder.append_is_monotonic(field_is_monotonic(field));
+                metrics_builder.resource.append_id(Some(0));
+                metrics_builder.scope.append_id(Some(0));
 
-        // One data point per metric field, no per-point attributes.
-        parent_ids.push(metric_id);
+                parent_ids.push(metric_id);
+                accumulation_modes.push(field_accumulation_mode(field));
+                metric_id += 1;
+            }
+        }
     }
 
     let total_points = parent_ids.len();
     let metrics_batch = metrics_builder.finish()?;
 
-    // Empty attributes batch (no per-data-point dimensions).
     let mut attrs_builder = AttributesRecordBatchBuilder::<u32>::new();
     let attrs_batch = attrs_builder.finish()?;
 
-    Ok(PrecomputedMetricSchema::from_parts(
-        metrics_batch,
-        attrs_batch,
-        total_points,
-        parent_ids,
-    ))
+    Ok(DescriptorSchema {
+        schema: PrecomputedMetricSchema::from_parts(
+            metrics_batch,
+            attrs_batch,
+            total_points,
+            parent_ids,
+        ),
+        accumulation_modes,
+    })
 }
 
 /// Build a `ResourceAttrs` child batch from key-value pairs.
@@ -130,36 +178,32 @@ pub fn build_scope_attrs_from_entity(
     builder.finish()
 }
 
-/// Extract integer counter values from a `MetricValue` slice.
+/// Extract values from a `MetricValue` slice, expanding Mmsc fields.
 ///
-/// Each value is mapped to `i64` for the NumberDataPoints `int_value`
-/// column. F64 values are truncated. Mmsc snapshots use the sum.
-#[must_use]
-pub fn snapshot_to_int_values(values: &[MetricValue]) -> Vec<i64> {
-    values
-        .iter()
-        .map(|v| match v {
-            MetricValue::U64(n) => *n as i64,
-            MetricValue::F64(n) => *n as i64,
-            MetricValue::Mmsc(s) => s.sum as i64,
-        })
-        .collect()
-}
-
-/// Extract double values from a `MetricValue` slice.
-///
-/// Each value is mapped to `f64` for the NumberDataPoints `double_value`
+/// Mmsc values expand to 4 data points (min, max, sum, count).
+/// All values are mapped to `i64` for the NumberDataPoints `int_value`
 /// column.
 #[must_use]
-pub fn snapshot_to_double_values(values: &[MetricValue]) -> Vec<f64> {
-    values
-        .iter()
-        .map(|v| match v {
-            MetricValue::U64(n) => *n as f64,
-            MetricValue::F64(n) => *n,
-            MetricValue::Mmsc(s) => s.sum,
-        })
-        .collect()
+pub fn expand_snapshot(desc: &MetricsDescriptor, values: &[MetricValue]) -> Vec<i64> {
+    let mut result = Vec::new();
+    for (field, value) in desc.metrics.iter().zip(values.iter()) {
+        match (field.instrument, value) {
+            (Instrument::Mmsc, MetricValue::Mmsc(s)) => {
+                result.push(s.min as i64);
+                result.push(s.max as i64);
+                result.push(s.sum as i64);
+                result.push(s.count as i64);
+            }
+            (Instrument::Mmsc, _) => {
+                // Shouldn't happen, but handle gracefully.
+                result.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            (_, MetricValue::U64(n)) => result.push(*n as i64),
+            (_, MetricValue::F64(n)) => result.push(*n as i64),
+            (_, MetricValue::Mmsc(s)) => result.push(s.sum as i64),
+        }
+    }
+    result
 }
 
 /// Returns true if all values in the snapshot are zero.
@@ -207,6 +251,17 @@ fn field_is_monotonic(field: &MetricsField) -> Option<bool> {
     }
 }
 
+fn field_accumulation_mode(field: &MetricsField) -> AccumulationMode {
+    match field.instrument {
+        Instrument::Counter if field.temporality == Some(Temporality::Delta) => {
+            AccumulationMode::Add
+        }
+        Instrument::Gauge => AccumulationMode::Replace,
+        // Cumulative counters, observe counters, up-down counters: replace.
+        _ => AccumulationMode::Replace,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,26 +303,30 @@ mod tests {
     #[test]
     fn descriptor_to_schema_basic() {
         let desc = test_descriptor();
-        let schema = descriptor_to_schema(desc).expect("should build schema");
+        let ds = descriptor_to_schema(desc).expect("should build schema");
 
         // 3 metrics → 3 data points, 0 attributes
-        assert_eq!(schema.total_points(), 3);
-        assert_eq!(schema.metrics_batch().num_rows(), 3);
-        assert_eq!(schema.attrs_batch().num_rows(), 0);
+        assert_eq!(ds.schema.total_points(), 3);
+        assert_eq!(ds.schema.metrics_batch().num_rows(), 3);
+        assert_eq!(ds.schema.attrs_batch().num_rows(), 0);
+        // 2 delta counters (Add) + 1 gauge (Replace)
+        assert_eq!(ds.accumulation_modes[0], AccumulationMode::Add);
+        assert_eq!(ds.accumulation_modes[1], AccumulationMode::Add);
+        assert_eq!(ds.accumulation_modes[2], AccumulationMode::Replace);
     }
 
     #[test]
     fn descriptor_to_schema_data_points_build() {
         let desc = test_descriptor();
-        let schema = descriptor_to_schema(desc).expect("should build schema");
-        let builder = schema.data_points_builder();
+        let ds = descriptor_to_schema(desc).expect("should build schema");
+        let builder = ds.schema.data_points_builder();
 
         let values = vec![
             MetricValue::U64(100),
             MetricValue::U64(95),
             MetricValue::U64(5),
         ];
-        let int_values = snapshot_to_int_values(&values);
+        let int_values = expand_snapshot(desc, &values);
 
         let batch = builder
             .build_int_values_i64(1_000_000_000, 2_000_000_000, &int_values)
@@ -277,10 +336,31 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_to_int_values_mixed() {
+    fn expand_snapshot_with_mmsc() {
+        static DESC: MetricsDescriptor = MetricsDescriptor {
+            name: "test.mixed",
+            metrics: &[
+                MetricsField {
+                    name: "items",
+                    unit: "{item}",
+                    brief: "Items",
+                    instrument: Instrument::Counter,
+                    temporality: Some(Temporality::Delta),
+                    value_type: MetricValueType::U64,
+                },
+                MetricsField {
+                    name: "latency",
+                    unit: "ms",
+                    brief: "Latency",
+                    instrument: Instrument::Mmsc,
+                    temporality: Some(Temporality::Delta),
+                    value_type: MetricValueType::F64,
+                },
+            ],
+        };
+
         let values = vec![
             MetricValue::U64(42),
-            MetricValue::F64(1.5),
             MetricValue::Mmsc(crate::instrument::MmscSnapshot {
                 min: 1.0,
                 max: 10.0,
@@ -288,8 +368,34 @@ mod tests {
                 count: 10,
             }),
         ];
-        let ints = snapshot_to_int_values(&values);
-        assert_eq!(ints, vec![42, 1, 55]);
+        // Counter: 1 point, Mmsc: 4 points (min, max, sum, count)
+        let expanded = expand_snapshot(&DESC, &values);
+        assert_eq!(expanded, vec![42, 1, 10, 55, 10]);
+    }
+
+    #[test]
+    fn mmsc_schema_expansion() {
+        static DESC: MetricsDescriptor = MetricsDescriptor {
+            name: "test.mmsc",
+            metrics: &[MetricsField {
+                name: "latency",
+                unit: "ms",
+                brief: "Latency",
+                instrument: Instrument::Mmsc,
+                temporality: Some(Temporality::Delta),
+                value_type: MetricValueType::F64,
+            }],
+        };
+
+        let ds = descriptor_to_schema(&DESC).expect("should build");
+        // 1 Mmsc field → 4 metric rows, 4 data points
+        assert_eq!(ds.schema.metrics_batch().num_rows(), 4);
+        assert_eq!(ds.schema.total_points(), 4);
+        // min/max = Replace, sum/count = Add
+        assert_eq!(ds.accumulation_modes[0], AccumulationMode::Replace);
+        assert_eq!(ds.accumulation_modes[1], AccumulationMode::Replace);
+        assert_eq!(ds.accumulation_modes[2], AccumulationMode::Add);
+        assert_eq!(ds.accumulation_modes[3], AccumulationMode::Add);
     }
 
     #[test]

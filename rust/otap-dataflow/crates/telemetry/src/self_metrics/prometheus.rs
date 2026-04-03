@@ -65,6 +65,18 @@ impl PrometheusExporter {
         self.state.write().ingest_delta(identity, delta_dp)
     }
 
+    /// Ingest a batch with per-data-point accumulation modes.
+    pub fn ingest_with_modes(
+        &self,
+        identity: MetricIdentity,
+        delta_dp: &RecordBatch,
+        modes: &[crate::self_metrics::bridge::AccumulationMode],
+    ) -> Result<(), arrow::error::ArrowError> {
+        self.state
+            .write()
+            .ingest_with_modes(identity, delta_dp, modes)
+    }
+
     /// Format the current cumulative state as OpenMetrics text.
     #[must_use]
     pub fn format_metrics(&self) -> String {
