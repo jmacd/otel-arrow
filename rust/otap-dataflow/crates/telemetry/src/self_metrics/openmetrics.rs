@@ -8,7 +8,7 @@ use std::fmt::Write;
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{Int64Type, UInt8Type, UInt16Type, UInt32Type};
 
-use crate::accumulator::CumulativeEntry;
+use crate::self_metrics::accumulator::CumulativeEntry;
 
 /// Format cumulative entries as OpenMetrics text.
 ///
@@ -264,8 +264,9 @@ fn get_optional_i64_column(batch: &RecordBatch, name: &str) -> Option<arrow::arr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accumulator::{CumulativeAccumulator, MetricIdentity, EntityKey};
-    use crate::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
+    use crate::registry::EntityKey;
+    use crate::self_metrics::accumulator::{CumulativeAccumulator, MetricIdentity};
+    use crate::self_metrics::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
 
     const TEST_SCHEMA: &str = "test.consumer";
 

@@ -1,16 +1,31 @@
-//! Self-metrics for the telemetry system.
+//! Self-metrics: OTAP-native metrics SDK with codegen-driven Arrow encoding.
 //!
-//! Generated from `self_metrics.yaml` by `cargo xtask generate-metrics`.
+//! This module provides:
+//! - [`Dimension`](dimension::Dimension) trait for bounded enum types
+//! - [`PrecomputedMetricSchema`](precomputed::PrecomputedMetricSchema) for
+//!   init-time Arrow batch construction
+//! - [`CumulativeAccumulator`](accumulator::CumulativeAccumulator) for
+//!   Arrow-native delta→cumulative accumulation
+//! - [`PrometheusExporter`](prometheus::PrometheusExporter) for HTTP `/metrics`
+//! - Generated counter structs in [`generated`]
 
+pub mod accumulator;
+pub mod assembly;
+pub mod collectable;
+pub mod collector;
+pub mod dimension;
 pub mod generated;
+pub mod openmetrics;
+pub mod precomputed;
+pub mod prometheus;
 
 #[cfg(test)]
 mod tests {
+    use super::assembly::assemble_metrics_payload;
+    use super::dimension::{Dimension, Outcome};
     use super::generated::*;
     use otap_df_config::SignalType;
     use otap_df_config::policy::MetricLevel;
-    use otap_df_metrics_sdk::assembly::assemble_metrics_payload;
-    use otap_df_metrics_sdk::dimension::{Dimension, Outcome};
 
     #[test]
     fn basic_level_counter_lifecycle() {

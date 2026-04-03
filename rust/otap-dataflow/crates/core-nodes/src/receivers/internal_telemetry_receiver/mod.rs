@@ -216,7 +216,7 @@ impl InternalTelemetryReceiver {
     async fn collect_otap_metrics(
         _effect_handler: &local::EffectHandler<OtapPdata>,
         _collectors: &[Arc<
-            parking_lot::Mutex<otap_df_metrics_sdk::collectable::MetricSetCollector>,
+            parking_lot::Mutex<otap_df_telemetry::self_metrics::collectable::MetricSetCollector>,
         >],
     ) -> Result<(), Error> {
         // TODO: Wire counter struct references through the collectors.

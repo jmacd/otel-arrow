@@ -41,7 +41,7 @@ pub fn assemble_metrics_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
+    use crate::self_metrics::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
 
     #[test]
     fn assemble_roundtrip() {
@@ -58,8 +58,7 @@ mod tests {
             attrs_per_point: 1,
         }];
 
-        let schema =
-            PrecomputedMetricSchema::new(&metrics).expect("should build schema");
+        let schema = PrecomputedMetricSchema::new(&metrics).expect("should build schema");
         let builder = schema.data_points_builder();
 
         let dp_batch = builder

@@ -28,11 +28,11 @@
 use crate::error::Error;
 use crate::event::{ObservedEvent, ObservedEventReporter};
 use crate::registry::TelemetryRegistryHandle;
+use crate::self_metrics::collectable::MetricSetCollector;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use otap_df_config::observed_state::SendPolicy;
 use otap_df_config::pipeline::telemetry::TelemetryConfig;
 use otap_df_config::settings::telemetry::logs::{LogLevel, LoggingProviders, ProviderMode};
-use otap_df_metrics_sdk::collectable::MetricSetCollector;
 use self_tracing::LogContextFn;
 use std::sync::Arc;
 use tracing_init::ProviderSetup;

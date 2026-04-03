@@ -15,9 +15,9 @@ use axum::routing::get;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-use crate::accumulator::{CumulativeAccumulator, MetricIdentity};
-use crate::openmetrics::format_openmetrics;
-use crate::precomputed::PrecomputedMetricSchema;
+use crate::self_metrics::accumulator::{CumulativeAccumulator, MetricIdentity};
+use crate::self_metrics::openmetrics::format_openmetrics;
+use crate::self_metrics::precomputed::PrecomputedMetricSchema;
 
 /// Shared state for the protometheus exporter.
 ///
@@ -39,11 +39,7 @@ impl PrometheusExporter {
     }
 
     /// Register a schema for a given schema key.
-    pub fn register_schema(
-        &self,
-        schema_key: &'static str,
-        schema: PrecomputedMetricSchema,
-    ) {
+    pub fn register_schema(&self, schema_key: &'static str, schema: PrecomputedMetricSchema) {
         self.state.write().register_schema(schema_key, schema);
     }
 
@@ -97,8 +93,8 @@ async fn metrics_handler(State(exporter): State<PrometheusExporter>) -> impl Int
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accumulator::EntityKey;
-    use crate::precomputed::CounterMetricDef;
+    use crate::registry::EntityKey;
+    use crate::self_metrics::precomputed::CounterMetricDef;
 
     const TEST_SCHEMA: &str = "test.consumer";
 

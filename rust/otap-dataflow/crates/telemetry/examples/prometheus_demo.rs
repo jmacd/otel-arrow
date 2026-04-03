@@ -19,12 +19,13 @@ use std::time::Duration;
 
 use otap_df_config::SignalType;
 use otap_df_config::policy::MetricLevel;
-use otap_df_metrics_sdk::accumulator::{EntityKey, MetricIdentity};
-use otap_df_metrics_sdk::dimension::Outcome;
-use otap_df_metrics_sdk::prometheus::PrometheusExporter;
+use otap_df_telemetry::registry::EntityKey;
+use otap_df_telemetry::self_metrics::accumulator::MetricIdentity;
+use otap_df_telemetry::self_metrics::dimension::Outcome;
 use otap_df_telemetry::self_metrics::generated::{
     NodeConsumerItems, NodeProducerItems, precomputed_schema,
 };
+use otap_df_telemetry::self_metrics::prometheus::PrometheusExporter;
 use rand::Rng;
 use rand::RngExt;
 use tokio::net::TcpListener;
@@ -53,22 +54,22 @@ impl SimulatedNode {
         for &signal in &signals {
             // Most items succeed
             let success_count: u64 = rng.random_range(10..100);
-            self.consumer
-                .add(success_count, Outcome::Success, signal);
-            self.producer
-                .add(success_count.saturating_sub(rng.random_range(0..5)), Outcome::Success, signal);
+            self.consumer.add(success_count, Outcome::Success, signal);
+            self.producer.add(
+                success_count.saturating_sub(rng.random_range(0..5)),
+                Outcome::Success,
+                signal,
+            );
 
             // Occasional failures
             if rng.random_bool(0.3) {
                 let fail_count: u64 = rng.random_range(1..5);
-                self.consumer
-                    .add(fail_count, Outcome::Failure, signal);
+                self.consumer.add(fail_count, Outcome::Failure, signal);
             }
 
             // Rare refused
             if rng.random_bool(0.1) {
-                self.consumer
-                    .add(1, Outcome::Refused, signal);
+                self.consumer.add(1, Outcome::Refused, signal);
             }
         }
     }

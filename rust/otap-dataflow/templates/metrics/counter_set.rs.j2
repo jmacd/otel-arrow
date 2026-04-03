@@ -11,8 +11,8 @@
 
 use otap_df_config::policy::MetricLevel;
 use otap_df_config::SignalType;
-use otap_df_metrics_sdk::dimension::{Dimension, Outcome};
-use otap_df_metrics_sdk::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
+use crate::self_metrics::dimension::{Dimension, Outcome};
+use crate::self_metrics::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
 use crate::instrument::Counter;
 
 {% for metric in metrics %}

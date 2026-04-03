@@ -6,8 +6,8 @@
 
 use arrow::error::ArrowError;
 
-use crate::assembly::assemble_metrics_payload;
-use crate::precomputed::PrecomputedMetricSchema;
+use crate::self_metrics::assembly::assemble_metrics_payload;
+use crate::self_metrics::precomputed::PrecomputedMetricSchema;
 use otap_df_pdata::OtapArrowRecords;
 
 /// Encodes counter metric snapshots into OTAP Arrow record batches.
@@ -105,7 +105,7 @@ impl std::error::Error for EncodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
+    use crate::self_metrics::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
 
     fn test_schema() -> PrecomputedMetricSchema {
         let metrics = [CounterMetricDef {

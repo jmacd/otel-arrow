@@ -314,11 +314,7 @@ fn build_context(schema: &ResolvedSchema) -> TemplateCtx {
 }
 
 /// Generate Rust code for a metrics schema file.
-pub fn generate(
-    schema_path: &Path,
-    template_dir: &Path,
-    output_path: &Path,
-) -> Result<()> {
+pub fn generate(schema_path: &Path, template_dir: &Path, output_path: &Path) -> Result<()> {
     // Parse schema
     let schema_file = SchemaFile::from_file(schema_path).context("failed to parse schema YAML")?;
     let resolved = schema_file.resolve().context("failed to resolve schema")?;
@@ -360,11 +356,7 @@ pub fn run() -> Result<()> {
     let schema_path = workspace_root.join("crates/telemetry/self_metrics.yaml");
     if schema_path.exists() {
         let output_path = workspace_root.join("crates/telemetry/src/self_metrics/generated.rs");
-        generate(
-            &schema_path,
-            &template_dir,
-            &output_path,
-        )?;
+        generate(&schema_path, &template_dir, &output_path)?;
     } else {
         println!("No schema found at: {}", schema_path.display());
     }

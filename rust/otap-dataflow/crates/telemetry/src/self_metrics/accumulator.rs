@@ -16,16 +16,9 @@ use arrow::error::ArrowError;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use slotmap::new_key_type;
+use crate::registry::EntityKey;
 
-// Placeholder until metrics-sdk is merged into crates/telemetry.
-// Will become otap_df_telemetry::registry::EntityKey.
-new_key_type! {
-    /// Entity key placeholder — identifies a pipeline node's scope.
-    pub struct EntityKey;
-}
-
-use crate::precomputed::PrecomputedMetricSchema;
+use crate::self_metrics::precomputed::PrecomputedMetricSchema;
 
 /// Column indices in the NumberDataPoints RecordBatch.
 /// These match the schema produced by `CounterDataPointsBuilder::build_int_values`.
@@ -74,11 +67,7 @@ impl CumulativeAccumulator {
 
     /// Register a schema. Must be called before ingesting deltas for
     /// that schema_key.
-    pub fn register_schema(
-        &mut self,
-        schema_key: &'static str,
-        schema: PrecomputedMetricSchema,
-    ) {
+    pub fn register_schema(&mut self, schema_key: &'static str, schema: PrecomputedMetricSchema) {
         let _ = self.schemas.insert(schema_key, schema);
     }
 
@@ -105,10 +94,9 @@ impl CumulativeAccumulator {
 
                 cols[ndp_cols::TIME] = Arc::clone(delta_dp.column(ndp_cols::TIME));
 
-                let _ = self.state.insert(
-                    identity,
-                    RecordBatch::try_new(cumulative.schema(), cols)?,
-                );
+                let _ = self
+                    .state
+                    .insert(identity, RecordBatch::try_new(cumulative.schema(), cols)?);
             }
         }
         Ok(())
@@ -160,8 +148,8 @@ pub struct CumulativeEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::self_metrics::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
     use arrow::array::{Array, Int64Array};
-    use crate::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
 
     const SCHEMA_A: &str = "test.consumer";
     const SCHEMA_B: &str = "test.producer";

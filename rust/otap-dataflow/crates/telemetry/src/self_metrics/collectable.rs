@@ -4,7 +4,7 @@
 //! collection path. Each generated metric set implements this trait
 //! to provide its counter values as a flat array for encoding.
 
-use crate::collector::{EncodeError, MetricsEncoder};
+use crate::self_metrics::collector::{EncodeError, MetricsEncoder};
 use otap_df_pdata::OtapArrowRecords;
 
 /// A collection of counters that can be snapshotted and encoded.
@@ -75,7 +75,7 @@ impl MetricSetCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
+    use crate::self_metrics::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
 
     struct TestMetrics {
         values: [u64; 3],
@@ -97,20 +97,18 @@ mod tests {
     }
 
     fn test_encoder() -> MetricsEncoder {
-        let schema = PrecomputedMetricSchema::new(
-            &[CounterMetricDef {
-                name: "test.counter",
-                unit: "{item}",
-                description: "test",
-                num_points: 3,
-                point_attributes: &[
-                    ("outcome", "success"),
-                    ("outcome", "failure"),
-                    ("outcome", "refused"),
-                ],
-                attrs_per_point: 1,
-            }],
-        )
+        let schema = PrecomputedMetricSchema::new(&[CounterMetricDef {
+            name: "test.counter",
+            unit: "{item}",
+            description: "test",
+            num_points: 3,
+            point_attributes: &[
+                ("outcome", "success"),
+                ("outcome", "failure"),
+                ("outcome", "refused"),
+            ],
+            attrs_per_point: 1,
+        }])
         .unwrap();
         MetricsEncoder::new(schema, 1_000_000_000)
     }
