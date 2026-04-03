@@ -22,10 +22,15 @@ use otap_df_otap::OTAP_EXPORTER_FACTORIES;
 use otap_df_otap::pdata::OtapPdata;
 use otap_df_pdata::OtapPayload;
 use otap_df_pdata::views::otap::OtapLogsView;
+use otap_df_pdata::views::otap::OtapMetricsView;
 use otap_df_pdata::views::otlp::bytes::logs::RawLogsData;
 use otap_df_pdata_views::views::common::InstrumentationScopeView;
 use otap_df_pdata_views::views::logs::{
     LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView,
+};
+use otap_df_pdata_views::views::metrics::{
+    DataType, DataView, GaugeView, MetricView, MetricsView, NumberDataPointView,
+    ResourceMetricsView, ScopeMetricsView, SumView, Value,
 };
 use otap_df_pdata_views::views::resource::ResourceView;
 use otap_df_telemetry::otel_error;
@@ -157,12 +162,24 @@ impl ConsoleExporter {
         );
     }
 
-    async fn export_metrics(&self, _payload: &OtapPayload) {
-        // TODO: Implement metrics formatting.
-        otel_error!(
-            "console.metrics.not_implemented",
-            message = "Metrics formatting not yet implemented"
-        );
+    async fn export_metrics(&self, payload: &OtapPayload) {
+        match payload {
+            OtapPayload::OtlpBytes(_bytes) => {
+                // OTLP bytes metrics view not yet available; convert to OTAP first.
+                otel_error!(
+                    "console.metrics.otlp_bytes_unsupported",
+                    message = "OTLP bytes metrics display not yet supported; use OTAP Arrow format"
+                );
+            }
+            OtapPayload::OtapArrowRecords(records) => match OtapMetricsView::try_from(records) {
+                Ok(metrics_view) => {
+                    self.formatter.print_metrics_data(&metrics_view).await;
+                }
+                Err(e) => {
+                    otel_error!("console.metrics_view.otap_create_failed", error = ?e, message = "Failed to create OTAP metrics view");
+                }
+            },
+        }
     }
 }
 
@@ -393,6 +410,282 @@ impl HierarchicalFormatter {
         f(&mut w);
         let len = w.position();
         output.extend_from_slice(&buf[..len]);
+    }
+
+    // --- Metrics formatting ---
+
+    /// Print metrics data to stdout.
+    pub async fn print_metrics_data<M: MetricsView>(&self, metrics_data: &M) {
+        let mut output = Vec::new();
+        self.format_metrics_data_to(metrics_data, &mut output);
+
+        use tokio::io::AsyncWriteExt;
+
+        if let Err(err) = tokio::io::stdout().write_all(&output).await {
+            otel_error!("console.write_failed", error = ?err, message = "Could not write metrics to console");
+        }
+    }
+
+    /// Format metrics from a MetricsView to a byte buffer.
+    fn format_metrics_data_to<M: MetricsView>(&self, metrics_data: &M, output: &mut Vec<u8>) {
+        for resource_metrics in metrics_data.resources() {
+            self.format_resource_metrics_to(&resource_metrics, output);
+        }
+    }
+
+    /// Format a ResourceMetrics with its nested scopes.
+    fn format_resource_metrics_to<R: ResourceMetricsView>(
+        &self,
+        resource_metrics: &R,
+        output: &mut Vec<u8>,
+    ) {
+        let first_ts = self.get_first_metric_timestamp(resource_metrics);
+
+        self.format_line(output, |w| {
+            w.format_header_line(
+                Some(first_ts),
+                resource_metrics
+                    .resource()
+                    .iter()
+                    .flat_map(|r| r.attributes()),
+                |w| {
+                    w.write_styled(AnsiCode::Cyan, |w| {
+                        let _ = w.write_all(b"RESOURCE");
+                    });
+                    let _ = w.write_all(b"   ");
+                },
+                |w| {
+                    let _ = w.write_all(b"v1.Resource");
+                },
+                |_| {},
+            );
+        });
+
+        let mut scopes = resource_metrics.scopes().peekable();
+        while let Some(scope_metrics) = scopes.next() {
+            let is_last_scope = scopes.peek().is_none();
+            self.format_scope_metrics_to(&scope_metrics, is_last_scope, output);
+        }
+    }
+
+    /// Get the first timestamp from metrics in a ResourceMetrics.
+    fn get_first_metric_timestamp<R: ResourceMetricsView>(
+        &self,
+        resource_metrics: &R,
+    ) -> SystemTime {
+        for scope_metrics in resource_metrics.scopes() {
+            for metric in scope_metrics.metrics() {
+                if let Some(data) = metric.data() {
+                    if let Some(ts) = Self::first_data_point_time(&data) {
+                        return nanos_to_time(ts);
+                    }
+                }
+            }
+        }
+        SystemTime::UNIX_EPOCH
+    }
+
+    /// Extract the first timestamp from a DataView.
+    fn first_data_point_time<'a, D: DataView<'a>>(data: &D) -> Option<u64> {
+        match data.value_type() {
+            DataType::Gauge => data
+                .as_gauge()
+                .and_then(|g| g.data_points().next().map(|dp| dp.time_unix_nano())),
+            DataType::Sum => data
+                .as_sum()
+                .and_then(|s| s.data_points().next().map(|dp| dp.time_unix_nano())),
+            _ => None,
+        }
+    }
+
+    /// Format a ScopeMetrics with its nested metrics.
+    fn format_scope_metrics_to<S: ScopeMetricsView>(
+        &self,
+        scope_metrics: &S,
+        is_last_scope: bool,
+        output: &mut Vec<u8>,
+    ) {
+        let prefix = self.tree.vertical;
+        let scope = scope_metrics.scope();
+        let name = scope.as_ref().and_then(|s| s.name());
+        let version = scope.as_ref().and_then(|s| s.version());
+
+        self.format_line(output, |w| {
+            w.format_header_line(
+                None,
+                scope.iter().flat_map(|s| s.attributes()),
+                |w| {
+                    let _ = w.write_all(prefix.as_bytes());
+                    let _ = w.write_all(b" ");
+                    w.write_styled(AnsiCode::Magenta, |w| {
+                        let _ = w.write_all(b"SCOPE");
+                    });
+                    let _ = w.write_all(b"    ");
+                },
+                |w| match (name, version) {
+                    (Some(n), Some(v)) => {
+                        let _ = w.write_all(n);
+                        let _ = w.write_all(b"/");
+                        let _ = w.write_all(v);
+                    }
+                    (Some(n), None) => {
+                        let _ = w.write_all(n);
+                    }
+                    _ => {
+                        let _ = w.write_all(b"v1.InstrumentationScope");
+                    }
+                },
+                |_| {},
+            );
+        });
+
+        let mut metrics = scope_metrics.metrics().peekable();
+        while let Some(metric) = metrics.next() {
+            let is_last_metric = metrics.peek().is_none();
+            self.format_metric_to(&metric, is_last_scope, is_last_metric, output);
+        }
+    }
+
+    /// Format a single metric with its data points.
+    fn format_metric_to<MV: MetricView>(
+        &self,
+        metric: &MV,
+        is_last_scope: bool,
+        is_last_metric: bool,
+        output: &mut Vec<u8>,
+    ) {
+        let name = metric.name();
+        let unit = metric.unit();
+        let tree = self.tree;
+
+        let data = match metric.data() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let type_label = match data.value_type() {
+            DataType::Gauge => "gauge",
+            DataType::Sum => "sum",
+            DataType::Histogram => "histogram",
+            DataType::ExponentialHistogram => "exp_histogram",
+            DataType::Summary => "summary",
+        };
+
+        // Collect data points for display.
+        let points = Self::collect_number_data_points(&data);
+
+        for (i, (ts_nanos, value_str, dp_attrs)) in points.iter().enumerate() {
+            let is_last_point = i == points.len() - 1;
+            let time = nanos_to_time(*ts_nanos);
+
+            self.format_line(output, |w| {
+                // Tree prefix
+                let _ = w.write_all(tree.vertical.as_bytes());
+                let _ = w.write_all(b" ");
+                if is_last_metric && is_last_scope && is_last_point {
+                    let _ = w.write_all(tree.corner.as_bytes());
+                } else {
+                    let _ = w.write_all(tree.tee.as_bytes());
+                }
+                let _ = w.write_all(b" ");
+
+                // Timestamp
+                w.write_timestamp(time);
+                let _ = w.write_all(b" ");
+
+                // Type badge
+                w.write_styled(AnsiCode::Yellow, |w| {
+                    let _ = w.write_all(type_label.as_bytes());
+                });
+                let _ = w.write_all(b" ");
+
+                // Metric name
+                w.write_styled(AnsiCode::Bold, |w| {
+                    let _ = w.write_all(name);
+                });
+
+                // Unit
+                if !unit.is_empty() {
+                    let _ = w.write_all(b" (");
+                    let _ = w.write_all(unit);
+                    let _ = w.write_all(b")");
+                }
+
+                // Value
+                let _ = w.write_all(b" = ");
+                let _ = w.write_all(value_str.as_bytes());
+
+                // Data point attributes
+                if !dp_attrs.is_empty() {
+                    let _ = w.write_all(b" [");
+                    let _ = w.write_all(dp_attrs.as_bytes());
+                    let _ = w.write_all(b"]");
+                }
+
+                let _ = w.write_all(b"\n");
+            });
+        }
+    }
+
+    /// Collect number data points from a DataView as (timestamp, value_string, attrs_string).
+    fn collect_number_data_points<'a, D: DataView<'a>>(data: &D) -> Vec<(u64, String, String)> {
+        let mut points = Vec::new();
+
+        match data.value_type() {
+            DataType::Gauge => {
+                if let Some(gauge) = data.as_gauge() {
+                    for dp in gauge.data_points() {
+                        points.push(Self::format_number_data_point(&dp));
+                    }
+                }
+            }
+            DataType::Sum => {
+                if let Some(sum) = data.as_sum() {
+                    for dp in sum.data_points() {
+                        points.push(Self::format_number_data_point(&dp));
+                    }
+                }
+            }
+            _ => {
+                // Histogram/Summary: show type only for now.
+                points.push((0, "(unsupported type)".to_string(), String::new()));
+            }
+        }
+
+        if points.is_empty() {
+            points.push((0, "(no data points)".to_string(), String::new()));
+        }
+        points
+    }
+
+    /// Format a single NumberDataPoint as (timestamp, value_string, attrs_string).
+    fn format_number_data_point<N: NumberDataPointView>(dp: &N) -> (u64, String, String) {
+        let ts = dp.time_unix_nano();
+        let value_str = match dp.value() {
+            Some(Value::Integer(v)) => format!("{v}"),
+            Some(Value::Double(v)) => format!("{v}"),
+            None => "null".to_string(),
+        };
+        let attrs: Vec<String> = dp
+            .attributes()
+            .map(|a| {
+                use otap_df_pdata_views::views::common::{AnyValueView, AttributeView};
+                let key = String::from_utf8_lossy(a.key()).into_owned();
+                let val = a
+                    .value()
+                    .map(|v| {
+                        v.as_string()
+                            .map(|s| String::from_utf8_lossy(s).into_owned())
+                            .or_else(|| v.as_int64().map(|i| format!("{i}")))
+                            .or_else(|| v.as_double().map(|d| format!("{d}")))
+                            .or_else(|| v.as_bool().map(|b| format!("{b}")))
+                            .unwrap_or_else(|| "?".to_string())
+                    })
+                    .unwrap_or_default();
+                format!("{key}={val}")
+            })
+            .collect();
+        (ts, value_str, attrs.join(","))
     }
 }
 
