@@ -73,20 +73,18 @@ impl PrecomputedMetricSchema {
                 .append_aggregation_temporality(Some(AggregationTemporality::Delta as i32));
             metrics_builder.append_is_monotonic(Some(true));
 
-            // Resource: single resource, id=0
+            // Resource: single shared resource, id=0.
+            // schema_url and dropped_attributes_count are omitted —
+            // schema_url is deprecated and attributes are never dropped
+            // with codegen'd schemas.
             metrics_builder.resource.append_id(Some(0));
-            metrics_builder.resource.append_schema_url(None);
-            metrics_builder.resource.append_dropped_attributes_count(0);
 
-            // Scope
+            // Scope: id + name only. Version and dropped_attributes_count
+            // are omitted for the same reasons.
             metrics_builder.scope.append_id(Some(0));
             metrics_builder
                 .scope
                 .append_name(Some(scope_name.as_bytes()));
-            metrics_builder.scope.append_version(None);
-            metrics_builder.scope.append_dropped_attributes_count(0);
-
-            metrics_builder.append_scope_schema_url(&[]);
 
             // Data points and their attributes
             for point_idx in 0..def.num_points {
