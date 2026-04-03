@@ -105,6 +105,9 @@ pub fn descriptor_to_schema(desc: &MetricsDescriptor) -> Result<DescriptorSchema
                     metrics_builder.append_is_monotonic(*monotonic);
                     metrics_builder.resource.append_id(Some(0));
                     metrics_builder.scope.append_id(Some(0));
+                    metrics_builder
+                        .scope
+                        .append_name(Some(desc.name.as_bytes()));
 
                     parent_ids.push(metric_id);
                     accumulation_modes.push(*mode);
@@ -122,6 +125,9 @@ pub fn descriptor_to_schema(desc: &MetricsDescriptor) -> Result<DescriptorSchema
                 metrics_builder.append_is_monotonic(field_is_monotonic(field));
                 metrics_builder.resource.append_id(Some(0));
                 metrics_builder.scope.append_id(Some(0));
+                metrics_builder
+                    .scope
+                    .append_name(Some(desc.name.as_bytes()));
 
                 parent_ids.push(metric_id);
                 accumulation_modes.push(field_accumulation_mode(field));
