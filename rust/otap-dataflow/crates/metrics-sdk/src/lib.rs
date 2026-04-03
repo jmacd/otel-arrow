@@ -10,4 +10,5 @@ pub mod assembly;
 pub mod collectable;
 pub mod collector;
 pub mod dimension;
+pub mod openmetrics;
 pub mod precomputed;
