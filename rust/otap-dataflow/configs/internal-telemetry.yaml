@@ -41,6 +41,11 @@ engine:
           runtime_metrics: detailed
       # Internal telemetry pipeline
       # Runs on a single thread (controller-managed) and can use dedicated policies.
+      # Logs (ITS mode) and metrics flow through this pipeline.
+      # Metrics are produced by MetricsTap as OTAP Arrow payloads with
+      # precomputed resource/scope attrs, sent through the ITR, batched,
+      # and exported here. The console exporter converts OTAP→OTLP for display.
+      # Prometheus /metrics is served independently by MetricsTap (always-on).
       nodes:
         telemetry:
           type: "receiver:internal_telemetry"
