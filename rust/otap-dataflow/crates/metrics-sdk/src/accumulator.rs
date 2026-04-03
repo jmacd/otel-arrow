@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::precomputed::PrecomputedMetricSchema;
 
 /// Column indices in the NumberDataPoints RecordBatch.
-/// These match the schema produced by `NumberDataPointsRecordBatchBuilder`.
+/// These match the schema produced by `CounterDataPointsBuilder::build_int_values`.
 mod ndp_cols {
     /// id: UInt32
     #[allow(dead_code)]
@@ -28,19 +28,13 @@ mod ndp_cols {
     pub const TIME: usize = 3;
     /// int_value: Int64
     pub const INT_VALUE: usize = 4;
-    /// double_value: Float64
-    pub const DOUBLE_VALUE: usize = 5;
-    /// flags: UInt32
-    #[allow(dead_code)]
-    pub const FLAGS: usize = 6;
 }
 
 /// Cumulative accumulator for delta OTAP metric batches.
 ///
 /// Stores the running cumulative state as a NumberDataPoints RecordBatch.
-/// On each delta ingestion, the int_value (or double_value) columns are
-/// added element-wise using Arrow compute kernels. The time_unix_nano
-/// column is updated to the latest delta timestamp.
+/// On each delta ingestion, the int_value column is added element-wise
+/// using Arrow compute kernels. The time_unix_nano column is updated to the latest delta timestamp.
 ///
 /// The metrics table and attributes table are precomputed from the schema
 /// and never change — they are simply cloned on scrape.
@@ -64,7 +58,7 @@ impl CumulativeAccumulator {
 
     /// Ingest a delta NumberDataPoints batch.
     ///
-    /// Adds the delta's int_value and double_value columns to the
+    /// Adds the delta's int_value column to the cumulative state.
     /// cumulative state. Updates time_unix_nano from the delta.
     ///
     /// The delta batch must have the same schema and row count as
@@ -81,12 +75,7 @@ impl CumulativeAccumulator {
                 // Add int_value columns element-wise
                 let cum_int = cumulative.column(ndp_cols::INT_VALUE);
                 let delta_int = delta_dp.column(ndp_cols::INT_VALUE);
-                cols[ndp_cols::INT_VALUE] = add_nullable_numeric(cum_int, delta_int)?;
-
-                // Add double_value columns element-wise
-                let cum_dbl = cumulative.column(ndp_cols::DOUBLE_VALUE);
-                let delta_dbl = delta_dp.column(ndp_cols::DOUBLE_VALUE);
-                cols[ndp_cols::DOUBLE_VALUE] = add_nullable_numeric(cum_dbl, delta_dbl)?;
+                cols[ndp_cols::INT_VALUE] = add(cum_int, delta_int)?;
 
                 // Update time_unix_nano from delta (latest timestamp wins)
                 cols[ndp_cols::TIME] = Arc::clone(delta_dp.column(ndp_cols::TIME));
@@ -127,36 +116,11 @@ pub struct CumulativeSnapshot {
     pub data_points_batch: RecordBatch,
 }
 
-/// Add two nullable numeric arrays element-wise.
-///
-/// Handles the case where both arrays may have nulls (e.g., int_value is
-/// null when double_value is used, and vice versa). Null + Null = Null,
-/// Null + X = X, X + Null = X.
-fn add_nullable_numeric(cumulative: &ArrayRef, delta: &ArrayRef) -> Result<ArrayRef, ArrowError> {
-    // If both are entirely null, return as-is
-    if cumulative.null_count() == cumulative.len() && delta.null_count() == delta.len() {
-        return Ok(Arc::clone(cumulative));
-    }
-
-    // If cumulative is entirely null, the delta is the new state
-    if cumulative.null_count() == cumulative.len() {
-        return Ok(Arc::clone(delta));
-    }
-
-    // If delta is entirely null, cumulative is unchanged
-    if delta.null_count() == delta.len() {
-        return Ok(Arc::clone(cumulative));
-    }
-
-    // Both have some non-null values — use Arrow add
-    add(cumulative, delta)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::precomputed::{CounterMetricDef, PrecomputedMetricSchema};
-    use arrow::array::{Array, Float64Array, Int64Array};
+    use arrow::array::{Array, Int64Array};
 
     fn test_schema() -> PrecomputedMetricSchema {
         PrecomputedMetricSchema::new(
@@ -268,25 +232,5 @@ mod tests {
         assert_eq!(snap.attrs_batch.num_rows(), 3);
         // Data points: 3
         assert_eq!(snap.data_points_batch.num_rows(), 3);
-    }
-
-    #[test]
-    fn double_value_column_stays_null_for_int_counters() {
-        let schema = test_schema();
-        let mut acc = CumulativeAccumulator::new(schema.clone());
-
-        acc.ingest_delta(&build_delta(&schema, &[10, 5, 2]))
-            .unwrap();
-        acc.ingest_delta(&build_delta(&schema, &[3, 1, 0])).unwrap();
-
-        let snap = acc.snapshot().unwrap();
-        let dbl_col = snap
-            .data_points_batch
-            .column(ndp_cols::DOUBLE_VALUE)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        // All double values should be null for int counters
-        assert_eq!(dbl_col.null_count(), 3);
     }
 }

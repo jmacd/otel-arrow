@@ -9,13 +9,13 @@
 //!
 //! This module provides types for building and holding these tables.
 
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, TimestampNanosecondArray, UInt16Array, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::error::ArrowError;
+use std::sync::Arc;
 
 use otap_df_pdata::encode::record::attributes::AttributesRecordBatchBuilder;
-use otap_df_pdata::encode::record::metrics::{
-    MetricsRecordBatchBuilder, NumberDataPointsRecordBatchBuilder,
-};
+use otap_df_pdata::encode::record::metrics::MetricsRecordBatchBuilder;
 use otap_df_pdata::otlp::metrics::MetricType;
 use otap_df_pdata::proto::opentelemetry::metrics::v1::AggregationTemporality;
 
@@ -54,12 +54,6 @@ pub struct PrecomputedMetricSchema {
 
 impl PrecomputedMetricSchema {
     /// Build the precomputed schema from a list of counter metric definitions.
-    ///
-    /// The resulting metrics batch contains only metric identity columns
-    /// (id, type, name, description, unit, temporality, monotonic).
-    /// Resource and scope are intentionally omitted — they are contextual
-    /// and assembled at the receiver/export boundary, mirroring how ITS
-    /// logs carry scope via EntityKey and resource via configuration.
     pub fn new(metrics: &[CounterMetricDef]) -> Result<Self, ArrowError> {
         let mut metrics_builder = MetricsRecordBatchBuilder::new();
         let mut attrs_builder = AttributesRecordBatchBuilder::<u32>::new();
@@ -79,12 +73,10 @@ impl PrecomputedMetricSchema {
                 .append_aggregation_temporality(Some(AggregationTemporality::Delta as i32));
             metrics_builder.append_is_monotonic(Some(true));
 
-            // Resource and scope: append only the id field so the
+            // Resource and scope: append only a placeholder id so the
             // StructArray builders produce valid (non-empty) arrays.
-            // All other resource/scope fields (schema_url, attributes,
-            // name, version) are contextual and assembled at the
-            // receiver/export boundary — mirroring how ITS logs carry
-            // scope via EntityKey and resource via configuration.
+            // All other resource/scope fields are contextual and
+            // assembled at the receiver/export boundary.
             metrics_builder.resource.append_id(Some(0));
             metrics_builder.scope.append_id(Some(0));
 
@@ -166,8 +158,10 @@ impl CounterDataPointsBuilder {
 
     /// Build a NumberDataPoints record batch from integer counter values.
     ///
-    /// `values` must have length `total_points`. Each entry corresponds
-    /// to one data point in the precomputed schema order.
+    /// Produces a minimal batch with only the columns needed for int
+    /// counters: id, parent_id, start_time_unix_nano, time_unix_nano,
+    /// and int_value. The double_value and flags columns are omitted
+    /// since they are unused for integer counters.
     pub fn build_int_values(
         &self,
         start_time_unix_nano: i64,
@@ -180,17 +174,38 @@ impl CounterDataPointsBuilder {
             "values length must match total_points"
         );
 
-        let mut ndp = NumberDataPointsRecordBatchBuilder::new();
-        for (i, &value) in values.iter().enumerate() {
-            ndp.append_id(i as u32);
-            ndp.append_parent_id(self.parent_ids[i]);
-            ndp.append_start_time_unix_nano(Some(start_time_unix_nano));
-            ndp.append_time_unix_nano(time_unix_nano);
-            ndp.append_int_value(Some(value as i64));
-            ndp.append_double_value(None);
-            ndp.append_flags(0);
-        }
-        ndp.finish()
+        let n = self.total_points;
+        let ids: Vec<u32> = (0..n as u32).collect();
+        let start_times: Vec<i64> = vec![start_time_unix_nano; n];
+        let times: Vec<i64> = vec![time_unix_nano; n];
+        let int_values: Vec<i64> = values.iter().map(|&v| v as i64).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("parent_id", DataType::UInt16, false),
+            Field::new(
+                "start_time_unix_nano",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new(
+                "time_unix_nano",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("int_value", DataType::Int64, true),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(ids)),
+                Arc::new(UInt16Array::from(self.parent_ids.clone())),
+                Arc::new(TimestampNanosecondArray::from(start_times)),
+                Arc::new(TimestampNanosecondArray::from(times)),
+                Arc::new(arrow::array::Int64Array::from(int_values)),
+            ],
+        )
     }
 }
 
@@ -213,8 +228,7 @@ mod tests {
             attrs_per_point: 1,
         }];
 
-        let schema =
-            PrecomputedMetricSchema::new(&metrics).expect("should build schema");
+        let schema = PrecomputedMetricSchema::new(&metrics).expect("should build schema");
 
         assert_eq!(schema.total_points(), 3);
         assert_eq!(schema.metrics_batch().num_rows(), 1);
@@ -244,8 +258,7 @@ mod tests {
             attrs_per_point: 2,
         }];
 
-        let schema =
-            PrecomputedMetricSchema::new(&metrics).expect("should build schema");
+        let schema = PrecomputedMetricSchema::new(&metrics).expect("should build schema");
 
         assert_eq!(schema.total_points(), 9);
         assert_eq!(schema.metrics_batch().num_rows(), 1);
@@ -268,8 +281,7 @@ mod tests {
             attrs_per_point: 1,
         }];
 
-        let schema =
-            PrecomputedMetricSchema::new(&metrics).expect("should build schema");
+        let schema = PrecomputedMetricSchema::new(&metrics).expect("should build schema");
         let builder = schema.data_points_builder();
 
         let start_time = 1_000_000_000i64;
