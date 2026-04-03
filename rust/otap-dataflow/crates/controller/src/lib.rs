@@ -1015,7 +1015,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         let admin_tracing_setup = telemetry_system.admin_tracing_setup();
         let internal_tracing_setup = telemetry_system.internal_tracing_setup();
 
-        let metrics_dispatcher = telemetry_system.dispatcher();
+        let metrics_tap = telemetry_system.metrics_tap();
         let metrics_reporter = telemetry_system.reporter();
         let controller_ctx = ControllerContext::new(telemetry_system.registry());
         // Declare all topics up front before any pipeline thread starts.
@@ -1102,16 +1102,12 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             move |cancellation_token| internal_collector.run(cancellation_token),
         )?;
 
-        // Start the metrics dispatcher only if there are metric readers configured.
-        let metrics_dispatcher_handle = if telemetry_config.metrics.has_readers() {
-            Some(spawn_thread_local_task(
-                "metrics-dispatcher",
-                admin_tracing_setup.clone(),
-                move |cancellation_token| metrics_dispatcher.run_dispatch_loop(cancellation_token),
-            )?)
-        } else {
-            None
-        };
+        // Start the metrics tap (replaces MetricsDispatcher + OTel SDK metrics).
+        let metrics_tap_handle = spawn_thread_local_task(
+            "metrics-tap",
+            admin_tracing_setup.clone(),
+            move |cancellation_token| metrics_tap.run(cancellation_token),
+        )?;
 
         // Start the observed state store background task
         let obs_state_join_handle = spawn_thread_local_task(
@@ -1353,11 +1349,9 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         engine_metrics_handle.shutdown_and_join()?;
         admin_server_handle.shutdown_and_join()?;
         metrics_agg_handle.shutdown_and_join()?;
-        if let Some(handle) = metrics_dispatcher_handle {
-            handle.shutdown_and_join()?;
-        }
+        metrics_tap_handle.shutdown_and_join()?;
         obs_state_join_handle.shutdown_and_join()?;
-        telemetry_system.shutdown_otel()?;
+        telemetry_system.shutdown()?;
 
         Ok(())
     }

@@ -28,9 +28,10 @@
 use crate::error::Error;
 use crate::event::{ObservedEvent, ObservedEventReporter};
 use crate::registry::TelemetryRegistryHandle;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
 use otap_df_config::observed_state::SendPolicy;
 use otap_df_config::pipeline::telemetry::TelemetryConfig;
+use otap_df_config::pipeline::telemetry::metrics::readers::MetricsReaderConfig;
+use otap_df_config::pipeline::telemetry::metrics::readers::pull::MetricsPullExporterConfig;
 use otap_df_config::settings::telemetry::logs::{LogLevel, LoggingProviders, ProviderMode};
 use self_tracing::LogContextFn;
 use std::sync::Arc;
@@ -180,15 +181,9 @@ pub struct InternalTelemetrySystem {
     /// The process reporting metrics to an external system.
     metrics_reporter: reporter::MetricsReporter,
 
-    /// The dispatcher that flushes internal telemetry metrics.
-    dispatcher: Arc<metrics::dispatcher::MetricsDispatcher>,
-
-    // === OTel SDK Subsystem ===
-    /// OTel SDK meter provider for metrics export.
-    sdk_meter_provider: SdkMeterProvider,
-
-    /// Tokio runtime for OTLP exporters (kept alive).
-    _otel_runtime: Option<tokio::runtime::Runtime>,
+    /// OTAP-native metrics tap: replaces MetricsDispatcher + OTel SDK metrics.
+    /// Always present. Feeds PrometheusExporter and produces OTAP payloads.
+    metrics_tap: Arc<self_metrics::metrics_tap::MetricsTap>,
 
     // === Logging Configuration ===
     /// Log level from config.
@@ -247,18 +242,33 @@ impl InternalTelemetrySystem {
         // 1. Create internal metrics subsystem
         let (collector, metrics_reporter) =
             collector::InternalCollector::new(config, telemetry_registry.clone());
-        let dispatcher = Arc::new(metrics::dispatcher::MetricsDispatcher::new(
-            telemetry_registry.clone(),
-            config.reporting_interval,
-        ));
 
-        // 2. Create OTel SDK providers
-        // OTel Logger is only needed for OpenTelemetry mode
-        let otel_client = otel_sdk::OpentelemetryClient::new(config)?;
-        let sdk_meter_provider = otel_client.meter_provider().clone();
-        let otel_runtime = otel_client.into_runtime();
+        // Build resource attrs for OTAP payloads from config.
+        let resource_kv: Vec<(&str, &str)> = config
+            .resource
+            .iter()
+            .filter_map(|(k, v)| {
+                if let otap_df_config::pipeline::telemetry::AttributeValue::String(s) = v {
+                    Some((k.as_str(), s.as_str()))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        // 3. Create ITS channel if any provider uses ITS mode
+        let metrics_tap = Arc::new(
+            self_metrics::metrics_tap::MetricsTap::new(
+                telemetry_registry.clone(),
+                config.reporting_interval,
+                &resource_kv,
+            )
+            .map_err(|e| Error::ConfigurationError(e.to_string()))?,
+        );
+
+        // Start the Prometheus HTTP server if configured.
+        Self::start_prometheus_if_configured(config, &metrics_tap);
+
+        // 2. Create ITS channel if any provider uses ITS mode
         let (its_reporter, its_settings) = if config.logs.providers.uses_its_provider() {
             let (sender, logs_receiver) = flume::bounded(config.reporting_channel_size);
             let reporter = if let Some(log_tap) = &log_tap_handle {
@@ -285,9 +295,7 @@ impl InternalTelemetrySystem {
             registry: telemetry_registry,
             collector: Arc::new(collector),
             metrics_reporter,
-            dispatcher,
-            sdk_meter_provider,
-            _otel_runtime: otel_runtime,
+            metrics_tap,
             log_level: config.logs.level.clone(),
             provider_modes: config.logs.providers.clone(),
             context_fn,
@@ -395,21 +403,82 @@ impl InternalTelemetrySystem {
         self.metrics_reporter.clone()
     }
 
-    /// Returns a shareable handle to the metrics dispatcher.
+    /// Returns a shareable handle to the metrics tap.
     #[must_use]
-    pub fn dispatcher(&self) -> Arc<metrics::dispatcher::MetricsDispatcher> {
-        self.dispatcher.clone()
+    pub fn metrics_tap(&self) -> Arc<self_metrics::metrics_tap::MetricsTap> {
+        self.metrics_tap.clone()
     }
 
-    /// Shuts down the OpenTelemetry SDK providers.
-    pub fn shutdown_otel(self) -> Result<(), Error> {
-        let meter_shutdown_result = self.sdk_meter_provider.shutdown();
-
-        if let Err(e) = meter_shutdown_result {
-            return Err(Error::ShutdownError(e.to_string()));
-        }
-
+    /// Shuts down the telemetry system.
+    pub fn shutdown(self) -> Result<(), Error> {
         Ok(())
+    }
+
+    /// Start the Prometheus HTTP server if any pull/prometheus reader is
+    /// configured. The server uses MetricsTap's PrometheusExporter.
+    fn start_prometheus_if_configured(
+        config: &TelemetryConfig,
+        metrics_tap: &Arc<self_metrics::metrics_tap::MetricsTap>,
+    ) {
+        for reader in &config.metrics.readers {
+            if let MetricsReaderConfig::Pull(pull) = reader {
+                let MetricsPullExporterConfig::Prometheus(prom_config) = &pull.exporter;
+                let exporter = metrics_tap.prometheus_exporter().clone();
+                let addr = format!("{}:{}", prom_config.host, prom_config.port);
+                let path = prom_config.path.clone();
+
+                // Spawn the Prometheus server on a background thread with
+                // its own tokio runtime (matching the previous OTel SDK behavior).
+                let _ = std::thread::Builder::new()
+                    .name("prometheus-server".into())
+                    .spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("prometheus runtime");
+                        rt.block_on(async {
+                            let router = axum::Router::new()
+                                .route(
+                                    &path,
+                                    axum::routing::get(
+                                        move |axum::extract::State(exp): axum::extract::State<
+                                            self_metrics::prometheus::PrometheusExporter,
+                                        >| async move {
+                                            let body = exp.format_metrics();
+                                            (
+                                                axum::http::StatusCode::OK,
+                                                [(
+                                                    axum::http::header::CONTENT_TYPE,
+                                                    "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                                                )],
+                                                body,
+                                            )
+                                        },
+                                    ),
+                                )
+                                .with_state(exporter);
+
+                            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        addr = %addr,
+                                        "Failed to bind Prometheus metrics endpoint"
+                                    );
+                                    return;
+                                }
+                            };
+                            tracing::info!(
+                                addr = %addr,
+                                path = %path,
+                                "Prometheus metrics endpoint started"
+                            );
+                            let _ = axum::serve(listener, router).await;
+                        });
+                    });
+            }
+        }
     }
 }
 
