@@ -6,5 +6,7 @@
 //! - [`CounterDataPointsBuilder`] for runtime data point encoding
 
 pub mod assembly;
+pub mod collectable;
+pub mod collector;
 pub mod dimension;
 pub mod precomputed;

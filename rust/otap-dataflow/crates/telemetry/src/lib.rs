@@ -32,6 +32,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use otap_df_config::observed_state::SendPolicy;
 use otap_df_config::pipeline::telemetry::TelemetryConfig;
 use otap_df_config::settings::telemetry::logs::{LogLevel, LoggingProviders, ProviderMode};
+use otap_df_metrics_sdk::collectable::MetricSetCollector;
 use self_tracing::LogContextFn;
 use std::sync::Arc;
 use tracing_init::ProviderSetup;
@@ -147,6 +148,10 @@ pub struct InternalTelemetrySettings {
     pub registry: TelemetryRegistryHandle,
     /// Optional retained-log sink shared with admin consumers.
     pub log_tap: Option<log_tap::InternalLogTapHandle>,
+    /// OTAP metric set collectors for direct Arrow encoding.
+    /// Each collector holds a precomputed schema and a reference to
+    /// the counter struct it collects from.
+    pub otap_metrics_collectors: Vec<Arc<parking_lot::Mutex<MetricSetCollector>>>,
 }
 
 impl std::fmt::Debug for InternalTelemetrySettings {
@@ -276,6 +281,7 @@ impl InternalTelemetrySystem {
                     resource_bytes,
                     registry: telemetry_registry.clone(),
                     log_tap: log_tap_handle.clone(),
+                    otap_metrics_collectors: Vec::new(),
                 }),
             )
         } else {

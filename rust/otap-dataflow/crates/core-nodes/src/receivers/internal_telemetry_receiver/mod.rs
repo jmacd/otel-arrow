@@ -111,6 +111,7 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
         let logs_receiver = internal.logs_receiver;
         let resource_bytes = internal.resource_bytes;
         let log_tap = internal.log_tap;
+        let otap_metrics_collectors = internal.otap_metrics_collectors;
         let mut scope_cache = ScopeToBytesMap::new(internal.registry);
 
         // Start periodic telemetry collection
@@ -150,7 +151,11 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                             return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
                         }
                         Ok(NodeControlMsg::CollectTelemetry { .. }) => {
-                            // No metrics to report for now
+                            // Collect OTAP metrics from registered collectors
+                            Self::collect_otap_metrics(
+                                &effect_handler,
+                                &otap_metrics_collectors,
+                            ).await?;
                         }
                         Err(e) => {
                             return Err(Error::ChannelRecvError(e));
@@ -201,6 +206,24 @@ impl InternalTelemetryReceiver {
             OtlpProtoBytes::ExportLogsRequest(buf.into_bytes()).into(),
         );
         effect_handler.send_message(pdata).await?;
+        Ok(())
+    }
+
+    /// Collect OTAP metrics from all registered metric set collectors.
+    ///
+    /// Each collector snapshots its counters, encodes to OTAP Arrow,
+    /// and sends the result downstream via the effect handler.
+    async fn collect_otap_metrics(
+        _effect_handler: &local::EffectHandler<OtapPdata>,
+        _collectors: &[Arc<
+            parking_lot::Mutex<otap_df_metrics_sdk::collectable::MetricSetCollector>,
+        >],
+    ) -> Result<(), Error> {
+        // TODO: Wire counter struct references through the collectors.
+        // When a metric set is registered, its counter struct and
+        // collector are paired. On CollectTelemetry, the collector
+        // snapshots the counters and encodes to OTAP, then the
+        // result is sent via effect_handler.send_message().
         Ok(())
     }
 }
