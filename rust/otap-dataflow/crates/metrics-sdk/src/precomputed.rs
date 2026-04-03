@@ -16,6 +16,8 @@ use otap_df_pdata::encode::record::attributes::AttributesRecordBatchBuilder;
 use otap_df_pdata::encode::record::metrics::{
     MetricsRecordBatchBuilder, NumberDataPointsRecordBatchBuilder,
 };
+use otap_df_pdata::otlp::metrics::MetricType;
+use otap_df_pdata::proto::opentelemetry::metrics::v1::AggregationTemporality;
 
 /// Description of a single counter metric for precomputation.
 pub struct CounterMetricDef {
@@ -28,37 +30,30 @@ pub struct CounterMetricDef {
     /// Number of data points this metric produces (product of active
     /// dimension cardinalities).
     pub num_points: usize,
-    /// Attribute key/value pairs for each data point, in order.
-    /// Each entry is `(key, value)`. The length must equal
-    /// `num_points * num_attrs_per_point`.
-    pub point_attributes: &'static [(&'static str, &'static str)],
     /// Number of attributes per data point.
     pub attrs_per_point: usize,
+    /// Attribute key/value pairs for each data point, in order.
+    /// Each entry is `(key, value)`. The length must equal
+    /// `num_points * attrs_per_point`.
+    pub point_attributes: &'static [(&'static str, &'static str)],
 }
 
 /// Holds precomputed metrics and attributes record batches for a metric set.
-///
-/// These batches are built once at init time and reused on every
-/// collection tick. Only the NumberDataPoints table changes per tick.
 #[derive(Clone)]
 pub struct PrecomputedMetricSchema {
     /// The metrics table (one row per counter).
     metrics_batch: RecordBatch,
-    /// The data-point attributes table (dimension attrs per data point).
-    /// Parent IDs are u32 matching NumberDataPoints IDs.
+    /// The data-point attributes table. Parent IDs are u32 matching
+    /// NumberDataPoints IDs.
     attrs_batch: RecordBatch,
     /// Total number of data points across all metrics.
     total_points: usize,
-    /// Precomputed parent_id for each data point (which metric row it
-    /// belongs to, as a u16 metric ID).
+    /// Precomputed parent_id for each data point.
     parent_ids: Vec<u16>,
 }
 
 impl PrecomputedMetricSchema {
     /// Build the precomputed schema from a list of counter metric definitions.
-    ///
-    /// The `scope_name` identifies the instrumentation scope (e.g.,
-    /// `"otap-df-telemetry"`).
     pub fn new(metrics: &[CounterMetricDef], scope_name: &str) -> Result<Self, ArrowError> {
         let mut metrics_builder = MetricsRecordBatchBuilder::new();
         let mut attrs_builder = AttributesRecordBatchBuilder::<u32>::new();
@@ -70,13 +65,12 @@ impl PrecomputedMetricSchema {
 
             // Metrics table row
             metrics_builder.append_id(metric_id);
-            // metric_type 2 = Sum (from OTLP MetricDescriptor)
-            metrics_builder.append_metric_type(2);
+            metrics_builder.append_metric_type(MetricType::Sum as u8);
             metrics_builder.append_name(def.name.as_bytes());
             metrics_builder.append_description(def.description.as_bytes());
             metrics_builder.append_unit(def.unit.as_bytes());
-            // DELTA = 1
-            metrics_builder.append_aggregation_temporality(Some(1));
+            metrics_builder
+                .append_aggregation_temporality(Some(AggregationTemporality::Delta as i32));
             metrics_builder.append_is_monotonic(Some(true));
 
             // Resource: single resource, id=0
