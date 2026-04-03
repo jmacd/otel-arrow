@@ -111,6 +111,7 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
         let logs_receiver = internal.logs_receiver;
         let resource_bytes = internal.resource_bytes;
         let log_tap = internal.log_tap;
+        let metrics_receiver = internal.metrics_receiver;
         let mut scope_cache = ScopeToBytesMap::new(internal.registry);
 
         // Start periodic telemetry collection
@@ -119,6 +120,16 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
             .await?;
 
         loop {
+            // Build the metrics future: recv from channel if present,
+            // otherwise pend forever (won't be selected).
+            let metrics_fut = async {
+                if let Some(ref rx) = metrics_receiver {
+                    rx.recv_async().await.ok()
+                } else {
+                    std::future::pending().await
+                }
+            };
+
             tokio::select! {
                 biased;
 
@@ -134,11 +145,16 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                                     Self::send_log_event(&effect_handler, log_event, &resource_bytes, &mut scope_cache).await?;
                                 }
                             }
+                            // Drain pending metrics.
+                            if let Some(ref mr) = metrics_receiver {
+                                while let Ok(payload) = mr.try_recv() {
+                                    Self::send_metrics_payload(&effect_handler, payload).await?;
+                                }
+                            }
                             effect_handler.notify_receiver_drained().await?;
                             return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
                         }
                         Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
-                            // Drain any remaining logs from channel before shutdown
                             while let Ok(event) = logs_receiver.try_recv() {
                                 if let ObservedEvent::Log(log_event) = event {
                                     if let Some(log_tap) = log_tap.as_ref() {
@@ -147,10 +163,16 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                                     Self::send_log_event(&effect_handler, log_event, &resource_bytes, &mut scope_cache).await?;
                                 }
                             }
+                            if let Some(ref mr) = metrics_receiver {
+                                while let Ok(payload) = mr.try_recv() {
+                                    Self::send_metrics_payload(&effect_handler, payload).await?;
+                                }
+                            }
                             return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
                         }
                         Ok(NodeControlMsg::CollectTelemetry { .. }) => {
-                            // No metrics to report for now
+                            // Metrics collection is driven by MetricsTap's own timer.
+                            // Payloads arrive via the metrics_receiver channel.
                         }
                         Err(e) => {
                             return Err(Error::ChannelRecvError(e));
@@ -179,6 +201,11 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                         }
                     }
                 }
+
+                // Receive OTAP metrics payloads from MetricsTap
+                Some(payload) = metrics_fut => {
+                    Self::send_metrics_payload(&effect_handler, payload).await?;
+                }
             }
         }
     }
@@ -200,6 +227,20 @@ impl InternalTelemetryReceiver {
             Context::default(),
             OtlpProtoBytes::ExportLogsRequest(buf.into_bytes()).into(),
         );
+        effect_handler.send_message(pdata).await?;
+        Ok(())
+    }
+
+    /// Send an OTAP metrics payload into the pipeline.
+    ///
+    /// The payload is already a complete OTAP Arrow batch with
+    /// resource/scope child tables. The batch processor downstream
+    /// handles ID reindexing when merging multiple payloads.
+    async fn send_metrics_payload(
+        effect_handler: &local::EffectHandler<OtapPdata>,
+        payload: otap_df_telemetry::self_metrics::metrics_tap::OtapMetricsPayload,
+    ) -> Result<(), Error> {
+        let pdata = OtapPdata::new(Context::default(), payload.records.into());
         effect_handler.send_message(pdata).await?;
         Ok(())
     }

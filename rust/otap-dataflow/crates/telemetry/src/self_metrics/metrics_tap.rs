@@ -27,20 +27,17 @@ use otap_df_pdata::OtapArrowRecords;
 use otap_df_pdata::otap::Metrics;
 use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
-use crate::attributes::AttributeSetHandler;
-use crate::descriptor::MetricsDescriptor;
 use crate::error::Error;
 use crate::metrics::MetricValue;
-use crate::registry::TelemetryRegistryHandle;
+use crate::registry::{EntityKey, TelemetryRegistryHandle};
 use crate::self_metrics::accumulator::MetricIdentity;
 use crate::self_metrics::bridge;
 use crate::self_metrics::precomputed::PrecomputedMetricSchema;
 use crate::self_metrics::prometheus::PrometheusExporter;
 
-/// Cached precomputed schema for a metric set.
-struct CachedSchema {
+/// Cached precomputed schema for a descriptor (keyed by descriptor name).
+struct CachedDescriptor {
     schema: PrecomputedMetricSchema,
-    scope_attrs: RecordBatch,
     accumulation_modes: Vec<bridge::AccumulationMode>,
 }
 
@@ -52,14 +49,27 @@ pub struct OtapMetricsPayload {
 
 /// MetricsTap collects metrics and exports them via Prometheus and/or
 /// pipeline injection.
+///
+/// Caching mirrors the logging pattern:
+/// - **Resource**: single `RecordBatch` precomputed once (like `resource_bytes`)
+/// - **Scope**: `HashMap<EntityKey, RecordBatch>` cached per entity
+///   (like `ScopeToBytesMap` for logs)
+/// - **Schema**: `HashMap<&'static str, CachedDescriptor>` per descriptor name
+///
+/// RecordBatch cloning is cheap (Arc-backed column buffers) so reusing
+/// cached batches across collection ticks is effectively zero-copy.
 pub struct MetricsTap {
     registry: TelemetryRegistryHandle,
     reporting_interval: std::time::Duration,
     prometheus: PrometheusExporter,
-    /// Precomputed resource attributes batch (shared across all payloads).
+    /// Precomputed resource attributes batch (built once, zerocopy reuse).
     resource_attrs: RecordBatch,
-    /// Cached per-descriptor precomputed schemas, keyed by descriptor name.
-    schema_cache: parking_lot::Mutex<HashMap<&'static str, CachedSchema>>,
+    /// Per-descriptor precomputed schemas (metrics table + accumulation modes).
+    descriptor_cache: parking_lot::Mutex<HashMap<&'static str, CachedDescriptor>>,
+    /// Per-entity scope attributes batches (like ScopeToBytesMap for logs).
+    scope_cache: parking_lot::Mutex<HashMap<EntityKey, RecordBatch>>,
+    /// Optional channel for ITS pipeline injection.
+    metrics_sender: Option<flume::Sender<OtapMetricsPayload>>,
     /// Pipeline startup time for delta start_time_unix_nano.
     start_time_nanos: i64,
 }
@@ -69,7 +79,7 @@ impl MetricsTap {
     ///
     /// `resource_attrs` are key-value pairs describing the pipeline
     /// resource (e.g., `service.name`). These are encoded once and
-    /// reused across all OTAP payloads.
+    /// reused across all OTAP payloads (like `resource_bytes` for logs).
     pub fn new(
         registry: TelemetryRegistryHandle,
         reporting_interval: std::time::Duration,
@@ -88,9 +98,24 @@ impl MetricsTap {
             reporting_interval,
             prometheus: PrometheusExporter::new(),
             resource_attrs: resource_attrs_batch,
-            schema_cache: parking_lot::Mutex::new(HashMap::new()),
+            descriptor_cache: parking_lot::Mutex::new(HashMap::new()),
+            scope_cache: parking_lot::Mutex::new(HashMap::new()),
+            metrics_sender: None,
             start_time_nanos,
         })
+    }
+
+    /// Create a metrics channel for ITS pipeline injection.
+    ///
+    /// Returns the receiver end. Payloads produced during
+    /// `collect_and_dispatch()` will be sent through this channel.
+    pub fn create_metrics_channel(
+        &mut self,
+        capacity: usize,
+    ) -> flume::Receiver<OtapMetricsPayload> {
+        let (sender, receiver) = flume::bounded(capacity);
+        self.metrics_sender = Some(sender);
+        receiver
     }
 
     /// Get a reference to the Prometheus exporter for serving /metrics.
@@ -115,8 +140,8 @@ impl MetricsTap {
     }
 
     /// Perform one collection cycle: visit all metric sets, build
-    /// deltas, feed the Prometheus accumulator, and return OTAP payloads
-    /// for pipeline injection (ITS mode).
+    /// deltas, feed the Prometheus accumulator, and send OTAP payloads
+    /// through the ITS channel if configured.
     pub fn collect_and_dispatch(&self) -> Result<Vec<OtapMetricsPayload>, Error> {
         let time_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -134,38 +159,59 @@ impl MetricsTap {
                     return;
                 }
 
-                // Get or create cached schema for this descriptor.
+                // Get or create cached descriptor schema.
                 let desc_key = descriptor.name;
-
-                let mut cache = self.schema_cache.lock();
-                if !cache.contains_key(desc_key) {
-                    match self.build_cached_schema(descriptor, attrs) {
-                        Ok(cached) => {
-                            let _ = cache.insert(desc_key, cached);
+                let mut desc_cache = self.descriptor_cache.lock();
+                if !desc_cache.contains_key(desc_key) {
+                    match bridge::descriptor_to_schema(descriptor) {
+                        Ok(ds) => {
+                            let _ = desc_cache.insert(
+                                desc_key,
+                                CachedDescriptor {
+                                    schema: ds.schema,
+                                    accumulation_modes: ds.accumulation_modes,
+                                },
+                            );
                         }
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
                                 descriptor = descriptor.name,
-                                "Failed to build precomputed schema for metric set"
+                                "Failed to build precomputed schema"
                             );
                             return;
                         }
                     }
                 }
-
-                let cached = match cache.get(desc_key) {
+                let cached_desc = match desc_cache.get(desc_key) {
                     Some(c) => c,
                     None => return,
                 };
 
+                // Get or create cached scope attrs for this entity
+                // (like ScopeToBytesMap for logs).
+                let mut scope_cache = self.scope_cache.lock();
+                let scope_attrs = scope_cache
+                    .entry(entity_key)
+                    .or_insert_with(|| {
+                        bridge::build_scope_attrs_from_entity(attrs).unwrap_or_else(|e| {
+                            tracing::warn!(
+                                error = %e,
+                                descriptor = descriptor.name,
+                                "Failed to build scope attrs"
+                            );
+                            RecordBatch::new_empty(arrow::datatypes::Schema::empty().into())
+                        })
+                    })
+                    .clone();
+
                 // Build delta NumberDataPoints with Mmsc expansion.
                 let int_values = bridge::expand_snapshot(descriptor, &values);
-                let dp_batch = match cached.schema.data_points_builder().build_int_values_i64(
-                    self.start_time_nanos,
-                    time_nanos,
-                    &int_values,
-                ) {
+                let dp_batch = match cached_desc
+                    .schema
+                    .data_points_builder()
+                    .build_int_values_i64(self.start_time_nanos, time_nanos, &int_values)
+                {
                     Ok(batch) => batch,
                     Err(e) => {
                         tracing::warn!(
@@ -183,14 +229,13 @@ impl MetricsTap {
                     entity_key,
                 };
 
-                // Register schema if first time for this identity's schema_key.
                 self.prometheus
-                    .register_schema_if_needed(descriptor.name, cached.schema.clone());
+                    .register_schema_if_needed(descriptor.name, cached_desc.schema.clone());
 
                 if let Err(e) = self.prometheus.ingest_with_modes(
                     identity,
                     &dp_batch,
-                    &cached.accumulation_modes,
+                    &cached_desc.accumulation_modes,
                 ) {
                     tracing::warn!(
                         error = %e,
@@ -199,8 +244,8 @@ impl MetricsTap {
                     );
                 }
 
-                // Assemble complete OTAP payload for pipeline injection.
-                match self.assemble_payload(cached, dp_batch) {
+                // Assemble complete OTAP payload.
+                match self.assemble_payload(cached_desc, &scope_attrs, dp_batch) {
                     Ok(payload) => payloads.push(payload),
                     Err(e) => {
                         tracing::warn!(
@@ -213,38 +258,37 @@ impl MetricsTap {
             },
         );
 
+        // Send payloads through the ITS channel if configured.
+        if let Some(ref sender) = self.metrics_sender {
+            for payload in &payloads {
+                // Try to send; if the channel is full, log and drop.
+                if sender
+                    .try_send(OtapMetricsPayload {
+                        records: payload.records.clone(),
+                    })
+                    .is_err()
+                {
+                    tracing::debug!("ITS metrics channel full, dropping payload");
+                }
+            }
+        }
+
         Ok(payloads)
-    }
-
-    fn build_cached_schema(
-        &self,
-        descriptor: &'static MetricsDescriptor,
-        attrs: &dyn AttributeSetHandler,
-    ) -> Result<CachedSchema, Error> {
-        let desc_schema = bridge::descriptor_to_schema(descriptor)
-            .map_err(|e| Error::MetricEncoding(e.to_string()))?;
-        let scope_attrs = bridge::build_scope_attrs_from_entity(attrs)
-            .map_err(|e| Error::MetricEncoding(e.to_string()))?;
-
-        Ok(CachedSchema {
-            schema: desc_schema.schema,
-            scope_attrs,
-            accumulation_modes: desc_schema.accumulation_modes,
-        })
     }
 
     fn assemble_payload(
         &self,
-        cached: &CachedSchema,
+        cached_desc: &CachedDescriptor,
+        scope_attrs: &RecordBatch,
         dp_batch: RecordBatch,
     ) -> Result<OtapMetricsPayload, Error> {
         let mut records = OtapArrowRecords::Metrics(Metrics::default());
 
-        if cached.schema.metrics_batch().num_rows() > 0 {
+        if cached_desc.schema.metrics_batch().num_rows() > 0 {
             records
                 .set(
                     ArrowPayloadType::UnivariateMetrics,
-                    cached.schema.metrics_batch().clone(),
+                    cached_desc.schema.metrics_batch().clone(),
                 )
                 .map_err(|e| Error::MetricEncoding(e.to_string()))?;
         }
@@ -261,9 +305,9 @@ impl MetricsTap {
                 .map_err(|e| Error::MetricEncoding(e.to_string()))?;
         }
 
-        if cached.scope_attrs.num_rows() > 0 {
+        if scope_attrs.num_rows() > 0 {
             records
-                .set(ArrowPayloadType::ScopeAttrs, cached.scope_attrs.clone())
+                .set(ArrowPayloadType::ScopeAttrs, scope_attrs.clone())
                 .map_err(|e| Error::MetricEncoding(e.to_string()))?;
         }
 

@@ -65,10 +65,34 @@ pub fn descriptor_to_schema(desc: &MetricsDescriptor) -> Result<DescriptorSchema
             Instrument::Mmsc => {
                 // Expand Mmsc into 4 separate metrics.
                 let sub_metrics = [
-                    (format!("{}.min", field.name), MetricType::Gauge, None, None, AccumulationMode::Replace),
-                    (format!("{}.max", field.name), MetricType::Gauge, None, None, AccumulationMode::Replace),
-                    (format!("{}.sum", field.name), MetricType::Sum, Some(AggregationTemporality::Cumulative as i32), Some(true), AccumulationMode::Add),
-                    (format!("{}.count", field.name), MetricType::Sum, Some(AggregationTemporality::Cumulative as i32), Some(true), AccumulationMode::Add),
+                    (
+                        format!("{}.min", field.name),
+                        MetricType::Gauge,
+                        None,
+                        None,
+                        AccumulationMode::Replace,
+                    ),
+                    (
+                        format!("{}.max", field.name),
+                        MetricType::Gauge,
+                        None,
+                        None,
+                        AccumulationMode::Replace,
+                    ),
+                    (
+                        format!("{}.sum", field.name),
+                        MetricType::Sum,
+                        Some(AggregationTemporality::Cumulative as i32),
+                        Some(true),
+                        AccumulationMode::Add,
+                    ),
+                    (
+                        format!("{}.count", field.name),
+                        MetricType::Sum,
+                        Some(AggregationTemporality::Cumulative as i32),
+                        Some(true),
+                        AccumulationMode::Add,
+                    ),
                 ];
 
                 for (name, metric_type, temporality, monotonic, mode) in &sub_metrics {
@@ -93,7 +117,8 @@ pub fn descriptor_to_schema(desc: &MetricsDescriptor) -> Result<DescriptorSchema
                 metrics_builder.append_name(field.name.as_bytes());
                 metrics_builder.append_description(field.brief.as_bytes());
                 metrics_builder.append_unit(field.unit.as_bytes());
-                metrics_builder.append_aggregation_temporality(field_aggregation_temporality(field));
+                metrics_builder
+                    .append_aggregation_temporality(field_aggregation_temporality(field));
                 metrics_builder.append_is_monotonic(field_is_monotonic(field));
                 metrics_builder.resource.append_id(Some(0));
                 metrics_builder.scope.append_id(Some(0));

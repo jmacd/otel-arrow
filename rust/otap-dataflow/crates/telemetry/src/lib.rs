@@ -147,6 +147,9 @@ pub struct InternalTelemetrySettings {
     pub registry: TelemetryRegistryHandle,
     /// Optional retained-log sink shared with admin consumers.
     pub log_tap: Option<log_tap::InternalLogTapHandle>,
+    /// Receiver end of the metrics channel for OTAP metric payloads.
+    /// Present when MetricsTap has a metrics channel configured.
+    pub metrics_receiver: Option<flume::Receiver<self_metrics::metrics_tap::OtapMetricsPayload>>,
 }
 
 impl std::fmt::Debug for InternalTelemetrySettings {
@@ -256,7 +259,7 @@ impl InternalTelemetrySystem {
             })
             .collect();
 
-        let metrics_tap = Arc::new(
+        let mut metrics_tap = Arc::new(
             self_metrics::metrics_tap::MetricsTap::new(
                 telemetry_registry.clone(),
                 config.reporting_interval,
@@ -278,6 +281,14 @@ impl InternalTelemetrySystem {
                 ObservedEventReporter::new(SendPolicy::default(), sender)
             };
             let resource_bytes = otel_sdk::encode_resource_bytes(&config.resource);
+
+            // Create a metrics channel for ITS pipeline injection.
+            let metrics_receiver = {
+                let tap = Arc::get_mut(&mut metrics_tap)
+                    .expect("metrics_tap should have single owner at init");
+                Some(tap.create_metrics_channel(config.reporting_channel_size))
+            };
+
             (
                 Some(reporter),
                 Some(InternalTelemetrySettings {
@@ -285,6 +296,7 @@ impl InternalTelemetrySystem {
                     resource_bytes,
                     registry: telemetry_registry.clone(),
                     log_tap: log_tap_handle.clone(),
+                    metrics_receiver,
                 }),
             )
         } else {
