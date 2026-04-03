@@ -14,8 +14,11 @@ use otap_df_pdata::OtapArrowRecords;
 /// specific counter struct types.
 pub trait CollectableMetrics: Send + 'static {
     /// Snapshot all counter values into the provided buffer.
-    /// Returns `None` if the metric set is disabled.
-    fn snapshot_into(&self, buf: &mut Vec<u64>) -> bool;
+    ///
+    /// `buf` is a pre-sized slice with exactly the right number of
+    /// elements for this metric set (matching the precomputed schema's
+    /// total_points). Returns `false` if the metric set is disabled.
+    fn snapshot_into(&self, buf: &mut [u64]) -> bool;
 
     /// Clear all counters after a successful collection.
     fn clear(&mut self);
@@ -80,7 +83,7 @@ mod tests {
     }
 
     impl CollectableMetrics for TestMetrics {
-        fn snapshot_into(&self, buf: &mut Vec<u64>) -> bool {
+        fn snapshot_into(&self, buf: &mut [u64]) -> bool {
             if !self.enabled {
                 return false;
             }
