@@ -3,17 +3,20 @@
 
 //! Precomputed OTAP schema types for the internal metrics SDK.
 //!
-//! For each metric set, OTAP encoding produces 3 tables:
+//! For each metric set at a given level, OTAP encoding produces:
 //!
-//! 1. **Metrics table** — one row per metric (name, type, unit, temporality,
-//!    monotonic). Fully determined by the schema; precomputed at init time.
-//! 2. **Attributes table** — one row per (data_point, attribute_key) pair
-//!    for dimension attributes. Fully determined by the schema; precomputed.
-//! 3. **DataPoints table** — one row per data point. Built at runtime from
-//!    counter/gauge/histogram snapshots during each collection tick.
+//! 1. **Metrics table** — `num_metrics × num_scopes` rows. Each row has a
+//!    scope.id referencing the scope that carries its dimension attributes.
+//!    Metric name/description/unit are dictionary-encoded (stored once).
+//!    **Precomputed at init time.**
+//! 2. **ScopeAttrs table** — `num_scopes × num_dimensions` rows. Each row
+//!    is one (scope_id, attribute_key, attribute_value) triple.
+//!    **Precomputed at init time.**
+//! 3. **NumberDataPoints table** — `num_metrics × num_scopes` rows. One
+//!    data point per metric row. **Built at runtime per collection tick.**
 //!
-//! This module provides types for holding the precomputed tables and for
-//! building the runtime data points table.
+//! The metrics and scope tables are built once and cloned by Arc reference
+//! on each tick. Only the NDP table is rebuilt (timestamps + values).
 
 use arrow::array::{Int64Builder, UInt16Builder, UInt32Builder};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -21,32 +24,34 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
-/// Holds the precomputed metrics and attributes record batches for a
-/// single metric set at a specific [`MetricLevel`].
+/// Holds the precomputed tables for a single metric set at a specific level.
 ///
-/// The metrics and attributes tables are fully determined by the schema
-/// and the active MetricLevel, so they can be constructed once at startup.
-/// Only the data points table needs to be built per collection tick.
-///
-/// [`MetricLevel`]: otap_df_config::policy::MetricLevel
+/// The metrics table and scope attrs table are fully determined by the
+/// schema and the active MetricLevel. They are constructed once at startup.
+/// Only the NDP table needs to be built per collection tick.
 #[derive(Clone, Debug)]
 pub struct PrecomputedMetricSchema {
-    /// The metrics table (one row per metric). Static after init.
+    /// The metrics table: `num_metrics × num_scopes` rows.
+    /// Dictionary-encoded columns for name, description, unit, etc.
     pub metrics_batch: RecordBatch,
-    /// The attributes table (dimension attrs per data point). Static after init.
-    pub attrs_batch: Option<RecordBatch>,
-    /// Number of data points per metric (product of active dimension cardinalities).
-    pub points_per_metric: Vec<usize>,
-    /// Total number of data points across all metrics.
-    pub total_points: usize,
-    /// Precomputed parent_ids for the data points table: which metric
-    /// (by row index in the metrics table) each data point belongs to.
+    /// The scope attributes table: `num_scopes × num_dimensions` rows.
+    /// Empty if no dimensions are active at this level.
+    pub scope_attrs_batch: Option<RecordBatch>,
+    /// Number of scopes (unique dimension combinations) at this level.
+    pub num_scopes: usize,
+    /// Number of metrics in the set.
+    pub num_metrics: usize,
+    /// Total rows in metrics table = `num_metrics × num_scopes`.
+    /// Also the number of NDP rows per tick.
+    pub total_rows: usize,
+    /// Precomputed parent_ids for the NDP table.
+    /// `parent_ids[i]` = the metric row index that NDP row i belongs to.
     pub parent_ids: Vec<u16>,
 }
 
-/// Builds a NumberDataPoints RecordBatch from a flat snapshot of counter/gauge values.
+/// Builds a NumberDataPoints RecordBatch from a flat snapshot of values.
 ///
-/// The parent_ids and point count are precomputed from the schema.
+/// The parent_ids and row count are precomputed from the schema.
 /// The hot path is: set timestamps + fill values → `finish()`.
 pub struct NumberDataPointsBuilder {
     schema: Arc<Schema>,
@@ -62,15 +67,11 @@ impl NumberDataPointsBuilder {
     /// Create from a precomputed schema.
     #[must_use]
     pub fn new(precomputed: &PrecomputedMetricSchema) -> Self {
-        let n = precomputed.total_points;
+        let n = precomputed.total_rows;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt32, false),
             Field::new("parent_id", DataType::UInt16, false),
-            Field::new(
-                "start_time_unix_nano",
-                DataType::Int64,
-                true,
-            ),
+            Field::new("start_time_unix_nano", DataType::Int64, true),
             Field::new("time_unix_nano", DataType::Int64, false),
             Field::new("int_value", DataType::Int64, true),
         ]));
@@ -86,16 +87,11 @@ impl NumberDataPointsBuilder {
         }
     }
 
-    /// Fill data point values from a flat counter snapshot.
+    /// Fill data point values from a flat snapshot.
     ///
-    /// `values` must have length == total_points from the schema.
-    /// Each entry corresponds to one data point in schema order.
-    pub fn set_int_values(
-        &mut self,
-        start_time_ns: i64,
-        time_ns: i64,
-        values: &[u64],
-    ) {
+    /// `values` layout: for each metric, `num_scopes` values in scope order.
+    /// Total length = `num_metrics × num_scopes`.
+    pub fn set_int_values(&mut self, start_time_ns: i64, time_ns: i64, values: &[u64]) {
         debug_assert_eq!(values.len(), self.parent_ids.len());
 
         for (i, (&parent_id, &value)) in
@@ -137,64 +133,62 @@ mod tests {
     }
 
     #[test]
-    fn ndp_builder_basic() {
+    fn ndp_builder_basic_level() {
+        // Basic: 2 metrics × 1 scope = 2 rows
         let precomputed = PrecomputedMetricSchema {
             metrics_batch: make_empty_metrics_batch(),
-            attrs_batch: None,
-            points_per_metric: vec![3],
-            total_points: 3,
-            parent_ids: vec![0, 0, 0],
+            scope_attrs_batch: None,
+            num_scopes: 1,
+            num_metrics: 2,
+            total_rows: 2,
+            parent_ids: vec![0, 1],
         };
 
         let mut builder = NumberDataPointsBuilder::new(&precomputed);
-        builder.set_int_values(100, 200, &[10, 20, 30]);
+        builder.set_int_values(100, 200, &[42, 17]);
 
         let batch = builder.finish().unwrap();
-        assert_eq!(batch.num_rows(), 3);
-
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        assert_eq!(ids.values(), &[0, 1, 2]);
+        assert_eq!(batch.num_rows(), 2);
 
         let parent_ids = batch
             .column(1)
             .as_any()
             .downcast_ref::<UInt16Array>()
             .unwrap();
-        assert_eq!(parent_ids.values(), &[0, 0, 0]);
+        assert_eq!(parent_ids.values(), &[0, 1]);
 
         let values = batch
             .column(4)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(values.values(), &[10, 20, 30]);
+        assert_eq!(values.values(), &[42, 17]);
     }
 
     #[test]
-    fn ndp_builder_multi_metric() {
+    fn ndp_builder_normal_level() {
+        // Normal: 2 metrics × 3 scopes = 6 rows
+        // Layout: metric0[scope0,scope1,scope2], metric1[scope0,scope1,scope2]
         let precomputed = PrecomputedMetricSchema {
             metrics_batch: make_empty_metrics_batch(),
-            attrs_batch: None,
-            points_per_metric: vec![2, 3],
-            total_points: 5,
-            parent_ids: vec![0, 0, 1, 1, 1],
+            scope_attrs_batch: None,
+            num_scopes: 3,
+            num_metrics: 2,
+            total_rows: 6,
+            parent_ids: vec![0, 1, 2, 3, 4, 5],
         };
 
         let mut builder = NumberDataPointsBuilder::new(&precomputed);
-        builder.set_int_values(0, 1000, &[1, 2, 3, 4, 5]);
+        builder.set_int_values(0, 1000, &[1, 2, 3, 4, 5, 6]);
 
         let batch = builder.finish().unwrap();
-        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(batch.num_rows(), 6);
 
-        let parent_ids = batch
-            .column(1)
+        let ids = batch
+            .column(0)
             .as_any()
-            .downcast_ref::<UInt16Array>()
+            .downcast_ref::<UInt32Array>()
             .unwrap();
-        assert_eq!(parent_ids.values(), &[0, 0, 1, 1, 1]);
+        assert_eq!(ids.values(), &[0, 1, 2, 3, 4, 5]);
     }
 }

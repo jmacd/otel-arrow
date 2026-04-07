@@ -17,15 +17,15 @@ pub const SIGNAL_TYPE_CARDINALITY: usize = 3;
 
 /// Metrics for items consumed by a pipeline node.
 pub enum NodeConsumer {
-    /// Active at `MetricLevel::Basic` (3 scopes).
+    /// Active at `MetricLevel::Basic` (1 scopes).
     Basic {
+        items: [Counter<u64>; 1],
+        duration: [Counter<f64>; 1],
+    },
+    /// Active at `MetricLevel::Normal` (3 scopes).
+    Normal {
         items: [Counter<u64>; 3],
         duration: [Counter<f64>; 3],
-    },
-    /// Active at `MetricLevel::Normal` (9 scopes).
-    Normal {
-        items: [Counter<u64>; 9],
-        duration: [Counter<f64>; 9],
     },
     /// Active at `MetricLevel::Detailed` (9 scopes).
     Detailed {
@@ -59,10 +59,10 @@ impl NodeConsumer {
     pub fn add_items(&mut self, value: u64, outcome: usize, signal_type: usize) {
         match self {
             NodeConsumer::Basic { items, .. } => {
-                items[outcome].add(value);
+                items[0].add(value);
             }
             NodeConsumer::Normal { items, .. } => {
-                items[outcome * 3 + signal_type].add(value);
+                items[outcome].add(value);
             }
             NodeConsumer::Detailed { items, .. } => {
                 items[outcome * 3 + signal_type].add(value);
@@ -75,10 +75,10 @@ impl NodeConsumer {
     pub fn record_duration(&mut self, value: f64, outcome: usize, signal_type: usize) {
         match self {
             NodeConsumer::Basic { duration, .. } => {
-                duration[outcome].add(value);
+                duration[0].add(value);
             }
             NodeConsumer::Normal { duration, .. } => {
-                duration[outcome * 3 + signal_type].add(value);
+                duration[outcome].add(value);
             }
             NodeConsumer::Detailed { duration, .. } => {
                 duration[outcome * 3 + signal_type].add(value);
@@ -162,15 +162,15 @@ impl NodeConsumer {
 
 /// Metrics for items produced by a pipeline node.
 pub enum NodeProducer {
-    /// Active at `MetricLevel::Basic` (3 scopes).
+    /// Active at `MetricLevel::Basic` (1 scopes).
     Basic {
+        items: [Counter<u64>; 1],
+        duration: [Counter<f64>; 1],
+    },
+    /// Active at `MetricLevel::Normal` (3 scopes).
+    Normal {
         items: [Counter<u64>; 3],
         duration: [Counter<f64>; 3],
-    },
-    /// Active at `MetricLevel::Normal` (9 scopes).
-    Normal {
-        items: [Counter<u64>; 9],
-        duration: [Counter<f64>; 9],
     },
     /// Active at `MetricLevel::Detailed` (9 scopes).
     Detailed {
@@ -204,10 +204,10 @@ impl NodeProducer {
     pub fn add_items(&mut self, value: u64, outcome: usize, signal_type: usize) {
         match self {
             NodeProducer::Basic { items, .. } => {
-                items[outcome].add(value);
+                items[0].add(value);
             }
             NodeProducer::Normal { items, .. } => {
-                items[outcome * 3 + signal_type].add(value);
+                items[outcome].add(value);
             }
             NodeProducer::Detailed { items, .. } => {
                 items[outcome * 3 + signal_type].add(value);
@@ -220,10 +220,10 @@ impl NodeProducer {
     pub fn record_duration(&mut self, value: f64, outcome: usize, signal_type: usize) {
         match self {
             NodeProducer::Basic { duration, .. } => {
-                duration[outcome].add(value);
+                duration[0].add(value);
             }
             NodeProducer::Normal { duration, .. } => {
-                duration[outcome * 3 + signal_type].add(value);
+                duration[outcome].add(value);
             }
             NodeProducer::Detailed { duration, .. } => {
                 duration[outcome * 3 + signal_type].add(value);

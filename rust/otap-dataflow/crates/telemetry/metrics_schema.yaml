@@ -24,9 +24,9 @@ metric_sets:
     x-otap:
       levels:
         basic:
-          dimensions: [outcome]
+          dimensions: []
         normal:
-          dimensions: [outcome, signal_type]
+          dimensions: [outcome]
         detailed:
           dimensions: [outcome, signal_type]
     metrics:
@@ -49,9 +49,9 @@ metric_sets:
     x-otap:
       levels:
         basic:
-          dimensions: [outcome]
+          dimensions: []
         normal:
-          dimensions: [outcome, signal_type]
+          dimensions: [outcome]
         detailed:
           dimensions: [outcome, signal_type]
     metrics:

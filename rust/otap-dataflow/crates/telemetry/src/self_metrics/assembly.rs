@@ -32,8 +32,8 @@ pub fn assemble_metrics_payload(
         encoded.ndp_batch,
     );
 
-    if let Some(attrs) = encoded.attrs_batch {
-        store.set(ArrowPayloadType::NumberDpAttrs, attrs);
+    if let Some(scope_attrs) = encoded.scope_attrs_batch {
+        store.set(ArrowPayloadType::ScopeAttrs, scope_attrs);
     }
 
     let metrics = Metrics::try_from(store)?;

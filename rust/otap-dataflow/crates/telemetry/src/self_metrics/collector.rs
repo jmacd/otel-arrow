@@ -47,7 +47,7 @@ impl MetricsEncoder {
     /// Create an encoder from a precomputed schema.
     #[must_use]
     pub fn new(precomputed: PrecomputedMetricSchema) -> Self {
-        let n = precomputed.total_points;
+        let n = precomputed.total_rows;
         Self {
             precomputed,
             snapshot_buf: vec![0u64; n],
@@ -83,7 +83,7 @@ impl MetricsEncoder {
 
         Ok(Some(EncodedMetrics {
             metrics_batch: self.precomputed.metrics_batch.clone(),
-            attrs_batch: self.precomputed.attrs_batch.clone(),
+            scope_attrs_batch: self.precomputed.scope_attrs_batch.clone(),
             ndp_batch,
         }))
     }
@@ -98,10 +98,10 @@ impl MetricsEncoder {
 /// The three OTAP Arrow tables produced by a single metric set collection.
 #[derive(Debug)]
 pub struct EncodedMetrics {
-    /// The metrics (root) table — one row per metric definition.
+    /// The metrics (root) table — `num_metrics × num_scopes` rows.
     pub metrics_batch: RecordBatch,
-    /// The attributes table — dimension attributes per data point.
-    pub attrs_batch: Option<RecordBatch>,
+    /// The scope attributes table — dimension values per scope.
+    pub scope_attrs_batch: Option<RecordBatch>,
     /// The NumberDataPoints table — counter/gauge values.
     pub ndp_batch: RecordBatch,
 }
