@@ -23,6 +23,7 @@ otap-df-pdata = { workspace = true }
 otap-df-config = { workspace = true }
 otap-df-pdata-views = { workspace = true }
 
+arrow = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }

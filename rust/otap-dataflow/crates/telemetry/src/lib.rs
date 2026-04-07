@@ -52,6 +52,8 @@ pub mod metrics;
 pub mod otel_sdk;
 pub mod registry;
 pub mod reporter;
+/// OTAP-native internal metrics SDK (codegen-driven).
+pub mod self_metrics;
 pub mod self_tracing;
 pub mod semconv;
 /// Tokio tracing subscriber initialization.
