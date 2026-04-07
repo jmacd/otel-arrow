@@ -10,6 +10,10 @@
 
 use otap_df_config::policy::MetricLevel;
 use crate::instrument::Counter;
+use crate::self_metrics::precomputed::{
+    DimensionInfo, MetricInfo, PrecomputedMetricSchema,
+};
+use otap_df_pdata::otlp::metrics::MetricType;
 
 pub const OUTCOME_CARDINALITY: usize = 3;
 
@@ -158,6 +162,48 @@ impl NodeConsumer {
             }
         }
     }
+    /// Build the precomputed OTAP schema for a given level.
+    ///
+    /// Returns the metrics table, scope attrs table, and NDP layout
+    /// metadata. Called once at init time.
+    pub fn precomputed_schema(level: MetricLevel) -> Result<PrecomputedMetricSchema, arrow::error::ArrowError> {
+        const METRICS: &[MetricInfo] = &[
+            MetricInfo {
+                name: "node.consumer.items",
+                description: "Items consumed by this node.",
+                unit: "{item}",
+                metric_type: MetricType::Sum,
+                aggregation_temporality: Some(1),
+                is_monotonic: Some(true),
+            },
+            MetricInfo {
+                name: "node.consumer.duration",
+                description: "Time to consume items.",
+                unit: "ns",
+                metric_type: MetricType::ExponentialHistogram,
+                aggregation_temporality: Some(1),
+                is_monotonic: None,
+            },
+        ];
+
+        const DIMENSIONS: &[DimensionInfo] = &[
+            DimensionInfo { key: "outcome", values: &["success", "failure", "refused"] },
+            DimensionInfo { key: "signal_type", values: &["logs", "metrics", "traces"] },
+        ];
+
+        let active_dims: &[usize] = match level {
+            MetricLevel::None | MetricLevel::Basic => &[],
+            MetricLevel::Normal => &[0],
+            MetricLevel::Detailed => &[0, 1],
+        };
+
+        PrecomputedMetricSchema::build(METRICS, DIMENSIONS, active_dims)
+    }
+
+    /// Number of scopes at each level for `NodeConsumer`.
+    pub const SCOPES_BASIC: usize = 1;
+    pub const SCOPES_NORMAL: usize = 3;
+    pub const SCOPES_DETAILED: usize = 9;
 }
 
 /// Metrics for items produced by a pipeline node.
@@ -303,5 +349,47 @@ impl NodeProducer {
             }
         }
     }
+    /// Build the precomputed OTAP schema for a given level.
+    ///
+    /// Returns the metrics table, scope attrs table, and NDP layout
+    /// metadata. Called once at init time.
+    pub fn precomputed_schema(level: MetricLevel) -> Result<PrecomputedMetricSchema, arrow::error::ArrowError> {
+        const METRICS: &[MetricInfo] = &[
+            MetricInfo {
+                name: "node.producer.items",
+                description: "Items produced by this node.",
+                unit: "{item}",
+                metric_type: MetricType::Sum,
+                aggregation_temporality: Some(1),
+                is_monotonic: Some(true),
+            },
+            MetricInfo {
+                name: "node.producer.duration",
+                description: "Time to produce items.",
+                unit: "ns",
+                metric_type: MetricType::ExponentialHistogram,
+                aggregation_temporality: Some(1),
+                is_monotonic: None,
+            },
+        ];
+
+        const DIMENSIONS: &[DimensionInfo] = &[
+            DimensionInfo { key: "outcome", values: &["success", "failure", "refused"] },
+            DimensionInfo { key: "signal_type", values: &["logs", "metrics", "traces"] },
+        ];
+
+        let active_dims: &[usize] = match level {
+            MetricLevel::None | MetricLevel::Basic => &[],
+            MetricLevel::Normal => &[0],
+            MetricLevel::Detailed => &[0, 1],
+        };
+
+        PrecomputedMetricSchema::build(METRICS, DIMENSIONS, active_dims)
+    }
+
+    /// Number of scopes at each level for `NodeProducer`.
+    pub const SCOPES_BASIC: usize = 1;
+    pub const SCOPES_NORMAL: usize = 3;
+    pub const SCOPES_DETAILED: usize = 9;
 }
 

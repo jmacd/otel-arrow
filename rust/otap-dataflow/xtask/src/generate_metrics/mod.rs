@@ -109,6 +109,10 @@ fn render_generated_code(sets: &[ResolvedMetricSet]) -> anyhow::Result<String> {
          \n\
          use otap_df_config::policy::MetricLevel;\n\
          use crate::instrument::Counter;\n\
+         use crate::self_metrics::precomputed::{\n\
+         \x20   DimensionInfo, MetricInfo, PrecomputedMetricSchema,\n\
+         };\n\
+         use otap_df_pdata::otlp::metrics::MetricType;\n\
          \n",
     );
 
@@ -210,6 +214,9 @@ fn render_metric_set(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Resul
 
     // Generate needs_flush.
     render_needs_flush(out, set)?;
+
+    // Generate precomputed_schema().
+    render_precomputed_schema(out, set)?;
 
     out.push_str("}\n\n");
     Ok(())
@@ -431,6 +438,99 @@ fn render_needs_flush(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Resu
 
     out.push_str("        }\n");
     out.push_str("    }\n");
+    Ok(())
+}
+
+fn render_precomputed_schema(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Result<()> {
+    let struct_name = to_pascal_case(&set.id);
+
+    out.push_str("    /// Build the precomputed OTAP schema for a given level.\n");
+    out.push_str("    ///\n");
+    out.push_str("    /// Returns the metrics table, scope attrs table, and NDP layout\n");
+    out.push_str("    /// metadata. Called once at init time.\n");
+    out.push_str(&format!(
+        "    pub fn precomputed_schema(level: MetricLevel) -> Result<PrecomputedMetricSchema, arrow::error::ArrowError> {{\n"
+    ));
+
+    // Emit static METRICS array.
+    out.push_str("        const METRICS: &[MetricInfo] = &[\n");
+    for m in &set.metrics {
+        let metric_type = match m.def.recording_mode {
+            ir::RecordingMode::Counting => "MetricType::Sum",
+            ir::RecordingMode::Histogram => "MetricType::ExponentialHistogram",
+            ir::RecordingMode::LastValue => "MetricType::Gauge",
+        };
+        let (temporality, monotonic) = match m.def.recording_mode {
+            ir::RecordingMode::Counting => ("Some(1)", "Some(true)"), // Delta, monotonic
+            ir::RecordingMode::Histogram => ("Some(1)", "None"),      // Delta
+            ir::RecordingMode::LastValue => ("None", "None"),
+        };
+        out.push_str(&format!(
+            "            MetricInfo {{\n\
+             \x20               name: {:?},\n\
+             \x20               description: {:?},\n\
+             \x20               unit: {:?},\n\
+             \x20               metric_type: {metric_type},\n\
+             \x20               aggregation_temporality: {temporality},\n\
+             \x20               is_monotonic: {monotonic},\n\
+             \x20           }},\n",
+            m.def.name, m.def.brief, m.def.unit,
+        ));
+    }
+    out.push_str("        ];\n\n");
+
+    // Emit static DIMENSIONS array.
+    out.push_str("        const DIMENSIONS: &[DimensionInfo] = &[\n");
+    for dim in &set.dimensions {
+        let values_str: Vec<String> = dim.values.iter().map(|v| format!("{v:?}")).collect();
+        out.push_str(&format!(
+            "            DimensionInfo {{ key: {:?}, values: &[{}] }},\n",
+            dim.key,
+            values_str.join(", "),
+        ));
+    }
+    out.push_str("        ];\n\n");
+
+    // Emit level match.
+    out.push_str("        let active_dims: &[usize] = match level {\n");
+    for (level_variant, level_match) in [
+        ("basic", "MetricLevel::None | MetricLevel::Basic"),
+        ("normal", "MetricLevel::Normal"),
+        ("detailed", "MetricLevel::Detailed"),
+    ] {
+        let layout = match level_variant {
+            "basic" => &set.levels.basic,
+            "normal" => &set.levels.normal,
+            "detailed" => &set.levels.detailed,
+            _ => unreachable!(),
+        };
+        let dims_str = format!("{:?}", layout.active_dimensions);
+        out.push_str(&format!(
+            "            {level_match} => &{dims_str},\n"
+        ));
+    }
+    out.push_str("        };\n\n");
+
+    out.push_str("        PrecomputedMetricSchema::build(METRICS, DIMENSIONS, active_dims)\n");
+    out.push_str("    }\n");
+
+    // Also emit a convenience constant for scope counts.
+    out.push_str(&format!(
+        "\n    /// Number of scopes at each level for `{struct_name}`.\n"
+    ));
+    out.push_str(&format!(
+        "    pub const SCOPES_BASIC: usize = {};\n",
+        set.levels.basic.num_scopes
+    ));
+    out.push_str(&format!(
+        "    pub const SCOPES_NORMAL: usize = {};\n",
+        set.levels.normal.num_scopes
+    ));
+    out.push_str(&format!(
+        "    pub const SCOPES_DETAILED: usize = {};\n",
+        set.levels.detailed.num_scopes
+    ));
+
     Ok(())
 }
 

@@ -22,7 +22,36 @@ use arrow::array::{Int64Builder, UInt16Builder, UInt32Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use otap_df_pdata::encode::record::attributes::AttributesRecordBatchBuilder;
+use otap_df_pdata::encode::record::metrics::MetricsRecordBatchBuilder;
+use otap_df_pdata::otlp::metrics::MetricType;
 use std::sync::Arc;
+
+/// Metadata for one metric in a metric set (used to build precomputed tables).
+#[derive(Debug, Clone)]
+pub struct MetricInfo {
+    /// Metric name (e.g., "node.consumer.items").
+    pub name: &'static str,
+    /// Metric description.
+    pub description: &'static str,
+    /// Unit string.
+    pub unit: &'static str,
+    /// OTAP metric type (Sum, Gauge, ExponentialHistogram, ...).
+    pub metric_type: MetricType,
+    /// Aggregation temporality (1=Delta, 2=Cumulative). None for Gauge.
+    pub aggregation_temporality: Option<i32>,
+    /// Whether the metric is monotonic (only for Sum).
+    pub is_monotonic: Option<bool>,
+}
+
+/// Metadata for one dimension in a metric set.
+#[derive(Debug, Clone)]
+pub struct DimensionInfo {
+    /// Attribute key (e.g., "outcome").
+    pub key: &'static str,
+    /// Enumerated values in index order.
+    pub values: &'static [&'static str],
+}
 
 /// Holds the precomputed tables for a single metric set at a specific level.
 ///
@@ -47,6 +76,92 @@ pub struct PrecomputedMetricSchema {
     /// Precomputed parent_ids for the NDP table.
     /// `parent_ids[i]` = the metric row index that NDP row i belongs to.
     pub parent_ids: Vec<u16>,
+}
+
+impl PrecomputedMetricSchema {
+    /// Build precomputed tables from metric and dimension metadata.
+    ///
+    /// The `active_dimensions` slice selects which dimensions (by index
+    /// into `dimensions`) are active at this level. The number of scopes
+    /// is the product of active dimension cardinalities.
+    pub fn build(
+        metrics: &[MetricInfo],
+        dimensions: &[DimensionInfo],
+        active_dimensions: &[usize],
+    ) -> Result<Self, ArrowError> {
+        // Compute scope count.
+        let num_scopes = if active_dimensions.is_empty() {
+            1
+        } else {
+            active_dimensions
+                .iter()
+                .map(|&i| dimensions[i].values.len())
+                .product()
+        };
+        let num_metrics = metrics.len();
+        let total_rows = num_metrics * num_scopes;
+
+        // ── Build metrics table ─────────────────────────────────────
+        // num_metrics × num_scopes rows, ordered as:
+        // metric0[scope0], metric0[scope1], ..., metric1[scope0], ...
+        let mut mb = MetricsRecordBatchBuilder::new();
+        let mut row_id: u16 = 0;
+        for metric in metrics {
+            for scope_id in 0..num_scopes {
+                mb.append_id(row_id);
+                mb.scope.append_id(Some(scope_id as u16));
+                mb.append_metric_type(metric.metric_type as u8);
+                mb.append_name(metric.name.as_bytes());
+                mb.append_description(metric.description.as_bytes());
+                mb.append_unit(metric.unit.as_bytes());
+                mb.append_aggregation_temporality(metric.aggregation_temporality);
+                mb.append_is_monotonic(metric.is_monotonic);
+                row_id += 1;
+            }
+        }
+        let metrics_batch = mb.finish()?;
+
+        // ── Build scope attrs table ─────────────────────────────────
+        // num_scopes × num_active_dims rows.
+        let scope_attrs_batch = if active_dimensions.is_empty() {
+            None
+        } else {
+            let mut ab = AttributesRecordBatchBuilder::<u16>::new();
+            for scope_id in 0..num_scopes {
+                // Decompose scope_id into per-dimension indices.
+                let mut remaining = scope_id;
+                // Walk dimensions in reverse to extract indices (row-major).
+                let mut dim_indices = vec![0usize; active_dimensions.len()];
+                for i in (0..active_dimensions.len()).rev() {
+                    let card = dimensions[active_dimensions[i]].values.len();
+                    dim_indices[i] = remaining % card;
+                    remaining /= card;
+                }
+                // Emit one row per dimension.
+                for (pos, &dim_idx) in active_dimensions.iter().enumerate() {
+                    let dim = &dimensions[dim_idx];
+                    let value = dim.values[dim_indices[pos]];
+                    ab.append_parent_id(&(scope_id as u16));
+                    ab.append_key(dim.key.as_bytes());
+                    ab.any_values_builder.append_str(value.as_bytes());
+                }
+            }
+            Some(ab.finish()?)
+        };
+
+        // ── Build parent_ids for NDP ────────────────────────────────
+        // One NDP row per metric table row.
+        let parent_ids: Vec<u16> = (0..total_rows as u16).collect();
+
+        Ok(Self {
+            metrics_batch,
+            scope_attrs_batch,
+            num_scopes,
+            num_metrics,
+            total_rows,
+            parent_ids,
+        })
+    }
 }
 
 /// Builds a NumberDataPoints RecordBatch from a flat snapshot of values.
