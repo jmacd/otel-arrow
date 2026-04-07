@@ -24,4 +24,7 @@
 pub mod assembly;
 pub mod collector;
 pub mod dimension;
+/// Generated metric set types — do not edit manually.
+#[allow(missing_docs)]
+pub mod generated;
 pub mod precomputed;

@@ -21,6 +21,7 @@ use std::time::Instant;
 
 mod diagnostics;
 mod genproto;
+mod generate_metrics;
 mod structure_check;
 
 #[cfg(not(tarpaulin_include))]
@@ -44,6 +45,11 @@ fn main() -> anyhow::Result<()> {
                 ensure_no_extra_args("compile-proto", &args.collect::<Vec<_>>())?;
                 genproto::compile_proto()?;
                 Ok(())
+            }
+            "generate-metrics" => {
+                let remaining = args.collect::<Vec<_>>();
+                let check_only = remaining.iter().any(|a| a == "--check");
+                generate_metrics::run(check_only)
             }
             "structure-check" => {
                 ensure_no_extra_args("structure-check", &args.collect::<Vec<_>>())?;
@@ -73,6 +79,7 @@ Tasks:
   - quick-check: Run a faster iterative subset: structure check, cargo fmt --all, cargo clippy --workspace --lib --bins --tests, and cargo test --workspace --lib --bins --tests --no-run. This is not a replacement for `cargo xtask check`.
   - check-benches: Lint and compile bench targets only.
   - structure-check: Validate the entire structure of the project.
+  - generate-metrics [--check]: Generate Rust code from metrics_schema.yaml files. Use --check to verify generated files are up to date.
   - compile-proto: Compile the protobufs files
 "
     );

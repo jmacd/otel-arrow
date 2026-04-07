@@ -1,0 +1,99 @@
+# Pilot metric schema for internal telemetry (consumer/producer counters).
+#
+# This schema defines the self-observability metrics for pipeline nodes.
+# It uses OTel SemConv YAML structure extended with x-otap for level-aware
+# dimensioning and recording mode control.
+#
+# The codegen system reads this file and produces Rust metric set structs
+# with level-aware enum variants, dimension-indexed APIs, and OTAP Arrow
+# precomputed schema constructors.
+
+# Shared attribute definitions referenced by metrics below.
+attributes:
+  - id: outcome
+    type: string
+    brief: "Request processing outcome."
+    values: [success, failure, refused]
+
+  - id: signal_type
+    type: string
+    brief: "Telemetry signal type."
+    values: [logs, metrics, traces]
+
+# Metric set definitions.
+metric_sets:
+  - id: node_consumer
+    brief: "Metrics for items consumed by a pipeline node."
+    metrics:
+      - name: node.consumer.items
+        instrument: counter
+        unit: "{item}"
+        brief: "Items consumed by this node."
+        value_type: u64
+        x-otap:
+          interface: delta
+          recording_mode: counting
+          levels:
+            basic:
+              dimensions: [outcome]
+            normal:
+              dimensions: [outcome, signal_type]
+            detailed:
+              dimensions: [outcome, signal_type]
+
+      - name: node.consumer.duration
+        instrument: counter
+        unit: ns
+        brief: "Time to consume items."
+        value_type: f64
+        x-otap:
+          interface: delta
+          recording_mode: histogram
+          levels:
+            basic:
+              dimensions: [outcome]
+              histogram_size: 0
+            normal:
+              dimensions: [outcome]
+              histogram_size: 8
+            detailed:
+              dimensions: [outcome]
+              histogram_size: 16
+
+  - id: node_producer
+    brief: "Metrics for items produced by a pipeline node."
+    metrics:
+      - name: node.producer.items
+        instrument: counter
+        unit: "{item}"
+        brief: "Items produced by this node."
+        value_type: u64
+        x-otap:
+          interface: delta
+          recording_mode: counting
+          levels:
+            basic:
+              dimensions: [outcome]
+            normal:
+              dimensions: [outcome, signal_type]
+            detailed:
+              dimensions: [outcome, signal_type]
+
+      - name: node.producer.duration
+        instrument: counter
+        unit: ns
+        brief: "Time to produce items."
+        value_type: f64
+        x-otap:
+          interface: delta
+          recording_mode: histogram
+          levels:
+            basic:
+              dimensions: [outcome]
+              histogram_size: 0
+            normal:
+              dimensions: [outcome]
+              histogram_size: 8
+            detailed:
+              dimensions: [outcome]
+              histogram_size: 16
