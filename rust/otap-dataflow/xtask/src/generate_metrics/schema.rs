@@ -21,43 +21,40 @@ pub fn parse_and_resolve(path: &Path) -> anyhow::Result<(MetricSchema, Vec<Resol
 
     let mut resolved_sets = Vec::new();
     for set_def in &schema.metric_sets {
-        let mut resolved_metrics = Vec::new();
-        for metric in &set_def.metrics {
-            let resolved = resolve_metric(metric, &attr_map)?;
-            resolved_metrics.push(resolved);
-        }
-        resolved_sets.push(ResolvedMetricSet {
-            id: set_def.id.clone(),
-            brief: set_def.brief.clone(),
-            metrics: resolved_metrics,
-        });
+        let resolved = resolve_metric_set(set_def, &attr_map)?;
+        resolved_sets.push(resolved);
     }
 
     Ok((schema, resolved_sets))
 }
 
-/// A metric set with resolved dimension information.
+/// A metric set with resolved dimension and layout information.
 #[derive(Debug, Clone)]
 pub struct ResolvedMetricSet {
     pub id: String,
     pub brief: String,
+    /// Resolved dimensions (shared by all metrics in this set).
+    pub dimensions: Vec<ResolvedDimension>,
+    /// Per-level layouts (scope counts, active dimensions).
+    pub levels: ResolvedLevels,
+    /// Resolved metrics.
     pub metrics: Vec<ResolvedMetric>,
 }
 
-fn resolve_metric(
-    metric: &MetricDef,
+fn resolve_metric_set(
+    set_def: &MetricSetDef,
     attr_map: &HashMap<&str, &AttributeDef>,
-) -> anyhow::Result<ResolvedMetric> {
+) -> anyhow::Result<ResolvedMetricSet> {
     // Collect all dimension IDs referenced across all levels.
-    let all_dim_ids = collect_all_dimensions(&metric.otap.levels);
+    let all_dim_ids = collect_all_dimensions(&set_def.otap.levels);
 
     // Resolve each dimension against the attribute map.
     let mut dimensions = Vec::new();
     for dim_id in &all_dim_ids {
         let attr = attr_map.get(dim_id.as_str()).ok_or_else(|| {
             anyhow::anyhow!(
-                "Metric '{}': unknown attribute '{}' referenced in dimensions",
-                metric.name,
+                "Metric set '{}': unknown attribute '{}' referenced in dimensions",
+                set_def.id,
                 dim_id
             )
         })?;
@@ -69,20 +66,26 @@ fn resolve_metric(
         });
     }
 
-    // Validate archetype × recording mode compatibility.
-    validate_archetype_mode(metric.instrument, metric.otap.recording_mode, &metric.name)?;
-
     // Compute per-level layouts.
     let levels = ResolvedLevels {
-        basic: resolve_level(&metric.otap.levels.basic, &dimensions, &all_dim_ids),
-        normal: resolve_level(&metric.otap.levels.normal, &dimensions, &all_dim_ids),
-        detailed: resolve_level(&metric.otap.levels.detailed, &dimensions, &all_dim_ids),
+        basic: resolve_level(&set_def.otap.levels.basic, &dimensions, &all_dim_ids),
+        normal: resolve_level(&set_def.otap.levels.normal, &dimensions, &all_dim_ids),
+        detailed: resolve_level(&set_def.otap.levels.detailed, &dimensions, &all_dim_ids),
     };
 
-    Ok(ResolvedMetric {
-        def: metric.clone(),
+    // Resolve metrics (validate archetype × recording mode).
+    let mut resolved_metrics = Vec::new();
+    for metric in &set_def.metrics {
+        validate_archetype_mode(metric.instrument, metric.recording_mode, &metric.name)?;
+        resolved_metrics.push(ResolvedMetric { def: metric.clone() });
+    }
+
+    Ok(ResolvedMetricSet {
+        id: set_def.id.clone(),
+        brief: set_def.brief.clone(),
         dimensions,
         levels,
+        metrics: resolved_metrics,
     })
 }
 
@@ -111,7 +114,7 @@ fn resolve_level(
         .filter_map(|d| all_dim_ids.iter().position(|id| id == d))
         .collect();
 
-    let total_points = if active_dimensions.is_empty() {
+    let num_scopes = if active_dimensions.is_empty() {
         1
     } else {
         active_dimensions
@@ -122,8 +125,7 @@ fn resolve_level(
 
     ResolvedLevelLayout {
         active_dimensions,
-        total_points,
-        histogram_size: config.histogram_size,
+        num_scopes,
     }
 }
 
@@ -170,22 +172,21 @@ attributes:
 metric_sets:
   - id: test_set
     brief: "Test"
+    x-otap:
+      levels:
+        basic:
+          dimensions: [outcome]
+        normal:
+          dimensions: [outcome, signal_type]
+        detailed:
+          dimensions: [outcome, signal_type]
     metrics:
       - name: test.counter
         instrument: counter
         unit: "{item}"
         brief: "A counter."
         value_type: u64
-        x-otap:
-          interface: delta
-          recording_mode: counting
-          levels:
-            basic:
-              dimensions: [outcome]
-            normal:
-              dimensions: [outcome, signal_type]
-            detailed:
-              dimensions: [outcome, signal_type]
+        recording_mode: counting
 "#
     }
 
@@ -196,7 +197,7 @@ metric_sets:
         assert_eq!(schema.metric_sets.len(), 1);
         assert_eq!(schema.metric_sets[0].metrics.len(), 1);
         assert_eq!(
-            schema.metric_sets[0].metrics[0].otap.recording_mode,
+            schema.metric_sets[0].metrics[0].recording_mode,
             RecordingMode::Counting
         );
     }
@@ -207,21 +208,22 @@ metric_sets:
         let attr_map: HashMap<&str, &AttributeDef> =
             schema.attributes.iter().map(|a| (a.id.as_str(), a)).collect();
 
-        let metric = &schema.metric_sets[0].metrics[0];
-        let resolved = resolve_metric(metric, &attr_map).unwrap();
+        let set_def = &schema.metric_sets[0];
+        let resolved = resolve_metric_set(set_def, &attr_map).unwrap();
 
+        // Dimensions are per-set now.
         assert_eq!(resolved.dimensions.len(), 2);
         assert_eq!(resolved.dimensions[0].id, "outcome");
         assert_eq!(resolved.dimensions[0].cardinality, 3);
         assert_eq!(resolved.dimensions[1].id, "signal_type");
         assert_eq!(resolved.dimensions[1].cardinality, 3);
 
-        // Basic: outcome only → 3 points
-        assert_eq!(resolved.levels.basic.total_points, 3);
+        // Basic: outcome only → 3 scopes
+        assert_eq!(resolved.levels.basic.num_scopes, 3);
         assert_eq!(resolved.levels.basic.active_dimensions, vec![0]);
 
-        // Normal: outcome × signal_type → 9 points
-        assert_eq!(resolved.levels.normal.total_points, 9);
+        // Normal: outcome × signal_type → 9 scopes
+        assert_eq!(resolved.levels.normal.num_scopes, 9);
         assert_eq!(resolved.levels.normal.active_dimensions, vec![0, 1]);
     }
 

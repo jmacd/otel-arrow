@@ -107,6 +107,98 @@ differentiated by `direction = "pos"` / `direction = "neg"`.
 Each is monotonic within its direction. The original signed
 sum can be reconstructed as `pos.sum - neg.sum`.
 
+## Scope-Based Dimension Encoding
+
+**Key architectural decision** (per OTAP/OTel-Arrow architect):
+
+Dimension attributes (outcome, signal_type, etc.) are encoded as **scope
+attributes** rather than per-data-point attributes. This means:
+
+1. **Shared dimensions per metric set**: All metrics in a metric_set share
+   the same dimension attributes. Dimensions are declared at the set level,
+   not per-metric. Each unique combination of dimension values becomes a
+   separate scope ID.
+
+2. **Precomputed scope table**: At init time, enumerate all dimension
+   combinations for the active MetricLevel. For Basic with [outcome]:
+   3 scopes. For Normal with [outcome, signal_type]: 9 scopes. The scope
+   attributes table is fully precomputable.
+
+3. **No per-data-point attributes**: The NumberDpAttrs table is not needed.
+   All attributes live in ScopeAttrs. This is cheaper at encoding time and
+   avoids redundant attribute storage.
+
+4. **One metric row per metric × scope**: The UnivariateMetrics table has
+   one row per (metric, scope) pair. With 2 metrics × 9 scopes = 18 rows.
+   Each metric row references a scope ID. Each has exactly 1 NDP row.
+
+5. **Multivariate efficiency**: Within a scope, multiple metrics share the
+   same timestamp and scope attributes. This is the natural grouping for
+   OTAP multivariate encoding when it arrives.
+
+### Example: Normal level (outcome × signal_type = 9 scopes)
+
+```
+ScopeAttrs (precomputed, 18 rows = 9 scopes × 2 attrs each)
+┌───────────┬───────────────┬───────────────┐
+│ parent_id │ attribute_key │ attribute_str │
+├───────────┼───────────────┼───────────────┤
+│         0 │ outcome       │ success       │
+│         0 │ signal_type   │ logs          │
+│         1 │ outcome       │ success       │
+│         1 │ signal_type   │ metrics       │
+│       ... │ ...           │ ...           │
+│         8 │ outcome       │ refused       │
+│         8 │ signal_type   │ traces        │
+└───────────┴───────────────┴───────────────┘
+
+UnivariateMetrics (precomputed, 18 rows = 2 metrics × 9 scopes)
+┌────┬─────────────┬─────────────────────┬──────────────┐
+│ id │ metric_type │ name                │ scope.id     │
+├────┼─────────────┼─────────────────────┼──────────────┤
+│  0 │ Sum         │ node.consumer.items │            0 │
+│  1 │ Sum         │ node.consumer.items │            1 │
+│ ...│ ...         │ ...                 │          ... │
+│  9 │ ExpHisto    │ node.consumer.dur   │            0 │
+│ 10 │ ExpHisto    │ node.consumer.dur   │            1 │
+│ ...│ ...         │ ...                 │          ... │
+└────┴─────────────┴─────────────────────┴──────────────┘
+
+NumberDataPoints (runtime, 18 rows — 1 per metric row)
+┌───────────┬───────────┐
+│ parent_id │ int_value │
+├───────────┼───────────┤
+│         0 │        42 │  ← items[success,logs]
+│         1 │        17 │  ← items[success,metrics]
+│       ... │       ... │
+└───────────┴───────────┘
+```
+
+### Schema YAML impact
+
+Dimensions move from per-metric to per-metric-set:
+
+```yaml
+metric_sets:
+  - id: node_consumer
+    x-otap:
+      levels:
+        basic:
+          dimensions: [outcome]
+        normal:
+          dimensions: [outcome, signal_type]
+        detailed:
+          dimensions: [outcome, signal_type]
+    metrics:
+      - name: node.consumer.items
+        instrument: counter
+        ...
+      - name: node.consumer.duration
+        instrument: counter
+        recording_mode: histogram
+        ...
+```
+
 ## Design
 
 ### Instrument Model

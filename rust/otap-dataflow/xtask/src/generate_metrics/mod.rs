@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 const LEVEL_NAMES: &[&str] = &["Basic", "Normal", "Detailed"];
 
 /// Get the level layout for a metric by level name.
-fn get_level_layout<'a>(m: &'a ir::ResolvedMetric, level: &str) -> &'a ir::ResolvedLevelLayout {
+fn get_set_level_layout<'a>(set: &'a ResolvedMetricSet, level: &str) -> &'a ir::ResolvedLevelLayout {
     match level {
-        "Basic" => &m.levels.basic,
-        "Normal" => &m.levels.normal,
-        "Detailed" => &m.levels.detailed,
+        "Basic" => &set.levels.basic,
+        "Normal" => &set.levels.normal,
+        "Detailed" => &set.levels.detailed,
         _ => unreachable!(),
     }
 }
@@ -122,11 +122,9 @@ fn render_generated_code(sets: &[ResolvedMetricSet]) -> anyhow::Result<String> {
 fn render_metric_set(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Result<()> {
     let struct_name = to_pascal_case(&set.id);
 
-    // Generate dimension index helper functions for each dimension.
-    for metric in &set.metrics {
-        for dim in &metric.dimensions {
-            render_dimension_constants(out, dim);
-        }
+    // Generate dimension cardinality constants (shared across the set).
+    for dim in &set.dimensions {
+        render_dimension_constants(out, dim);
     }
 
     // Generate the level-aware metric set enum.
@@ -134,14 +132,14 @@ fn render_metric_set(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Resul
     out.push_str(&format!("pub enum {struct_name} {{\n"));
 
     for level_name in LEVEL_NAMES {
+        let layout = get_set_level_layout(set, level_name);
+        let n = layout.num_scopes; // All metrics share this size.
         let fields: Vec<String> = set
             .metrics
             .iter()
             .map(|m| {
-                let layout = get_level_layout(m, level_name);
                 let field_name = metric_field_name(&m.def.name);
-                let n = layout.total_points;
-                match m.def.otap.recording_mode {
+                match m.def.recording_mode {
                     ir::RecordingMode::Counting => {
                         if m.def.value_type == ir::ValueType::U64 {
                             format!("        {field_name}: [Counter<u64>; {n}]")
@@ -163,7 +161,7 @@ fn render_metric_set(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Resul
             })
             .collect();
 
-        out.push_str(&format!("    /// Active at `MetricLevel::{level_name}`.\n"));
+        out.push_str(&format!("    /// Active at `MetricLevel::{level_name}` ({n} scopes).\n"));
         out.push_str(&format!("    {level_name} {{\n"));
         for field in &fields {
             out.push_str(field);
@@ -237,20 +235,20 @@ fn render_metric_method(
     metric: &ir::ResolvedMetric,
     set: &ResolvedMetricSet,
 ) -> anyhow::Result<()> {
-    let method_name = match metric.def.otap.recording_mode {
+    let method_name = match metric.def.recording_mode {
         ir::RecordingMode::Counting => format!("add_{}", metric_field_name(&metric.def.name)),
         ir::RecordingMode::Histogram => format!("record_{}", metric_field_name(&metric.def.name)),
         ir::RecordingMode::LastValue => format!("set_{}", metric_field_name(&metric.def.name)),
     };
 
-    // Build dimension parameters.
-    let dim_params: Vec<String> = metric
+    // Dimension parameters come from the set (shared by all metrics).
+    let dim_params: Vec<String> = set
         .dimensions
         .iter()
         .map(|d| format!("{}: usize", d.id))
         .collect();
 
-    let value_type = match metric.def.otap.recording_mode {
+    let value_type = match metric.def.recording_mode {
         ir::RecordingMode::Counting => {
             if metric.def.value_type == ir::ValueType::U64 {
                 "u64"
@@ -284,14 +282,14 @@ fn render_metric_method(
     out.push_str(&format!("        match self {{\n"));
 
     for level_variant in LEVEL_NAMES {
-        let layout = get_level_layout(metric, level_variant);
-        let index_expr = build_index_expr(&metric.dimensions, &layout.active_dimensions);
+        let layout = get_set_level_layout(set, level_variant);
+        let index_expr = build_index_expr(&set.dimensions, &layout.active_dimensions);
 
         out.push_str(&format!(
             "            {struct_name}::{level_variant} {{ {field_name}, .. }} => {{\n"
         ));
 
-        match metric.def.otap.recording_mode {
+        match metric.def.recording_mode {
             ir::RecordingMode::Counting | ir::RecordingMode::Histogram => {
                 out.push_str(&format!(
                     "                {field_name}[{index_expr}].add(value);\n"
@@ -327,9 +325,9 @@ fn render_snapshot_into(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Re
         ));
         for m in &set.metrics {
             let field_name = metric_field_name(&m.def.name);
-            match m.def.otap.recording_mode {
+            match m.def.recording_mode {
                 ir::RecordingMode::Counting | ir::RecordingMode::Histogram => {
-                    let cast = if m.def.value_type == ir::ValueType::U64 && m.def.otap.recording_mode == ir::RecordingMode::Counting {
+                    let cast = if m.def.value_type == ir::ValueType::U64 && m.def.recording_mode == ir::RecordingMode::Counting {
                         "" // u64 Counter → u64 dest, no cast
                     } else {
                         " as u64"
@@ -375,7 +373,7 @@ fn render_clear(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Result<()>
         ));
         for m in &set.metrics {
             let field_name = metric_field_name(&m.def.name);
-            match m.def.otap.recording_mode {
+            match m.def.recording_mode {
                 ir::RecordingMode::Counting | ir::RecordingMode::Histogram => {
                     out.push_str(&format!(
                         "                for c in {field_name}.iter_mut() {{ c.reset(); }}\n"
@@ -413,7 +411,7 @@ fn render_needs_flush(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Resu
         let mut checks = Vec::new();
         for m in &set.metrics {
             let field_name = metric_field_name(&m.def.name);
-            match m.def.otap.recording_mode {
+            match m.def.recording_mode {
                 ir::RecordingMode::Counting => {
                     let zero = if m.def.value_type == ir::ValueType::U64 { "0u64" } else { "0.0f64" };
                     checks.push(format!("{field_name}.iter().any(|c| c.get() != {zero})"));

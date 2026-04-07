@@ -33,7 +33,8 @@ pub struct AttributeDef {
     pub values: Vec<String>,
 }
 
-/// A metric set groups related metrics that share entity attributes.
+/// A metric set groups related metrics that share entity attributes
+/// and dimension attributes (which map to OTAP scopes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricSetDef {
     /// Identifier used for the generated Rust type (e.g., "node_consumer").
@@ -41,6 +42,9 @@ pub struct MetricSetDef {
     /// Short description.
     #[serde(default)]
     pub brief: String,
+    /// OTAP-specific level configuration (dimensions are per-set, not per-metric).
+    #[serde(rename = "x-otap")]
+    pub otap: SetOtapConfig,
     /// Individual metrics in this set.
     pub metrics: Vec<MetricDef>,
 }
@@ -61,9 +65,9 @@ pub struct MetricDef {
     /// Numeric value type.
     #[serde(default)]
     pub value_type: ValueType,
-    /// OTAP-specific extensions.
-    #[serde(rename = "x-otap")]
-    pub otap: OtapConfig,
+    /// Recording mode for this metric.
+    #[serde(default)]
+    pub recording_mode: RecordingMode,
 }
 
 /// Instrument archetype — the semantic kind of the metric.
@@ -100,6 +104,12 @@ pub enum RecordingMode {
     LastValue,
 }
 
+impl Default for RecordingMode {
+    fn default() -> Self {
+        Self::Counting
+    }
+}
+
 /// Interface style — how callers report values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,19 +126,12 @@ impl Default for InterfaceStyle {
     }
 }
 
-/// OTAP-specific metric configuration.
+/// OTAP-specific configuration at the metric set level.
+/// Dimensions are per-set (they map to OTAP scopes, shared by all metrics).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OtapConfig {
-    /// Interface style (delta or cumulative).
-    #[serde(default)]
-    pub interface: InterfaceStyle,
-    /// Recording mode.
-    pub recording_mode: RecordingMode,
-    /// Per-level configuration.
+pub struct SetOtapConfig {
+    /// Per-level dimension configuration.
     pub levels: LevelConfigs,
-    /// Optional view overrides.
-    #[serde(default)]
-    pub view: Option<ViewOverride>,
 }
 
 /// Per-level configuration for all three metric levels.
@@ -164,15 +167,11 @@ pub struct ViewOverride {
 
 // ── Computed fields for codegen ──────────────────────────────────────
 
-/// Resolved metric with computed layout information for code generation.
+/// Resolved metric — just wraps the definition (dimensions are per-set now).
 #[derive(Debug, Clone)]
 pub struct ResolvedMetric {
     /// The original metric definition.
     pub def: MetricDef,
-    /// Resolved dimensions with their cardinalities.
-    pub dimensions: Vec<ResolvedDimension>,
-    /// Per-level computed layouts.
-    pub levels: ResolvedLevels,
 }
 
 /// A dimension resolved against the attribute definitions.
@@ -188,7 +187,7 @@ pub struct ResolvedDimension {
     pub cardinality: usize,
 }
 
-/// Computed layouts for all three levels.
+/// Computed layouts for all three levels (per metric set).
 #[derive(Debug, Clone)]
 pub struct ResolvedLevels {
     pub basic: ResolvedLevelLayout,
@@ -200,10 +199,9 @@ pub struct ResolvedLevels {
 #[derive(Debug, Clone)]
 pub struct ResolvedLevelLayout {
     /// Which dimensions are active at this level (indices into
-    /// the metric's dimensions vec).
+    /// the set's dimensions vec).
     pub active_dimensions: Vec<usize>,
-    /// Total number of data points = product of active dimension cardinalities.
-    pub total_points: usize,
-    /// Histogram word count (0 = MMSC, >0 = ExpoHisto<N>).
-    pub histogram_size: usize,
+    /// Number of scopes = product of active dimension cardinalities.
+    /// Each scope is one unique combination of dimension values.
+    pub num_scopes: usize,
 }
