@@ -22,6 +22,8 @@ use otap_df_pdata::OtapArrowRecords;
 use otap_df_pdata::otap::Metrics;
 use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
+use otap_df_config::pipeline::telemetry::metrics::views::ViewConfig;
+
 use crate::error::Error;
 use crate::metrics::MetricValue;
 use crate::registry::{EntityKey, TelemetryRegistryHandle};
@@ -59,6 +61,8 @@ pub struct MetricsTap {
     metrics_sender: Option<flume::Sender<OtapMetricsPayload>>,
     /// Pipeline startup time for delta start_time_unix_nano.
     start_time_nanos: i64,
+    /// View configurations for metric renaming.
+    views: Vec<ViewConfig>,
 }
 
 impl MetricsTap {
@@ -67,6 +71,7 @@ impl MetricsTap {
         registry: TelemetryRegistryHandle,
         reporting_interval: std::time::Duration,
         resource_attrs: &[(&str, &str)],
+        views: Vec<ViewConfig>,
     ) -> Result<Self, Error> {
         let resource_attrs_batch = bridge::build_resource_attrs(resource_attrs)
             .map_err(|e| Error::MetricEncoding(e.to_string()))?;
@@ -85,6 +90,7 @@ impl MetricsTap {
             scope_cache: parking_lot::Mutex::new(HashMap::new()),
             metrics_sender: None,
             start_time_nanos,
+            views,
         })
     }
 
@@ -140,7 +146,7 @@ impl MetricsTap {
                 let desc_key = descriptor.name;
                 let mut desc_cache = self.descriptor_cache.lock();
                 if !desc_cache.contains_key(desc_key) {
-                    match bridge::descriptor_to_schema(descriptor) {
+                    match bridge::descriptor_to_schema_with_views(descriptor, &self.views) {
                         Ok(ds) => {
                             let _ = desc_cache.insert(
                                 desc_key,
@@ -355,6 +361,7 @@ mod tests {
             registry.clone(),
             std::time::Duration::from_secs(1),
             &[("service.name", "test")],
+            Vec::new(),
         )
         .expect("should create tap");
         (registry, tap)

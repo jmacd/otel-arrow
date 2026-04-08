@@ -25,6 +25,8 @@ use crate::descriptor::{
 use crate::metrics::MetricValue;
 use crate::self_metrics::precomputed::PrecomputedMetricSchema;
 
+use otap_df_config::pipeline::telemetry::metrics::views::ViewConfig;
+
 /// Whether a data point value should be added to the cumulative
 /// state or replace it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,46 +47,70 @@ pub struct DescriptorSchema {
 
 /// Build a [`PrecomputedMetricSchema`] from an existing `MetricsDescriptor`.
 ///
+/// Equivalent to `descriptor_to_schema_with_views(desc, &[])`.
+pub fn descriptor_to_schema(desc: &MetricsDescriptor) -> Result<DescriptorSchema, ArrowError> {
+    descriptor_to_schema_with_views(desc, &[])
+}
+
+/// Build a [`PrecomputedMetricSchema`] from an existing `MetricsDescriptor`,
+/// applying view transformations.
+///
 /// Each non-Mmsc field becomes one metric row and one data point.
 /// Each Mmsc field expands to 4 metrics: `_min` (gauge), `_max` (gauge),
 /// `_sum` (counter), `_count` (counter), matching the admin endpoint.
 ///
+/// Views are applied at init time: if a view selector matches
+/// `(descriptor.name, field.name)`, the stream's name and/or description
+/// replace the original values in the precomputed metrics table.
+///
 /// Resource and scope IDs are set to `Some(0)` — the caller must
 /// provide matching `ResourceAttrs` and `ScopeAttrs` child batches.
-pub fn descriptor_to_schema(desc: &MetricsDescriptor) -> Result<DescriptorSchema, ArrowError> {
+pub fn descriptor_to_schema_with_views(
+    desc: &MetricsDescriptor,
+    views: &[ViewConfig],
+) -> Result<DescriptorSchema, ArrowError> {
     let mut metrics_builder = MetricsRecordBatchBuilder::new();
     let mut parent_ids: Vec<u16> = Vec::new();
     let mut accumulation_modes: Vec<AccumulationMode> = Vec::new();
     let mut metric_id: u16 = 0;
 
     for field in desc.metrics.iter() {
+        // Find matching view for this (scope, instrument) pair.
+        let view = find_matching_view(views, desc.name, field.name);
+        let effective_name = view
+            .and_then(|v| v.stream.name.as_deref())
+            .unwrap_or(field.name);
+        let effective_description = view
+            .and_then(|v| v.stream.description.as_deref())
+            .unwrap_or(field.brief);
+
         match field.instrument {
             Instrument::Mmsc => {
                 // Expand Mmsc into 4 separate metrics.
                 let sub_metrics = [
                     (
-                        format!("{}.min", field.name),
+                        format!("{effective_name}.min"),
                         MetricType::Gauge,
                         None,
                         None,
                         AccumulationMode::Replace,
                     ),
                     (
-                        format!("{}.max", field.name),
+                        format!("{effective_name}.max"),
                         MetricType::Gauge,
                         None,
                         None,
                         AccumulationMode::Replace,
                     ),
                     (
-                        format!("{}.sum", field.name),
+                        format!("{effective_name}.sum"),
                         MetricType::Sum,
                         Some(AggregationTemporality::Cumulative as i32),
                         Some(true),
                         AccumulationMode::Add,
                     ),
                     (
-                        format!("{}.count", field.name),
+                        format!("{effective_name}.count"),
                         MetricType::Sum,
                         Some(AggregationTemporality::Cumulative as i32),
                         Some(true),
@@ -96,7 +122,7 @@ pub fn descriptor_to_schema(desc: &MetricsDescriptor) -> Result<DescriptorSchema
                     metrics_builder.append_id(metric_id);
                     metrics_builder.append_metric_type(*metric_type as u8);
                     metrics_builder.append_name(name.as_bytes());
-                    metrics_builder.append_description(field.brief.as_bytes());
+                    metrics_builder.append_description(effective_description.as_bytes());
                     metrics_builder.append_unit(field.unit.as_bytes());
                     metrics_builder.append_aggregation_temporality(*temporality);
                     metrics_builder.append_is_monotonic(*monotonic);
@@ -114,8 +140,8 @@ pub fn descriptor_to_schema(desc: &MetricsDescriptor) -> Result<DescriptorSchema
             _ => {
                 metrics_builder.append_id(metric_id);
                 metrics_builder.append_metric_type(instrument_to_metric_type(field) as u8);
-                metrics_builder.append_name(field.name.as_bytes());
-                metrics_builder.append_description(field.brief.as_bytes());
+                metrics_builder.append_name(effective_name.as_bytes());
+                metrics_builder.append_description(effective_description.as_bytes());
                 metrics_builder.append_unit(field.unit.as_bytes());
                 metrics_builder
                     .append_aggregation_temporality(field_aggregation_temporality(field));
@@ -243,6 +269,30 @@ pub fn descriptor_is_all_int(desc: &MetricsDescriptor) -> bool {
     desc.metrics
         .iter()
         .all(|f| f.value_type == MetricValueType::U64)
+}
+
+/// Find a matching view for a given scope name and instrument name.
+///
+/// Returns the first view whose selector matches. A selector field
+/// that is `None` matches any value (wildcard).
+fn find_matching_view<'a>(
+    views: &'a [ViewConfig],
+    scope_name: &str,
+    instrument_name: &str,
+) -> Option<&'a ViewConfig> {
+    views.iter().find(|v| {
+        let scope_ok = v
+            .selector
+            .scope_name
+            .as_ref()
+            .is_none_or(|s| s == scope_name);
+        let name_ok = v
+            .selector
+            .instrument_name
+            .as_ref()
+            .is_none_or(|n| n == instrument_name);
+        scope_ok && name_ok
+    })
 }
 
 fn instrument_to_metric_type(field: &MetricsField) -> MetricType {
@@ -438,5 +488,156 @@ mod tests {
     fn descriptor_is_all_int_check() {
         let desc = test_descriptor();
         assert!(descriptor_is_all_int(desc));
+    }
+
+    #[test]
+    fn view_renames_metric() {
+        use otap_df_config::pipeline::telemetry::metrics::views::{
+            MetricSelector, MetricStream, ViewConfig,
+        };
+
+        let desc = test_descriptor();
+        let views = vec![ViewConfig {
+            selector: MetricSelector {
+                scope_name: Some("test.metrics".to_string()),
+                instrument_name: Some("items.received".to_string()),
+            },
+            stream: MetricStream {
+                name: Some("http.requests.total".to_string()),
+                description: Some("Total HTTP requests".to_string()),
+            },
+        }];
+
+        let ds = descriptor_to_schema_with_views(desc, &views).expect("should build");
+
+        // 3 metrics, same as without views.
+        assert_eq!(ds.schema.metrics_batch().num_rows(), 3);
+
+        // Verify the first metric was renamed via OpenMetrics output.
+        let mut acc = crate::self_metrics::accumulator::CumulativeAccumulator::new();
+        acc.register_schema("test", ds.schema.clone());
+        let dp = ds
+            .schema
+            .data_points_builder()
+            .build_int_values(1_000_000_000, 2_000_000_000, &[10, 5, 3])
+            .unwrap();
+        acc.ingest_delta(
+            crate::self_metrics::accumulator::MetricIdentity {
+                schema_key: "test",
+                entity_key: crate::registry::EntityKey::default(),
+            },
+            &dp,
+        )
+        .unwrap();
+        let text = crate::self_metrics::openmetrics::format_openmetrics(&acc.snapshot());
+
+        // Renamed metric.
+        assert!(text.contains("http_requests_total_total 10"));
+        assert!(text.contains("Total HTTP requests"));
+        // Unrenamed metrics still present.
+        assert!(text.contains("items_sent_total 5"));
+        assert!(text.contains("queue_size 3"));
+    }
+
+    #[test]
+    fn view_renames_mmsc_metric() {
+        use otap_df_config::pipeline::telemetry::metrics::views::{
+            MetricSelector, MetricStream, ViewConfig,
+        };
+
+        static DESC: MetricsDescriptor = MetricsDescriptor {
+            name: "test.mmsc",
+            metrics: &[MetricsField {
+                name: "latency",
+                unit: "ms",
+                brief: "Latency",
+                instrument: Instrument::Mmsc,
+                temporality: Some(Temporality::Delta),
+                value_type: MetricValueType::F64,
+            }],
+        };
+
+        let views = vec![ViewConfig {
+            selector: MetricSelector {
+                scope_name: None,
+                instrument_name: Some("latency".to_string()),
+            },
+            stream: MetricStream {
+                name: Some("process_duration".to_string()),
+                description: Some("Processing duration".to_string()),
+            },
+        }];
+
+        let ds = descriptor_to_schema_with_views(&DESC, &views).expect("should build");
+        // Mmsc expands to 4 sub-metrics with renamed base.
+        assert_eq!(ds.schema.metrics_batch().num_rows(), 4);
+
+        let mut acc = crate::self_metrics::accumulator::CumulativeAccumulator::new();
+        acc.register_schema("test", ds.schema.clone());
+        let dp = ds
+            .schema
+            .data_points_builder()
+            .build_int_values(1_000_000_000, 2_000_000_000, &[1, 10, 55, 10])
+            .unwrap();
+        acc.ingest_delta(
+            crate::self_metrics::accumulator::MetricIdentity {
+                schema_key: "test",
+                entity_key: crate::registry::EntityKey::default(),
+            },
+            &dp,
+        )
+        .unwrap();
+        let text = crate::self_metrics::openmetrics::format_openmetrics(&acc.snapshot());
+
+        assert!(text.contains("process_duration_min"));
+        assert!(text.contains("process_duration_max"));
+        assert!(text.contains("process_duration_sum"));
+        assert!(text.contains("process_duration_count"));
+        assert!(text.contains("Processing duration"));
+        // Original name should NOT appear.
+        assert!(!text.contains("latency_min"));
+    }
+
+    #[test]
+    fn view_wildcard_scope_matches_any() {
+        use otap_df_config::pipeline::telemetry::metrics::views::{
+            MetricSelector, MetricStream, ViewConfig,
+        };
+
+        let desc = test_descriptor();
+        let views = vec![ViewConfig {
+            selector: MetricSelector {
+                scope_name: None, // wildcard
+                instrument_name: Some("queue.size".to_string()),
+            },
+            stream: MetricStream {
+                name: Some("buffer.depth".to_string()),
+                description: None, // keep original
+            },
+        }];
+
+        let ds = descriptor_to_schema_with_views(desc, &views).expect("should build");
+
+        let mut acc = crate::self_metrics::accumulator::CumulativeAccumulator::new();
+        acc.register_schema("test", ds.schema.clone());
+        let dp = ds
+            .schema
+            .data_points_builder()
+            .build_int_values(1_000_000_000, 2_000_000_000, &[10, 5, 3])
+            .unwrap();
+        acc.ingest_delta(
+            crate::self_metrics::accumulator::MetricIdentity {
+                schema_key: "test",
+                entity_key: crate::registry::EntityKey::default(),
+            },
+            &dp,
+        )
+        .unwrap();
+        let text = crate::self_metrics::openmetrics::format_openmetrics(&acc.snapshot());
+
+        assert!(text.contains("buffer_depth"));
+        // Original description preserved.
+        assert!(text.contains("Current queue depth"));
+        assert!(!text.contains("queue_size"));
     }
 }
