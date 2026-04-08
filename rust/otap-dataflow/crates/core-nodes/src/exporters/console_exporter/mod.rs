@@ -21,11 +21,19 @@ use otap_df_engine::{ConsumerEffectHandlerExtension, ExporterFactory};
 use otap_df_otap::OTAP_EXPORTER_FACTORIES;
 use otap_df_otap::pdata::OtapPdata;
 use otap_df_pdata::OtapPayload;
+use otap_df_pdata::otlp::OtlpProtoBytes;
 use otap_df_pdata::views::otap::OtapLogsView;
+use otap_df_pdata::views::otap::OtapMetricsView;
 use otap_df_pdata::views::otlp::bytes::logs::RawLogsData;
-use otap_df_pdata_views::views::common::InstrumentationScopeView;
+use otap_df_pdata::views::otlp::bytes::metrics::RawMetricsData;
+use otap_df_pdata_views::views::common::{AnyValueView, AttributeView, InstrumentationScopeView};
 use otap_df_pdata_views::views::logs::{
     LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView,
+};
+use otap_df_pdata_views::views::metrics::{
+    BucketsView, DataType, DataView, ExponentialHistogramDataPointView,
+    ExponentialHistogramView, GaugeView, MetricView, MetricsView, NumberDataPointView,
+    ResourceMetricsView, ScopeMetricsView, SumView, Value,
 };
 use otap_df_pdata_views::views::resource::ResourceView;
 use otap_df_telemetry::otel_error;
@@ -157,12 +165,22 @@ impl ConsoleExporter {
         );
     }
 
-    async fn export_metrics(&self, _payload: &OtapPayload) {
-        // TODO: Implement metrics formatting.
-        otel_error!(
-            "console.metrics.not_implemented",
-            message = "Metrics formatting not yet implemented"
-        );
+    async fn export_metrics(&self, payload: &OtapPayload) {
+        match payload {
+            OtapPayload::OtlpBytes(OtlpProtoBytes::ExportMetricsRequest(data)) => {
+                let metrics_view = RawMetricsData::new(data);
+                self.formatter.print_metrics_data(&metrics_view).await;
+            }
+            OtapPayload::OtapArrowRecords(records) => match OtapMetricsView::try_from(records) {
+                Ok(metrics_view) => {
+                    self.formatter.print_metrics_data(&metrics_view).await;
+                }
+                Err(e) => {
+                    otel_error!("console.metrics_view.otap_create_failed", error = ?e, message = "Failed to create OTAP metrics view");
+                }
+            },
+            _ => {}
+        }
     }
 }
 
@@ -381,6 +399,225 @@ impl HierarchicalFormatter {
                 |_| {}, // No line suffix (scope printed above).
             );
         });
+    }
+
+    // ─── Metrics formatting ────────────────────────────────────────
+
+    /// Format and print metrics data to stdout.
+    pub async fn print_metrics_data<M: MetricsView>(&self, metrics_data: &M) {
+        let mut output = Vec::new();
+        for resource_metrics in metrics_data.resources() {
+            self.format_resource_metrics(&resource_metrics, &mut output);
+        }
+        use tokio::io::AsyncWriteExt;
+        if let Err(err) = tokio::io::stdout().write_all(&output).await {
+            otel_error!("console.write_failed", error = ?err, message = "Could not write to console");
+        }
+    }
+
+    fn format_resource_metrics<R: ResourceMetricsView>(
+        &self,
+        rm: &R,
+        output: &mut Vec<u8>,
+    ) {
+        self.format_line(output, |w| {
+            w.format_header_line(
+                None,
+                rm.resource().iter().flat_map(|r| r.attributes()),
+                |w| {
+                    w.write_styled(AnsiCode::Cyan, |w| {
+                        let _ = w.write_all(b"RESOURCE");
+                    });
+                    let _ = w.write_all(b"   ");
+                },
+                |w| {
+                    let _ = w.write_all(b"v1.Resource");
+                },
+                |_| {},
+            );
+        });
+        for sm in rm.scopes() {
+            self.format_scope_metrics(&sm, output);
+        }
+    }
+
+    fn format_scope_metrics<S: ScopeMetricsView>(&self, sm: &S, output: &mut Vec<u8>) {
+        let tree = self.tree;
+        let scope = sm.scope();
+        let name = scope.as_ref().and_then(|s| s.name());
+        self.format_line(output, |w| {
+            w.format_header_line(
+                None,
+                scope.iter().flat_map(|s| s.attributes()),
+                |w| {
+                    let _ = w.write_all(tree.vertical.as_bytes());
+                    let _ = w.write_all(b" ");
+                    w.write_styled(AnsiCode::Magenta, |w| {
+                        let _ = w.write_all(b"SCOPE");
+                    });
+                    let _ = w.write_all(b"    ");
+                },
+                |w| {
+                    if let Some(n) = name {
+                        let _ = w.write_all(n);
+                    } else {
+                        let _ = w.write_all(b"v1.InstrumentationScope");
+                    }
+                },
+                |_| {},
+            );
+        });
+        let mut iter = sm.metrics().peekable();
+        while let Some(metric) = iter.next() {
+            let is_last = iter.peek().is_none();
+            self.format_metric_entry(&metric, is_last, output);
+        }
+    }
+
+    fn format_metric_entry<V: MetricView>(&self, metric: &V, is_last: bool, output: &mut Vec<u8>) {
+        let tree = self.tree;
+        let connector = if is_last { tree.corner } else { tree.tee };
+        let child_prefix = if is_last { "  " } else { tree.vertical };
+
+        let data = metric.data();
+        let type_label = match data.as_ref().map(|d| d.value_type()) {
+            Some(DataType::Sum) => "SUM",
+            Some(DataType::Gauge) => "GAUGE",
+            Some(DataType::Histogram) => "HISTO",
+            Some(DataType::ExponentialHistogram) => "EXPHISTO",
+            Some(DataType::Summary) => "SUMMARY",
+            None => "METRIC",
+        };
+
+        self.format_line(output, |w| {
+            let _ = w.write_all(tree.vertical.as_bytes());
+            let _ = w.write_all(b" ");
+            let _ = w.write_all(connector.as_bytes());
+            let _ = w.write_all(b" ");
+            w.write_styled(AnsiCode::Green, |w| {
+                let _ = w.write_all(type_label.as_bytes());
+            });
+            let _ = w.write_all(b" ");
+            let _ = w.write_all(metric.name());
+            let unit = metric.unit();
+            if !unit.is_empty() {
+                let _ = w.write_all(b" (");
+                let _ = w.write_all(unit);
+                let _ = w.write_all(b")");
+            }
+            let _ = w.write_all(b"\n");
+        });
+
+        if let Some(data) = data {
+            match data.value_type() {
+                DataType::Sum => {
+                    if let Some(sum) = data.as_sum() {
+                        for dp in sum.data_points() {
+                            self.format_number_dp(&dp, child_prefix, output);
+                        }
+                    }
+                }
+                DataType::Gauge => {
+                    if let Some(gauge) = data.as_gauge() {
+                        for dp in gauge.data_points() {
+                            self.format_number_dp(&dp, child_prefix, output);
+                        }
+                    }
+                }
+                DataType::ExponentialHistogram => {
+                    if let Some(eh) = data.as_exponential_histogram() {
+                        for dp in eh.data_points() {
+                            self.format_exp_histo_dp(&dp, child_prefix, output);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn format_number_dp<D: NumberDataPointView>(&self, dp: &D, prefix: &str, output: &mut Vec<u8>) {
+        let tree = self.tree;
+        self.format_line(output, |w| {
+            let _ = w.write_all(tree.vertical.as_bytes());
+            let _ = w.write_all(b" ");
+            let _ = w.write_all(prefix.as_bytes());
+            let _ = w.write_all(b"   ");
+            match dp.value() {
+                Some(Value::Integer(v)) => {
+                    let _ = write!(w, "{v}");
+                }
+                Some(Value::Double(v)) => {
+                    let _ = write!(w, "{v:.3}");
+                }
+                None => {
+                    let _ = w.write_all(b"-");
+                }
+            }
+            Self::write_dp_attrs(w, dp.attributes());
+            let _ = w.write_all(b"\n");
+        });
+    }
+
+    fn format_exp_histo_dp<D: ExponentialHistogramDataPointView>(
+        &self,
+        dp: &D,
+        prefix: &str,
+        output: &mut Vec<u8>,
+    ) {
+        let tree = self.tree;
+        self.format_line(output, |w| {
+            let _ = w.write_all(tree.vertical.as_bytes());
+            let _ = w.write_all(b" ");
+            let _ = w.write_all(prefix.as_bytes());
+            let _ = w.write_all(b"   ");
+            let _ = write!(
+                w, "n={} sum={:.3} min={:.3} max={:.3} s={} z={}",
+                dp.count(),
+                dp.sum().unwrap_or(0.0),
+                dp.min().unwrap_or(0.0),
+                dp.max().unwrap_or(0.0),
+                dp.scale(),
+                dp.zero_count(),
+            );
+            if let Some(pos) = dp.positive() {
+                let counts: Vec<u64> = pos.bucket_counts().collect();
+                if !counts.is_empty() {
+                    let _ = write!(w, " +[off={},n={:?}]", pos.offset(), counts);
+                }
+            }
+            Self::write_dp_attrs(w, dp.attributes());
+            let _ = w.write_all(b"\n");
+        });
+    }
+
+    /// Write attribute key=value pairs inline as `[k=v, k=v]`.
+    fn write_dp_attrs(w: &mut StyledBufWriter<'_>, attrs: impl Iterator<Item = impl AttributeView>) {
+        let mut first = true;
+        for attr in attrs {
+            if first {
+                let _ = w.write_all(b" [");
+                first = false;
+            } else {
+                let _ = w.write_all(b", ");
+            }
+            let _ = w.write_all(attr.key());
+            let _ = w.write_all(b"=");
+            if let Some(val) = attr.value() {
+                if let Some(s) = val.as_string() {
+                    let _ = w.write_all(s);
+                } else if let Some(i) = val.as_int64() {
+                    let _ = write!(w, "{i}");
+                } else if let Some(d) = val.as_double() {
+                    let _ = write!(w, "{d}");
+                } else if let Some(b) = val.as_bool() {
+                    let _ = write!(w, "{b}");
+                }
+            }
+        }
+        if !first {
+            let _ = w.write_all(b"]");
+        }
     }
 
     /// Format a line to the output buffer.
