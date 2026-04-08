@@ -147,6 +147,10 @@ pub struct InternalTelemetrySettings {
     pub registry: TelemetryRegistryHandle,
     /// Optional retained-log sink shared with admin consumers.
     pub log_tap: Option<log_tap::InternalLogTapHandle>,
+    /// OTAP-native metric set collectors for the internal metrics SDK.
+    /// Each collector snapshots, encodes, and clears one metric set per tick.
+    pub otap_metrics_collectors:
+        Arc<parking_lot::Mutex<Vec<Box<dyn self_metrics::collector::DynMetricSetCollector>>>>,
 }
 
 impl std::fmt::Debug for InternalTelemetrySettings {
@@ -276,6 +280,7 @@ impl InternalTelemetrySystem {
                     resource_bytes,
                     registry: telemetry_registry.clone(),
                     log_tap: log_tap_handle.clone(),
+                    otap_metrics_collectors: Arc::new(parking_lot::Mutex::new(Vec::new())),
                 }),
             )
         } else {

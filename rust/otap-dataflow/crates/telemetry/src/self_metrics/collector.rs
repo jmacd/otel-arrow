@@ -141,3 +141,26 @@ impl<M: CollectableMetrics> MetricSetCollector<M> {
         Ok(result)
     }
 }
+
+/// Trait-object-safe interface for collecting metrics from any metric set.
+///
+/// Used by the Internal Telemetry Receiver to collect from heterogeneous
+/// metric set types without knowing their concrete type.
+pub trait DynMetricSetCollector: Send {
+    /// Snapshot, encode, and clear. Returns `None` if all zeros.
+    fn collect(
+        &mut self,
+        start_time_ns: i64,
+        time_ns: i64,
+    ) -> Result<Option<EncodedMetrics>, ArrowError>;
+}
+
+impl<M: CollectableMetrics> DynMetricSetCollector for MetricSetCollector<M> {
+    fn collect(
+        &mut self,
+        start_time_ns: i64,
+        time_ns: i64,
+    ) -> Result<Option<EncodedMetrics>, ArrowError> {
+        self.collect(start_time_ns, time_ns)
+    }
+}

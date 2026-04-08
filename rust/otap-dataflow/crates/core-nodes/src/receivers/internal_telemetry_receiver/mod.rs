@@ -25,6 +25,7 @@ use otap_df_pdata::OtlpProtoBytes;
 use otap_df_pdata::otlp::ProtoBuffer;
 use otap_df_telemetry::event::{LogEvent, ObservedEvent};
 use otap_df_telemetry::metrics::MetricSetSnapshot;
+use otap_df_telemetry::otel_error;
 use otap_df_telemetry::self_tracing::{ScopeToBytesMap, encode_export_logs_request};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -150,7 +151,33 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                             return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
                         }
                         Ok(NodeControlMsg::CollectTelemetry { .. }) => {
-                            // No metrics to report for now
+                            // Collect OTAP-native metrics from registered collectors.
+                            let now_ns = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos() as i64;
+                            let mut collectors = self.internal_telemetry.otap_metrics_collectors.lock();
+                            for collector in collectors.iter_mut() {
+                                match collector.collect(0, now_ns) {
+                                    Ok(Some(encoded)) => {
+                                        match otap_df_telemetry::self_metrics::assembly::assemble_metrics_payload(encoded) {
+                                            Ok(otap_records) => {
+                                                let pdata = OtapPdata::new(Context::default(), otap_records.into());
+                                                if let Err(e) = effect_handler.send_message(pdata).await {
+                                                    otel_error!("itr.metrics.send_failed", error = ?e, message = "Failed to send metrics");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                otel_error!("itr.metrics.assemble_failed", error = ?e, message = "Failed to assemble metrics");
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {} // No data to report.
+                                    Err(e) => {
+                                        otel_error!("itr.metrics.collect_failed", error = ?e, message = "Failed to collect metrics");
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             return Err(Error::ChannelRecvError(e));
