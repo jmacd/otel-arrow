@@ -24,6 +24,7 @@
 pub mod assembly;
 pub mod collector;
 pub mod dimension;
+pub mod edp_encoder;
 /// Generated metric set types — do not edit manually.
 #[allow(missing_docs)]
 pub mod generated;
