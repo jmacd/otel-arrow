@@ -41,8 +41,12 @@ pub enum AccumulationMode {
 pub struct DescriptorSchema {
     /// The precomputed OTAP schema.
     pub schema: PrecomputedMetricSchema,
-    /// Per-data-point accumulation mode (same length as total_points).
+    /// Per-NumberDataPoint accumulation mode.
     pub accumulation_modes: Vec<AccumulationMode>,
+    /// Indices into the original descriptor fields that are Mmsc (histogram).
+    pub histogram_field_indices: Vec<usize>,
+    /// Indices into the original descriptor fields that are non-Mmsc (number).
+    pub number_field_indices: Vec<usize>,
 }
 
 /// Build a [`PrecomputedMetricSchema`] from an existing `MetricsDescriptor`.
@@ -55,9 +59,10 @@ pub fn descriptor_to_schema(desc: &MetricsDescriptor) -> Result<DescriptorSchema
 /// Build a [`PrecomputedMetricSchema`] from an existing `MetricsDescriptor`,
 /// applying view transformations.
 ///
-/// Each non-Mmsc field becomes one metric row and one data point.
-/// Each Mmsc field expands to 4 metrics: `_min` (gauge), `_max` (gauge),
-/// `_sum` (counter), `_count` (counter), matching the admin endpoint.
+/// Each non-Mmsc field becomes one metric row and one NumberDataPoint.
+/// Each Mmsc field becomes one metric row (MetricType::Histogram) and
+/// one HistogramDataPoint with empty explicit bounds, carrying
+/// min/max/sum/count — matching the original OTel SDK behavior.
 ///
 /// Views are applied at init time: if a view selector matches
 /// `(descriptor.name, field.name)`, the stream's name and/or description
@@ -70,11 +75,14 @@ pub fn descriptor_to_schema_with_views(
     views: &[ViewConfig],
 ) -> Result<DescriptorSchema, ArrowError> {
     let mut metrics_builder = MetricsRecordBatchBuilder::new();
-    let mut parent_ids: Vec<u16> = Vec::new();
+    let mut number_parent_ids: Vec<u16> = Vec::new();
+    let mut histogram_parent_ids: Vec<u16> = Vec::new();
     let mut accumulation_modes: Vec<AccumulationMode> = Vec::new();
+    let mut number_field_indices: Vec<usize> = Vec::new();
+    let mut histogram_field_indices: Vec<usize> = Vec::new();
     let mut metric_id: u16 = 0;
 
-    for field in desc.metrics.iter() {
+    for (field_idx, field) in desc.metrics.iter().enumerate() {
         // Find matching view for this (scope, instrument) pair.
         let view = find_matching_view(views, desc.name, field.name);
         let effective_name = view
@@ -86,56 +94,25 @@ pub fn descriptor_to_schema_with_views(
 
         match field.instrument {
             Instrument::Mmsc => {
-                // Expand Mmsc into 4 separate metrics.
-                let sub_metrics = [
-                    (
-                        format!("{effective_name}.min"),
-                        MetricType::Gauge,
-                        None,
-                        None,
-                        AccumulationMode::Replace,
-                    ),
-                    (
-                        format!("{effective_name}.max"),
-                        MetricType::Gauge,
-                        None,
-                        None,
-                        AccumulationMode::Replace,
-                    ),
-                    (
-                        format!("{effective_name}.sum"),
-                        MetricType::Sum,
-                        Some(AggregationTemporality::Cumulative as i32),
-                        Some(true),
-                        AccumulationMode::Add,
-                    ),
-                    (
-                        format!("{effective_name}.count"),
-                        MetricType::Sum,
-                        Some(AggregationTemporality::Cumulative as i32),
-                        Some(true),
-                        AccumulationMode::Add,
-                    ),
-                ];
+                // Single histogram metric row with empty explicit bounds.
+                metrics_builder.append_id(metric_id);
+                metrics_builder.append_metric_type(MetricType::Histogram as u8);
+                metrics_builder.append_name(effective_name.as_bytes());
+                metrics_builder.append_description(effective_description.as_bytes());
+                metrics_builder.append_unit(field.unit.as_bytes());
+                metrics_builder.append_aggregation_temporality(Some(
+                    AggregationTemporality::Delta as i32,
+                ));
+                metrics_builder.append_is_monotonic(None);
+                metrics_builder.resource.append_id(Some(0));
+                metrics_builder.scope.append_id(Some(0));
+                metrics_builder
+                    .scope
+                    .append_name(Some(desc.name.as_bytes()));
 
-                for (name, metric_type, temporality, monotonic, mode) in &sub_metrics {
-                    metrics_builder.append_id(metric_id);
-                    metrics_builder.append_metric_type(*metric_type as u8);
-                    metrics_builder.append_name(name.as_bytes());
-                    metrics_builder.append_description(effective_description.as_bytes());
-                    metrics_builder.append_unit(field.unit.as_bytes());
-                    metrics_builder.append_aggregation_temporality(*temporality);
-                    metrics_builder.append_is_monotonic(*monotonic);
-                    metrics_builder.resource.append_id(Some(0));
-                    metrics_builder.scope.append_id(Some(0));
-                    metrics_builder
-                        .scope
-                        .append_name(Some(desc.name.as_bytes()));
-
-                    parent_ids.push(metric_id);
-                    accumulation_modes.push(*mode);
-                    metric_id += 1;
-                }
+                histogram_parent_ids.push(metric_id);
+                histogram_field_indices.push(field_idx);
+                metric_id += 1;
             }
             _ => {
                 metrics_builder.append_id(metric_id);
@@ -152,14 +129,16 @@ pub fn descriptor_to_schema_with_views(
                     .scope
                     .append_name(Some(desc.name.as_bytes()));
 
-                parent_ids.push(metric_id);
+                number_parent_ids.push(metric_id);
                 accumulation_modes.push(field_accumulation_mode(field));
+                number_field_indices.push(field_idx);
                 metric_id += 1;
             }
         }
     }
 
-    let total_points = parent_ids.len();
+    let total_number_points = number_parent_ids.len();
+    let total_histogram_points = histogram_parent_ids.len();
     let metrics_batch = metrics_builder.finish()?;
 
     let mut attrs_builder = AttributesRecordBatchBuilder::<u32>::new();
@@ -169,10 +148,14 @@ pub fn descriptor_to_schema_with_views(
         schema: PrecomputedMetricSchema::from_parts(
             metrics_batch,
             attrs_batch,
-            total_points,
-            parent_ids,
+            total_number_points,
+            number_parent_ids,
+            total_histogram_points,
+            histogram_parent_ids,
         ),
         accumulation_modes,
+        histogram_field_indices,
+        number_field_indices,
     })
 }
 
@@ -230,31 +213,45 @@ pub fn build_scope_attrs_from_entity(
     builder.finish()
 }
 
-/// Extract values from a `MetricValue` slice, expanding Mmsc fields.
+/// Extract non-Mmsc values from a `MetricValue` slice.
 ///
-/// Mmsc values expand to 4 data points (min, max, sum, count).
-/// All values are mapped to `i64` for the NumberDataPoints `int_value`
-/// column.
+/// Only includes fields at the given indices. All values are mapped
+/// to `i64` for the NumberDataPoints `int_value` column.
 #[must_use]
-pub fn expand_snapshot(desc: &MetricsDescriptor, values: &[MetricValue]) -> Vec<i64> {
-    let mut result = Vec::new();
-    for (field, value) in desc.metrics.iter().zip(values.iter()) {
-        match (field.instrument, value) {
-            (Instrument::Mmsc, MetricValue::Mmsc(s)) => {
-                result.push(s.min as i64);
-                result.push(s.max as i64);
-                result.push(s.sum as i64);
-                result.push(s.count as i64);
-            }
-            (Instrument::Mmsc, _) => {
-                result.extend_from_slice(&[0, 0, 0, 0]);
-            }
-            (_, MetricValue::U64(n)) => result.push(*n as i64),
-            (_, MetricValue::F64(n)) => result.push(*n as i64),
-            (_, MetricValue::Mmsc(s)) => result.push(s.sum as i64),
-        }
-    }
-    result
+pub fn expand_number_snapshot(
+    values: &[MetricValue],
+    number_field_indices: &[usize],
+) -> Vec<i64> {
+    number_field_indices
+        .iter()
+        .map(|&i| match &values[i] {
+            MetricValue::U64(n) => *n as i64,
+            MetricValue::F64(n) => *n as i64,
+            MetricValue::Mmsc(s) => s.sum as i64,
+        })
+        .collect()
+}
+
+/// Extract Mmsc values from a `MetricValue` slice as `MmscSnapshot`s.
+///
+/// Only includes fields at the given indices.
+#[must_use]
+pub fn expand_histogram_snapshot(
+    values: &[MetricValue],
+    histogram_field_indices: &[usize],
+) -> Vec<crate::instrument::MmscSnapshot> {
+    histogram_field_indices
+        .iter()
+        .map(|&i| match &values[i] {
+            MetricValue::Mmsc(s) => *s,
+            _ => crate::instrument::MmscSnapshot {
+                min: 0.0,
+                max: 0.0,
+                sum: 0.0,
+                count: 0,
+            },
+        })
+        .collect()
 }
 
 /// Returns true if all values in the snapshot are zero.
@@ -377,7 +374,7 @@ mod tests {
         let desc = test_descriptor();
         let ds = descriptor_to_schema(desc).expect("should build schema");
 
-        assert_eq!(ds.schema.total_points(), 3);
+        assert_eq!(ds.schema.total_number_points(), 3);
         assert_eq!(ds.schema.metrics_batch().num_rows(), 3);
         assert_eq!(ds.schema.attrs_batch().num_rows(), 0);
         assert_eq!(ds.accumulation_modes[0], AccumulationMode::Add);
@@ -396,7 +393,7 @@ mod tests {
             MetricValue::U64(95),
             MetricValue::U64(5),
         ];
-        let int_values = expand_snapshot(desc, &values);
+        let int_values = expand_number_snapshot(&values, &ds.number_field_indices);
 
         let batch = builder
             .build_int_values_i64(1_000_000_000, 2_000_000_000, &int_values)
@@ -406,29 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_snapshot_with_mmsc() {
-        static DESC: MetricsDescriptor = MetricsDescriptor {
-            name: "test.mixed",
-            metrics: &[
-                MetricsField {
-                    name: "items",
-                    unit: "{item}",
-                    brief: "Items",
-                    instrument: Instrument::Counter,
-                    temporality: Some(Temporality::Delta),
-                    value_type: MetricValueType::U64,
-                },
-                MetricsField {
-                    name: "latency",
-                    unit: "ms",
-                    brief: "Latency",
-                    instrument: Instrument::Mmsc,
-                    temporality: Some(Temporality::Delta),
-                    value_type: MetricValueType::F64,
-                },
-            ],
-        };
-
+    fn expand_snapshot_splits_number_and_histogram() {
         let values = vec![
             MetricValue::U64(42),
             MetricValue::Mmsc(crate::instrument::MmscSnapshot {
@@ -438,12 +413,18 @@ mod tests {
                 count: 10,
             }),
         ];
-        let expanded = expand_snapshot(&DESC, &values);
-        assert_eq!(expanded, vec![42, 1, 10, 55, 10]);
+        // Counter at index 0, Mmsc at index 1.
+        let number_vals = expand_number_snapshot(&values, &[0]);
+        assert_eq!(number_vals, vec![42]);
+
+        let hist_vals = expand_histogram_snapshot(&values, &[1]);
+        assert_eq!(hist_vals.len(), 1);
+        assert_eq!(hist_vals[0].count, 10);
+        assert_eq!(hist_vals[0].sum, 55.0);
     }
 
     #[test]
-    fn mmsc_schema_expansion() {
+    fn mmsc_schema_produces_histogram_metric() {
         static DESC: MetricsDescriptor = MetricsDescriptor {
             name: "test.mmsc",
             metrics: &[MetricsField {
@@ -457,12 +438,12 @@ mod tests {
         };
 
         let ds = descriptor_to_schema(&DESC).expect("should build");
-        assert_eq!(ds.schema.metrics_batch().num_rows(), 4);
-        assert_eq!(ds.schema.total_points(), 4);
-        assert_eq!(ds.accumulation_modes[0], AccumulationMode::Replace);
-        assert_eq!(ds.accumulation_modes[1], AccumulationMode::Replace);
-        assert_eq!(ds.accumulation_modes[2], AccumulationMode::Add);
-        assert_eq!(ds.accumulation_modes[3], AccumulationMode::Add);
+        // 1 Mmsc field → 1 histogram metric row, 0 number points, 1 histogram point.
+        assert_eq!(ds.schema.metrics_batch().num_rows(), 1);
+        assert_eq!(ds.schema.total_number_points(), 0);
+        assert_eq!(ds.schema.total_histogram_points(), 1);
+        assert_eq!(ds.number_field_indices, vec![] as Vec<usize>);
+        assert_eq!(ds.histogram_field_indices, vec![0]);
     }
 
     #[test]
@@ -569,33 +550,24 @@ mod tests {
         }];
 
         let ds = descriptor_to_schema_with_views(&DESC, &views).expect("should build");
-        // Mmsc expands to 4 sub-metrics with renamed base.
-        assert_eq!(ds.schema.metrics_batch().num_rows(), 4);
+        // Mmsc becomes 1 histogram metric row.
+        assert_eq!(ds.schema.metrics_batch().num_rows(), 1);
+        assert_eq!(ds.schema.total_number_points(), 0);
+        assert_eq!(ds.schema.total_histogram_points(), 1);
 
-        let mut acc = crate::self_metrics::accumulator::CumulativeAccumulator::new();
-        acc.register_schema("test", ds.schema.clone());
-        let dp = ds
+        // Build a histogram data point to verify the builder works.
+        let snap = crate::instrument::MmscSnapshot {
+            min: 1.0,
+            max: 10.0,
+            sum: 55.0,
+            count: 10,
+        };
+        let hdp = ds
             .schema
-            .data_points_builder()
-            .build_int_values(1_000_000_000, 2_000_000_000, &[1, 10, 55, 10])
+            .histogram_data_points_builder()
+            .build(1_000_000_000, 2_000_000_000, &[snap])
             .unwrap();
-        acc.ingest_delta(
-            crate::self_metrics::accumulator::MetricIdentity {
-                schema_key: "test",
-                entity_key: crate::registry::EntityKey::default(),
-            },
-            &dp,
-        )
-        .unwrap();
-        let text = crate::self_metrics::openmetrics::format_openmetrics(&acc.snapshot());
-
-        assert!(text.contains("process_duration_min"));
-        assert!(text.contains("process_duration_max"));
-        assert!(text.contains("process_duration_sum"));
-        assert!(text.contains("process_duration_count"));
-        assert!(text.contains("Processing duration"));
-        // Original name should NOT appear.
-        assert!(!text.contains("latency_min"));
+        assert_eq!(hdp.num_rows(), 1);
     }
 
     #[test]

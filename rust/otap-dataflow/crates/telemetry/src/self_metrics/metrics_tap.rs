@@ -36,6 +36,8 @@ use crate::self_metrics::prometheus::PrometheusExporter;
 struct CachedDescriptor {
     schema: PrecomputedMetricSchema,
     accumulation_modes: Vec<bridge::AccumulationMode>,
+    histogram_field_indices: Vec<usize>,
+    number_field_indices: Vec<usize>,
 }
 
 /// An assembled OTAP metrics payload ready for pipeline injection.
@@ -153,6 +155,8 @@ impl MetricsTap {
                                 CachedDescriptor {
                                     schema: ds.schema,
                                     accumulation_modes: ds.accumulation_modes,
+                                    histogram_field_indices: ds.histogram_field_indices,
+                                    number_field_indices: ds.number_field_indices,
                                 },
                             );
                         }
@@ -187,22 +191,54 @@ impl MetricsTap {
                     })
                     .clone();
 
-                // Build delta NumberDataPoints with Mmsc expansion.
-                let int_values = bridge::expand_snapshot(descriptor, &values);
-                let dp_batch = match cached_desc
-                    .schema
-                    .data_points_builder()
-                    .build_int_values_i64(self.start_time_nanos, time_nanos, &int_values)
-                {
-                    Ok(batch) => batch,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            descriptor = descriptor.name,
-                            "Failed to build data points batch"
-                        );
-                        return;
+                // Build delta NumberDataPoints for non-Mmsc fields.
+                let ndp_batch = if !cached_desc.number_field_indices.is_empty() {
+                    let int_values = bridge::expand_number_snapshot(
+                        &values,
+                        &cached_desc.number_field_indices,
+                    );
+                    match cached_desc
+                        .schema
+                        .data_points_builder()
+                        .build_int_values_i64(self.start_time_nanos, time_nanos, &int_values)
+                    {
+                        Ok(batch) => Some(batch),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                descriptor = descriptor.name,
+                                "Failed to build number data points batch"
+                            );
+                            return;
+                        }
                     }
+                } else {
+                    None
+                };
+
+                // Build delta HistogramDataPoints for Mmsc fields.
+                let hdp_batch = if !cached_desc.histogram_field_indices.is_empty() {
+                    let histograms = bridge::expand_histogram_snapshot(
+                        &values,
+                        &cached_desc.histogram_field_indices,
+                    );
+                    match cached_desc
+                        .schema
+                        .histogram_data_points_builder()
+                        .build(self.start_time_nanos, time_nanos, &histograms)
+                    {
+                        Ok(batch) => Some(batch),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                descriptor = descriptor.name,
+                                "Failed to build histogram data points batch"
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    None
                 };
 
                 // Feed Prometheus accumulator with per-point modes.
@@ -214,20 +250,22 @@ impl MetricsTap {
                 self.prometheus
                     .register_schema_if_needed(descriptor.name, cached_desc.schema.clone());
 
-                if let Err(e) = self.prometheus.ingest_with_modes(
-                    identity,
-                    &dp_batch,
-                    &cached_desc.accumulation_modes,
-                ) {
-                    tracing::warn!(
-                        error = %e,
-                        descriptor = descriptor.name,
-                        "Failed to ingest into Prometheus accumulator"
-                    );
+                if let Some(ref ndp) = ndp_batch {
+                    if let Err(e) = self.prometheus.ingest_with_modes(
+                        identity,
+                        ndp,
+                        &cached_desc.accumulation_modes,
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            descriptor = descriptor.name,
+                            "Failed to ingest into Prometheus accumulator"
+                        );
+                    }
                 }
 
                 // Assemble complete OTAP payload.
-                match self.assemble_payload(cached_desc, &scope_attrs, dp_batch) {
+                match self.assemble_payload(cached_desc, &scope_attrs, ndp_batch, hdp_batch) {
                     Ok(payload) => payloads.push(payload),
                     Err(e) => {
                         tracing::warn!(
@@ -261,7 +299,8 @@ impl MetricsTap {
         &self,
         cached_desc: &CachedDescriptor,
         scope_attrs: &RecordBatch,
-        dp_batch: RecordBatch,
+        ndp_batch: Option<RecordBatch>,
+        hdp_batch: Option<RecordBatch>,
     ) -> Result<OtapMetricsPayload, Error> {
         let mut records = OtapArrowRecords::Metrics(Metrics::default());
 
@@ -274,10 +313,20 @@ impl MetricsTap {
                 .map_err(|e| Error::MetricEncoding(e.to_string()))?;
         }
 
-        if dp_batch.num_rows() > 0 {
-            records
-                .set(ArrowPayloadType::NumberDataPoints, dp_batch)
-                .map_err(|e| Error::MetricEncoding(e.to_string()))?;
+        if let Some(ndp) = ndp_batch {
+            if ndp.num_rows() > 0 {
+                records
+                    .set(ArrowPayloadType::NumberDataPoints, ndp)
+                    .map_err(|e| Error::MetricEncoding(e.to_string()))?;
+            }
+        }
+
+        if let Some(hdp) = hdp_batch {
+            if hdp.num_rows() > 0 {
+                records
+                    .set(ArrowPayloadType::HistogramDataPoints, hdp)
+                    .map_err(|e| Error::MetricEncoding(e.to_string()))?;
+            }
         }
 
         if self.resource_attrs.num_rows() > 0 {
@@ -304,6 +353,7 @@ mod tests {
     };
     use crate::metrics::MetricSetHandler;
     use crate::registry::TelemetryRegistryHandle;
+    use otap_df_pdata::otap::OtapBatchStore;
 
     #[derive(Debug, Default, Clone)]
     struct TestMetrics {
@@ -562,29 +612,24 @@ mod tests {
             "expected gauge with latest value, got:\n{text}"
         );
 
-        // Mmsc: renamed via view, expanded to 4 sub-metrics.
-        assert!(
-            text.contains("process_duration_min"),
-            "expected renamed mmsc sub-metrics, got:\n{text}"
-        );
-        assert!(
-            text.contains("process_duration_max"),
-            "expected renamed mmsc sub-metrics, got:\n{text}"
-        );
-        assert!(
-            text.contains("process_duration_sum"),
-            "expected renamed mmsc sub-metrics, got:\n{text}"
-        );
-        assert!(
-            text.contains("process_duration_count"),
-            "expected renamed mmsc sub-metrics, got:\n{text}"
-        );
-        assert!(text.contains("Processing duration"));
-
-        // OTAP payloads should be Metrics variant.
+        // Mmsc: histogram data points are in the OTAP payload but
+        // not yet in the Prometheus accumulator (histograms are
+        // separate from NumberDataPoints). Verify the OTAP payload
+        // contains HistogramDataPoints.
         for payload in &payloads {
             match &payload.records {
-                OtapArrowRecords::Metrics(_) => {}
+                OtapArrowRecords::Metrics(m) => {
+                    // Should have histogram data points.
+                    assert!(
+                        m.get(ArrowPayloadType::HistogramDataPoints).is_some(),
+                        "expected HistogramDataPoints in OTAP payload"
+                    );
+                    // Should also have number data points.
+                    assert!(
+                        m.get(ArrowPayloadType::NumberDataPoints).is_some(),
+                        "expected NumberDataPoints in OTAP payload"
+                    );
+                }
                 _ => panic!("expected Metrics variant"),
             }
         }

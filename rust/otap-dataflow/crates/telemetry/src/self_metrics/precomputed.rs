@@ -15,7 +15,9 @@ use arrow::error::ArrowError;
 use std::sync::Arc;
 
 use otap_df_pdata::encode::record::attributes::AttributesRecordBatchBuilder;
-use otap_df_pdata::encode::record::metrics::MetricsRecordBatchBuilder;
+use otap_df_pdata::encode::record::metrics::{
+    HistogramDataPointsRecordBatchBuilder, MetricsRecordBatchBuilder,
+};
 use otap_df_pdata::otlp::metrics::MetricType;
 use otap_df_pdata::proto::opentelemetry::metrics::v1::AggregationTemporality;
 
@@ -41,15 +43,19 @@ pub struct CounterMetricDef {
 /// Holds precomputed metrics and attributes record batches for a metric set.
 #[derive(Clone)]
 pub struct PrecomputedMetricSchema {
-    /// The metrics table (one row per counter).
+    /// The metrics table (one row per metric).
     metrics_batch: RecordBatch,
     /// The data-point attributes table. Parent IDs are u32 matching
     /// NumberDataPoints IDs.
     attrs_batch: RecordBatch,
-    /// Total number of data points across all metrics.
-    total_points: usize,
-    /// Precomputed parent_id for each data point.
-    parent_ids: Vec<u16>,
+    /// Total number of NumberDataPoints across all non-Mmsc metrics.
+    total_number_points: usize,
+    /// Precomputed parent_id for each NumberDataPoint.
+    number_parent_ids: Vec<u16>,
+    /// Total number of HistogramDataPoints (one per Mmsc metric).
+    total_histogram_points: usize,
+    /// Precomputed parent_id for each HistogramDataPoint.
+    histogram_parent_ids: Vec<u16>,
 }
 
 impl PrecomputedMetricSchema {
@@ -104,8 +110,10 @@ impl PrecomputedMetricSchema {
         Ok(Self {
             metrics_batch,
             attrs_batch,
-            total_points,
-            parent_ids,
+            total_number_points: total_points,
+            number_parent_ids: parent_ids,
+            total_histogram_points: 0,
+            histogram_parent_ids: Vec::new(),
         })
     }
 
@@ -121,36 +129,48 @@ impl PrecomputedMetricSchema {
         &self.attrs_batch
     }
 
-    /// Total number of data points across all metrics.
+    /// Total number of NumberDataPoints across all non-Mmsc metrics.
     #[must_use]
-    pub fn total_points(&self) -> usize {
-        self.total_points
+    pub fn total_number_points(&self) -> usize {
+        self.total_number_points
+    }
+
+    /// Total number of HistogramDataPoints (Mmsc metrics).
+    #[must_use]
+    pub fn total_histogram_points(&self) -> usize {
+        self.total_histogram_points
     }
 
     /// Create a `PrecomputedMetricSchema` from pre-built parts.
-    ///
-    /// Used by the bridge module which builds the metrics and attrs
-    /// batches directly from `MetricsDescriptor` rather than from
-    /// `CounterMetricDef`.
     #[must_use]
     pub fn from_parts(
         metrics_batch: RecordBatch,
         attrs_batch: RecordBatch,
-        total_points: usize,
-        parent_ids: Vec<u16>,
+        total_number_points: usize,
+        number_parent_ids: Vec<u16>,
+        total_histogram_points: usize,
+        histogram_parent_ids: Vec<u16>,
     ) -> Self {
         Self {
             metrics_batch,
             attrs_batch,
-            total_points,
-            parent_ids,
+            total_number_points,
+            number_parent_ids,
+            total_histogram_points,
+            histogram_parent_ids,
         }
     }
 
-    /// Create a new data points builder for this schema.
+    /// Create a new NumberDataPoints builder for this schema.
     #[must_use]
     pub fn data_points_builder(&self) -> CounterDataPointsBuilder {
         CounterDataPointsBuilder::new(self)
+    }
+
+    /// Create a new HistogramDataPoints builder for Mmsc fields.
+    #[must_use]
+    pub fn histogram_data_points_builder(&self) -> MmscHistogramBuilder {
+        MmscHistogramBuilder::new(self)
     }
 }
 
@@ -164,8 +184,8 @@ pub struct CounterDataPointsBuilder {
 impl CounterDataPointsBuilder {
     fn new(schema: &PrecomputedMetricSchema) -> Self {
         Self {
-            parent_ids: schema.parent_ids.clone(),
-            total_points: schema.total_points,
+            parent_ids: schema.number_parent_ids.clone(),
+            total_points: schema.total_number_points,
         }
     }
 
@@ -263,6 +283,59 @@ impl CounterDataPointsBuilder {
     }
 }
 
+/// Builds HistogramDataPoints record batch for Mmsc snapshots using
+/// the pdata `HistogramDataPointsRecordBatchBuilder`.
+pub struct MmscHistogramBuilder {
+    parent_ids: Vec<u16>,
+    total_points: usize,
+}
+
+impl MmscHistogramBuilder {
+    fn new(schema: &PrecomputedMetricSchema) -> Self {
+        Self {
+            parent_ids: schema.histogram_parent_ids.clone(),
+            total_points: schema.total_histogram_points,
+        }
+    }
+
+    /// Build a HistogramDataPoints record batch from Mmsc snapshots.
+    ///
+    /// Each `MmscSnapshot` becomes one histogram data point with empty
+    /// explicit bounds and one bucket (the total count), carrying
+    /// min/max/sum/count.
+    pub fn build(
+        &self,
+        start_time_unix_nano: i64,
+        time_unix_nano: i64,
+        snapshots: &[crate::instrument::MmscSnapshot],
+    ) -> Result<RecordBatch, ArrowError> {
+        assert_eq!(
+            snapshots.len(),
+            self.total_points,
+            "snapshots length must match total_histogram_points"
+        );
+
+        let mut builder = HistogramDataPointsRecordBatchBuilder::new();
+
+        for (i, snap) in snapshots.iter().enumerate() {
+            builder.append_id(i as u32);
+            builder.append_parent_id(self.parent_ids[i]);
+            builder.append_start_time_unix_nano(start_time_unix_nano);
+            builder.append_time_unix_nano(time_unix_nano);
+            builder.append_count(snap.count);
+            builder.append_sum(Some(snap.sum));
+            builder.append_min(Some(snap.min));
+            builder.append_max(Some(snap.max));
+            // Empty explicit bounds → one bucket with the full count.
+            builder.append_explicit_bounds(std::iter::empty());
+            builder.append_bucket_counts(std::iter::once(snap.count));
+            builder.append_flags(0);
+        }
+
+        builder.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,7 +357,7 @@ mod tests {
 
         let schema = PrecomputedMetricSchema::new(&metrics).expect("should build schema");
 
-        assert_eq!(schema.total_points(), 3);
+        assert_eq!(schema.total_number_points(), 3);
         assert_eq!(schema.metrics_batch().num_rows(), 1);
         assert_eq!(schema.attrs_batch().num_rows(), 3);
     }
@@ -313,7 +386,7 @@ mod tests {
 
         let schema = PrecomputedMetricSchema::new(&metrics).expect("should build schema");
 
-        assert_eq!(schema.total_points(), 9);
+        assert_eq!(schema.total_number_points(), 9);
         assert_eq!(schema.metrics_batch().num_rows(), 1);
         assert_eq!(schema.attrs_batch().num_rows(), 18);
     }

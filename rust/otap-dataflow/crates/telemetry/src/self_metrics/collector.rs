@@ -30,7 +30,7 @@ impl MetricsEncoder {
     /// Number of data points this encoder expects.
     #[must_use]
     pub fn total_points(&self) -> usize {
-        self.schema.total_points()
+        self.schema.total_number_points()
     }
 
     /// Encode a snapshot of integer counter values into OTAP Arrow records.
@@ -53,7 +53,8 @@ impl MetricsEncoder {
         let records = assemble_metrics_payload(
             self.schema.metrics_batch(),
             self.schema.attrs_batch(),
-            dp_batch,
+            Some(dp_batch),
+            None,
         )
         .map_err(EncodeError::Pdata)?;
 

@@ -6,15 +6,17 @@ use otap_df_pdata::OtapArrowRecords;
 use otap_df_pdata::otap::Metrics;
 use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
-/// Assemble a complete OTAP metrics payload from the 3 tables.
+/// Assemble a complete OTAP metrics payload from the tables.
 ///
-/// - `metrics_batch`: precomputed metrics table (one row per counter).
+/// - `metrics_batch`: precomputed metrics table (one row per metric).
 /// - `attrs_batch`: precomputed attributes table (dimension attrs per data point).
-/// - `data_points_batch`: runtime NumberDataPoints table (counter values).
+/// - `ndp_batch`: optional NumberDataPoints table (counter/gauge values).
+/// - `hdp_batch`: optional HistogramDataPoints table (Mmsc values).
 pub fn assemble_metrics_payload(
     metrics_batch: &RecordBatch,
     attrs_batch: &RecordBatch,
-    data_points_batch: RecordBatch,
+    ndp_batch: Option<RecordBatch>,
+    hdp_batch: Option<RecordBatch>,
 ) -> Result<OtapArrowRecords, otap_df_pdata::error::Error> {
     let mut records = OtapArrowRecords::Metrics(Metrics::default());
 
@@ -22,8 +24,16 @@ pub fn assemble_metrics_payload(
         records.set(ArrowPayloadType::UnivariateMetrics, metrics_batch.clone())?;
     }
 
-    if data_points_batch.num_rows() > 0 {
-        records.set(ArrowPayloadType::NumberDataPoints, data_points_batch)?;
+    if let Some(ndp) = ndp_batch {
+        if ndp.num_rows() > 0 {
+            records.set(ArrowPayloadType::NumberDataPoints, ndp)?;
+        }
+    }
+
+    if let Some(hdp) = hdp_batch {
+        if hdp.num_rows() > 0 {
+            records.set(ArrowPayloadType::HistogramDataPoints, hdp)?;
+        }
     }
 
     if attrs_batch.num_rows() > 0 {
@@ -61,7 +71,7 @@ mod tests {
             .expect("should build data points");
 
         let records =
-            assemble_metrics_payload(schema.metrics_batch(), schema.attrs_batch(), dp_batch)
+            assemble_metrics_payload(schema.metrics_batch(), schema.attrs_batch(), Some(dp_batch), None)
                 .expect("should assemble");
 
         match &records {
