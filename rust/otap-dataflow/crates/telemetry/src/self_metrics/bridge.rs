@@ -272,7 +272,8 @@ pub fn descriptor_is_all_int(desc: &MetricsDescriptor) -> bool {
 ///
 /// Returns the first view whose selector matches. A selector field
 /// that is `None` matches any value (wildcard).
-fn find_matching_view<'a>(
+#[must_use]
+pub fn find_matching_view<'a>(
     views: &'a [ViewConfig],
     scope_name: &str,
     instrument_name: &str,

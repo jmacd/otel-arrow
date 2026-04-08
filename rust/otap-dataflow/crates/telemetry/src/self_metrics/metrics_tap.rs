@@ -38,6 +38,12 @@ struct CachedDescriptor {
     accumulation_modes: Vec<bridge::AccumulationMode>,
     histogram_field_indices: Vec<usize>,
     number_field_indices: Vec<usize>,
+    /// Metric names for histogram fields (used for Prometheus exposition).
+    histogram_names: Vec<String>,
+    /// Metric descriptions for histogram fields.
+    histogram_descriptions: Vec<String>,
+    /// Metric units for histogram fields.
+    histogram_units: Vec<String>,
 }
 
 /// An assembled OTAP metrics payload ready for pipeline injection.
@@ -150,6 +156,29 @@ impl MetricsTap {
                 if !desc_cache.contains_key(desc_key) {
                     match bridge::descriptor_to_schema_with_views(descriptor, &self.views) {
                         Ok(ds) => {
+                            // Extract histogram metric names/descriptions from descriptor
+                            // with view overrides applied.
+                            let mut hist_names = Vec::new();
+                            let mut hist_descriptions = Vec::new();
+                            let mut hist_units = Vec::new();
+                            for &idx in &ds.histogram_field_indices {
+                                let field = &descriptor.metrics[idx];
+                                let view = bridge::find_matching_view(
+                                    &self.views,
+                                    descriptor.name,
+                                    field.name,
+                                );
+                                hist_names.push(
+                                    view.and_then(|v| v.stream.name.clone())
+                                        .unwrap_or_else(|| field.name.to_string()),
+                                );
+                                hist_descriptions.push(
+                                    view.and_then(|v| v.stream.description.clone())
+                                        .unwrap_or_else(|| field.brief.to_string()),
+                                );
+                                hist_units.push(field.unit.to_string());
+                            }
+
                             let _ = desc_cache.insert(
                                 desc_key,
                                 CachedDescriptor {
@@ -157,6 +186,9 @@ impl MetricsTap {
                                     accumulation_modes: ds.accumulation_modes,
                                     histogram_field_indices: ds.histogram_field_indices,
                                     number_field_indices: ds.number_field_indices,
+                                    histogram_names: hist_names,
+                                    histogram_descriptions: hist_descriptions,
+                                    histogram_units: hist_units,
                                 },
                             );
                         }
@@ -262,6 +294,21 @@ impl MetricsTap {
                             "Failed to ingest into Prometheus accumulator"
                         );
                     }
+                }
+
+                // Feed Prometheus histogram accumulator with Mmsc snapshots.
+                if !cached_desc.histogram_field_indices.is_empty() {
+                    let histograms = bridge::expand_histogram_snapshot(
+                        &values,
+                        &cached_desc.histogram_field_indices,
+                    );
+                    self.prometheus.ingest_histograms(
+                        identity,
+                        &cached_desc.histogram_names,
+                        &cached_desc.histogram_descriptions,
+                        &cached_desc.histogram_units,
+                        &histograms,
+                    );
                 }
 
                 // Assemble complete OTAP payload.
@@ -612,19 +659,29 @@ mod tests {
             "expected gauge with latest value, got:\n{text}"
         );
 
-        // Mmsc: histogram data points are in the OTAP payload but
-        // not yet in the Prometheus accumulator (histograms are
-        // separate from NumberDataPoints). Verify the OTAP payload
-        // contains HistogramDataPoints.
+        // Mmsc: histogram data points are in the OTAP payload AND
+        // in the Prometheus output as histogram type.
+        assert!(
+            text.contains("# TYPE process_duration histogram"),
+            "expected histogram type in Prometheus output, got:\n{text}"
+        );
+        assert!(
+            text.contains("process_duration_count"),
+            "expected histogram count, got:\n{text}"
+        );
+        assert!(
+            text.contains("process_duration_sum"),
+            "expected histogram sum, got:\n{text}"
+        );
+        assert!(text.contains("Processing duration"));
+
         for payload in &payloads {
             match &payload.records {
                 OtapArrowRecords::Metrics(m) => {
-                    // Should have histogram data points.
                     assert!(
                         m.get(ArrowPayloadType::HistogramDataPoints).is_some(),
                         "expected HistogramDataPoints in OTAP payload"
                     );
-                    // Should also have number data points.
                     assert!(
                         m.get(ArrowPayloadType::NumberDataPoints).is_some(),
                         "expected NumberDataPoints in OTAP payload"
