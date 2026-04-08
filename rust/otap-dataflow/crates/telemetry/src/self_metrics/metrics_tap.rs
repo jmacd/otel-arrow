@@ -423,4 +423,205 @@ mod tests {
         assert!(text.contains("15"));
         assert!(text.contains("12"));
     }
+
+    // --- Integration tests ---
+
+    /// Mixed instrument types: Counter + Gauge + Mmsc.
+    #[derive(Debug, Default, Clone)]
+    struct MixedMetrics {
+        requests: u64,
+        queue_depth: u64,
+        latency: crate::instrument::Mmsc,
+    }
+
+    static MIXED_DESCRIPTOR: MetricsDescriptor = MetricsDescriptor {
+        name: "test.mixed",
+        metrics: &[
+            MetricsField {
+                name: "requests",
+                unit: "{request}",
+                brief: "Request count",
+                instrument: Instrument::Counter,
+                temporality: Some(Temporality::Delta),
+                value_type: MetricValueType::U64,
+            },
+            MetricsField {
+                name: "queue.depth",
+                unit: "{item}",
+                brief: "Current queue depth",
+                instrument: Instrument::Gauge,
+                temporality: None,
+                value_type: MetricValueType::U64,
+            },
+            MetricsField {
+                name: "latency",
+                unit: "ns",
+                brief: "Processing latency",
+                instrument: Instrument::Mmsc,
+                temporality: Some(Temporality::Delta),
+                value_type: MetricValueType::F64,
+            },
+        ],
+    };
+
+    impl MetricSetHandler for MixedMetrics {
+        fn descriptor(&self) -> &'static MetricsDescriptor {
+            &MIXED_DESCRIPTOR
+        }
+
+        fn snapshot_values(&self) -> Vec<MetricValue> {
+            vec![
+                MetricValue::U64(self.requests),
+                MetricValue::U64(self.queue_depth),
+                MetricValue::Mmsc(self.latency.get()),
+            ]
+        }
+
+        fn clear_values(&mut self) {
+            self.requests = 0;
+            self.queue_depth = 0;
+            self.latency.reset();
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.requests > 0 || self.queue_depth > 0 || self.latency.get().count > 0
+        }
+    }
+
+    #[test]
+    fn integration_mixed_instruments_with_views() {
+        use otap_df_config::pipeline::telemetry::metrics::views::{
+            MetricSelector, MetricStream, ViewConfig,
+        };
+
+        let views = vec![
+            ViewConfig {
+                selector: MetricSelector {
+                    scope_name: Some("test.mixed".to_string()),
+                    instrument_name: Some("requests".to_string()),
+                },
+                stream: MetricStream {
+                    name: Some("http.requests".to_string()),
+                    description: Some("HTTP request count".to_string()),
+                },
+            },
+            ViewConfig {
+                selector: MetricSelector {
+                    scope_name: None,
+                    instrument_name: Some("latency".to_string()),
+                },
+                stream: MetricStream {
+                    name: Some("process.duration".to_string()),
+                    description: Some("Processing duration".to_string()),
+                },
+            },
+        ];
+
+        let registry = TelemetryRegistryHandle::new();
+        let tap = MetricsTap::new(
+            registry.clone(),
+            std::time::Duration::from_secs(1),
+            &[("service.name", "integration-test")],
+            views,
+        )
+        .expect("should create tap");
+
+        let mut metrics_set =
+            registry.register_metric_set::<MixedMetrics>(crate::testing::EmptyAttributes());
+
+        // First collection cycle.
+        metrics_set.requests = 100;
+        metrics_set.queue_depth = 5;
+        metrics_set.latency.record(1000.0);
+        metrics_set.latency.record(5000.0);
+        let snapshot = metrics_set.snapshot();
+        registry.accumulate_metric_set_snapshot(snapshot.key(), snapshot.get_metrics());
+        let payloads = tap.collect_and_dispatch().expect("should collect");
+        assert_eq!(payloads.len(), 1);
+
+        // Second collection cycle (delta accumulation).
+        metrics_set.requests = 50;
+        metrics_set.queue_depth = 3;
+        metrics_set.latency.record(2000.0);
+        let snapshot = metrics_set.snapshot();
+        registry.accumulate_metric_set_snapshot(snapshot.key(), snapshot.get_metrics());
+        let _ = tap.collect_and_dispatch().expect("should collect");
+
+        let text = tap.prometheus_exporter().format_metrics();
+
+        // Counter: renamed via view, cumulative (100+50=150).
+        assert!(
+            text.contains("http_requests_total 150"),
+            "expected renamed cumulative counter, got:\n{text}"
+        );
+        assert!(text.contains("HTTP request count"));
+
+        // Gauge: not renamed, replaced (latest value = 3).
+        assert!(
+            text.contains("queue_depth 3"),
+            "expected gauge with latest value, got:\n{text}"
+        );
+
+        // Mmsc: renamed via view, expanded to 4 sub-metrics.
+        assert!(
+            text.contains("process_duration_min"),
+            "expected renamed mmsc sub-metrics, got:\n{text}"
+        );
+        assert!(
+            text.contains("process_duration_max"),
+            "expected renamed mmsc sub-metrics, got:\n{text}"
+        );
+        assert!(
+            text.contains("process_duration_sum"),
+            "expected renamed mmsc sub-metrics, got:\n{text}"
+        );
+        assert!(
+            text.contains("process_duration_count"),
+            "expected renamed mmsc sub-metrics, got:\n{text}"
+        );
+        assert!(text.contains("Processing duration"));
+
+        // OTAP payloads should be Metrics variant.
+        for payload in &payloads {
+            match &payload.records {
+                OtapArrowRecords::Metrics(_) => {}
+                _ => panic!("expected Metrics variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn integration_its_channel_receives_payloads() {
+        let registry = TelemetryRegistryHandle::new();
+        let mut tap = MetricsTap::new(
+            registry.clone(),
+            std::time::Duration::from_secs(1),
+            &[("service.name", "its-test")],
+            Vec::new(),
+        )
+        .expect("should create tap");
+
+        let metrics_rx = tap.create_metrics_channel(10);
+
+        let mut metrics_set =
+            registry.register_metric_set::<TestMetrics>(crate::testing::EmptyAttributes());
+        metrics_set.items_in = 42;
+        metrics_set.items_out = 40;
+        let snapshot = metrics_set.snapshot();
+        registry.accumulate_metric_set_snapshot(snapshot.key(), snapshot.get_metrics());
+
+        let _ = tap.collect_and_dispatch().expect("should collect");
+
+        // ITS channel should have received the payload.
+        let payload = metrics_rx.try_recv().expect("should receive payload");
+        match &payload.records {
+            OtapArrowRecords::Metrics(_) => {}
+            _ => panic!("expected Metrics variant on ITS channel"),
+        }
+
+        // Prometheus should also have the data.
+        let text = tap.prometheus_exporter().format_metrics();
+        assert!(text.contains("items_in_total 42"));
+        assert!(text.contains("items_out_total 40"));
+    }
 }
