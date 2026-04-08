@@ -1,0 +1,101 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Lookup table-based mapping for exponential histograms.
+//!
+//! This module provides compile-time generated boundary and index tables
+//! at the highest compiled-in scale. The algorithm uses 2N linear buckets
+//! per scale with one boundary correction.
+
+include!("generated/lookup_tables.rs");
+
+/// Maps a positive f64 value to a bucket index using a compiled lookup table.
+///
+/// Always computes at `TABLE_SCALE` using the full boundary and index
+/// tables, then shifts down to the requested scale.
+#[inline]
+pub(crate) fn map_decomposed(significand: u64, base2_exp: i32, scale: i32) -> i32 {
+    debug_assert!(scale > 0);
+    debug_assert!(scale <= TABLE_SCALE);
+    debug_assert_eq!(51, TABLE_SCALE as u32 + INDEX_SHIFT);
+
+    let linear_idx = (significand >> INDEX_SHIFT) as usize;
+    let approx = INDEX_TABLE[linear_idx] as usize;
+
+    let mut bucket = approx as i32;
+    // A sentinel case at 0 implements upper-inclusivity.
+    if significand >= BOUNDARIES[approx + 1] {
+        bucket += 1;
+    }
+
+    let fine = (base2_exp << TABLE_SCALE) + bucket - 1;
+    fine >> (TABLE_SCALE - scale)
+}
+
+/// Returns the compiled-in scale of the lookup table. The exact lookup
+/// table has 2^table_scale() entries.
+#[inline]
+pub const fn table_scale() -> i32 {
+    TABLE_SCALE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::float64::{get_significand, get_unbiased_exponent};
+    use super::TABLE_SCALE;
+
+    fn map_to_index(value: f64, scale: i32) -> i32 {
+        super::map_decomposed(get_significand(value), get_unbiased_exponent(value), scale)
+    }
+
+    #[test]
+    fn test_powers_of_two() {
+        for scale in 1..=TABLE_SCALE {
+            for exp in -10..=10 {
+                let value = 2.0_f64.powi(exp);
+                let expected = (exp << scale) - 1;
+                let actual = map_to_index(value, scale);
+                assert_eq!(
+                    actual, expected,
+                    "power of two mismatch at scale={scale}, exp={exp}: got {actual}, expected {expected}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_basic_values() {
+        let scale = TABLE_SCALE.min(4);
+        assert_eq!(map_to_index(1.0, scale), -1);
+        let expected = (1 << scale) - 1;
+        assert_eq!(map_to_index(2.0, scale), expected);
+        let idx = map_to_index(1.5, scale);
+        let max_idx = (1 << scale) - 1;
+        assert!(
+            idx >= 0 && idx < max_idx,
+            "1.5 should be in [0, {max_idx}), got {idx}",
+        );
+    }
+
+    #[test]
+    fn test_table_scale() {
+        // The checked-in lookup tables are generated at scale 8.
+        assert_eq!(TABLE_SCALE, 8);
+    }
+
+    #[test]
+    fn test_all_scales_consistent() {
+        let test_values: &[f64] = &[1.1, 1.5, 1.9, 2.5, 3.3, 7.7, 0.3, 0.7, 100.0, 1e-10, 1e10];
+        for scale in 1..TABLE_SCALE {
+            for &v in test_values {
+                let direct = map_to_index(v, scale);
+                let fine = map_to_index(v, TABLE_SCALE);
+                let shifted = fine >> (TABLE_SCALE - scale);
+                assert_eq!(
+                    direct, shifted,
+                    "scale {scale} mismatch for value {v}: direct={direct}, shifted={shifted}",
+                );
+            }
+        }
+    }
+}
