@@ -28,7 +28,6 @@
 use crate::error::Error;
 use crate::event::{ObservedEvent, ObservedEventReporter};
 use crate::registry::TelemetryRegistryHandle;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
 use otap_df_config::observed_state::SendPolicy;
 use otap_df_config::pipeline::telemetry::TelemetryConfig;
 use otap_df_config::settings::telemetry::logs::{LogLevel, LoggingProviders, ProviderMode};
@@ -146,6 +145,9 @@ pub struct InternalTelemetrySettings {
     pub registry: TelemetryRegistryHandle,
     /// Optional retained-log sink shared with admin consumers.
     pub log_tap: Option<log_tap::InternalLogTapHandle>,
+    /// Receiver end of the metrics channel for OTAP metric payloads.
+    /// Present when MetricsTap has a metrics channel configured.
+    pub metrics_receiver: Option<flume::Receiver<self_metrics::metrics_tap::OtapMetricsPayload>>,
 }
 
 impl std::fmt::Debug for InternalTelemetrySettings {
@@ -180,15 +182,9 @@ pub struct InternalTelemetrySystem {
     /// The process reporting metrics to an external system.
     metrics_reporter: reporter::MetricsReporter,
 
-    /// The dispatcher that flushes internal telemetry metrics.
-    dispatcher: Arc<metrics::dispatcher::MetricsDispatcher>,
-
-    // === OTel SDK Subsystem ===
-    /// OTel SDK meter provider for metrics export.
-    sdk_meter_provider: SdkMeterProvider,
-
-    /// Tokio runtime for OTLP exporters (kept alive).
-    _otel_runtime: Option<tokio::runtime::Runtime>,
+    /// OTAP-native metrics tap: replaces MetricsDispatcher + OTel SDK metrics.
+    /// Always present. Feeds PrometheusExporter and produces OTAP payloads.
+    metrics_tap: Arc<self_metrics::metrics_tap::MetricsTap>,
 
     // === Logging Configuration ===
     /// Log level from config.
@@ -247,18 +243,31 @@ impl InternalTelemetrySystem {
         // 1. Create internal metrics subsystem
         let (collector, metrics_reporter) =
             collector::InternalCollector::new(config, telemetry_registry.clone());
-        let dispatcher = Arc::new(metrics::dispatcher::MetricsDispatcher::new(
-            telemetry_registry.clone(),
-            config.reporting_interval,
-        ));
 
-        // 2. Create OTel SDK providers
-        // OTel Logger is only needed for OpenTelemetry mode
-        let otel_client = otel_sdk::OpentelemetryClient::new(config)?;
-        let sdk_meter_provider = otel_client.meter_provider().clone();
-        let otel_runtime = otel_client.into_runtime();
+        // Build resource attrs for OTAP payloads from config.
+        let resource_kv: Vec<(&str, &str)> = config
+            .resource
+            .iter()
+            .filter_map(|(k, v)| {
+                if let otap_df_config::pipeline::telemetry::AttributeValue::String(s) = v {
+                    Some((k.as_str(), s.as_str()))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        // 3. Create ITS channel if any provider uses ITS mode
+        let mut metrics_tap = Arc::new(
+            self_metrics::metrics_tap::MetricsTap::new(
+                telemetry_registry.clone(),
+                config.reporting_interval,
+                &resource_kv,
+                config.metrics.views.clone(),
+            )
+            .map_err(|e| Error::ConfigurationError(e.to_string()))?,
+        );
+
+        // 2. Create ITS channel if any provider uses ITS mode
         let (its_reporter, its_settings) = if config.logs.providers.uses_its_provider() {
             let (sender, logs_receiver) = flume::bounded(config.reporting_channel_size);
             let reporter = if let Some(log_tap) = &log_tap_handle {
@@ -268,6 +277,14 @@ impl InternalTelemetrySystem {
                 ObservedEventReporter::new(SendPolicy::default(), sender)
             };
             let resource_bytes = otel_sdk::encode_resource_bytes(&config.resource);
+
+            // Create a metrics channel for ITS pipeline injection.
+            let metrics_receiver = {
+                let tap = Arc::get_mut(&mut metrics_tap)
+                    .expect("metrics_tap should have single owner at init");
+                Some(tap.create_metrics_channel(config.reporting_channel_size))
+            };
+
             (
                 Some(reporter),
                 Some(InternalTelemetrySettings {
@@ -275,6 +292,7 @@ impl InternalTelemetrySystem {
                     resource_bytes,
                     registry: telemetry_registry.clone(),
                     log_tap: log_tap_handle.clone(),
+                    metrics_receiver,
                 }),
             )
         } else {
@@ -285,9 +303,7 @@ impl InternalTelemetrySystem {
             registry: telemetry_registry,
             collector: Arc::new(collector),
             metrics_reporter,
-            dispatcher,
-            sdk_meter_provider,
-            _otel_runtime: otel_runtime,
+            metrics_tap,
             log_level: config.logs.level.clone(),
             provider_modes: config.logs.providers.clone(),
             context_fn,
@@ -395,20 +411,14 @@ impl InternalTelemetrySystem {
         self.metrics_reporter.clone()
     }
 
-    /// Returns a shareable handle to the metrics dispatcher.
+    /// Returns a shareable handle to the metrics tap.
     #[must_use]
-    pub fn dispatcher(&self) -> Arc<metrics::dispatcher::MetricsDispatcher> {
-        self.dispatcher.clone()
+    pub fn metrics_tap(&self) -> Arc<self_metrics::metrics_tap::MetricsTap> {
+        self.metrics_tap.clone()
     }
 
-    /// Shuts down the OpenTelemetry SDK providers.
-    pub fn shutdown_otel(self) -> Result<(), Error> {
-        let meter_shutdown_result = self.sdk_meter_provider.shutdown();
-
-        if let Err(e) = meter_shutdown_result {
-            return Err(Error::ShutdownError(e.to_string()));
-        }
-
+    /// Shuts down the telemetry system.
+    pub fn shutdown(self) -> Result<(), Error> {
         Ok(())
     }
 }

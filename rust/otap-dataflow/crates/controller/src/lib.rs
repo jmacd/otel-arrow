@@ -1071,7 +1071,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         let admin_tracing_setup = telemetry_system.admin_tracing_setup();
         let internal_tracing_setup = telemetry_system.internal_tracing_setup();
 
-        let metrics_dispatcher = telemetry_system.dispatcher();
+        let metrics_tap = telemetry_system.metrics_tap();
         let metrics_reporter = telemetry_system.reporter();
         let controller_ctx = ControllerContext::new(telemetry_system.registry());
         let memory_pressure_state = controller_ctx.memory_pressure_state();
@@ -1255,7 +1255,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             Some(spawn_thread_local_task(
                 "metrics-dispatcher",
                 admin_tracing_setup.clone(),
-                move |cancellation_token| metrics_dispatcher.run_dispatch_loop(cancellation_token),
+                move |cancellation_token| metrics_tap.run(cancellation_token),
             )?)
         } else {
             None
@@ -1519,7 +1519,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             handle.shutdown_and_join()?;
         }
         obs_state_join_handle.shutdown_and_join()?;
-        telemetry_system.shutdown_otel()?;
+        telemetry_system.shutdown()?;
 
         Ok(())
     }
