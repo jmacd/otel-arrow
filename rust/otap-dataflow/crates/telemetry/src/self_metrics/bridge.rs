@@ -213,21 +213,22 @@ pub fn build_scope_attrs_from_entity(
     builder.finish()
 }
 
-/// Extract non-Mmsc values from a `MetricValue` slice.
+/// Extract non-Mmsc values from a `MetricValue` slice as typed `NumberValue`s.
 ///
-/// Only includes fields at the given indices. All values are mapped
-/// to `i64` for the NumberDataPoints `int_value` column.
+/// Only includes fields at the given indices. Preserves the original
+/// type (int vs double) for proper Arrow encoding.
 #[must_use]
 pub fn expand_number_snapshot(
     values: &[MetricValue],
     number_field_indices: &[usize],
-) -> Vec<i64> {
+) -> Vec<crate::self_metrics::precomputed::NumberValue> {
+    use crate::self_metrics::precomputed::NumberValue;
     number_field_indices
         .iter()
         .map(|&i| match &values[i] {
-            MetricValue::U64(n) => *n as i64,
-            MetricValue::F64(n) => *n as i64,
-            MetricValue::Mmsc(s) => s.sum as i64,
+            MetricValue::U64(n) => NumberValue::Int(*n as i64),
+            MetricValue::F64(n) => NumberValue::Double(*n),
+            MetricValue::Mmsc(s) => NumberValue::Double(s.sum),
         })
         .collect()
 }
@@ -394,10 +395,10 @@ mod tests {
             MetricValue::U64(95),
             MetricValue::U64(5),
         ];
-        let int_values = expand_number_snapshot(&values, &ds.number_field_indices);
+        let typed_values = expand_number_snapshot(&values, &ds.number_field_indices);
 
         let batch = builder
-            .build_int_values_i64(1_000_000_000, 2_000_000_000, &int_values)
+            .build(1_000_000_000, 2_000_000_000, &typed_values)
             .expect("should build data points");
 
         assert_eq!(batch.num_rows(), 3);
@@ -405,6 +406,8 @@ mod tests {
 
     #[test]
     fn expand_snapshot_splits_number_and_histogram() {
+        use crate::self_metrics::precomputed::NumberValue;
+
         let values = vec![
             MetricValue::U64(42),
             MetricValue::Mmsc(crate::instrument::MmscSnapshot {
@@ -416,7 +419,7 @@ mod tests {
         ];
         // Counter at index 0, Mmsc at index 1.
         let number_vals = expand_number_snapshot(&values, &[0]);
-        assert_eq!(number_vals, vec![42]);
+        assert_eq!(number_vals, vec![NumberValue::Int(42)]);
 
         let hist_vals = expand_histogram_snapshot(&values, &[1]);
         assert_eq!(hist_vals.len(), 1);

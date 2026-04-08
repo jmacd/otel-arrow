@@ -225,14 +225,14 @@ impl MetricsTap {
 
                 // Build delta NumberDataPoints for non-Mmsc fields.
                 let ndp_batch = if !cached_desc.number_field_indices.is_empty() {
-                    let int_values = bridge::expand_number_snapshot(
+                    let typed_values = bridge::expand_number_snapshot(
                         &values,
                         &cached_desc.number_field_indices,
                     );
                     match cached_desc
                         .schema
                         .data_points_builder()
-                        .build_int_values_i64(self.start_time_nanos, time_nanos, &int_values)
+                        .build(self.start_time_nanos, time_nanos, &typed_values)
                     {
                         Ok(batch) => Some(batch),
                         Err(e) => {

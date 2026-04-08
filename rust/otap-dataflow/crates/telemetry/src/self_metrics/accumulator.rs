@@ -5,7 +5,7 @@
 //! per-identity cumulative NumberDataPoints batch. Delta arrivals are
 //! added pointwise using Arrow compute kernels, matched by identity.
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::kernels::numeric::add;
 use arrow::error::ArrowError;
 use std::collections::BTreeMap;
@@ -16,11 +16,14 @@ use crate::registry::EntityKey;
 use crate::self_metrics::precomputed::PrecomputedMetricSchema;
 
 /// Column indices in the NumberDataPoints RecordBatch.
+/// Matches the output of `NumberDataPointsRecordBatchBuilder::finish()`.
 mod ndp_cols {
     /// time_unix_nano: Timestamp(Nanosecond)
     pub const TIME: usize = 3;
-    /// int_value: Int64
+    /// int_value: Int64 (nullable)
     pub const INT_VALUE: usize = 4;
+    /// double_value: Float64 (nullable)
+    pub const DOUBLE_VALUE: usize = 5;
 }
 
 /// Identifies a metric stream: which schema and which entity (node).
@@ -79,9 +82,17 @@ impl CumulativeAccumulator {
             Some(cumulative) => {
                 let mut cols: Vec<ArrayRef> = cumulative.columns().to_vec();
 
-                let cum_int = cumulative.column(ndp_cols::INT_VALUE);
-                let delta_int = delta_dp.column(ndp_cols::INT_VALUE);
-                cols[ndp_cols::INT_VALUE] = add(cum_int, delta_int)?;
+                // Accumulate int_value column.
+                cols[ndp_cols::INT_VALUE] = add(
+                    cumulative.column(ndp_cols::INT_VALUE),
+                    delta_dp.column(ndp_cols::INT_VALUE),
+                )?;
+
+                // Accumulate double_value column.
+                cols[ndp_cols::DOUBLE_VALUE] = add(
+                    cumulative.column(ndp_cols::DOUBLE_VALUE),
+                    delta_dp.column(ndp_cols::DOUBLE_VALUE),
+                )?;
 
                 cols[ndp_cols::TIME] = Arc::clone(delta_dp.column(ndp_cols::TIME));
 
@@ -103,38 +114,26 @@ impl CumulativeAccumulator {
         delta_dp: &RecordBatch,
         modes: &[crate::self_metrics::bridge::AccumulationMode],
     ) -> Result<(), ArrowError> {
-        use crate::self_metrics::bridge::AccumulationMode;
-
         match self.state.get(&identity) {
             None => {
                 let _ = self.state.insert(identity, delta_dp.clone());
             }
             Some(cumulative) => {
                 let mut cols: Vec<ArrayRef> = cumulative.columns().to_vec();
+                let n = cumulative.num_rows();
 
-                let cum_arr = cumulative
-                    .column(ndp_cols::INT_VALUE)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .expect("int_value should be Int64Array");
-                let delta_arr = delta_dp
-                    .column(ndp_cols::INT_VALUE)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .expect("int_value should be Int64Array");
-
-                let merged: Vec<i64> = (0..cum_arr.len())
-                    .map(|i| {
-                        let mode = modes.get(i).copied().unwrap_or(AccumulationMode::Add);
-                        match mode {
-                            AccumulationMode::Add => cum_arr.value(i) + delta_arr.value(i),
-                            AccumulationMode::Replace => delta_arr.value(i),
-                        }
-                    })
-                    .collect();
-
+                // Accumulate int_value with modes.
+                let cum_int = cumulative.column(ndp_cols::INT_VALUE);
+                let delta_int = delta_dp.column(ndp_cols::INT_VALUE);
                 cols[ndp_cols::INT_VALUE] =
-                    Arc::new(arrow::array::Int64Array::from(merged)) as ArrayRef;
+                    accumulate_with_modes_i64(cum_int, delta_int, modes, n);
+
+                // Accumulate double_value with modes.
+                let cum_dbl = cumulative.column(ndp_cols::DOUBLE_VALUE);
+                let delta_dbl = delta_dp.column(ndp_cols::DOUBLE_VALUE);
+                cols[ndp_cols::DOUBLE_VALUE] =
+                    accumulate_with_modes_f64(cum_dbl, delta_dbl, modes, n);
+
                 cols[ndp_cols::TIME] = Arc::clone(delta_dp.column(ndp_cols::TIME));
 
                 let _ = self
@@ -161,6 +160,76 @@ impl CumulativeAccumulator {
             })
             .collect()
     }
+}
+
+/// Accumulate i64 values with per-element modes. Handles nullable arrays.
+fn accumulate_with_modes_i64(
+    cum: &ArrayRef,
+    delta: &ArrayRef,
+    modes: &[crate::self_metrics::bridge::AccumulationMode],
+    n: usize,
+) -> ArrayRef {
+    use crate::self_metrics::bridge::AccumulationMode;
+    let cum = cum
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("int_value column");
+    let delta = delta
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("int_value column");
+
+    let merged: arrow::array::Int64Array = (0..n)
+        .map(|i| {
+            if cum.is_null(i) && delta.is_null(i) {
+                None
+            } else {
+                let mode = modes.get(i).copied().unwrap_or(AccumulationMode::Add);
+                let c = if cum.is_null(i) { 0 } else { cum.value(i) };
+                let d = if delta.is_null(i) { 0 } else { delta.value(i) };
+                Some(match mode {
+                    AccumulationMode::Add => c + d,
+                    AccumulationMode::Replace => d,
+                })
+            }
+        })
+        .collect();
+    Arc::new(merged)
+}
+
+/// Accumulate f64 values with per-element modes. Handles nullable arrays.
+fn accumulate_with_modes_f64(
+    cum: &ArrayRef,
+    delta: &ArrayRef,
+    modes: &[crate::self_metrics::bridge::AccumulationMode],
+    n: usize,
+) -> ArrayRef {
+    use crate::self_metrics::bridge::AccumulationMode;
+    let cum = cum
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("double_value column");
+    let delta = delta
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("double_value column");
+
+    let merged: arrow::array::Float64Array = (0..n)
+        .map(|i| {
+            if cum.is_null(i) && delta.is_null(i) {
+                None
+            } else {
+                let mode = modes.get(i).copied().unwrap_or(AccumulationMode::Add);
+                let c = if cum.is_null(i) { 0.0 } else { cum.value(i) };
+                let d = if delta.is_null(i) { 0.0 } else { delta.value(i) };
+                Some(match mode {
+                    AccumulationMode::Add => c + d,
+                    AccumulationMode::Replace => d,
+                })
+            }
+        })
+        .collect();
+    Arc::new(merged)
 }
 
 impl Default for CumulativeAccumulator {

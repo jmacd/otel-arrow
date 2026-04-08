@@ -9,14 +9,13 @@
 //!
 //! This module provides types for building and holding these tables.
 
-use arrow::array::{RecordBatch, TimestampNanosecondArray, UInt16Array, UInt32Array};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::array::RecordBatch;
 use arrow::error::ArrowError;
-use std::sync::Arc;
 
 use otap_df_pdata::encode::record::attributes::AttributesRecordBatchBuilder;
 use otap_df_pdata::encode::record::metrics::{
     HistogramDataPointsRecordBatchBuilder, MetricsRecordBatchBuilder,
+    NumberDataPointsRecordBatchBuilder,
 };
 use otap_df_pdata::otlp::metrics::MetricType;
 use otap_df_pdata::proto::opentelemetry::metrics::v1::AggregationTemporality;
@@ -174,11 +173,20 @@ impl PrecomputedMetricSchema {
     }
 }
 
-/// Builds the NumberDataPoints record batch at runtime from counter
-/// snapshots.
+/// Builds the NumberDataPoints record batch at runtime using the pdata
+/// `NumberDataPointsRecordBatchBuilder`, supporting both int and double values.
 pub struct CounterDataPointsBuilder {
     parent_ids: Vec<u16>,
     total_points: usize,
+}
+
+/// A metric value that is either integer or floating-point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumberValue {
+    /// Integer measurement (Counter<u64>, Gauge<u64>, etc.).
+    Int(i64),
+    /// Floating-point measurement (Counter<f64>, Gauge<f64>, etc.).
+    Double(f64),
 }
 
 impl CounterDataPointsBuilder {
@@ -196,52 +204,17 @@ impl CounterDataPointsBuilder {
         time_unix_nano: i64,
         values: &[u64],
     ) -> Result<RecordBatch, ArrowError> {
-        assert_eq!(
-            values.len(),
-            self.total_points,
-            "values length must match total_points"
-        );
-
-        let n = self.total_points;
-        let ids: Vec<u32> = (0..n as u32).collect();
-        let start_times: Vec<i64> = vec![start_time_unix_nano; n];
-        let times: Vec<i64> = vec![time_unix_nano; n];
-        let int_values: Vec<i64> = values.iter().map(|&v| v as i64).collect();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt32, false),
-            Field::new("parent_id", DataType::UInt16, false),
-            Field::new(
-                "start_time_unix_nano",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                true,
-            ),
-            Field::new(
-                "time_unix_nano",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
-            Field::new("int_value", DataType::Int64, true),
-        ]));
-
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(UInt32Array::from(ids)),
-                Arc::new(UInt16Array::from(self.parent_ids.clone())),
-                Arc::new(TimestampNanosecondArray::from(start_times)),
-                Arc::new(TimestampNanosecondArray::from(times)),
-                Arc::new(arrow::array::Int64Array::from(int_values)),
-            ],
-        )
+        let typed: Vec<NumberValue> = values.iter().map(|&v| NumberValue::Int(v as i64)).collect();
+        self.build(start_time_unix_nano, time_unix_nano, &typed)
     }
 
-    /// Build a NumberDataPoints record batch from pre-converted i64 values.
-    pub fn build_int_values_i64(
+    /// Build a NumberDataPoints record batch from typed values
+    /// (mixed int/double).
+    pub fn build(
         &self,
         start_time_unix_nano: i64,
         time_unix_nano: i64,
-        values: &[i64],
+        values: &[NumberValue],
     ) -> Result<RecordBatch, ArrowError> {
         assert_eq!(
             values.len(),
@@ -249,37 +222,27 @@ impl CounterDataPointsBuilder {
             "values length must match total_points"
         );
 
-        let n = self.total_points;
-        let ids: Vec<u32> = (0..n as u32).collect();
-        let start_times: Vec<i64> = vec![start_time_unix_nano; n];
-        let times: Vec<i64> = vec![time_unix_nano; n];
+        let mut builder = NumberDataPointsRecordBatchBuilder::new();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt32, false),
-            Field::new("parent_id", DataType::UInt16, false),
-            Field::new(
-                "start_time_unix_nano",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                true,
-            ),
-            Field::new(
-                "time_unix_nano",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
-            Field::new("int_value", DataType::Int64, true),
-        ]));
+        for (i, value) in values.iter().enumerate() {
+            builder.append_id(i as u32);
+            builder.append_parent_id(self.parent_ids[i]);
+            builder.append_start_time_unix_nano(Some(start_time_unix_nano));
+            builder.append_time_unix_nano(time_unix_nano);
+            match value {
+                NumberValue::Int(v) => {
+                    builder.append_int_value(Some(*v));
+                    builder.append_double_value(None);
+                }
+                NumberValue::Double(v) => {
+                    builder.append_int_value(None);
+                    builder.append_double_value(Some(*v));
+                }
+            }
+            builder.append_flags(0);
+        }
 
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(UInt32Array::from(ids)),
-                Arc::new(UInt16Array::from(self.parent_ids.clone())),
-                Arc::new(TimestampNanosecondArray::from(start_times)),
-                Arc::new(TimestampNanosecondArray::from(times)),
-                Arc::new(arrow::array::Int64Array::from(values.to_vec())),
-            ],
-        )
+        builder.finish()
     }
 }
 

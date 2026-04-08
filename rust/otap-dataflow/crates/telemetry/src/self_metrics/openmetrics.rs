@@ -46,6 +46,7 @@ fn format_entry(out: &mut String, entry: &CumulativeEntry) {
 
     let dp_parent_ids = get_u16_column(data_points, "parent_id");
     let dp_int_values = get_optional_i64_column(data_points, "int_value");
+    let dp_double_values = get_optional_f64_column(data_points, "double_value");
     let dp_ids = get_u32_column(data_points, "id");
 
     let attr_parent_ids = get_u32_column(attrs, "parent_id");
@@ -87,9 +88,22 @@ fn format_entry(out: &mut String, entry: &CumulativeEntry) {
 
             let dp_id = dp_ids[dp_row];
 
+            // Prefer int_value, fall back to double_value.
             let value = if let Some(ref int_vals) = dp_int_values {
                 if !int_vals.is_null(dp_row) {
                     format!("{}", int_vals.value(dp_row))
+                } else if let Some(ref dbl_vals) = dp_double_values {
+                    if !dbl_vals.is_null(dp_row) {
+                        format!("{}", dbl_vals.value(dp_row))
+                    } else {
+                        "0".to_string()
+                    }
+                } else {
+                    "0".to_string()
+                }
+            } else if let Some(ref dbl_vals) = dp_double_values {
+                if !dbl_vals.is_null(dp_row) {
+                    format!("{}", dbl_vals.value(dp_row))
                 } else {
                     "0".to_string()
                 }
@@ -262,6 +276,16 @@ fn get_optional_i64_column(batch: &RecordBatch, name: &str) -> Option<arrow::arr
     let idx = batch.schema().index_of(name).ok()?;
     let col = batch.column(idx);
     Some(col.as_primitive::<Int64Type>().clone())
+}
+
+fn get_optional_f64_column(
+    batch: &RecordBatch,
+    name: &str,
+) -> Option<arrow::array::Float64Array> {
+    use arrow::datatypes::Float64Type;
+    let idx = batch.schema().index_of(name).ok()?;
+    let col = batch.column(idx);
+    Some(col.as_primitive::<Float64Type>().clone())
 }
 
 #[cfg(test)]
