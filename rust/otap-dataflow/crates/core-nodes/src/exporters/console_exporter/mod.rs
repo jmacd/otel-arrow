@@ -21,7 +21,6 @@ use otap_df_engine::{ConsumerEffectHandlerExtension, ExporterFactory};
 use otap_df_otap::OTAP_EXPORTER_FACTORIES;
 use otap_df_otap::pdata::OtapPdata;
 use otap_df_pdata::OtapPayload;
-use otap_df_pdata::otap::OtapArrowRecords;
 use otap_df_pdata::views::otap::OtapLogsView;
 use otap_df_pdata::views::otlp::bytes::logs::RawLogsData;
 use otap_df_pdata_views::views::common::InstrumentationScopeView;
@@ -158,18 +157,12 @@ impl ConsoleExporter {
         );
     }
 
-    async fn export_metrics(&self, payload: &OtapPayload) {
-        match payload {
-            OtapPayload::OtapArrowRecords(records) => {
-                self.formatter.print_metrics_arrow(records).await;
-            }
-            _ => {
-                otel_error!(
-                    "console.metrics.unsupported_format",
-                    message = "Metrics console export only supports OTAP Arrow format"
-                );
-            }
-        }
+    async fn export_metrics(&self, _payload: &OtapPayload) {
+        // TODO: Implement metrics formatting.
+        otel_error!(
+            "console.metrics.not_implemented",
+            message = "Metrics formatting not yet implemented"
+        );
     }
 }
 
@@ -388,55 +381,6 @@ impl HierarchicalFormatter {
                 |_| {}, // No line suffix (scope printed above).
             );
         });
-    }
-
-    // ─── Metrics formatting ────────────────────────────────────────
-
-    /// Print OTAP Arrow metrics batches to stdout.
-    pub async fn print_metrics_arrow(&self, records: &OtapArrowRecords) {
-        use arrow::util::pretty::pretty_format_batches;
-        use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
-
-        let mut output: Vec<u8> = Vec::new();
-
-        output.extend_from_slice(b"=== METRICS ===\n");
-
-        // Print the root metrics table.
-        if let Some(metrics_batch) = records.get(ArrowPayloadType::UnivariateMetrics) {
-            let _ = write!(output, "-- UnivariateMetrics ({} rows) --\n", metrics_batch.num_rows());
-            if let Ok(formatted) = pretty_format_batches(&[metrics_batch.clone()]) {
-                let _ = write!(output, "{formatted}\n");
-            }
-        }
-
-        // Print NumberDataPoints if present.
-        if let Some(ndp_batch) = records.get(ArrowPayloadType::NumberDataPoints) {
-            let _ = write!(output, "-- NumberDataPoints ({} rows) --\n", ndp_batch.num_rows());
-            if let Ok(formatted) = pretty_format_batches(&[ndp_batch.clone()]) {
-                let _ = write!(output, "{formatted}\n");
-            }
-        }
-
-        // Print ExponentialHistogramDataPoints if present.
-        if let Some(edp_batch) = records.get(ArrowPayloadType::ExpHistogramDataPoints) {
-            let _ = write!(output, "-- ExpHistogramDataPoints ({} rows) --\n", edp_batch.num_rows());
-            if let Ok(formatted) = pretty_format_batches(&[edp_batch.clone()]) {
-                let _ = write!(output, "{formatted}\n");
-            }
-        }
-
-        // Print ScopeAttrs if present.
-        if let Some(scope_attrs) = records.get(ArrowPayloadType::ScopeAttrs) {
-            let _ = write!(output, "-- ScopeAttrs ({} rows) --\n", scope_attrs.num_rows());
-            if let Ok(formatted) = pretty_format_batches(&[scope_attrs.clone()]) {
-                let _ = write!(output, "{formatted}\n");
-            }
-        }
-
-        use tokio::io::AsyncWriteExt;
-        if let Err(err) = tokio::io::stdout().write_all(&output).await {
-            otel_error!("console.write_failed", error = ?err, message = "Could not write to console");
-        }
     }
 
     /// Format a line to the output buffer.
