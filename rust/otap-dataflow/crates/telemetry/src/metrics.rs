@@ -511,6 +511,39 @@ impl MetricSetRegistry {
         }
     }
 
+    /// Like [`visit_metrics_and_reset`](Self::visit_metrics_and_reset)
+    /// but also passes the `EntityKey` for each metric set.
+    pub(crate) fn visit_metrics_and_reset_with_entity<F>(
+        &mut self,
+        entities: &EntityRegistry,
+        mut f: F,
+    ) where
+        for<'a> F: FnMut(
+            EntityKey,
+            &'static MetricsDescriptor,
+            &'a dyn AttributeSetHandler,
+            MetricsIterator<'a>,
+        ),
+    {
+        for entry in self.metrics.values_mut() {
+            let values = &mut entry.metric_values;
+            if values.iter().any(|&v| !v.is_zero()) {
+                let desc = entry.metrics_descriptor;
+                if let Some(attrs) = entities.get(entry.entity_key) {
+                    f(
+                        entry.entity_key,
+                        desc,
+                        attrs,
+                        MetricsIterator::new(desc.metrics, values),
+                    );
+                }
+
+                // Zero after reporting.
+                values.iter_mut().for_each(MetricValue::reset);
+            }
+        }
+    }
+
     /// Generates a SemConvRegistry from the current MetricSetRegistry.
     /// AttributeFields are deduplicated based on their key.
     #[must_use]
