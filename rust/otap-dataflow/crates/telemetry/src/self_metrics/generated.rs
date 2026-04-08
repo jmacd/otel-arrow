@@ -9,10 +9,11 @@
 #![allow(clippy::needless_update)]
 
 use otap_df_config::policy::MetricLevel;
-use crate::instrument::Counter;
+use crate::instrument::{Counter, Mmsc};
 use crate::self_metrics::precomputed::{
     DimensionInfo, MetricInfo, PrecomputedMetricSchema,
 };
+use otel_expohisto::Histogram;
 use otap_df_pdata::otlp::metrics::MetricType;
 
 pub const OUTCOME_CARDINALITY: usize = 3;
@@ -24,17 +25,17 @@ pub enum NodeConsumer {
     /// Active at `MetricLevel::Basic` (1 scopes).
     Basic {
         items: [Counter<u64>; 1],
-        duration: [Counter<f64>; 1],
+        duration: [Mmsc; 1],
     },
     /// Active at `MetricLevel::Normal` (3 scopes).
     Normal {
         items: [Counter<u64>; 3],
-        duration: [Counter<f64>; 3],
+        duration: [Histogram<8>; 3],
     },
     /// Active at `MetricLevel::Detailed` (9 scopes).
     Detailed {
         items: [Counter<u64>; 9],
-        duration: [Counter<f64>; 9],
+        duration: [Histogram<16>; 9],
     },
 }
 
@@ -79,13 +80,13 @@ impl NodeConsumer {
     pub fn record_duration(&mut self, value: f64, outcome: usize, signal_type: usize) {
         match self {
             NodeConsumer::Basic { duration, .. } => {
-                duration[0].add(value);
+                duration[0].record(value);
             }
             NodeConsumer::Normal { duration, .. } => {
-                duration[outcome].add(value);
+                let _ = duration[outcome].update(value);
             }
             NodeConsumer::Detailed { duration, .. } => {
-                duration[outcome * 3 + signal_type].add(value);
+                let _ = duration[outcome * 3 + signal_type].update(value);
             }
         }
     }
@@ -99,8 +100,8 @@ impl NodeConsumer {
                     dest[offset] = c.get();
                     offset += 1;
                 }
-                for c in duration.iter() {
-                    dest[offset] = c.get() as u64;
+                for h in duration.iter() {
+                    dest[offset] = h.get().count;
                     offset += 1;
                 }
             }
@@ -109,8 +110,8 @@ impl NodeConsumer {
                     dest[offset] = c.get();
                     offset += 1;
                 }
-                for c in duration.iter() {
-                    dest[offset] = c.get() as u64;
+                for h in duration.iter() {
+                    dest[offset] = h.view().stats().count;
                     offset += 1;
                 }
             }
@@ -119,8 +120,8 @@ impl NodeConsumer {
                     dest[offset] = c.get();
                     offset += 1;
                 }
-                for c in duration.iter() {
-                    dest[offset] = c.get() as u64;
+                for h in duration.iter() {
+                    dest[offset] = h.view().stats().count;
                     offset += 1;
                 }
             }
@@ -132,15 +133,15 @@ impl NodeConsumer {
         match self {
             NodeConsumer::Basic { items, duration } => {
                 for c in items.iter_mut() { c.reset(); }
-                for c in duration.iter_mut() { c.reset(); }
+                for h in duration.iter_mut() { h.reset(); }
             }
             NodeConsumer::Normal { items, duration } => {
                 for c in items.iter_mut() { c.reset(); }
-                for c in duration.iter_mut() { c.reset(); }
+                for h in duration.iter_mut() { h.clear(); }
             }
             NodeConsumer::Detailed { items, duration } => {
                 for c in items.iter_mut() { c.reset(); }
-                for c in duration.iter_mut() { c.reset(); }
+                for h in duration.iter_mut() { h.clear(); }
             }
         }
     }
@@ -150,15 +151,15 @@ impl NodeConsumer {
         match self {
             NodeConsumer::Basic { items, duration } => {
                 items.iter().any(|c| c.get() != 0u64)
-                    || duration.iter().any(|c| c.get() != 0.0f64)
+                    || duration.iter().any(|h| h.get().count != 0)
             }
             NodeConsumer::Normal { items, duration } => {
                 items.iter().any(|c| c.get() != 0u64)
-                    || duration.iter().any(|c| c.get() != 0.0f64)
+                    || duration.iter().any(|h| h.view().stats().count != 0)
             }
             NodeConsumer::Detailed { items, duration } => {
                 items.iter().any(|c| c.get() != 0u64)
-                    || duration.iter().any(|c| c.get() != 0.0f64)
+                    || duration.iter().any(|h| h.view().stats().count != 0)
             }
         }
     }
@@ -211,17 +212,17 @@ pub enum NodeProducer {
     /// Active at `MetricLevel::Basic` (1 scopes).
     Basic {
         items: [Counter<u64>; 1],
-        duration: [Counter<f64>; 1],
+        duration: [Mmsc; 1],
     },
     /// Active at `MetricLevel::Normal` (3 scopes).
     Normal {
         items: [Counter<u64>; 3],
-        duration: [Counter<f64>; 3],
+        duration: [Histogram<8>; 3],
     },
     /// Active at `MetricLevel::Detailed` (9 scopes).
     Detailed {
         items: [Counter<u64>; 9],
-        duration: [Counter<f64>; 9],
+        duration: [Histogram<16>; 9],
     },
 }
 
@@ -266,13 +267,13 @@ impl NodeProducer {
     pub fn record_duration(&mut self, value: f64, outcome: usize, signal_type: usize) {
         match self {
             NodeProducer::Basic { duration, .. } => {
-                duration[0].add(value);
+                duration[0].record(value);
             }
             NodeProducer::Normal { duration, .. } => {
-                duration[outcome].add(value);
+                let _ = duration[outcome].update(value);
             }
             NodeProducer::Detailed { duration, .. } => {
-                duration[outcome * 3 + signal_type].add(value);
+                let _ = duration[outcome * 3 + signal_type].update(value);
             }
         }
     }
@@ -286,8 +287,8 @@ impl NodeProducer {
                     dest[offset] = c.get();
                     offset += 1;
                 }
-                for c in duration.iter() {
-                    dest[offset] = c.get() as u64;
+                for h in duration.iter() {
+                    dest[offset] = h.get().count;
                     offset += 1;
                 }
             }
@@ -296,8 +297,8 @@ impl NodeProducer {
                     dest[offset] = c.get();
                     offset += 1;
                 }
-                for c in duration.iter() {
-                    dest[offset] = c.get() as u64;
+                for h in duration.iter() {
+                    dest[offset] = h.view().stats().count;
                     offset += 1;
                 }
             }
@@ -306,8 +307,8 @@ impl NodeProducer {
                     dest[offset] = c.get();
                     offset += 1;
                 }
-                for c in duration.iter() {
-                    dest[offset] = c.get() as u64;
+                for h in duration.iter() {
+                    dest[offset] = h.view().stats().count;
                     offset += 1;
                 }
             }
@@ -319,15 +320,15 @@ impl NodeProducer {
         match self {
             NodeProducer::Basic { items, duration } => {
                 for c in items.iter_mut() { c.reset(); }
-                for c in duration.iter_mut() { c.reset(); }
+                for h in duration.iter_mut() { h.reset(); }
             }
             NodeProducer::Normal { items, duration } => {
                 for c in items.iter_mut() { c.reset(); }
-                for c in duration.iter_mut() { c.reset(); }
+                for h in duration.iter_mut() { h.clear(); }
             }
             NodeProducer::Detailed { items, duration } => {
                 for c in items.iter_mut() { c.reset(); }
-                for c in duration.iter_mut() { c.reset(); }
+                for h in duration.iter_mut() { h.clear(); }
             }
         }
     }
@@ -337,15 +338,15 @@ impl NodeProducer {
         match self {
             NodeProducer::Basic { items, duration } => {
                 items.iter().any(|c| c.get() != 0u64)
-                    || duration.iter().any(|c| c.get() != 0.0f64)
+                    || duration.iter().any(|h| h.get().count != 0)
             }
             NodeProducer::Normal { items, duration } => {
                 items.iter().any(|c| c.get() != 0u64)
-                    || duration.iter().any(|c| c.get() != 0.0f64)
+                    || duration.iter().any(|h| h.view().stats().count != 0)
             }
             NodeProducer::Detailed { items, duration } => {
                 items.iter().any(|c| c.get() != 0u64)
-                    || duration.iter().any(|c| c.get() != 0.0f64)
+                    || duration.iter().any(|h| h.view().stats().count != 0)
             }
         }
     }

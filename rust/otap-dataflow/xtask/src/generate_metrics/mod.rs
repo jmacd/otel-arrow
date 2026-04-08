@@ -108,10 +108,11 @@ fn render_generated_code(sets: &[ResolvedMetricSet]) -> anyhow::Result<String> {
          #![allow(clippy::needless_update)]\n\
          \n\
          use otap_df_config::policy::MetricLevel;\n\
-         use crate::instrument::Counter;\n\
+         use crate::instrument::{Counter, Mmsc};\n\
          use crate::self_metrics::precomputed::{\n\
          \x20   DimensionInfo, MetricInfo, PrecomputedMetricSchema,\n\
          };\n\
+         use otel_expohisto::Histogram;\n\
          use otap_df_pdata::otlp::metrics::MetricType;\n\
          \n",
     );
@@ -152,7 +153,8 @@ fn render_metric_set(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Resul
                         }
                     }
                     ir::RecordingMode::Histogram => {
-                        format!("        {field_name}: [Counter<f64>; {n}]")
+                        let histo_type = histogram_type_for_level(level_name);
+                        format!("        {field_name}: [{histo_type}; {n}]")
                     }
                     ir::RecordingMode::LastValue => {
                         if m.def.value_type == ir::ValueType::U64 {
@@ -297,10 +299,23 @@ fn render_metric_method(
         ));
 
         match metric.def.recording_mode {
-            ir::RecordingMode::Counting | ir::RecordingMode::Histogram => {
+            ir::RecordingMode::Counting => {
                 out.push_str(&format!(
                     "                {field_name}[{index_expr}].add(value);\n"
                 ));
+            }
+            ir::RecordingMode::Histogram => {
+                if *level_variant == "Basic" {
+                    out.push_str(&format!(
+                        "                {field_name}[{index_expr}].record(value);\n"
+                    ));
+                } else {
+                    // Histogram<N>::update returns Result; ignore error for now
+                    // (only fails on NaN/Inf/negative which shouldn't occur for durations).
+                    out.push_str(&format!(
+                        "                let _ = {field_name}[{index_expr}].update(value);\n"
+                    ));
+                }
             }
             ir::RecordingMode::LastValue => {
                 out.push_str(&format!(
@@ -333,8 +348,8 @@ fn render_snapshot_into(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Re
         for m in &set.metrics {
             let field_name = metric_field_name(&m.def.name);
             match m.def.recording_mode {
-                ir::RecordingMode::Counting | ir::RecordingMode::Histogram => {
-                    let cast = if m.def.value_type == ir::ValueType::U64 && m.def.recording_mode == ir::RecordingMode::Counting {
+                ir::RecordingMode::Counting => {
+                    let cast = if m.def.value_type == ir::ValueType::U64 {
                         "" // u64 Counter → u64 dest, no cast
                     } else {
                         " as u64"
@@ -345,6 +360,25 @@ fn render_snapshot_into(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Re
                          \x20                   offset += 1;\n\
                          \x20               }}\n"
                     ));
+                }
+                ir::RecordingMode::Histogram => {
+                    // Snapshot histogram count as proxy for NDP encoding.
+                    // Full EDP encoding reads the histogram views directly.
+                    if level_variant == "Basic" {
+                        out.push_str(&format!(
+                            "                for h in {field_name}.iter() {{\n\
+                             \x20                   dest[offset] = h.get().count;\n\
+                             \x20                   offset += 1;\n\
+                             \x20               }}\n"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "                for h in {field_name}.iter() {{\n\
+                             \x20                   dest[offset] = h.view().stats().count;\n\
+                             \x20                   offset += 1;\n\
+                             \x20               }}\n"
+                        ));
+                    }
                 }
                 ir::RecordingMode::LastValue => {
                     let cast = if m.def.value_type == ir::ValueType::U64 { "" } else { " as u64" };
@@ -381,10 +415,22 @@ fn render_clear(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Result<()>
         for m in &set.metrics {
             let field_name = metric_field_name(&m.def.name);
             match m.def.recording_mode {
-                ir::RecordingMode::Counting | ir::RecordingMode::Histogram => {
+                ir::RecordingMode::Counting => {
                     out.push_str(&format!(
                         "                for c in {field_name}.iter_mut() {{ c.reset(); }}\n"
                     ));
+                }
+                ir::RecordingMode::Histogram => {
+                    // Both Mmsc and Histogram<N> have clear() methods.
+                    if level_variant == "Basic" {
+                        out.push_str(&format!(
+                            "                for h in {field_name}.iter_mut() {{ h.reset(); }}\n"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "                for h in {field_name}.iter_mut() {{ h.clear(); }}\n"
+                        ));
+                    }
                 }
                 ir::RecordingMode::LastValue => {
                     let zero = if m.def.value_type == ir::ValueType::U64 { "0u64" } else { "0.0f64" };
@@ -424,7 +470,11 @@ fn render_needs_flush(out: &mut String, set: &ResolvedMetricSet) -> anyhow::Resu
                     checks.push(format!("{field_name}.iter().any(|c| c.get() != {zero})"));
                 }
                 ir::RecordingMode::Histogram => {
-                    checks.push(format!("{field_name}.iter().any(|c| c.get() != 0.0f64)"));
+                    if level_variant == "Basic" {
+                        checks.push(format!("{field_name}.iter().any(|h| h.get().count != 0)"));
+                    } else {
+                        checks.push(format!("{field_name}.iter().any(|h| h.view().stats().count != 0)"));
+                    }
                 }
                 ir::RecordingMode::LastValue => {
                     let zero = if m.def.value_type == ir::ValueType::U64 { "0u64" } else { "0.0f64" };
@@ -532,6 +582,17 @@ fn render_precomputed_schema(out: &mut String, set: &ResolvedMetricSet) -> anyho
     ));
 
     Ok(())
+}
+
+/// Returns the Rust type string for histogram fields at a given level.
+/// Basic → Mmsc, Normal → Histogram<8>, Detailed → Histogram<16>.
+fn histogram_type_for_level(level: &str) -> &'static str {
+    match level {
+        "Basic" => "Mmsc",
+        "Normal" => "Histogram<8>",
+        "Detailed" => "Histogram<16>",
+        _ => unreachable!(),
+    }
 }
 
 /// Build an index expression for array access given active dimensions.
