@@ -198,50 +198,73 @@ def col_center_x(table, col_name):
     return table.x + table.width // 2
 
 
-def col_header_y(table):
-    """Y center of the column header row."""
-    return table.y + TABLE_TITLE_H + HEADER_H // 2
+def col_header_bottom(table):
+    """Y of the bottom edge of the column header row."""
+    return table.y + TABLE_TITLE_H + HEADER_H
 
 
 DOT_R = 5          # radius of the connection dot
-STUB_LEN = 18      # vertical stub before the curve begins
+STUB_LEN = 20      # vertical stub outside the table before the curve
 
 
 def render_fk_arrow(src_table, src_col_name, dst_table, dst_col_name,
                     label="", color=COL_FK_LINE, offset=0, **kw) -> str:
-    """Draw an FK arrow with colored dots on the column headers and a
-    short vertical stub so the origin/destination columns are obvious."""
+    """Draw an FK arrow originating from a colored dot on the source
+    column header, routing out through the nearest table edge, curving
+    to the destination table, and terminating with an arrowhead on a
+    colored dot on the destination column header.
+
+    The arrow always exits the source table downward (from the bottom
+    edge) and enters the destination table from the top edge, which
+    matches the parent→child reading direction of the tables.
+    """
     sx = col_center_x(src_table, src_col_name)
     dx = col_center_x(dst_table, dst_col_name)
 
-    # Dots sit on the column header row
-    src_dot_y = col_header_y(src_table)
-    dst_dot_y = col_header_y(dst_table)
+    # Dot positions: center of column header cell
+    src_dot_y = table_col_header_center_y(src_table)
+    dst_dot_y = table_col_header_center_y(dst_table)
 
-    # The path runs from below the source table to above the dest table
-    sy = src_table.y + src_table.height
-    dy = dst_table.y
+    # The visible path exits the source table at its bottom edge and
+    # enters the destination table at its top edge.
+    src_exit_y = src_table.y + src_table.height
+    dst_enter_y = dst_table.y
 
-    # Stub: drop straight down from the table edge, then curve
-    stub_sy = sy + STUB_LEN
-    stub_dy = dy - STUB_LEN
-    mid_y = (stub_sy + stub_dy) / 2 + offset
+    # Determine whether source is above or below destination and
+    # adjust so arrows always route through open space.
+    if src_exit_y < dst_enter_y:
+        # Normal case: source above destination
+        stub_s = src_exit_y + STUB_LEN
+        stub_d = dst_enter_y - STUB_LEN
+    else:
+        # Source is below destination: exit from source top instead
+        src_exit_y = src_table.y
+        dst_enter_y = dst_table.y + dst_table.height
+        stub_s = src_exit_y - STUB_LEN
+        stub_d = dst_enter_y + STUB_LEN
+
+    mid_y = (stub_s + stub_d) / 2 + offset
 
     cid = color.replace("#", "")
+
+    # Path: vertical line inside table (dot → edge), stub, curve,
+    # stub, vertical line inside table (edge → dot)
     path = (
-        f'M {sx},{sy} '          # start at bottom of src table
-        f'L {sx},{stub_sy} '     # vertical stub down
-        f'C {sx},{mid_y} {dx},{mid_y} {dx},{stub_dy} '  # curve
-        f'L {dx},{dy}'           # vertical stub up into dst
+        f'M {sx},{src_dot_y} '
+        f'L {sx},{src_exit_y} '
+        f'L {sx},{stub_s} '
+        f'C {sx},{mid_y} {dx},{mid_y} {dx},{stub_d} '
+        f'L {dx},{dst_enter_y} '
+        f'L {dx},{dst_dot_y} '
     )
 
     parts = [
-        # Colored dot on source column header
+        # Colored dot on source column header (open circle = origin)
         f'<circle cx="{sx}" cy="{src_dot_y}" r="{DOT_R}" '
-        f'fill="{color}" opacity="0.85"/>',
-        # Colored dot on destination column header
+        f'fill="white" stroke="{color}" stroke-width="2"/>',
+        # Colored dot on destination column header (filled = target)
         f'<circle cx="{dx}" cy="{dst_dot_y}" r="{DOT_R}" '
-        f'fill="{color}" opacity="0.85"/>',
+        f'fill="{color}"/>',
         # The arrow path
         f'<path d="{path}" fill="none" stroke="{color}" '
         f'stroke-width="1.5" stroke-dasharray="6,3" '
@@ -250,7 +273,6 @@ def render_fk_arrow(src_table, src_col_name, dst_table, dst_col_name,
     if label:
         lx = (sx + dx) / 2
         ly = mid_y - 8
-        # White background for readability
         parts.append(
             f'<rect x="{lx - len(label) * 3.5 - 4}" y="{ly - 10}" '
             f'width="{len(label) * 7 + 8}" height="14" rx="3" '
@@ -262,6 +284,11 @@ def render_fk_arrow(src_table, src_col_name, dst_table, dst_col_name,
             f'{xml_escape(label)}</text>'
         )
     return "\n".join(parts)
+
+
+def table_col_header_center_y(table):
+    """Y center of the column header row."""
+    return table.y + TABLE_TITLE_H + HEADER_H // 2
 
 
 def arrow_marker(color):

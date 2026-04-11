@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1705 614" width="1705" height="614">
 <defs>
-<marker id="ah-e74c3c" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#e74c3c"/></marker>
 <marker id="ah-3498db" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#3498db"/></marker>
+<marker id="ah-e74c3c" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#e74c3c"/></marker>
 <marker id="ah-27ae60" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#27ae60"/></marker>
 </defs>
 <rect width="1705" height="614" fill="#f8f9fa" rx="10"/>
@@ -298,34 +298,34 @@
 <rect x="1218" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="1248" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
 <rect x="669" y="418" width="609" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
-<circle cx="129" cy="343" r="5" fill="#e74c3c" opacity="0.85"/>
-<circle cx="60" cy="111" r="5" fill="#e74c3c" opacity="0.85"/>
-<path d="M 129,378 L 129,396 C 129,224.0 60,224.0 60,52 L 60,70" fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
+<circle cx="129" cy="343" r="5" fill="white" stroke="#e74c3c" stroke-width="2"/>
+<circle cx="60" cy="111" r="5" fill="#e74c3c"/>
+<path d="M 129,343 L 129,302 L 129,282 C 129,224.0 60,224.0 60,166 L 60,146 L 60,111 " fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
 <rect x="41.5" y="206.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
 <text x="94.5" y="216.0" text-anchor="middle" fill="#e74c3c" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
-<circle cx="807" cy="343" r="5" fill="#e74c3c" opacity="0.85"/>
-<circle cx="60" cy="111" r="5" fill="#e74c3c" opacity="0.85"/>
-<path d="M 807,378 L 807,396 C 807,234.0 60,234.0 60,52 L 60,70" fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
+<circle cx="807" cy="343" r="5" fill="white" stroke="#e74c3c" stroke-width="2"/>
+<circle cx="60" cy="111" r="5" fill="#e74c3c"/>
+<path d="M 807,343 L 807,302 L 807,282 C 807,234.0 60,234.0 60,166 L 60,146 L 60,111 " fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
 <rect x="380.5" y="216.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
 <text x="433.5" y="226.0" text-anchor="middle" fill="#e74c3c" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
-<circle cx="69" cy="459" r="5" fill="#27ae60" opacity="0.85"/>
-<circle cx="60" cy="343" r="5" fill="#27ae60" opacity="0.85"/>
-<path d="M 69,494 L 69,512 C 69,398.0 60,398.0 60,284 L 60,302" fill="none" stroke="#27ae60" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-27ae60)"/>
+<circle cx="69" cy="459" r="5" fill="white" stroke="#27ae60" stroke-width="2"/>
+<circle cx="60" cy="343" r="5" fill="#27ae60"/>
+<path d="M 69,459 L 69,418 L 69,398 C 69,398.0 60,398.0 60,398 L 60,378 L 60,343 " fill="none" stroke="#27ae60" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-27ae60)"/>
 <rect x="11.5" y="380.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
 <text x="64.5" y="390.0" text-anchor="middle" fill="#27ae60" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
-<circle cx="708" cy="459" r="5" fill="#27ae60" opacity="0.85"/>
-<circle cx="738" cy="343" r="5" fill="#27ae60" opacity="0.85"/>
-<path d="M 708,494 L 708,512 C 708,398.0 738,398.0 738,284 L 738,302" fill="none" stroke="#27ae60" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-27ae60)"/>
+<circle cx="708" cy="459" r="5" fill="white" stroke="#27ae60" stroke-width="2"/>
+<circle cx="738" cy="343" r="5" fill="#27ae60"/>
+<path d="M 708,459 L 708,418 L 708,398 C 708,398.0 738,398.0 738,398 L 738,378 L 738,343 " fill="none" stroke="#27ae60" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-27ae60)"/>
 <rect x="670.0" y="380.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
 <text x="723.0" y="390.0" text-anchor="middle" fill="#27ae60" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
-<circle cx="69" cy="227" r="5" fill="#3498db" opacity="0.85"/>
-<circle cx="133" cy="111" r="5" fill="#3498db" opacity="0.85"/>
-<path d="M 69,262 L 69,280 C 69,166.0 133,166.0 133,52 L 133,70" fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
+<circle cx="69" cy="227" r="5" fill="white" stroke="#3498db" stroke-width="2"/>
+<circle cx="133" cy="111" r="5" fill="#3498db"/>
+<path d="M 69,227 L 69,186 L 69,166 C 69,166.0 133,166.0 133,166 L 133,146 L 133,111 " fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
 <rect x="16.5" y="148.0" width="169" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
 <text x="101.0" y="158.0" text-anchor="middle" fill="#3498db" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → resource.id</text>
-<circle cx="708" cy="227" r="5" fill="#3498db" opacity="0.85"/>
-<circle cx="208" cy="111" r="5" fill="#3498db" opacity="0.85"/>
-<path d="M 708,262 L 708,280 C 708,151.0 208,151.0 208,52 L 208,70" fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
+<circle cx="708" cy="227" r="5" fill="white" stroke="#3498db" stroke-width="2"/>
+<circle cx="208" cy="111" r="5" fill="#3498db"/>
+<path d="M 708,227 L 708,186 L 708,166 C 708,151.0 208,151.0 208,166 L 208,146 L 208,111 " fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
 <rect x="384.0" y="133.0" width="148" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
 <text x="458.0" y="143.0" text-anchor="middle" fill="#3498db" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → scope.id</text>
 </svg>
