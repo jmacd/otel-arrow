@@ -268,19 +268,19 @@ def render_table(table: Table) -> str:
 
 
 def col_center_x(table, col_name):
-    """X center of a named column in a table, accounting for the
-    separator gap between used and unused column groups."""
+    """X position for arrow anchors on a named column — offset to the
+    right of center so arrows don't overlap the centered text."""
     cx = table.x
     has_sep = _has_separator(table)
     for i, c in enumerate(table.columns):
-        # Insert separator gap at the used/unused boundary
         if has_sep and i > 0:
             prev_unused = _col_is_unused(table.columns[i - 1])
             curr_unused = _col_is_unused(c)
             if not prev_unused and curr_unused:
                 cx += SEP_WIDTH
         if c.name == col_name:
-            return cx + c.width // 2
+            # Right-of-center: 70% across the column width
+            return cx + int(c.width * 0.7)
         cx += c.width
     return table.x + table.width // 2
 

@@ -384,14 +384,14 @@
 <line x1="467" y1="614" x2="467" y2="728" stroke="#95a5a6" stroke-width="3" stroke-dasharray="4,3" opacity="0.6"/>
 <text x="467" y="611" text-anchor="middle" fill="#95a5a6" font-family="Consolas, 'Courier New', monospace" font-size="8" font-style="italic">unused</text>
 <rect x="30" y="586" width="539" height="142" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
-<circle cx="69" cy="111" r="5" fill="white" stroke="#3498db" stroke-width="2"/>
-<circle cx="219" cy="435" r="5" fill="#3498db"/>
-<path d="M 69,111 L 69,344 L 69,364 C 69,369.0 219,369.0 219,374 L 219,394 L 219,435 " fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
-<rect x="70.0" y="351.0" width="148" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
-<text x="144.0" y="361.0" text-anchor="middle" fill="#3498db" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → scope.id</text>
-<circle cx="129" cy="627" r="5" fill="white" stroke="#e74c3c" stroke-width="2"/>
-<circle cx="60" cy="435" r="5" fill="#e74c3c"/>
-<path d="M 129,627 L 129,586 L 129,566 C 129,561.0 60,561.0 60,556 L 60,536 L 60,435 " fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
-<rect x="41.5" y="543.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
-<text x="94.5" y="553.0" text-anchor="middle" fill="#e74c3c" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
+<circle cx="85" cy="111" r="5" fill="white" stroke="#3498db" stroke-width="2"/>
+<circle cx="233" cy="435" r="5" fill="#3498db"/>
+<path d="M 85,111 L 85,344 L 85,364 C 85,369.0 233,369.0 233,374 L 233,394 L 233,435 " fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
+<rect x="85.0" y="351.0" width="148" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
+<text x="159.0" y="361.0" text-anchor="middle" fill="#3498db" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → scope.id</text>
+<circle cx="145" cy="627" r="5" fill="white" stroke="#e74c3c" stroke-width="2"/>
+<circle cx="72" cy="435" r="5" fill="#e74c3c"/>
+<path d="M 145,627 L 145,586 L 145,566 C 145,561.0 72,561.0 72,556 L 72,536 L 72,435 " fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
+<rect x="55.5" y="543.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
+<text x="108.5" y="553.0" text-anchor="middle" fill="#e74c3c" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
 </svg>
