@@ -49,11 +49,18 @@ COL_TEXT = "#2c3e50"
 COL_TYPE_TEXT = "#7f8c8d"
 COL_ID_HIGHLIGHT = "#e8f4fd"
 COL_FK_LINE = "#3498db"
-COL_NULLABLE_HEADER = "#5d6d7e"     # lighter than required header
-COL_NULLABLE_DATA = "#f5f5f0"       # faint warm tint for nullable data cells
+COL_UNUSED_HEADER = "#7f8c8d"       # muted header for unused columns
+COL_UNUSED_DATA = "#ececec"         # grey-ish for unused data cells
 COL_SEPARATOR = "#95a5a6"           # vertical separator between groups
 
 SEP_WIDTH = 3                       # width of the visual separator
+
+
+def _col_is_unused(col) -> bool:
+    """A column is unused when it has data rows but every value is empty."""
+    if not col.values:
+        return False
+    return all(str(v).strip() == "" for v in col.values)
 
 
 @dataclass
@@ -91,9 +98,13 @@ def compute_col_widths(table: Table):
 
 
 def compute_table_size(table: Table):
+    # Sort columns: used first, unused last (stable within each group)
+    used = [c for c in table.columns if not _col_is_unused(c)]
+    unused = [c for c in table.columns if _col_is_unused(c)]
+    table.columns = used + unused
+
     compute_col_widths(table)
     table.width = sum(c.width for c in table.columns)
-    # Add separator if table has both required and nullable columns
     if _has_separator(table):
         table.width += SEP_WIDTH
     n_rows = max(len(c.values) for c in table.columns) if table.columns else 0
@@ -101,11 +112,10 @@ def compute_table_size(table: Table):
 
 
 def _has_separator(table: Table) -> bool:
-    """True if the table has a mix of required and nullable columns,
-    meaning we should draw a vertical separator."""
-    has_req = any(not c.nullable for c in table.columns)
-    has_nul = any(c.nullable for c in table.columns)
-    return has_req and has_nul
+    """True if the table has both used and unused columns."""
+    has_used = any(not _col_is_unused(c) for c in table.columns)
+    has_unused = any(_col_is_unused(c) for c in table.columns)
+    return has_used and has_unused
 
 
 def xml_escape(s):
@@ -144,35 +154,27 @@ def render_table(table: Table) -> str:
 
     cy = y0 + TABLE_TITLE_H
 
-    # ── helper to track x and inject separator ──
-    sep_x = None  # x of the separator line
-
-    def advance_x(cx, col_idx):
-        """Return the x for this column, inserting separator gap if needed."""
-        nonlocal sep_x
-        if has_sep and col_idx > 0:
-            prev = table.columns[col_idx - 1]
-            curr = table.columns[col_idx]
-            if not prev.nullable and curr.nullable and sep_x is None:
-                sep_x = cx
-                cx += SEP_WIDTH
-        return cx
+    # ── helper: detect the boundary between used and unused columns ──
+    def is_sep_boundary(idx):
+        """True if the separator should appear before column at idx."""
+        if not has_sep or idx == 0:
+            return False
+        prev_unused = _col_is_unused(table.columns[idx - 1])
+        curr_unused = _col_is_unused(table.columns[idx])
+        return not prev_unused and curr_unused
 
     # ── Column headers ──
     cx = x0
     for i, col in enumerate(table.columns):
-        cx = advance_x(cx, i)
+        if is_sep_boundary(i):
+            cx += SEP_WIDTH
+        unused = _col_is_unused(col)
         if col.is_id or col.is_fk:
-            bg = COL_ID_HIGHLIGHT
-            tc = COL_TEXT
-        elif col.nullable:
-            bg = COL_NULLABLE_HEADER
-            tc = COL_HEADER_TEXT
+            bg, tc = COL_ID_HIGHLIGHT, COL_TEXT
+        elif unused:
+            bg, tc = COL_UNUSED_HEADER, COL_HEADER_TEXT
         else:
-            bg = COL_HEADER_BG
-            tc = COL_HEADER_TEXT
-
-        display_name = col.name + "?" if col.nullable else col.name
+            bg, tc = COL_HEADER_BG, COL_HEADER_TEXT
 
         parts.append(
             f'<rect x="{cx}" y="{cy}" width="{col.width}" height="{HEADER_H}" '
@@ -182,17 +184,18 @@ def render_table(table: Table) -> str:
             f'<text x="{cx + col.width // 2}" y="{cy + 11}" '
             f'text-anchor="middle" fill="{tc}" '
             f'font-family="{FONT}" font-size="{HEADER_FONT_SIZE}" font-weight="bold">'
-            f'{xml_escape(display_name)}</text>'
+            f'{xml_escape(col.name)}</text>'
         )
         cx += col.width
     cy += HEADER_H
 
     # ── Type row ──
     cx = x0
-    sep_x = None
     for i, col in enumerate(table.columns):
-        cx = advance_x(cx, i)
-        bg = COL_NULLABLE_DATA if col.nullable else COL_ROW_ODD
+        if is_sep_boundary(i):
+            cx += SEP_WIDTH
+        unused = _col_is_unused(col)
+        bg = COL_UNUSED_DATA if unused else COL_ROW_ODD
         parts.append(
             f'<rect x="{cx}" y="{cy}" width="{col.width}" height="{CELL_H}" '
             f'fill="{bg}" stroke="{COL_BORDER}" stroke-width="0.5"/>'
@@ -209,14 +212,15 @@ def render_table(table: Table) -> str:
     # ── Data rows ──
     for row_idx in range(n_rows):
         cx = x0
-        sep_x = None
         base_bg = COL_ROW_EVEN if row_idx % 2 == 0 else COL_ROW_ODD
         for i, col in enumerate(table.columns):
-            cx = advance_x(cx, i)
+            if is_sep_boundary(i):
+                cx += SEP_WIDTH
+            unused = _col_is_unused(col)
             if col.is_id or col.is_fk:
                 cell_bg = COL_ID_HIGHLIGHT
-            elif col.nullable:
-                cell_bg = COL_NULLABLE_DATA
+            elif unused:
+                cell_bg = COL_UNUSED_DATA
             else:
                 cell_bg = base_bg
             val = col.values[row_idx] if row_idx < len(col.values) else ""
@@ -233,12 +237,11 @@ def render_table(table: Table) -> str:
             cx += col.width
         cy += CELL_H
 
-    # ── Vertical separator between required and nullable groups ──
+    # ── Vertical separator between used and unused columns ──
     if has_sep:
-        # Find separator x position
         sx = x0
         for i, col in enumerate(table.columns):
-            if i > 0 and not table.columns[i - 1].nullable and col.nullable:
+            if is_sep_boundary(i):
                 break
             sx += col.width
         sep_top = y0 + TABLE_TITLE_H
@@ -249,12 +252,11 @@ def render_table(table: Table) -> str:
             f'stroke="{COL_SEPARATOR}" stroke-width="{SEP_WIDTH}" '
             f'stroke-dasharray="4,3" opacity="0.6"/>'
         )
-        # Label
         parts.append(
             f'<text x="{sx + SEP_WIDTH // 2}" y="{sep_top - 3}" '
             f'text-anchor="middle" fill="{COL_SEPARATOR}" '
             f'font-family="{FONT}" font-size="8" font-style="italic">'
-            f'nullable</text>'
+            f'unused</text>'
         )
 
     # Outline
@@ -266,9 +268,17 @@ def render_table(table: Table) -> str:
 
 
 def col_center_x(table, col_name):
-    """X center of a named column in a table."""
+    """X center of a named column in a table, accounting for the
+    separator gap between used and unused column groups."""
     cx = table.x
-    for c in table.columns:
+    has_sep = _has_separator(table)
+    for i, c in enumerate(table.columns):
+        # Insert separator gap at the used/unused boundary
+        if has_sep and i > 0:
+            prev_unused = _col_is_unused(table.columns[i - 1])
+            curr_unused = _col_is_unused(c)
+            if not prev_unused and curr_unused:
+                cx += SEP_WIDTH
         if c.name == col_name:
             return cx + c.width // 2
         cx += c.width
