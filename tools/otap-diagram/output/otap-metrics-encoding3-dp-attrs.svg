@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 844 842" width="844" height="842">
 <defs>
+<marker id="ah-3498db" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#3498db"/></marker>
 <marker id="ah-27ae60" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#27ae60"/></marker>
 <marker id="ah-e74c3c" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#e74c3c"/></marker>
-<marker id="ah-3498db" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#3498db"/></marker>
 </defs>
 <rect width="844" height="842" fill="#f8f9fa" rx="10"/>
 <text x="422" y="34" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="16" font-weight="bold">OTAP Metrics: Data Point Attributes</text>
@@ -314,10 +314,19 @@
 <rect x="579" y="700" width="60" height="22" fill="#ffffff" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="609" y="715" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="12"></text>
 <rect x="30" y="580" width="609" height="142" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
-<path d="M 69,190 C 69,215.0 219,215.0 219,240" fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
-<text x="144.0" y="209.0" text-anchor="middle" fill="#3498db" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → scope.id</text>
-<path d="M 129,530 C 129,385.0 60,385.0 60,240" fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
-<text x="94.5" y="379.0" text-anchor="middle" fill="#e74c3c" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
-<path d="M 69,722 C 69,555.0 60,555.0 60,388" fill="none" stroke="#27ae60" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-27ae60)"/>
-<text x="64.5" y="549.0" text-anchor="middle" fill="#27ae60" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
+<circle cx="69" cy="111" r="5" fill="#3498db" opacity="0.85"/>
+<circle cx="219" cy="281" r="5" fill="#3498db" opacity="0.85"/>
+<path d="M 69,190 L 69,208 C 69,215.0 219,215.0 219,222 L 219,240" fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
+<rect x="70.0" y="197.0" width="148" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
+<text x="144.0" y="207.0" text-anchor="middle" fill="#3498db" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → scope.id</text>
+<circle cx="129" cy="429" r="5" fill="#e74c3c" opacity="0.85"/>
+<circle cx="60" cy="281" r="5" fill="#e74c3c" opacity="0.85"/>
+<path d="M 129,530 L 129,548 C 129,385.0 60,385.0 60,222 L 60,240" fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
+<rect x="41.5" y="367.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
+<text x="94.5" y="377.0" text-anchor="middle" fill="#e74c3c" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
+<circle cx="69" cy="621" r="5" fill="#27ae60" opacity="0.85"/>
+<circle cx="60" cy="429" r="5" fill="#27ae60" opacity="0.85"/>
+<path d="M 69,722 L 69,740 C 69,555.0 60,555.0 60,370 L 60,388" fill="none" stroke="#27ae60" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-27ae60)"/>
+<rect x="11.5" y="537.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
+<text x="64.5" y="547.0" text-anchor="middle" fill="#27ae60" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
 </svg>

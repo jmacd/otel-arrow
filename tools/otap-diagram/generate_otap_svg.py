@@ -188,31 +188,74 @@ def render_table(table: Table) -> str:
     return "\n".join(parts)
 
 
+def col_center_x(table, col_name):
+    """X center of a named column in a table."""
+    cx = table.x
+    for c in table.columns:
+        if c.name == col_name:
+            return cx + c.width // 2
+        cx += c.width
+    return table.x + table.width // 2
+
+
+def col_header_y(table):
+    """Y center of the column header row."""
+    return table.y + TABLE_TITLE_H + HEADER_H // 2
+
+
+DOT_R = 5          # radius of the connection dot
+STUB_LEN = 18      # vertical stub before the curve begins
+
+
 def render_fk_arrow(src_table, src_col_name, dst_table, dst_col_name,
                     label="", color=COL_FK_LINE, offset=0, **kw) -> str:
-    def col_cx(t, cname):
-        cx = t.x
-        for c in t.columns:
-            if c.name == cname:
-                return cx + c.width // 2
-            cx += c.width
-        return t.x + t.width // 2
+    """Draw an FK arrow with colored dots on the column headers and a
+    short vertical stub so the origin/destination columns are obvious."""
+    sx = col_center_x(src_table, src_col_name)
+    dx = col_center_x(dst_table, dst_col_name)
 
-    sx = col_cx(src_table, src_col_name)
-    dx = col_cx(dst_table, dst_col_name)
+    # Dots sit on the column header row
+    src_dot_y = col_header_y(src_table)
+    dst_dot_y = col_header_y(dst_table)
+
+    # The path runs from below the source table to above the dest table
     sy = src_table.y + src_table.height
     dy = dst_table.y
-    mid_y = (sy + dy) / 2 + offset
+
+    # Stub: drop straight down from the table edge, then curve
+    stub_sy = sy + STUB_LEN
+    stub_dy = dy - STUB_LEN
+    mid_y = (stub_sy + stub_dy) / 2 + offset
 
     cid = color.replace("#", "")
-    path = f'M {sx},{sy} C {sx},{mid_y} {dx},{mid_y} {dx},{dy}'
+    path = (
+        f'M {sx},{sy} '          # start at bottom of src table
+        f'L {sx},{stub_sy} '     # vertical stub down
+        f'C {sx},{mid_y} {dx},{mid_y} {dx},{stub_dy} '  # curve
+        f'L {dx},{dy}'           # vertical stub up into dst
+    )
+
     parts = [
+        # Colored dot on source column header
+        f'<circle cx="{sx}" cy="{src_dot_y}" r="{DOT_R}" '
+        f'fill="{color}" opacity="0.85"/>',
+        # Colored dot on destination column header
+        f'<circle cx="{dx}" cy="{dst_dot_y}" r="{DOT_R}" '
+        f'fill="{color}" opacity="0.85"/>',
+        # The arrow path
         f'<path d="{path}" fill="none" stroke="{color}" '
         f'stroke-width="1.5" stroke-dasharray="6,3" '
-        f'marker-end="url(#ah-{cid})"/>'
+        f'marker-end="url(#ah-{cid})"/>',
     ]
     if label:
-        lx, ly = (sx + dx) / 2, mid_y - 6
+        lx = (sx + dx) / 2
+        ly = mid_y - 8
+        # White background for readability
+        parts.append(
+            f'<rect x="{lx - len(label) * 3.5 - 4}" y="{ly - 10}" '
+            f'width="{len(label) * 7 + 8}" height="14" rx="3" '
+            f'fill="{COL_BG}" opacity="0.9"/>'
+        )
         parts.append(
             f'<text x="{lx}" y="{ly}" text-anchor="middle" fill="{color}" '
             f'font-family="{FONT}" font-size="10" font-weight="bold">'
