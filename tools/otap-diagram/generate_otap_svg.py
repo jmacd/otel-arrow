@@ -49,6 +49,11 @@ COL_TEXT = "#2c3e50"
 COL_TYPE_TEXT = "#7f8c8d"
 COL_ID_HIGHLIGHT = "#e8f4fd"
 COL_FK_LINE = "#3498db"
+COL_NULLABLE_HEADER = "#5d6d7e"     # lighter than required header
+COL_NULLABLE_DATA = "#f5f5f0"       # faint warm tint for nullable data cells
+COL_SEPARATOR = "#95a5a6"           # vertical separator between groups
+
+SEP_WIDTH = 3                       # width of the visual separator
 
 
 @dataclass
@@ -58,6 +63,7 @@ class Column:
     values: list = field(default_factory=list)
     is_id: bool = False
     is_fk: bool = False
+    nullable: bool = False
     width: int = 0
 
 
@@ -87,8 +93,19 @@ def compute_col_widths(table: Table):
 def compute_table_size(table: Table):
     compute_col_widths(table)
     table.width = sum(c.width for c in table.columns)
+    # Add separator if table has both required and nullable columns
+    if _has_separator(table):
+        table.width += SEP_WIDTH
     n_rows = max(len(c.values) for c in table.columns) if table.columns else 0
     table.height = TABLE_TITLE_H + HEADER_H + CELL_H + n_rows * CELL_H
+
+
+def _has_separator(table: Table) -> bool:
+    """True if the table has a mix of required and nullable columns,
+    meaning we should draw a vertical separator."""
+    has_req = any(not c.nullable for c in table.columns)
+    has_nul = any(c.nullable for c in table.columns)
+    return has_req and has_nul
 
 
 def xml_escape(s):
@@ -101,6 +118,7 @@ def render_table(table: Table) -> str:
     parts = []
     x0, y0 = table.x, table.y
     n_rows = max(len(c.values) for c in table.columns) if table.columns else 0
+    has_sep = _has_separator(table)
 
     # Title banner
     parts.append(
@@ -126,11 +144,36 @@ def render_table(table: Table) -> str:
 
     cy = y0 + TABLE_TITLE_H
 
-    # Column headers
+    # ── helper to track x and inject separator ──
+    sep_x = None  # x of the separator line
+
+    def advance_x(cx, col_idx):
+        """Return the x for this column, inserting separator gap if needed."""
+        nonlocal sep_x
+        if has_sep and col_idx > 0:
+            prev = table.columns[col_idx - 1]
+            curr = table.columns[col_idx]
+            if not prev.nullable and curr.nullable and sep_x is None:
+                sep_x = cx
+                cx += SEP_WIDTH
+        return cx
+
+    # ── Column headers ──
     cx = x0
-    for col in table.columns:
-        bg = COL_ID_HIGHLIGHT if col.is_id or col.is_fk else COL_HEADER_BG
-        tc = COL_TEXT if col.is_id or col.is_fk else COL_HEADER_TEXT
+    for i, col in enumerate(table.columns):
+        cx = advance_x(cx, i)
+        if col.is_id or col.is_fk:
+            bg = COL_ID_HIGHLIGHT
+            tc = COL_TEXT
+        elif col.nullable:
+            bg = COL_NULLABLE_HEADER
+            tc = COL_HEADER_TEXT
+        else:
+            bg = COL_HEADER_BG
+            tc = COL_HEADER_TEXT
+
+        display_name = col.name + "?" if col.nullable else col.name
+
         parts.append(
             f'<rect x="{cx}" y="{cy}" width="{col.width}" height="{HEADER_H}" '
             f'fill="{bg}" stroke="{COL_BORDER}" stroke-width="0.5"/>'
@@ -139,17 +182,20 @@ def render_table(table: Table) -> str:
             f'<text x="{cx + col.width // 2}" y="{cy + 11}" '
             f'text-anchor="middle" fill="{tc}" '
             f'font-family="{FONT}" font-size="{HEADER_FONT_SIZE}" font-weight="bold">'
-            f'{xml_escape(col.name)}</text>'
+            f'{xml_escape(display_name)}</text>'
         )
         cx += col.width
     cy += HEADER_H
 
-    # Type row
+    # ── Type row ──
     cx = x0
-    for col in table.columns:
+    sep_x = None
+    for i, col in enumerate(table.columns):
+        cx = advance_x(cx, i)
+        bg = COL_NULLABLE_DATA if col.nullable else COL_ROW_ODD
         parts.append(
             f'<rect x="{cx}" y="{cy}" width="{col.width}" height="{CELL_H}" '
-            f'fill="{COL_ROW_ODD}" stroke="{COL_BORDER}" stroke-width="0.5"/>'
+            f'fill="{bg}" stroke="{COL_BORDER}" stroke-width="0.5"/>'
         )
         parts.append(
             f'<text x="{cx + col.width // 2}" y="{cy + 15}" '
@@ -160,12 +206,19 @@ def render_table(table: Table) -> str:
         cx += col.width
     cy += CELL_H
 
-    # Data rows
+    # ── Data rows ──
     for row_idx in range(n_rows):
         cx = x0
-        bg = COL_ROW_EVEN if row_idx % 2 == 0 else COL_ROW_ODD
-        for col in table.columns:
-            cell_bg = COL_ID_HIGHLIGHT if (col.is_id or col.is_fk) else bg
+        sep_x = None
+        base_bg = COL_ROW_EVEN if row_idx % 2 == 0 else COL_ROW_ODD
+        for i, col in enumerate(table.columns):
+            cx = advance_x(cx, i)
+            if col.is_id or col.is_fk:
+                cell_bg = COL_ID_HIGHLIGHT
+            elif col.nullable:
+                cell_bg = COL_NULLABLE_DATA
+            else:
+                cell_bg = base_bg
             val = col.values[row_idx] if row_idx < len(col.values) else ""
             parts.append(
                 f'<rect x="{cx}" y="{cy}" width="{col.width}" height="{CELL_H}" '
@@ -179,6 +232,30 @@ def render_table(table: Table) -> str:
             )
             cx += col.width
         cy += CELL_H
+
+    # ── Vertical separator between required and nullable groups ──
+    if has_sep:
+        # Find separator x position
+        sx = x0
+        for i, col in enumerate(table.columns):
+            if i > 0 and not table.columns[i - 1].nullable and col.nullable:
+                break
+            sx += col.width
+        sep_top = y0 + TABLE_TITLE_H
+        sep_bot = y0 + table.height
+        parts.append(
+            f'<line x1="{sx + SEP_WIDTH // 2}" y1="{sep_top}" '
+            f'x2="{sx + SEP_WIDTH // 2}" y2="{sep_bot}" '
+            f'stroke="{COL_SEPARATOR}" stroke-width="{SEP_WIDTH}" '
+            f'stroke-dasharray="4,3" opacity="0.6"/>'
+        )
+        # Label
+        parts.append(
+            f'<text x="{sx + SEP_WIDTH // 2}" y="{sep_top - 3}" '
+            f'text-anchor="middle" fill="{COL_SEPARATOR}" '
+            f'font-family="{FONT}" font-size="8" font-style="italic">'
+            f'nullable</text>'
+        )
 
     # Outline
     parts.append(
@@ -353,79 +430,79 @@ def make_overview():
         Column("parent_id", "uint16", [], is_fk=True),
         Column("key", "string/dict", []),
         Column("type", "uint8", []),
-        Column("str", "string/dict", []),
-        Column("int", "int64", []),
-        Column("double", "float64", []),
-        Column("bool", "bool", []),
-        Column("bytes", "binary", []),
-        Column("ser", "binary", []),
+        Column("str", "string/dict", [], nullable=True),
+        Column("int", "int64", [], nullable=True),
+        Column("double", "float64", [], nullable=True),
+        Column("bool", "bool", [], nullable=True),
+        Column("bytes", "binary", [], nullable=True),
+        Column("ser", "binary", [], nullable=True),
     ])
     scope_attrs = Table("ScopeAttrs", "SCOPE_ATTRS", [
         Column("parent_id", "uint16", [], is_fk=True),
         Column("key", "string/dict", []),
         Column("type", "uint8", []),
-        Column("str", "string/dict", []),
-        Column("int", "int64", []),
-        Column("double", "float64", []),
-        Column("bool", "bool", []),
-        Column("bytes", "binary", []),
-        Column("ser", "binary", []),
+        Column("str", "string/dict", [], nullable=True),
+        Column("int", "int64", [], nullable=True),
+        Column("double", "float64", [], nullable=True),
+        Column("bool", "bool", [], nullable=True),
+        Column("bytes", "binary", [], nullable=True),
+        Column("ser", "binary", [], nullable=True),
     ])
     metrics = Table("UnivariateMetrics", "UNIVARIATE_METRICS", [
         Column("id", "uint16", [], is_id=True),
-        Column("resource{}", "struct", []),
-        Column("scope{}", "struct", []),
-        Column("schema_url", "string/dict", []),
+        Column("resource{}", "struct", [], nullable=True),
+        Column("scope{}", "struct", [], nullable=True),
+        Column("schema_url", "string/dict", [], nullable=True),
         Column("metric_type", "uint8", []),
         Column("name", "string/dict", []),
-        Column("description", "string/dict", []),
-        Column("unit", "string/dict", []),
-        Column("agg_temporality", "int32", []),
-        Column("is_monotonic", "bool", []),
+        Column("description", "string/dict", [], nullable=True),
+        Column("unit", "string/dict", [], nullable=True),
+        Column("agg_temporality", "int32", [], nullable=True),
+        Column("is_monotonic", "bool", [], nullable=True),
     ])
     number_dp = Table("NumberDataPoint", "NUMBER_DATA_POINTS", [
-        Column("id", "uint32", [], is_id=True),
+        Column("id", "uint32", [], is_id=True, nullable=True),
         Column("parent_id", "uint16", [], is_fk=True),
-        Column("start_time_unix_nano", "timestamp_ns", []),
+        Column("start_time_unix_nano", "timestamp_ns", [], nullable=True),
         Column("time_unix_nano", "timestamp_ns", []),
-        Column("int_value", "int64", []),
-        Column("double_value", "float64", []),
-        Column("flags", "uint32", []),
+        Column("int_value", "int64", [], nullable=True),
+        Column("double_value", "float64", [], nullable=True),
+        Column("flags", "uint32", [], nullable=True),
     ])
     histogram_dp = Table("HistogramDataPoint", "HISTOGRAM_DATA_POINTS", [
-        Column("id", "uint32", [], is_id=True),
+        Column("id", "uint32", [], is_id=True, nullable=True),
         Column("parent_id", "uint16", [], is_fk=True),
-        Column("start_time_unix_nano", "timestamp_ns", []),
+        Column("start_time_unix_nano", "timestamp_ns", [], nullable=True),
         Column("time_unix_nano", "timestamp_ns", []),
-        Column("count", "uint64", []),
-        Column("sum", "float64", []),
-        Column("bucket_counts", "list<uint64>", []),
-        Column("explicit_bounds", "list<f64>", []),
-        Column("flags", "uint32", []),
-        Column("min", "float64", []),
-        Column("max", "float64", []),
+        Column("count", "uint64", [], nullable=True),
+        Column("sum", "float64", [], nullable=True),
+        Column("bucket_counts", "list<uint64>", [], nullable=True),
+        Column("explicit_bounds", "list<f64>", [], nullable=True),
+        Column("flags", "uint32", [], nullable=True),
+        Column("min", "float64", [], nullable=True),
+        Column("max", "float64", [], nullable=True),
     ])
     ndp_attrs = Table("NumberDPAttrs", "NUMBER_DP_ATTRS", [
         Column("parent_id", "uint32", [], is_fk=True),
         Column("key", "string/dict", []),
         Column("type", "uint8", []),
-        Column("str", "string/dict", []),
-        Column("int", "int64", []),
-        Column("double", "float64", []),
-        Column("bool", "bool", []),
-        Column("bytes", "binary", []),
-        Column("ser", "binary", []),
+        Column("str", "string/dict", [], nullable=True),
+        Column("int", "int64", [], nullable=True),
+        Column("double", "float64", [], nullable=True),
+        Column("bool", "bool", [], nullable=True),
+        Column("bytes", "binary", [], nullable=True),
+        Column("ser", "binary", [], nullable=True),
     ])
     hdp_attrs = Table("HistogramDPAttrs", "HISTOGRAM_DP_ATTRS", [
         Column("parent_id", "uint32", [], is_fk=True),
         Column("key", "string/dict", []),
         Column("type", "uint8", []),
-        Column("str", "string/dict", []),
-        Column("int", "int64", []),
-        Column("double", "float64", []),
-        Column("bool", "bool", []),
-        Column("bytes", "binary", []),
-        Column("ser", "binary", []),
+        Column("str", "string/dict", [], nullable=True),
+        Column("int", "int64", [], nullable=True),
+        Column("double", "float64", [], nullable=True),
+        Column("bool", "bool", [], nullable=True),
+        Column("bytes", "binary", [], nullable=True),
+        Column("ser", "binary", [], nullable=True),
     ])
 
     for t in [resource_attrs, scope_attrs, metrics, number_dp,
@@ -497,12 +574,12 @@ def _scope_attrs_cols(values_per_row):
         Column("parent_id", "uint16", pids, is_fk=True),
         Column("key", "string/dict", keys),
         Column("type", "uint8", types),
-        Column("str", "string/dict", strs),
-        Column("int", "int64", ints),
-        Column("double", "float64", doubles),
-        Column("bool", "bool", bools),
-        Column("bytes", "binary", bytess),
-        Column("ser", "binary", sers),
+        Column("str", "string/dict", strs, nullable=True),
+        Column("int", "int64", ints, nullable=True),
+        Column("double", "float64", doubles, nullable=True),
+        Column("bool", "bool", bools, nullable=True),
+        Column("bytes", "binary", bytess, nullable=True),
+        Column("ser", "binary", sers, nullable=True),
     ]
 
 
@@ -514,24 +591,24 @@ def make_encoding1():
     ]))
     metrics = Table("UnivariateMetrics", "UNIVARIATE_METRICS", [
         Column("id", "uint16", [0, 1, 2], is_id=True),
-        Column("resource.id", "uint16", [0, 0, 0]),
-        Column("scope.id", "uint16", [0, 0, 0]),
-        Column("scope.name", "str/dict", ["otap", "otap", "otap"]),
+        Column("resource.id", "uint16", [0, 0, 0], nullable=True),
+        Column("scope.id", "uint16", [0, 0, 0], nullable=True),
+        Column("scope.name", "str/dict", ["otap", "otap", "otap"], nullable=True),
         Column("metric_type", "uint8", ["Sum", "Sum", "Sum"]),
         Column("name", "str/dict", [
             "consumed_success", "consumed_failed", "consumed_refused"]),
-        Column("unit", "str/dict", ["{item}", "{item}", "{item}"]),
-        Column("agg_temp", "int32", ["Cum", "Cum", "Cum"]),
-        Column("is_monotonic", "bool", [True, True, True]),
+        Column("unit", "str/dict", ["{item}", "{item}", "{item}"], nullable=True),
+        Column("agg_temp", "int32", ["Cum", "Cum", "Cum"], nullable=True),
+        Column("is_monotonic", "bool", [True, True, True], nullable=True),
     ])
     ndp = Table("NumberDataPoint", "NUMBER_DATA_POINTS", [
-        Column("id", "uint32", [0, 1, 2], is_id=True),
+        Column("id", "uint32", [0, 1, 2], is_id=True, nullable=True),
         Column("parent_id", "uint16", [0, 1, 2], is_fk=True),
-        Column("start_time", "ts_ns", ["10:00:00", "10:00:00", "10:00:00"]),
+        Column("start_time", "ts_ns", ["10:00:00", "10:00:00", "10:00:00"], nullable=True),
         Column("time", "ts_ns", ["10:00:10", "10:00:10", "10:00:10"]),
-        Column("int_value", "int64", [142, 3, 0]),
-        Column("double_value", "float64", ["", "", ""]),
-        Column("flags", "uint32", [0, 0, 0]),
+        Column("int_value", "int64", [142, 3, 0], nullable=True),
+        Column("double_value", "float64", ["", "", ""], nullable=True),
+        Column("flags", "uint32", [0, 0, 0], nullable=True),
     ])
 
     scope_attrs.x = MARGIN; scope_attrs.y = MARGIN + 40
@@ -572,24 +649,24 @@ def make_encoding2():
     ]))
     metrics = Table("UnivariateMetrics", "UNIVARIATE_METRICS", [
         Column("id", "uint16", [0, 1, 2], is_id=True),
-        Column("resource.id", "uint16", [0, 0, 0]),
-        Column("scope.id", "uint16", [0, 1, 2]),
-        Column("scope.name", "str/dict", ["otap", "otap", "otap"]),
+        Column("resource.id", "uint16", [0, 0, 0], nullable=True),
+        Column("scope.id", "uint16", [0, 1, 2], nullable=True),
+        Column("scope.name", "str/dict", ["otap", "otap", "otap"], nullable=True),
         Column("metric_type", "uint8", ["Sum", "Sum", "Sum"]),
         Column("name", "str/dict", [
             "consumer.items", "consumer.items", "consumer.items"]),
-        Column("unit", "str/dict", ["{item}", "{item}", "{item}"]),
-        Column("agg_temp", "int32", ["Cum", "Cum", "Cum"]),
-        Column("is_monotonic", "bool", [True, True, True]),
+        Column("unit", "str/dict", ["{item}", "{item}", "{item}"], nullable=True),
+        Column("agg_temp", "int32", ["Cum", "Cum", "Cum"], nullable=True),
+        Column("is_monotonic", "bool", [True, True, True], nullable=True),
     ])
     ndp = Table("NumberDataPoint", "NUMBER_DATA_POINTS", [
-        Column("id", "uint32", [0, 1, 2], is_id=True),
+        Column("id", "uint32", [0, 1, 2], is_id=True, nullable=True),
         Column("parent_id", "uint16", [0, 1, 2], is_fk=True),
-        Column("start_time", "ts_ns", ["10:00:00", "10:00:00", "10:00:00"]),
+        Column("start_time", "ts_ns", ["10:00:00", "10:00:00", "10:00:00"], nullable=True),
         Column("time", "ts_ns", ["10:00:10", "10:00:10", "10:00:10"]),
-        Column("int_value", "int64", [142, 3, 0]),
-        Column("double_value", "float64", ["", "", ""]),
-        Column("flags", "uint32", [0, 0, 0]),
+        Column("int_value", "int64", [142, 3, 0], nullable=True),
+        Column("double_value", "float64", ["", "", ""], nullable=True),
+        Column("flags", "uint32", [0, 0, 0], nullable=True),
     ])
 
     scope_attrs.x = MARGIN; scope_attrs.y = MARGIN + 40
@@ -623,23 +700,23 @@ def make_encoding3():
     ]))
     metrics = Table("UnivariateMetrics", "UNIVARIATE_METRICS", [
         Column("id", "uint16", [0], is_id=True),
-        Column("resource.id", "uint16", [0]),
-        Column("scope.id", "uint16", [0]),
-        Column("scope.name", "str/dict", ["otap"]),
+        Column("resource.id", "uint16", [0], nullable=True),
+        Column("scope.id", "uint16", [0], nullable=True),
+        Column("scope.name", "str/dict", ["otap"], nullable=True),
         Column("metric_type", "uint8", ["Sum"]),
         Column("name", "str/dict", ["consumer.items"]),
-        Column("unit", "str/dict", ["{item}"]),
-        Column("agg_temp", "int32", ["Cum"]),
-        Column("is_monotonic", "bool", [True]),
+        Column("unit", "str/dict", ["{item}"], nullable=True),
+        Column("agg_temp", "int32", ["Cum"], nullable=True),
+        Column("is_monotonic", "bool", [True], nullable=True),
     ])
     ndp = Table("NumberDataPoint", "NUMBER_DATA_POINTS", [
-        Column("id", "uint32", [0, 1, 2], is_id=True),
+        Column("id", "uint32", [0, 1, 2], is_id=True, nullable=True),
         Column("parent_id", "uint16", [0, 0, 0], is_fk=True),
-        Column("start_time", "ts_ns", ["10:00:00", "10:00:00", "10:00:00"]),
+        Column("start_time", "ts_ns", ["10:00:00", "10:00:00", "10:00:00"], nullable=True),
         Column("time", "ts_ns", ["10:00:10", "10:00:10", "10:00:10"]),
-        Column("int_value", "int64", [142, 3, 0]),
-        Column("double_value", "float64", ["", "", ""]),
-        Column("flags", "uint32", [0, 0, 0]),
+        Column("int_value", "int64", [142, 3, 0], nullable=True),
+        Column("double_value", "float64", ["", "", ""], nullable=True),
+        Column("flags", "uint32", [0, 0, 0], nullable=True),
     ])
     dp_attrs = Table("NumberDPAttrs", "NUMBER_DP_ATTRS", _scope_attrs_cols([
         (0, "outcome", "Str", "success"),

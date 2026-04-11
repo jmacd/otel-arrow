@@ -1,331 +1,345 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1705 614" width="1705" height="614">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1711 614" width="1711" height="614">
 <defs>
 <marker id="ah-3498db" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#3498db"/></marker>
 <marker id="ah-e74c3c" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#e74c3c"/></marker>
 <marker id="ah-27ae60" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#27ae60"/></marker>
 </defs>
-<rect width="1705" height="614" fill="#f8f9fa" rx="10"/>
-<text x="852" y="34" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="16" font-weight="bold">OTAP Metrics Table Schemas — Overview</text>
-<text x="852" y="52" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="13">Arrow table schemas showing column names, types, and foreign-key relationships</text>
-<rect x="30" y="70" width="874" height="28" rx="6" ry="6" fill="#2c3e50"/>
-<rect x="30" y="92" width="874" height="6" fill="#2c3e50"/>
-<text x="467" y="90" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">UnivariateMetrics</text>
-<text x="467" y="79" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">UNIVARIATE_METRICS</text>
+<rect width="1711" height="614" fill="#f8f9fa" rx="10"/>
+<text x="855" y="34" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="16" font-weight="bold">OTAP Metrics Table Schemas — Overview</text>
+<text x="855" y="52" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="13">Arrow table schemas showing column names, types, and foreign-key relationships</text>
+<rect x="30" y="70" width="877" height="28" rx="6" ry="6" fill="#2c3e50"/>
+<rect x="30" y="92" width="877" height="6" fill="#2c3e50"/>
+<text x="468" y="90" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">UnivariateMetrics</text>
+<text x="468" y="79" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">UNIVARIATE_METRICS</text>
 <rect x="30" y="98" width="60" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="60" y="109" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">id</text>
-<rect x="90" y="98" width="86" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="133" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">resource{}</text>
-<rect x="176" y="98" width="65" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="208" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">scope{}</text>
-<rect x="241" y="98" width="86" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="284" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">schema_url</text>
-<rect x="327" y="98" width="93" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="373" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">metric_type</text>
-<rect x="420" y="98" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="462" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">name</text>
-<rect x="505" y="98" width="93" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="551" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">description</text>
-<rect x="598" y="98" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="640" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">unit</text>
-<rect x="683" y="98" width="121" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="743" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">agg_temporality</text>
-<rect x="804" y="98" width="100" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="854" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">is_monotonic</text>
+<rect x="93" y="98" width="86" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="136" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">resource{}?</text>
+<rect x="179" y="98" width="65" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="211" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">scope{}?</text>
+<rect x="244" y="98" width="86" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="287" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">schema_url?</text>
+<rect x="330" y="98" width="93" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="376" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">metric_type</text>
+<rect x="423" y="98" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="465" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">name</text>
+<rect x="508" y="98" width="93" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="554" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">description?</text>
+<rect x="601" y="98" width="85" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="643" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">unit?</text>
+<rect x="686" y="98" width="121" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="746" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">agg_temporality?</text>
+<rect x="807" y="98" width="100" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="857" y="109" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">is_monotonic?</text>
 <rect x="30" y="124" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="60" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint16</text>
-<rect x="90" y="124" width="86" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="133" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">struct</text>
-<rect x="176" y="124" width="65" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="208" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">struct</text>
-<rect x="241" y="124" width="86" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="284" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
-<rect x="327" y="124" width="93" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="373" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint8</text>
-<rect x="420" y="124" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="462" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
-<rect x="505" y="124" width="93" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="551" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
-<rect x="598" y="124" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="640" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
-<rect x="683" y="124" width="121" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="743" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int32</text>
-<rect x="804" y="124" width="100" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="854" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">bool</text>
-<rect x="30" y="70" width="874" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
-<rect x="30" y="186" width="609" height="28" rx="6" ry="6" fill="#2c3e50"/>
-<rect x="30" y="208" width="609" height="6" fill="#2c3e50"/>
-<text x="334" y="206" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ResourceAttrs</text>
-<text x="334" y="195" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">RESOURCE_ATTRS</text>
+<rect x="93" y="124" width="86" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="136" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">struct</text>
+<rect x="179" y="124" width="65" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="211" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">struct</text>
+<rect x="244" y="124" width="86" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="287" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
+<rect x="330" y="124" width="93" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="376" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint8</text>
+<rect x="423" y="124" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="465" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
+<rect x="508" y="124" width="93" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="554" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
+<rect x="601" y="124" width="85" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="643" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
+<rect x="686" y="124" width="121" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="746" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int32</text>
+<rect x="807" y="124" width="100" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="857" y="139" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">bool</text>
+<line x1="91" y1="98" x2="91" y2="146" stroke="#95a5a6" stroke-width="3" stroke-dasharray="4,3" opacity="0.6"/>
+<text x="91" y="95" text-anchor="middle" fill="#95a5a6" font-family="Consolas, 'Courier New', monospace" font-size="8" font-style="italic">nullable</text>
+<rect x="30" y="70" width="877" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
+<rect x="30" y="186" width="612" height="28" rx="6" ry="6" fill="#2c3e50"/>
+<rect x="30" y="208" width="612" height="6" fill="#2c3e50"/>
+<text x="336" y="206" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ResourceAttrs</text>
+<text x="336" y="195" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">RESOURCE_ATTRS</text>
 <rect x="30" y="214" width="79" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="69" y="225" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">parent_id</text>
 <rect x="109" y="214" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="151" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">key</text>
 <rect x="194" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="224" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">type</text>
-<rect x="254" y="214" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="296" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">str</text>
-<rect x="339" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="369" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">int</text>
-<rect x="399" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="429" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">double</text>
-<rect x="459" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="489" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bool</text>
-<rect x="519" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="549" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bytes</text>
-<rect x="579" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="609" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ser</text>
+<rect x="257" y="214" width="85" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="299" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">str?</text>
+<rect x="342" y="214" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="372" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">int?</text>
+<rect x="402" y="214" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="432" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">double?</text>
+<rect x="462" y="214" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="492" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bool?</text>
+<rect x="522" y="214" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="552" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bytes?</text>
+<rect x="582" y="214" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="612" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ser?</text>
 <rect x="30" y="240" width="79" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="69" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint16</text>
 <rect x="109" y="240" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="151" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
 <rect x="194" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="224" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint8</text>
-<rect x="254" y="240" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="296" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
-<rect x="339" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="369" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int64</text>
-<rect x="399" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="429" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
-<rect x="459" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="489" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">bool</text>
-<rect x="519" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="549" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
-<rect x="579" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="609" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
-<rect x="30" y="186" width="609" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
-<rect x="669" y="186" width="609" height="28" rx="6" ry="6" fill="#2c3e50"/>
-<rect x="669" y="208" width="609" height="6" fill="#2c3e50"/>
-<text x="973" y="206" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ScopeAttrs</text>
-<text x="973" y="195" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">SCOPE_ATTRS</text>
-<rect x="669" y="214" width="79" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="708" y="225" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">parent_id</text>
-<rect x="748" y="214" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="790" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">key</text>
-<rect x="833" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="863" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">type</text>
-<rect x="893" y="214" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="935" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">str</text>
-<rect x="978" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1008" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">int</text>
-<rect x="1038" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1068" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">double</text>
-<rect x="1098" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1128" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bool</text>
-<rect x="1158" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1188" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bytes</text>
-<rect x="1218" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1248" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ser</text>
-<rect x="669" y="240" width="79" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="708" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint16</text>
-<rect x="748" y="240" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="790" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
-<rect x="833" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="863" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint8</text>
-<rect x="893" y="240" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="935" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
-<rect x="978" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1008" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int64</text>
-<rect x="1038" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1068" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
-<rect x="1098" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1128" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">bool</text>
-<rect x="1158" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1188" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
-<rect x="1218" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1248" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
-<rect x="669" y="186" width="609" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
-<rect x="30" y="302" width="648" height="28" rx="6" ry="6" fill="#2c3e50"/>
-<rect x="30" y="324" width="648" height="6" fill="#2c3e50"/>
-<text x="354" y="322" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">NumberDataPoint</text>
-<text x="354" y="311" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">NUMBER_DATA_POINTS</text>
+<rect x="257" y="240" width="85" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="299" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
+<rect x="342" y="240" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="372" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int64</text>
+<rect x="402" y="240" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="432" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
+<rect x="462" y="240" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="492" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">bool</text>
+<rect x="522" y="240" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="552" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
+<rect x="582" y="240" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="612" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
+<line x1="255" y1="214" x2="255" y2="262" stroke="#95a5a6" stroke-width="3" stroke-dasharray="4,3" opacity="0.6"/>
+<text x="255" y="211" text-anchor="middle" fill="#95a5a6" font-family="Consolas, 'Courier New', monospace" font-size="8" font-style="italic">nullable</text>
+<rect x="30" y="186" width="612" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
+<rect x="672" y="186" width="612" height="28" rx="6" ry="6" fill="#2c3e50"/>
+<rect x="672" y="208" width="612" height="6" fill="#2c3e50"/>
+<text x="978" y="206" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ScopeAttrs</text>
+<text x="978" y="195" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">SCOPE_ATTRS</text>
+<rect x="672" y="214" width="79" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="711" y="225" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">parent_id</text>
+<rect x="751" y="214" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="793" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">key</text>
+<rect x="836" y="214" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="866" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">type</text>
+<rect x="899" y="214" width="85" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="941" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">str?</text>
+<rect x="984" y="214" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1014" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">int?</text>
+<rect x="1044" y="214" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1074" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">double?</text>
+<rect x="1104" y="214" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1134" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bool?</text>
+<rect x="1164" y="214" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1194" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bytes?</text>
+<rect x="1224" y="214" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1254" y="225" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ser?</text>
+<rect x="672" y="240" width="79" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="711" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint16</text>
+<rect x="751" y="240" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="793" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
+<rect x="836" y="240" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="866" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint8</text>
+<rect x="899" y="240" width="85" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="941" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
+<rect x="984" y="240" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1014" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int64</text>
+<rect x="1044" y="240" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1074" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
+<rect x="1104" y="240" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1134" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">bool</text>
+<rect x="1164" y="240" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1194" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
+<rect x="1224" y="240" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1254" y="255" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
+<line x1="897" y1="214" x2="897" y2="262" stroke="#95a5a6" stroke-width="3" stroke-dasharray="4,3" opacity="0.6"/>
+<text x="897" y="211" text-anchor="middle" fill="#95a5a6" font-family="Consolas, 'Courier New', monospace" font-size="8" font-style="italic">nullable</text>
+<rect x="672" y="186" width="612" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
+<rect x="30" y="302" width="651" height="28" rx="6" ry="6" fill="#2c3e50"/>
+<rect x="30" y="324" width="651" height="6" fill="#2c3e50"/>
+<text x="355" y="322" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">NumberDataPoint</text>
+<text x="355" y="311" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">NUMBER_DATA_POINTS</text>
 <rect x="30" y="330" width="60" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="60" y="341" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">id</text>
+<text x="60" y="341" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">id?</text>
 <rect x="90" y="330" width="79" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="129" y="341" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">parent_id</text>
-<rect x="169" y="330" width="156" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="247" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">start_time_unix_nano</text>
-<rect x="325" y="330" width="114" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="382" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">time_unix_nano</text>
-<rect x="439" y="330" width="79" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="478" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">int_value</text>
-<rect x="518" y="330" width="100" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="568" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">double_value</text>
-<rect x="618" y="330" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="648" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">flags</text>
-<rect x="30" y="356" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<rect x="172" y="330" width="156" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="250" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">start_time_unix_nano?</text>
+<rect x="328" y="330" width="114" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="385" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">time_unix_nano</text>
+<rect x="442" y="330" width="79" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="481" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">int_value?</text>
+<rect x="521" y="330" width="100" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="571" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">double_value?</text>
+<rect x="621" y="330" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="651" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">flags?</text>
+<rect x="30" y="356" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="60" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint32</text>
 <rect x="90" y="356" width="79" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="129" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint16</text>
-<rect x="169" y="356" width="156" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="247" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">timestamp_ns</text>
-<rect x="325" y="356" width="114" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="382" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">timestamp_ns</text>
-<rect x="439" y="356" width="79" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="478" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int64</text>
-<rect x="518" y="356" width="100" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="568" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
-<rect x="618" y="356" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="648" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint32</text>
-<rect x="30" y="302" width="648" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
-<rect x="708" y="302" width="937" height="28" rx="6" ry="6" fill="#2c3e50"/>
-<rect x="708" y="324" width="937" height="6" fill="#2c3e50"/>
-<text x="1176" y="322" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">HistogramDataPoint</text>
-<text x="1176" y="311" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">HISTOGRAM_DATA_POINTS</text>
-<rect x="708" y="330" width="60" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="738" y="341" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">id</text>
-<rect x="768" y="330" width="79" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="807" y="341" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">parent_id</text>
-<rect x="847" y="330" width="156" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="925" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">start_time_unix_nano</text>
-<rect x="1003" y="330" width="114" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1060" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">time_unix_nano</text>
-<rect x="1117" y="330" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1147" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">count</text>
-<rect x="1177" y="330" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1207" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">sum</text>
-<rect x="1237" y="330" width="107" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1290" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bucket_counts</text>
-<rect x="1344" y="330" width="121" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1404" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">explicit_bounds</text>
-<rect x="1465" y="330" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1495" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">flags</text>
-<rect x="1525" y="330" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1555" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">min</text>
-<rect x="1585" y="330" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1615" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">max</text>
-<rect x="708" y="356" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="738" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint32</text>
-<rect x="768" y="356" width="79" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="807" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint16</text>
-<rect x="847" y="356" width="156" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="925" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">timestamp_ns</text>
-<rect x="1003" y="356" width="114" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1060" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">timestamp_ns</text>
-<rect x="1117" y="356" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1147" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint64</text>
-<rect x="1177" y="356" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1207" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
-<rect x="1237" y="356" width="107" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1290" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">list&lt;uint64&gt;</text>
-<rect x="1344" y="356" width="121" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1404" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">list&lt;f64&gt;</text>
-<rect x="1465" y="356" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1495" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint32</text>
-<rect x="1525" y="356" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1555" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
-<rect x="1585" y="356" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1615" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
-<rect x="708" y="302" width="937" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
-<rect x="30" y="418" width="609" height="28" rx="6" ry="6" fill="#2c3e50"/>
-<rect x="30" y="440" width="609" height="6" fill="#2c3e50"/>
-<text x="334" y="438" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">NumberDPAttrs</text>
-<text x="334" y="427" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">NUMBER_DP_ATTRS</text>
+<rect x="172" y="356" width="156" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="250" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">timestamp_ns</text>
+<rect x="328" y="356" width="114" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="385" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">timestamp_ns</text>
+<rect x="442" y="356" width="79" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="481" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int64</text>
+<rect x="521" y="356" width="100" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="571" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
+<rect x="621" y="356" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="651" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint32</text>
+<line x1="170" y1="330" x2="170" y2="378" stroke="#95a5a6" stroke-width="3" stroke-dasharray="4,3" opacity="0.6"/>
+<text x="170" y="327" text-anchor="middle" fill="#95a5a6" font-family="Consolas, 'Courier New', monospace" font-size="8" font-style="italic">nullable</text>
+<rect x="30" y="302" width="651" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
+<rect x="711" y="302" width="940" height="28" rx="6" ry="6" fill="#2c3e50"/>
+<rect x="711" y="324" width="940" height="6" fill="#2c3e50"/>
+<text x="1181" y="322" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">HistogramDataPoint</text>
+<text x="1181" y="311" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">HISTOGRAM_DATA_POINTS</text>
+<rect x="711" y="330" width="60" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="741" y="341" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">id?</text>
+<rect x="771" y="330" width="79" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="810" y="341" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">parent_id</text>
+<rect x="853" y="330" width="156" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="931" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">start_time_unix_nano?</text>
+<rect x="1009" y="330" width="114" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1066" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">time_unix_nano</text>
+<rect x="1123" y="330" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1153" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">count?</text>
+<rect x="1183" y="330" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1213" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">sum?</text>
+<rect x="1243" y="330" width="107" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1296" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bucket_counts?</text>
+<rect x="1350" y="330" width="121" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1410" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">explicit_bounds?</text>
+<rect x="1471" y="330" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1501" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">flags?</text>
+<rect x="1531" y="330" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1561" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">min?</text>
+<rect x="1591" y="330" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1621" y="341" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">max?</text>
+<rect x="711" y="356" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="741" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint32</text>
+<rect x="771" y="356" width="79" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="810" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint16</text>
+<rect x="853" y="356" width="156" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="931" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">timestamp_ns</text>
+<rect x="1009" y="356" width="114" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1066" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">timestamp_ns</text>
+<rect x="1123" y="356" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1153" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint64</text>
+<rect x="1183" y="356" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1213" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
+<rect x="1243" y="356" width="107" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1296" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">list&lt;uint64&gt;</text>
+<rect x="1350" y="356" width="121" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1410" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">list&lt;f64&gt;</text>
+<rect x="1471" y="356" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1501" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint32</text>
+<rect x="1531" y="356" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1561" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
+<rect x="1591" y="356" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1621" y="371" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
+<line x1="851" y1="330" x2="851" y2="378" stroke="#95a5a6" stroke-width="3" stroke-dasharray="4,3" opacity="0.6"/>
+<text x="851" y="327" text-anchor="middle" fill="#95a5a6" font-family="Consolas, 'Courier New', monospace" font-size="8" font-style="italic">nullable</text>
+<rect x="711" y="302" width="940" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
+<rect x="30" y="418" width="612" height="28" rx="6" ry="6" fill="#2c3e50"/>
+<rect x="30" y="440" width="612" height="6" fill="#2c3e50"/>
+<text x="336" y="438" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">NumberDPAttrs</text>
+<text x="336" y="427" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">NUMBER_DP_ATTRS</text>
 <rect x="30" y="446" width="79" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="69" y="457" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">parent_id</text>
 <rect x="109" y="446" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="151" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">key</text>
 <rect x="194" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="224" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">type</text>
-<rect x="254" y="446" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="296" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">str</text>
-<rect x="339" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="369" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">int</text>
-<rect x="399" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="429" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">double</text>
-<rect x="459" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="489" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bool</text>
-<rect x="519" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="549" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bytes</text>
-<rect x="579" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="609" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ser</text>
+<rect x="257" y="446" width="85" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="299" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">str?</text>
+<rect x="342" y="446" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="372" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">int?</text>
+<rect x="402" y="446" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="432" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">double?</text>
+<rect x="462" y="446" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="492" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bool?</text>
+<rect x="522" y="446" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="552" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bytes?</text>
+<rect x="582" y="446" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="612" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ser?</text>
 <rect x="30" y="472" width="79" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="69" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint32</text>
 <rect x="109" y="472" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="151" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
 <rect x="194" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
 <text x="224" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint8</text>
-<rect x="254" y="472" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="296" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
-<rect x="339" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="369" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int64</text>
-<rect x="399" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="429" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
-<rect x="459" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="489" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">bool</text>
-<rect x="519" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="549" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
-<rect x="579" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="609" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
-<rect x="30" y="418" width="609" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
-<rect x="669" y="418" width="609" height="28" rx="6" ry="6" fill="#2c3e50"/>
-<rect x="669" y="440" width="609" height="6" fill="#2c3e50"/>
-<text x="973" y="438" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">HistogramDPAttrs</text>
-<text x="973" y="427" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">HISTOGRAM_DP_ATTRS</text>
-<rect x="669" y="446" width="79" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="708" y="457" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">parent_id</text>
-<rect x="748" y="446" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="790" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">key</text>
-<rect x="833" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="863" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">type</text>
-<rect x="893" y="446" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="935" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">str</text>
-<rect x="978" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1008" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">int</text>
-<rect x="1038" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1068" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">double</text>
-<rect x="1098" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1128" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bool</text>
-<rect x="1158" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1188" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bytes</text>
-<rect x="1218" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1248" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ser</text>
-<rect x="669" y="472" width="79" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="708" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint32</text>
-<rect x="748" y="472" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="790" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
-<rect x="833" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="863" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint8</text>
-<rect x="893" y="472" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="935" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
-<rect x="978" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1008" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int64</text>
-<rect x="1038" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1068" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
-<rect x="1098" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1128" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">bool</text>
-<rect x="1158" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1188" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
-<rect x="1218" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
-<text x="1248" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
-<rect x="669" y="418" width="609" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
+<rect x="257" y="472" width="85" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="299" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
+<rect x="342" y="472" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="372" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int64</text>
+<rect x="402" y="472" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="432" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
+<rect x="462" y="472" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="492" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">bool</text>
+<rect x="522" y="472" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="552" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
+<rect x="582" y="472" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="612" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
+<line x1="255" y1="446" x2="255" y2="494" stroke="#95a5a6" stroke-width="3" stroke-dasharray="4,3" opacity="0.6"/>
+<text x="255" y="443" text-anchor="middle" fill="#95a5a6" font-family="Consolas, 'Courier New', monospace" font-size="8" font-style="italic">nullable</text>
+<rect x="30" y="418" width="612" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
+<rect x="672" y="418" width="612" height="28" rx="6" ry="6" fill="#2c3e50"/>
+<rect x="672" y="440" width="612" height="6" fill="#2c3e50"/>
+<text x="978" y="438" text-anchor="middle" fill="#ffffff" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">HistogramDPAttrs</text>
+<text x="978" y="427" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="9" opacity="0.7">HISTOGRAM_DP_ATTRS</text>
+<rect x="672" y="446" width="79" height="26" fill="#e8f4fd" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="711" y="457" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">parent_id</text>
+<rect x="751" y="446" width="85" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="793" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">key</text>
+<rect x="836" y="446" width="60" height="26" fill="#34495e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="866" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">type</text>
+<rect x="899" y="446" width="85" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="941" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">str?</text>
+<rect x="984" y="446" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1014" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">int?</text>
+<rect x="1044" y="446" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1074" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">double?</text>
+<rect x="1104" y="446" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1134" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bool?</text>
+<rect x="1164" y="446" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1194" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">bytes?</text>
+<rect x="1224" y="446" width="60" height="26" fill="#5d6d7e" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1254" y="457" text-anchor="middle" fill="#ecf0f1" font-family="Consolas, 'Courier New', monospace" font-size="11" font-weight="bold">ser?</text>
+<rect x="672" y="472" width="79" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="711" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint32</text>
+<rect x="751" y="472" width="85" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="793" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
+<rect x="836" y="472" width="60" height="22" fill="#f0f4f8" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="866" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">uint8</text>
+<rect x="899" y="472" width="85" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="941" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">string/dict</text>
+<rect x="984" y="472" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1014" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">int64</text>
+<rect x="1044" y="472" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1074" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">float64</text>
+<rect x="1104" y="472" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1134" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">bool</text>
+<rect x="1164" y="472" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1194" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
+<rect x="1224" y="472" width="60" height="22" fill="#f5f5f0" stroke="#bdc3c7" stroke-width="0.5"/>
+<text x="1254" y="487" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="10" font-style="italic">binary</text>
+<line x1="897" y1="446" x2="897" y2="494" stroke="#95a5a6" stroke-width="3" stroke-dasharray="4,3" opacity="0.6"/>
+<text x="897" y="443" text-anchor="middle" fill="#95a5a6" font-family="Consolas, 'Courier New', monospace" font-size="8" font-style="italic">nullable</text>
+<rect x="672" y="418" width="612" height="76" rx="6" ry="6" fill="none" stroke="#bdc3c7" stroke-width="1.5"/>
 <circle cx="129" cy="343" r="5" fill="white" stroke="#e74c3c" stroke-width="2"/>
 <circle cx="60" cy="111" r="5" fill="#e74c3c"/>
 <path d="M 129,343 L 129,302 L 129,282 C 129,224.0 60,224.0 60,166 L 60,146 L 60,111 " fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
 <rect x="41.5" y="206.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
 <text x="94.5" y="216.0" text-anchor="middle" fill="#e74c3c" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
-<circle cx="807" cy="343" r="5" fill="white" stroke="#e74c3c" stroke-width="2"/>
+<circle cx="810" cy="343" r="5" fill="white" stroke="#e74c3c" stroke-width="2"/>
 <circle cx="60" cy="111" r="5" fill="#e74c3c"/>
-<path d="M 807,343 L 807,302 L 807,282 C 807,234.0 60,234.0 60,166 L 60,146 L 60,111 " fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
-<rect x="380.5" y="216.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
-<text x="433.5" y="226.0" text-anchor="middle" fill="#e74c3c" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
+<path d="M 810,343 L 810,302 L 810,282 C 810,234.0 60,234.0 60,166 L 60,146 L 60,111 " fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-e74c3c)"/>
+<rect x="382.0" y="216.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
+<text x="435.0" y="226.0" text-anchor="middle" fill="#e74c3c" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
 <circle cx="69" cy="459" r="5" fill="white" stroke="#27ae60" stroke-width="2"/>
 <circle cx="60" cy="343" r="5" fill="#27ae60"/>
 <path d="M 69,459 L 69,418 L 69,398 C 69,398.0 60,398.0 60,398 L 60,378 L 60,343 " fill="none" stroke="#27ae60" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-27ae60)"/>
 <rect x="11.5" y="380.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
 <text x="64.5" y="390.0" text-anchor="middle" fill="#27ae60" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
-<circle cx="708" cy="459" r="5" fill="white" stroke="#27ae60" stroke-width="2"/>
-<circle cx="738" cy="343" r="5" fill="#27ae60"/>
-<path d="M 708,459 L 708,418 L 708,398 C 708,398.0 738,398.0 738,398 L 738,378 L 738,343 " fill="none" stroke="#27ae60" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-27ae60)"/>
-<rect x="670.0" y="380.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
-<text x="723.0" y="390.0" text-anchor="middle" fill="#27ae60" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
+<circle cx="711" cy="459" r="5" fill="white" stroke="#27ae60" stroke-width="2"/>
+<circle cx="741" cy="343" r="5" fill="#27ae60"/>
+<path d="M 711,459 L 711,418 L 711,398 C 711,398.0 741,398.0 741,398 L 741,378 L 741,343 " fill="none" stroke="#27ae60" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-27ae60)"/>
+<rect x="673.0" y="380.0" width="106" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
+<text x="726.0" y="390.0" text-anchor="middle" fill="#27ae60" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → id</text>
 <circle cx="69" cy="227" r="5" fill="white" stroke="#3498db" stroke-width="2"/>
 <circle cx="133" cy="111" r="5" fill="#3498db"/>
 <path d="M 69,227 L 69,186 L 69,166 C 69,166.0 133,166.0 133,166 L 133,146 L 133,111 " fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
 <rect x="16.5" y="148.0" width="169" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
 <text x="101.0" y="158.0" text-anchor="middle" fill="#3498db" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → resource.id</text>
-<circle cx="708" cy="227" r="5" fill="white" stroke="#3498db" stroke-width="2"/>
+<circle cx="711" cy="227" r="5" fill="white" stroke="#3498db" stroke-width="2"/>
 <circle cx="208" cy="111" r="5" fill="#3498db"/>
-<path d="M 708,227 L 708,186 L 708,166 C 708,151.0 208,151.0 208,166 L 208,146 L 208,111 " fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
-<rect x="384.0" y="133.0" width="148" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
-<text x="458.0" y="143.0" text-anchor="middle" fill="#3498db" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → scope.id</text>
+<path d="M 711,227 L 711,186 L 711,166 C 711,151.0 208,151.0 208,166 L 208,146 L 208,111 " fill="none" stroke="#3498db" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ah-3498db)"/>
+<rect x="385.5" y="133.0" width="148" height="14" rx="3" fill="#f8f9fa" opacity="0.9"/>
+<text x="459.5" y="143.0" text-anchor="middle" fill="#3498db" font-family="Consolas, 'Courier New', monospace" font-size="10" font-weight="bold">parent_id → scope.id</text>
 </svg>
