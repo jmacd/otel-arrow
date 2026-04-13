@@ -2,45 +2,45 @@
 <rect width="780" height="1004" fill="#f8f9fa" rx="10"/>
 <text x="390" y="34" text-anchor="middle" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="16" font-weight="bold">OTLP Protobuf: Row-Major Nested Encoding</text>
 <text x="390" y="52" text-anchor="middle" fill="#7f8c8d" font-family="Consolas, 'Courier New', monospace" font-size="13">Same consumer.items data — 1 dimension (outcome), 3 data points</text>
-<rect x="30" y="70" width="720" height="884" rx="5" ry="5" fill="#eaf2f8" stroke="#2980b9" stroke-width="1.2"/>
-<text x="42" y="89" fill="#2980b9" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">ExportMetricsServiceRequest</text>
-<rect x="50" y="102" width="680" height="840" rx="5" ry="5" fill="#ebf5fb" stroke="#3498db" stroke-width="1.2"/>
-<text x="62" y="121" fill="#3498db" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[0] ResourceMetrics</text>
-<rect x="70" y="134" width="640" height="52" rx="5" ry="5" fill="#e8f8f5" stroke="#1abc9c" stroke-width="1.2"/>
-<text x="82" y="153" fill="#1abc9c" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">Resource</text>
+<rect x="30" y="70" width="720" height="884" rx="5" ry="5" fill="#f4f4f4" stroke="#999999" stroke-width="1.2"/>
+<text x="42" y="89" fill="#555555" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">ExportMetricsServiceRequest</text>
+<rect x="50" y="102" width="680" height="840" rx="5" ry="5" fill="#e8e8e8" stroke="#777777" stroke-width="1.2"/>
+<text x="62" y="121" fill="#444444" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[0] ResourceMetrics</text>
+<rect x="70" y="134" width="640" height="52" rx="5" ry="5" fill="#f4f4f4" stroke="#999999" stroke-width="1.2"/>
+<text x="82" y="153" fill="#555555" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">Resource</text>
 <text x="90" y="173" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">dropped_attributes_count:</tspan> 0</text>
-<rect x="70" y="192" width="640" height="738" rx="5" ry="5" fill="#fef9e7" stroke="#f39c12" stroke-width="1.2"/>
-<text x="82" y="211" fill="#f39c12" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[0] ScopeMetrics</text>
-<rect x="90" y="224" width="600" height="92" rx="5" ry="5" fill="#fdebd0" stroke="#e67e22" stroke-width="1.2"/>
-<text x="102" y="243" fill="#e67e22" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">InstrumentationScope</text>
+<rect x="70" y="192" width="640" height="738" rx="5" ry="5" fill="#f4f4f4" stroke="#999999" stroke-width="1.2"/>
+<text x="82" y="211" fill="#555555" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[0] ScopeMetrics</text>
+<rect x="90" y="224" width="600" height="92" rx="5" ry="5" fill="#e8e8e8" stroke="#777777" stroke-width="1.2"/>
+<text x="102" y="243" fill="#444444" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">InstrumentationScope</text>
 <text x="110" y="263" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">name:</tspan> "otap"</text>
 <text x="110" y="283" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">version:</tspan> "0.1"</text>
 <text x="110" y="303" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">attributes:</tspan> [{node_id: "node-7"}, {pipeline: "ingest"}]</text>
-<rect x="90" y="322" width="600" height="596" rx="5" ry="5" fill="#f5eef8" stroke="#8e44ad" stroke-width="1.2"/>
-<text x="102" y="341" fill="#8e44ad" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[0] Metric</text>
+<rect x="90" y="322" width="600" height="596" rx="5" ry="5" fill="#e8e8e8" stroke="#777777" stroke-width="1.2"/>
+<text x="102" y="341" fill="#444444" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[0] Metric</text>
 <text x="110" y="361" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">name:</tspan> "consumer.items"</text>
 <text x="110" y="381" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">unit:</tspan> "{item}"</text>
 <text x="110" y="401" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">description:</tspan> ""</text>
-<rect x="110" y="414" width="560" height="492" rx="5" ry="5" fill="#fdedec" stroke="#e74c3c" stroke-width="1.2"/>
-<text x="122" y="433" fill="#e74c3c" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">Sum</text>
+<rect x="110" y="414" width="560" height="492" rx="5" ry="5" fill="#f4f4f4" stroke="#999999" stroke-width="1.2"/>
+<text x="122" y="433" fill="#555555" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">Sum</text>
 <text x="130" y="453" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">aggregation_temporality:</tspan> CUMULATIVE</text>
 <text x="130" y="473" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">is_monotonic:</tspan> true</text>
-<rect x="130" y="486" width="520" height="132" rx="5" ry="5" fill="#fdf2e9" stroke="#d35400" stroke-width="1.2"/>
-<text x="142" y="505" fill="#d35400" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[0] NumberDataPoint</text>
+<rect x="130" y="486" width="520" height="132" rx="5" ry="5" fill="#e8e8e8" stroke="#777777" stroke-width="1.2"/>
+<text x="142" y="505" fill="#444444" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[0] NumberDataPoint</text>
 <text x="150" y="525" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">start_time_unix_nano:</tspan> 10:00:00</text>
 <text x="150" y="545" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">time_unix_nano:</tspan> 10:00:10</text>
 <text x="150" y="565" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">as_int:</tspan> 142</text>
 <text x="150" y="585" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">flags:</tspan> 0</text>
 <text x="150" y="605" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">attributes:</tspan> [{outcome: "success"}]</text>
-<rect x="130" y="624" width="520" height="132" rx="5" ry="5" fill="#fdf2e9" stroke="#d35400" stroke-width="1.2"/>
-<text x="142" y="643" fill="#d35400" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[1] NumberDataPoint</text>
+<rect x="130" y="624" width="520" height="132" rx="5" ry="5" fill="#e8e8e8" stroke="#777777" stroke-width="1.2"/>
+<text x="142" y="643" fill="#444444" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[1] NumberDataPoint</text>
 <text x="150" y="663" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">start_time_unix_nano:</tspan> 10:00:00</text>
 <text x="150" y="683" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">time_unix_nano:</tspan> 10:00:10</text>
 <text x="150" y="703" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">as_int:</tspan> 3</text>
 <text x="150" y="723" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">flags:</tspan> 0</text>
 <text x="150" y="743" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">attributes:</tspan> [{outcome: "failed"}]</text>
-<rect x="130" y="762" width="520" height="132" rx="5" ry="5" fill="#fdf2e9" stroke="#d35400" stroke-width="1.2"/>
-<text x="142" y="781" fill="#d35400" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[2] NumberDataPoint</text>
+<rect x="130" y="762" width="520" height="132" rx="5" ry="5" fill="#e8e8e8" stroke="#777777" stroke-width="1.2"/>
+<text x="142" y="781" fill="#444444" font-family="Consolas, 'Courier New', monospace" font-size="12" font-weight="bold">[2] NumberDataPoint</text>
 <text x="150" y="801" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">start_time_unix_nano:</tspan> 10:00:00</text>
 <text x="150" y="821" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">time_unix_nano:</tspan> 10:00:10</text>
 <text x="150" y="841" fill="#2c3e50" font-family="Consolas, 'Courier New', monospace" font-size="11"><tspan fill="#7f8c8d">as_int:</tspan> 0</text>

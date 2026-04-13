@@ -445,26 +445,10 @@ def make_otlp_tree():
     BOX_PAD_X = 12     # horizontal padding inside a box
     BOX_PAD_Y = 6      # vertical padding top/bottom inside a box
     BOX_GAP = 6        # vertical gap between sibling boxes
-    MSG_COLORS = {      # background tint per message type
-        "ExportMetricsServiceRequest": "#eaf2f8",
-        "ResourceMetrics": "#ebf5fb",
-        "Resource":        "#e8f8f5",
-        "ScopeMetrics":    "#fef9e7",
-        "InstrumentationScope": "#fdebd0",
-        "Metric":          "#f5eef8",
-        "Sum":             "#fdedec",
-        "NumberDataPoint": "#fdf2e9",
-    }
-    MSG_BORDER = {
-        "ExportMetricsServiceRequest": "#2980b9",
-        "ResourceMetrics": "#3498db",
-        "Resource":        "#1abc9c",
-        "ScopeMetrics":    "#f39c12",
-        "InstrumentationScope": "#e67e22",
-        "Metric":          "#8e44ad",
-        "Sum":             "#e74c3c",
-        "NumberDataPoint": "#d35400",
-    }
+    # Two alternating greys: lighter for even depth, slightly darker for odd
+    GREY_BG = ("#f4f4f4", "#e8e8e8")
+    GREY_BORDER = ("#999999", "#777777")
+    GREY_TITLE = ("#555555", "#444444")
 
     class Node:
         """A protobuf message or repeated element in the tree."""
@@ -479,11 +463,12 @@ def make_otlp_tree():
             self.w = 0
             self.h = 0
 
-    def layout(node, x, y, avail_w):
+    def layout(node, x, y, avail_w, depth=0):
         """Recursively compute positions and sizes, returns total height."""
         node.x = x
         node.y = y
         node.w = avail_w
+        node.depth = depth
 
         # Header line + field lines
         content_h = BOX_PAD_Y + LINE_H  # header
@@ -494,7 +479,7 @@ def make_otlp_tree():
         child_w = avail_w - INDENT * 2
 
         for child in node.children:
-            ch = layout(child, x + INDENT, child_y, child_w)
+            ch = layout(child, x + INDENT, child_y, child_w, depth + 1)
             child_y += ch + BOX_GAP
             content_h += ch + BOX_GAP
 
@@ -507,8 +492,10 @@ def make_otlp_tree():
     def render_node(node):
         """Render a single node as nested SVG rectangles."""
         parts = []
-        bg = MSG_COLORS.get(node.msg_type, "#f9f9f9")
-        border = MSG_BORDER.get(node.msg_type, COL_BORDER)
+        idx = node.depth % 2
+        bg = GREY_BG[idx]
+        border = GREY_BORDER[idx]
+        title_color = GREY_TITLE[idx]
 
         # Box
         parts.append(
@@ -525,7 +512,7 @@ def make_otlp_tree():
             label = f'{node.repeat_label} {node.msg_type}'
         parts.append(
             f'<text x="{node.x + BOX_PAD_X}" y="{ty}" '
-            f'fill="{border}" font-family="{FONT}" '
+            f'fill="{title_color}" font-family="{FONT}" '
             f'font-size="12" font-weight="bold">'
             f'{xml_escape(label)}</text>'
         )
