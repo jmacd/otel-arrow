@@ -434,136 +434,188 @@ def make_svg(tables, fk_arrows, title, subtitle="", note=""):
 
 # ── Diagram builders ──────────────────────────────────────────────
 
-def make_overview():
-    """Schema overview of all OTAP metrics tables (no data rows)."""
-    resource_attrs = Table("ResourceAttrs", "RESOURCE_ATTRS", [
-        Column("parent_id", "uint16", [], is_fk=True),
-        Column("key", "string/dict", []),
-        Column("type", "uint8", []),
-        Column("str", "string/dict", [], nullable=True),
-        Column("int", "int64", [], nullable=True),
-        Column("double", "float64", [], nullable=True),
-        Column("bool", "bool", [], nullable=True),
-        Column("bytes", "binary", [], nullable=True),
-        Column("ser", "binary", [], nullable=True),
-    ])
-    scope_attrs = Table("ScopeAttrs", "SCOPE_ATTRS", [
-        Column("parent_id", "uint16", [], is_fk=True),
-        Column("key", "string/dict", []),
-        Column("type", "uint8", []),
-        Column("str", "string/dict", [], nullable=True),
-        Column("int", "int64", [], nullable=True),
-        Column("double", "float64", [], nullable=True),
-        Column("bool", "bool", [], nullable=True),
-        Column("bytes", "binary", [], nullable=True),
-        Column("ser", "binary", [], nullable=True),
-    ])
-    metrics = Table("UnivariateMetrics", "UNIVARIATE_METRICS", [
-        Column("id", "uint16", [], is_id=True),
-        Column("resource{}", "struct", [], nullable=True),
-        Column("scope{}", "struct", [], nullable=True),
-        Column("schema_url", "string/dict", [], nullable=True),
-        Column("metric_type", "uint8", []),
-        Column("name", "string/dict", []),
-        Column("description", "string/dict", [], nullable=True),
-        Column("unit", "string/dict", [], nullable=True),
-        Column("agg_temporality", "int32", [], nullable=True),
-        Column("is_monotonic", "bool", [], nullable=True),
-    ])
-    number_dp = Table("NumberDataPoint", "NUMBER_DATA_POINTS", [
-        Column("id", "uint32", [], is_id=True, nullable=True),
-        Column("parent_id", "uint16", [], is_fk=True),
-        Column("start_time_unix_nano", "timestamp_ns", [], nullable=True),
-        Column("time_unix_nano", "timestamp_ns", []),
-        Column("int_value", "int64", [], nullable=True),
-        Column("double_value", "float64", [], nullable=True),
-        Column("flags", "uint32", [], nullable=True),
-    ])
-    histogram_dp = Table("HistogramDataPoint", "HISTOGRAM_DATA_POINTS", [
-        Column("id", "uint32", [], is_id=True, nullable=True),
-        Column("parent_id", "uint16", [], is_fk=True),
-        Column("start_time_unix_nano", "timestamp_ns", [], nullable=True),
-        Column("time_unix_nano", "timestamp_ns", []),
-        Column("count", "uint64", [], nullable=True),
-        Column("sum", "float64", [], nullable=True),
-        Column("bucket_counts", "list<uint64>", [], nullable=True),
-        Column("explicit_bounds", "list<f64>", [], nullable=True),
-        Column("flags", "uint32", [], nullable=True),
-        Column("min", "float64", [], nullable=True),
-        Column("max", "float64", [], nullable=True),
-    ])
-    ndp_attrs = Table("NumberDPAttrs", "NUMBER_DP_ATTRS", [
-        Column("parent_id", "uint32", [], is_fk=True),
-        Column("key", "string/dict", []),
-        Column("type", "uint8", []),
-        Column("str", "string/dict", [], nullable=True),
-        Column("int", "int64", [], nullable=True),
-        Column("double", "float64", [], nullable=True),
-        Column("bool", "bool", [], nullable=True),
-        Column("bytes", "binary", [], nullable=True),
-        Column("ser", "binary", [], nullable=True),
-    ])
-    hdp_attrs = Table("HistogramDPAttrs", "HISTOGRAM_DP_ATTRS", [
-        Column("parent_id", "uint32", [], is_fk=True),
-        Column("key", "string/dict", []),
-        Column("type", "uint8", []),
-        Column("str", "string/dict", [], nullable=True),
-        Column("int", "int64", [], nullable=True),
-        Column("double", "float64", [], nullable=True),
-        Column("bool", "bool", [], nullable=True),
-        Column("bytes", "binary", [], nullable=True),
-        Column("ser", "binary", [], nullable=True),
+def make_otlp_tree():
+    """Render the same consumer.items example as a nested OTLP protobuf
+    tree, showing the row-major structure for contrast with OTAP columns."""
+
+    # ── Nested-box tree renderer (independent of the table renderer) ──
+
+    INDENT = 20        # pixels per nesting level
+    LINE_H = 20        # height per text line
+    BOX_PAD_X = 12     # horizontal padding inside a box
+    BOX_PAD_Y = 6      # vertical padding top/bottom inside a box
+    BOX_GAP = 6        # vertical gap between sibling boxes
+    MSG_COLORS = {      # background tint per message type
+        "ExportMetricsServiceRequest": "#eaf2f8",
+        "ResourceMetrics": "#ebf5fb",
+        "Resource":        "#e8f8f5",
+        "ScopeMetrics":    "#fef9e7",
+        "InstrumentationScope": "#fdebd0",
+        "Metric":          "#f5eef8",
+        "Sum":             "#fdedec",
+        "NumberDataPoint": "#fdf2e9",
+    }
+    MSG_BORDER = {
+        "ExportMetricsServiceRequest": "#2980b9",
+        "ResourceMetrics": "#3498db",
+        "Resource":        "#1abc9c",
+        "ScopeMetrics":    "#f39c12",
+        "InstrumentationScope": "#e67e22",
+        "Metric":          "#8e44ad",
+        "Sum":             "#e74c3c",
+        "NumberDataPoint": "#d35400",
+    }
+
+    class Node:
+        """A protobuf message or repeated element in the tree."""
+        def __init__(self, msg_type, fields=None, children=None, repeat_label=None):
+            self.msg_type = msg_type       # e.g. "NumberDataPoint"
+            self.fields = fields or []     # list of (name, value) pairs
+            self.children = children or [] # list of Node
+            self.repeat_label = repeat_label  # e.g. "[0]"
+            # Computed during layout
+            self.x = 0
+            self.y = 0
+            self.w = 0
+            self.h = 0
+
+    def layout(node, x, y, avail_w):
+        """Recursively compute positions and sizes, returns total height."""
+        node.x = x
+        node.y = y
+        node.w = avail_w
+
+        # Header line + field lines
+        content_h = BOX_PAD_Y + LINE_H  # header
+        content_h += len(node.fields) * LINE_H
+        content_h += BOX_PAD_Y  # bottom padding before children
+
+        child_y = y + content_h
+        child_w = avail_w - INDENT * 2
+
+        for child in node.children:
+            ch = layout(child, x + INDENT, child_y, child_w)
+            child_y += ch + BOX_GAP
+            content_h += ch + BOX_GAP
+
+        if node.children:
+            content_h += BOX_PAD_Y  # extra bottom pad after children
+
+        node.h = content_h
+        return content_h
+
+    def render_node(node):
+        """Render a single node as nested SVG rectangles."""
+        parts = []
+        bg = MSG_COLORS.get(node.msg_type, "#f9f9f9")
+        border = MSG_BORDER.get(node.msg_type, COL_BORDER)
+
+        # Box
+        parts.append(
+            f'<rect x="{node.x}" y="{node.y}" '
+            f'width="{node.w}" height="{node.h}" '
+            f'rx="5" ry="5" fill="{bg}" stroke="{border}" stroke-width="1.2"/>'
+        )
+
+        ty = node.y + BOX_PAD_Y + 13
+
+        # Header: message type (and optional repeat label)
+        label = node.msg_type
+        if node.repeat_label:
+            label = f'{node.repeat_label} {node.msg_type}'
+        parts.append(
+            f'<text x="{node.x + BOX_PAD_X}" y="{ty}" '
+            f'fill="{border}" font-family="{FONT}" '
+            f'font-size="12" font-weight="bold">'
+            f'{xml_escape(label)}</text>'
+        )
+        ty += LINE_H
+
+        # Fields
+        for fname, fval in node.fields:
+            parts.append(
+                f'<text x="{node.x + BOX_PAD_X + 8}" y="{ty}" '
+                f'fill="{COL_TEXT}" font-family="{FONT}" font-size="11">'
+                f'<tspan fill="{COL_TYPE_TEXT}">{xml_escape(fname)}:</tspan> '
+                f'{xml_escape(fval)}</text>'
+            )
+            ty += LINE_H
+
+        # Children
+        for child in node.children:
+            parts.append(render_node(child))
+
+        return "\n".join(parts)
+
+    # ── Build the tree for the consumer.items example ──
+
+    def make_ndp(idx, outcome, value):
+        return Node("NumberDataPoint", [
+            ("start_time_unix_nano", "10:00:00"),
+            ("time_unix_nano",       "10:00:10"),
+            ("as_int",               str(value)),
+            ("flags",                "0"),
+            ("attributes",           f'[{{outcome: "{outcome}"}}]'),
+        ], repeat_label=f'[{idx}]')
+
+    tree = Node("ExportMetricsServiceRequest", children=[
+        Node("ResourceMetrics", repeat_label="[0]", children=[
+            Node("Resource", [
+                ("dropped_attributes_count", "0"),
+            ]),
+            Node("ScopeMetrics", repeat_label="[0]", children=[
+                Node("InstrumentationScope", [
+                    ("name",    '"otap"'),
+                    ("version", '"0.1"'),
+                    ("attributes", '[{node_id: "node-7"}, {pipeline: "ingest"}]'),
+                ]),
+                Node("Metric", repeat_label="[0]", fields=[
+                    ("name",        '"consumer.items"'),
+                    ("unit",        '"{item}"'),
+                    ("description", '""'),
+                ], children=[
+                    Node("Sum", [
+                        ("aggregation_temporality", "CUMULATIVE"),
+                        ("is_monotonic",            "true"),
+                    ], children=[
+                        make_ndp(0, "success", 142),
+                        make_ndp(1, "failed",  3),
+                        make_ndp(2, "refused", 0),
+                    ]),
+                ]),
+            ]),
+        ]),
     ])
 
-    for t in [resource_attrs, scope_attrs, metrics, number_dp,
-              histogram_dp, ndp_attrs, hdp_attrs]:
-        compute_table_size(t)
+    # ── Layout and render ──
 
-    metrics.x = MARGIN
-    metrics.y = MARGIN + 40
+    tree_w = 720
+    layout(tree, MARGIN, MARGIN + 40, tree_w)
 
-    resource_attrs.x = MARGIN
-    resource_attrs.y = metrics.y + metrics.height + TABLE_GAP
-    scope_attrs.x = resource_attrs.x + resource_attrs.width + TABLE_HGAP
-    scope_attrs.y = resource_attrs.y
+    svg_w = tree_w + MARGIN * 2
+    svg_h = tree.h + MARGIN * 2 + 60
 
-    number_dp.x = MARGIN
-    number_dp.y = resource_attrs.y + resource_attrs.height + TABLE_GAP
-    histogram_dp.x = number_dp.x + number_dp.width + TABLE_HGAP
-    histogram_dp.y = number_dp.y
-
-    ndp_attrs.x = MARGIN
-    ndp_attrs.y = number_dp.y + number_dp.height + TABLE_GAP
-    hdp_attrs.x = ndp_attrs.x + ndp_attrs.width + TABLE_HGAP
-    hdp_attrs.y = ndp_attrs.y
-
-    return make_svg(
-        [metrics, resource_attrs, scope_attrs, number_dp,
-         histogram_dp, ndp_attrs, hdp_attrs],
-        [
-            dict(src_table=number_dp, src_col_name="parent_id",
-                 dst_table=metrics, dst_col_name="id",
-                 label="parent_id \u2192 id", color="#e74c3c"),
-            dict(src_table=histogram_dp, src_col_name="parent_id",
-                 dst_table=metrics, dst_col_name="id",
-                 label="parent_id \u2192 id", color="#e74c3c", offset=10),
-            dict(src_table=ndp_attrs, src_col_name="parent_id",
-                 dst_table=number_dp, dst_col_name="id",
-                 label="parent_id \u2192 id", color="#27ae60"),
-            dict(src_table=hdp_attrs, src_col_name="parent_id",
-                 dst_table=histogram_dp, dst_col_name="id",
-                 label="parent_id \u2192 id", color="#27ae60"),
-            dict(src_table=resource_attrs, src_col_name="parent_id",
-                 dst_table=metrics, dst_col_name="resource{}",
-                 label="parent_id \u2192 resource.id", color=COL_FK_LINE),
-            dict(src_table=scope_attrs, src_col_name="parent_id",
-                 dst_table=metrics, dst_col_name="scope{}",
-                 label="parent_id \u2192 scope.id", color=COL_FK_LINE,
-                 offset=-15),
-        ],
-        "OTAP Metrics Table Schemas \u2014 Overview",
-        "Arrow table schemas showing column names, types, and foreign-key relationships",
-    )
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="0 0 {svg_w} {svg_h}" width="{svg_w}" height="{svg_h}">',
+        f'<rect width="{svg_w}" height="{svg_h}" fill="{COL_BG}" rx="10"/>',
+        f'<text x="{svg_w // 2}" y="{MARGIN + 4}" text-anchor="middle" '
+        f'fill="{COL_TABLE_TITLE}" font-family="{FONT}" '
+        f'font-size="{TITLE_FONT_SIZE}" font-weight="bold">'
+        f'OTLP Protobuf: Row-Major Nested Encoding</text>',
+        f'<text x="{svg_w // 2}" y="{MARGIN + 22}" text-anchor="middle" '
+        f'fill="{COL_TYPE_TEXT}" font-family="{FONT}" '
+        f'font-size="{SUBTITLE_FONT_SIZE}">'
+        f'Same consumer.items data \u2014 1 dimension (outcome), 3 data points</text>',
+        render_node(tree),
+        f'<text x="{svg_w // 2}" y="{svg_h - 12}" text-anchor="middle" '
+        f'fill="{COL_TYPE_TEXT}" font-family="{FONT}" font-size="11" '
+        f'font-style="italic">'
+        f'Each data point is a self-contained message carrying all context; '
+        f'attributes and metadata are repeated per point</text>',
+        '</svg>',
+    ]
+    return "\n".join(parts)
 
 
 def _scope_attrs_cols(values_per_row):
@@ -770,7 +822,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     diagrams = [
-        ("otap-metrics-overview.svg", make_overview),
+        ("otap-metrics-otlp-protobuf.svg", make_otlp_tree),
         ("otap-metrics-encoding1-flat.svg", make_encoding1),
         ("otap-metrics-encoding2-scope-dims.svg", make_encoding2),
         ("otap-metrics-encoding3-dp-attrs.svg", make_encoding3),
