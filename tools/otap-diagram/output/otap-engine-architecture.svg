@@ -97,9 +97,9 @@
 <line x1="1260" y1="546" x2="1260" y2="596" stroke="#3498db" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#acu)"/>
 <line x1="1300" y1="596" x2="1300" y2="546" stroke="#e74c3c" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#acd)"/>
 <text x="258" y="562" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#e74c3c" font-weight="bold" text-anchor="start">control</text>
-<text x="258" y="572" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="start">send/recv</text>
+<text x="258" y="572" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="start">timers, telemetry, config</text>
 <text x="418" y="562" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#3498db" font-weight="bold" text-anchor="start">completion</text>
-<text x="418" y="572" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="start">send/recv</text>
+<text x="418" y="572" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="start">ack/nack</text>
 <line x1="140" y1="419" x2="174" y2="419" stroke="#555555" stroke-width="2" marker-end="url(#an)"/>
 <line x1="1385" y1="419" x2="1420" y2="419" stroke="#555555" stroke-width="2" marker-end="url(#an)"/>
 <rect x="168" y="648" width="1224" height="364" rx="8" fill="#e8f8f5" stroke="#16a085" stroke-width="1.5"/>
@@ -138,9 +138,9 @@
 <line x1="1260" y1="930" x2="1260" y2="980" stroke="#3498db" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#acu)"/>
 <line x1="1300" y1="980" x2="1300" y2="930" stroke="#e74c3c" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#acd)"/>
 <text x="258" y="946" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#e74c3c" font-weight="bold" text-anchor="start">control</text>
-<text x="258" y="956" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="start">send/recv</text>
+<text x="258" y="956" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="start">timers, telemetry, config</text>
 <text x="418" y="946" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#3498db" font-weight="bold" text-anchor="start">completion</text>
-<text x="418" y="956" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="start">send/recv</text>
+<text x="418" y="956" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="start">ack/nack</text>
 <line x1="140" y1="803" x2="174" y2="803" stroke="#555555" stroke-width="2" marker-end="url(#an)"/>
 <line x1="1385" y1="803" x2="1420" y2="803" stroke="#555555" stroke-width="2" marker-end="url(#an)"/>
 <path d="M 1526,224 L 158,224 L 158,1012 L 1526,1012" fill="none" stroke="#34495e" stroke-width="1" stroke-dasharray="4,3"/>

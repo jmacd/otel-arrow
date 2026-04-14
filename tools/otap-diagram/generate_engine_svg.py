@@ -344,9 +344,9 @@ def make_engine_diagram():
         label_x1 = node_x_start + node_w * 2 // 9
         label_x2 = node_x_start + node_w * 6 // 9
         parts.append(text(label_x1, label_y + 8, "control", 7, C_CTRL_DOWN, "bold"))
-        parts.append(text(label_x1, label_y + 18, "send/recv", 7, C_SUBTEXT))
+        parts.append(text(label_x1, label_y + 18, "timers, telemetry, config", 7, C_SUBTEXT))
         parts.append(text(label_x2, label_y + 8, "completion", 7, C_CTRL_UP, "bold"))
-        parts.append(text(label_x2, label_y + 18, "send/recv", 7, C_SUBTEXT))
+        parts.append(text(label_x2, label_y + 18, "ack/nack", 7, C_SUBTEXT))
 
         # ── Network ingress arrow into receiver ──
         rcv_left = node_x_start
