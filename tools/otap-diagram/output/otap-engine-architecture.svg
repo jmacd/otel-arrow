@@ -1,130 +1,135 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1560 920" width="1560" height="920">
 <defs>
-<marker id="al" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#333333"/></marker>
-<marker id="as" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#666666"/></marker>
-<marker id="ac" markerWidth="6" markerHeight="6" refX="6" refY="3" orient="auto"><polygon points="0 0, 6 3, 0 6" fill="#999999"/></marker>
-<marker id="at" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#555555"/></marker>
-<marker id="an" markerWidth="9" markerHeight="9" refX="9" refY="4" orient="auto"><polygon points="0 0, 9 4, 0 9" fill="#555555"/></marker>
+<marker id="al" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#2ecc71"/></marker>
+<marker id="as" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#e67e22"/></marker>
+<marker id="ac" markerWidth="6" markerHeight="6" refX="6" refY="3" orient="auto"><polygon points="0 0, 6 3, 0 6" fill="#95a5a6"/></marker>
+<marker id="at" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><polygon points="0 0, 8 4, 0 8" fill="#3498db"/></marker>
+<marker id="an" markerWidth="9" markerHeight="9" refX="9" refY="4" orient="auto"><polygon points="0 0, 9 4, 0 9" fill="#2980b9"/></marker>
 </defs>
-<rect width="1560" height="920" fill="#f5f5f5" rx="12"/>
-<text x="780" y="32" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="20" fill="#333333" font-weight="bold" text-anchor="middle">OTAP Dataflow Engine Architecture</text>
-<rect x="20" y="50" width="1520" height="850" rx="12" fill="#ffffff" stroke="#333333" stroke-width="2.5"/>
-<text x="36" y="70" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="16" fill="#333333" font-weight="bold" text-anchor="start">Engine</text>
-<text x="112" y="70" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#777777" font-weight="normal" text-anchor="start">(process)</text>
-<rect x="34" y="86" width="1492" height="120" rx="8" fill="#e8e8e8" stroke="#444444" stroke-width="1.5"/>
-<text x="46" y="102" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" fill="#444444" font-weight="bold" text-anchor="start">Controller</text>
-<text x="134" y="102" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#777777" font-weight="normal" text-anchor="start">main thread — accessory tasks</text>
-<rect x="46" y="116" width="202" height="62" rx="5" fill="#f0f0f0" stroke="#bbbbbb" stroke-width="1"/>
-<text x="147" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">HTTP Admin</text>
-<text x="147" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">/admin /health</text>
-<rect x="256" y="116" width="202" height="62" rx="5" fill="#f0f0f0" stroke="#bbbbbb" stroke-width="1"/>
-<text x="357" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">Metrics</text>
-<text x="357" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">Aggregator</text>
-<text x="357" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">collect metrics</text>
-<rect x="466" y="116" width="202" height="62" rx="5" fill="#f0f0f0" stroke="#bbbbbb" stroke-width="1"/>
-<text x="567" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">Metrics</text>
-<text x="567" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">Dispatcher</text>
-<text x="567" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">ITS / Builtin</text>
-<rect x="676" y="116" width="202" height="62" rx="5" fill="#f0f0f0" stroke="#bbbbbb" stroke-width="1"/>
-<text x="777" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">Engine</text>
-<text x="777" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">Metrics</text>
-<text x="777" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">RSS, process</text>
-<rect x="886" y="116" width="202" height="62" rx="5" fill="#f0f0f0" stroke="#bbbbbb" stroke-width="1"/>
-<text x="987" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">Observed</text>
-<text x="987" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">State</text>
-<text x="987" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">health, events</text>
-<rect x="1096" y="116" width="202" height="62" rx="5" fill="#f0f0f0" stroke="#bbbbbb" stroke-width="1"/>
-<text x="1197" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">Memory</text>
-<text x="1197" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#222222" font-weight="bold" text-anchor="middle">Limiter</text>
-<text x="1197" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">watch broadcast</text>
-<rect x="1306" y="116" width="202" height="62" rx="5" fill="#e8e8e8" stroke="#888888" stroke-width="1"/>
-<text x="1407" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#444444" font-weight="bold" text-anchor="middle">Internal Telemetry</text>
-<text x="1407" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#444444" font-weight="bold" text-anchor="middle">Pipeline</text>
-<text x="1407" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">thread-0</text>
-<text x="46" y="220" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#999999" font-weight="normal" text-anchor="start">Control: RuntimeCtrlMsg (shutdown)  •  PipelineCompletionMsg (ack/nack)  •  watch::channel (memory pressure)  •  MetricsReporter (MPSC)</text>
-<rect x="34" y="232" width="1492" height="654" rx="8" fill="#efefef" stroke="#555555" stroke-width="1.5"/>
-<text x="48" y="250" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#555555" font-weight="bold" text-anchor="start">Pipeline Group "default"</text>
-<text x="264" y="250" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#777777" font-weight="normal" text-anchor="start">pipeline: otlp-gateway  •  core_allocation: 2</text>
-<rect x="48" y="264" width="90" height="608" rx="6" fill="#f7f7f7" stroke="#666666" stroke-width="1.5" stroke-dasharray="6,3"/>
-<text x="93" y="282" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#555555" font-weight="bold" text-anchor="middle">Network</text>
-<text x="93" y="296" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#555555" font-weight="bold" text-anchor="middle">Ingress</text>
-<text x="93" y="316" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="middle">gRPC :4317</text>
-<text x="93" y="330" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#666666" font-weight="bold" text-anchor="middle">SO_REUSEPORT</text>
-<text x="93" y="344" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">OS distributes</text>
-<text x="93" y="356" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">across cores</text>
-<rect x="1422" y="264" width="90" height="608" rx="6" fill="#f7f7f7" stroke="#666666" stroke-width="1.5" stroke-dasharray="6,3"/>
-<text x="1467" y="282" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#555555" font-weight="bold" text-anchor="middle">Network</text>
-<text x="1467" y="296" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#555555" font-weight="bold" text-anchor="middle">Egress</text>
-<text x="1467" y="316" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="middle">gRPC client</text>
-<text x="1467" y="330" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#666666" font-weight="bold" text-anchor="middle">Arc&lt;Channel&gt;</text>
-<text x="1467" y="344" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">shared conn</text>
-<text x="1467" y="356" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#777777" font-weight="normal" text-anchor="middle">across cores</text>
-<rect x="168" y="264" width="1224" height="294" rx="8" fill="#f7f7f7" stroke="#444444" stroke-width="1.5"/>
-<text x="178" y="280" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#444444" font-weight="bold" text-anchor="start">Engine Core 0</text>
-<text x="288" y="280" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">CPU 0  •  pinned thread-1  •  tokio LocalSet  •  single-threaded async</text>
-<rect x="178" y="292" width="361" height="228" rx="6" fill="#ffffff" stroke="#555555" stroke-width="1.5"/>
-<text x="188" y="308" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#555555" font-weight="bold" text-anchor="start">Receiver: otlp</text>
-<text x="188" y="324" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">gRPC server</text>
-<text x="188" y="338" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">SO_REUSEPORT listener</text>
-<text x="188" y="352" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#333333" font-weight="normal" text-anchor="start">output →</text>
-<rect x="599" y="292" width="361" height="228" rx="6" fill="#ffffff" stroke="#555555" stroke-width="1.5"/>
-<text x="609" y="308" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#555555" font-weight="bold" text-anchor="start">Processor: batch</text>
-<text x="609" y="324" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">accumulate items</text>
-<text x="609" y="338" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">flush on timer/size</text>
-<text x="609" y="352" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#333333" font-weight="normal" text-anchor="start">← input  output →</text>
-<rect x="1020" y="292" width="361" height="228" rx="6" fill="#ffffff" stroke="#555555" stroke-width="1.5"/>
-<text x="1030" y="308" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#555555" font-weight="bold" text-anchor="start">Exporter: otlp</text>
-<text x="1030" y="324" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">gRPC client</text>
-<text x="1030" y="338" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">shared connection</text>
-<text x="1030" y="352" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#333333" font-weight="normal" text-anchor="start">← input</text>
-<line x1="543" y1="406" x2="595" y2="406" stroke="#333333" stroke-width="2.5" marker-end="url(#al)"/>
-<text x="569" y="398" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#333333" font-weight="bold" text-anchor="middle">local MPSC</text>
-<text x="569" y="418" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#777777" font-weight="normal" text-anchor="middle">!Send, single-thread</text>
-<line x1="964" y1="406" x2="1016" y2="406" stroke="#333333" stroke-width="2.5" marker-end="url(#al)"/>
-<text x="990" y="398" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#333333" font-weight="bold" text-anchor="middle">local MPSC</text>
-<text x="990" y="418" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#777777" font-weight="normal" text-anchor="middle">!Send, single-thread</text>
-<rect x="178" y="530" width="1204" height="24" rx="4" fill="#f4f4f4" stroke="#888888" stroke-width="0.8"/>
-<text x="780" y="545" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#888888" font-weight="normal" text-anchor="middle">PipelineCtrl: timers  •  ack/nack dispatch  •  metrics reporting  •  memory pressure</text>
+<rect width="1560" height="920" fill="#f8f9fa" rx="12"/>
+<text x="780" y="32" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="20" fill="#2c3e50" font-weight="bold" text-anchor="middle">OTAP Dataflow Engine Architecture</text>
+<rect x="20" y="50" width="1520" height="850" rx="12" fill="#ffffff" stroke="#2c3e50" stroke-width="2.5"/>
+<text x="36" y="70" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="16" fill="#2c3e50" font-weight="bold" text-anchor="start">Engine</text>
+<text x="112" y="70" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#7f8c8d" font-weight="normal" text-anchor="start">(process)</text>
+<rect x="34" y="86" width="1492" height="120" rx="8" fill="#ecf0f1" stroke="#34495e" stroke-width="1.5"/>
+<text x="46" y="102" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" fill="#34495e" font-weight="bold" text-anchor="start">Controller</text>
+<text x="134" y="102" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#7f8c8d" font-weight="normal" text-anchor="start">main thread — accessory tasks</text>
+<rect x="46" y="116" width="202" height="62" rx="5" fill="#f4f4f4" stroke="#bdc3c7" stroke-width="1"/>
+<text x="147" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">HTTP Admin</text>
+<text x="147" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">/admin /health</text>
+<rect x="256" y="116" width="202" height="62" rx="5" fill="#f4f4f4" stroke="#bdc3c7" stroke-width="1"/>
+<text x="357" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">Metrics</text>
+<text x="357" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">Aggregator</text>
+<text x="357" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">collect metrics</text>
+<rect x="466" y="116" width="202" height="62" rx="5" fill="#f4f4f4" stroke="#bdc3c7" stroke-width="1"/>
+<text x="567" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">Metrics</text>
+<text x="567" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">Dispatcher</text>
+<text x="567" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">ITS / Builtin</text>
+<rect x="676" y="116" width="202" height="62" rx="5" fill="#f4f4f4" stroke="#bdc3c7" stroke-width="1"/>
+<text x="777" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">Engine</text>
+<text x="777" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">Metrics</text>
+<text x="777" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">RSS, process</text>
+<rect x="886" y="116" width="202" height="62" rx="5" fill="#f4f4f4" stroke="#bdc3c7" stroke-width="1"/>
+<text x="987" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">Observed</text>
+<text x="987" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">State</text>
+<text x="987" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">health, events</text>
+<rect x="1096" y="116" width="202" height="62" rx="5" fill="#f4f4f4" stroke="#bdc3c7" stroke-width="1"/>
+<text x="1197" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">Memory</text>
+<text x="1197" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#2c3e50" font-weight="bold" text-anchor="middle">Limiter</text>
+<text x="1197" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">watch broadcast</text>
+<rect x="1306" y="116" width="202" height="62" rx="5" fill="#fef9e7" stroke="#f39c12" stroke-width="1"/>
+<text x="1407" y="130" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#e67e22" font-weight="bold" text-anchor="middle">Internal Telemetry</text>
+<text x="1407" y="143" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#e67e22" font-weight="bold" text-anchor="middle">Pipeline</text>
+<text x="1407" y="170" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">thread-0</text>
+<text x="46" y="220" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#95a5a6" font-weight="normal" text-anchor="start">Control: RuntimeCtrlMsg (shutdown)  •  PipelineCompletionMsg (ack/nack)  •  watch::channel (memory pressure)  •  MetricsReporter (MPSC)</text>
+<rect x="34" y="232" width="1492" height="654" rx="8" fill="#eaf2f8" stroke="#2980b9" stroke-width="1.5"/>
+<text x="48" y="250" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#2980b9" font-weight="bold" text-anchor="start">Pipeline Group "default"</text>
+<text x="264" y="250" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#7f8c8d" font-weight="normal" text-anchor="start">pipeline: otlp-gateway  •  core_allocation: 2</text>
+<rect x="48" y="264" width="90" height="608" rx="6" fill="#f9f9f9" stroke="#555555" stroke-width="1.5" stroke-dasharray="6,3"/>
+<text x="93" y="282" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#2980b9" font-weight="bold" text-anchor="middle">Network</text>
+<text x="93" y="296" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#2980b9" font-weight="bold" text-anchor="middle">Ingress</text>
+<text x="93" y="316" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="middle">gRPC :4317</text>
+<text x="93" y="330" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#e67e22" font-weight="bold" text-anchor="middle">SO_REUSEPORT</text>
+<text x="93" y="344" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">OS distributes</text>
+<text x="93" y="356" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">across cores</text>
+<rect x="1422" y="264" width="90" height="608" rx="6" fill="#f9f9f9" stroke="#555555" stroke-width="1.5" stroke-dasharray="6,3"/>
+<text x="1467" y="282" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#2980b9" font-weight="bold" text-anchor="middle">Network</text>
+<text x="1467" y="296" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#2980b9" font-weight="bold" text-anchor="middle">Egress</text>
+<text x="1467" y="316" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="middle">gRPC client</text>
+<text x="1467" y="330" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#e67e22" font-weight="bold" text-anchor="middle">Arc&lt;Channel&gt;</text>
+<text x="1467" y="344" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">shared conn</text>
+<text x="1467" y="356" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="middle">across cores</text>
+<rect x="168" y="264" width="1224" height="294" rx="8" fill="#e8f8f5" stroke="#16a085" stroke-width="1.5"/>
+<text x="178" y="280" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#16a085" font-weight="bold" text-anchor="start">Engine Core 0</text>
+<text x="288" y="280" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">CPU 0  •  pinned thread-1  •  tokio LocalSet  •  single-threaded async</text>
+<rect x="178" y="292" width="361" height="228" rx="6" fill="#ffffff" stroke="#27ae60" stroke-width="1.5"/>
+<text x="188" y="308" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#27ae60" font-weight="bold" text-anchor="start">Receiver: otlp</text>
+<text x="188" y="324" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">gRPC server</text>
+<text x="188" y="338" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">SO_REUSEPORT listener</text>
+<rect x="599" y="292" width="361" height="228" rx="6" fill="#ffffff" stroke="#8e44ad" stroke-width="1.5"/>
+<text x="609" y="308" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#8e44ad" font-weight="bold" text-anchor="start">Processor: batch</text>
+<text x="609" y="324" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">accumulate items</text>
+<text x="609" y="338" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">flush on timer/size</text>
+<rect x="1020" y="292" width="361" height="228" rx="6" fill="#ffffff" stroke="#c0392b" stroke-width="1.5"/>
+<text x="1030" y="308" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#c0392b" font-weight="bold" text-anchor="start">Exporter: otlp</text>
+<text x="1030" y="324" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">gRPC client</text>
+<text x="1030" y="338" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">shared connection</text>
+<line x1="543" y1="406" x2="595" y2="406" stroke="#2ecc71" stroke-width="2.5" marker-end="url(#al)"/>
+<text x="569" y="398" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#2ecc71" font-weight="bold" text-anchor="middle">local MPSC</text>
+<text x="569" y="418" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="middle">!Send, single-thread</text>
+<line x1="964" y1="406" x2="1016" y2="406" stroke="#2ecc71" stroke-width="2.5" marker-end="url(#al)"/>
+<text x="990" y="398" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#2ecc71" font-weight="bold" text-anchor="middle">local MPSC</text>
+<text x="990" y="418" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="middle">!Send, single-thread</text>
+<rect x="178" y="500" width="1204" height="56" rx="4" fill="#f4f4f4" stroke="#7f8c8d" stroke-width="0.8"/>
+<text x="186" y="513" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#7f8c8d" font-weight="bold" text-anchor="start">PipelineCtrl Task</text>
+<text x="186" y="526" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="start">per-node: ControlSender + ControlReceiver  •  CompletionSender + CompletionReceiver</text>
+<text x="186" y="538" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="start">timer scheduling &amp; expiry  •  ack/nack unwind  •  metrics reporting  •  memory pressure watch</text>
+<text x="186" y="550" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#95a5a6" font-weight="normal" text-anchor="start">channels to each node for out-of-band control &amp; completion</text>
+<line x1="358" y1="520" x2="358" y2="500" stroke="#95a5a6" stroke-width="1" stroke-dasharray="3,3"/>
+<line x1="779" y1="520" x2="779" y2="500" stroke="#95a5a6" stroke-width="1" stroke-dasharray="3,3"/>
+<line x1="1200" y1="520" x2="1200" y2="500" stroke="#95a5a6" stroke-width="1" stroke-dasharray="3,3"/>
 <line x1="140" y1="406" x2="174" y2="406" stroke="#555555" stroke-width="2" marker-end="url(#an)"/>
 <line x1="1385" y1="406" x2="1420" y2="406" stroke="#555555" stroke-width="2" marker-end="url(#an)"/>
-<rect x="168" y="578" width="1224" height="294" rx="8" fill="#f7f7f7" stroke="#444444" stroke-width="1.5"/>
-<text x="178" y="594" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#444444" font-weight="bold" text-anchor="start">Engine Core 1</text>
-<text x="288" y="594" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">CPU 1  •  pinned thread-2  •  tokio LocalSet  •  single-threaded async</text>
-<rect x="178" y="606" width="361" height="228" rx="6" fill="#ffffff" stroke="#555555" stroke-width="1.5"/>
-<text x="188" y="622" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#555555" font-weight="bold" text-anchor="start">Receiver: otlp</text>
-<text x="188" y="638" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">gRPC server</text>
-<text x="188" y="652" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">SO_REUSEPORT listener</text>
-<text x="188" y="666" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#333333" font-weight="normal" text-anchor="start">output →</text>
-<rect x="599" y="606" width="361" height="228" rx="6" fill="#ffffff" stroke="#555555" stroke-width="1.5"/>
-<text x="609" y="622" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#555555" font-weight="bold" text-anchor="start">Processor: batch</text>
-<text x="609" y="638" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">accumulate items</text>
-<text x="609" y="652" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">flush on timer/size</text>
-<text x="609" y="666" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#333333" font-weight="normal" text-anchor="start">← input  output →</text>
-<rect x="1020" y="606" width="361" height="228" rx="6" fill="#ffffff" stroke="#555555" stroke-width="1.5"/>
-<text x="1030" y="622" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#555555" font-weight="bold" text-anchor="start">Exporter: otlp</text>
-<text x="1030" y="638" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">gRPC client</text>
-<text x="1030" y="652" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#777777" font-weight="normal" text-anchor="start">shared connection</text>
-<text x="1030" y="666" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#333333" font-weight="normal" text-anchor="start">← input</text>
-<line x1="543" y1="720" x2="595" y2="720" stroke="#333333" stroke-width="2.5" marker-end="url(#al)"/>
-<text x="569" y="712" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#333333" font-weight="bold" text-anchor="middle">local MPSC</text>
-<text x="569" y="732" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#777777" font-weight="normal" text-anchor="middle">!Send, single-thread</text>
-<line x1="964" y1="720" x2="1016" y2="720" stroke="#333333" stroke-width="2.5" marker-end="url(#al)"/>
-<text x="990" y="712" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#333333" font-weight="bold" text-anchor="middle">local MPSC</text>
-<text x="990" y="732" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#777777" font-weight="normal" text-anchor="middle">!Send, single-thread</text>
-<rect x="178" y="844" width="1204" height="24" rx="4" fill="#f4f4f4" stroke="#888888" stroke-width="0.8"/>
-<text x="780" y="859" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#888888" font-weight="normal" text-anchor="middle">PipelineCtrl: timers  •  ack/nack dispatch  •  metrics reporting  •  memory pressure</text>
+<rect x="168" y="578" width="1224" height="294" rx="8" fill="#e8f8f5" stroke="#16a085" stroke-width="1.5"/>
+<text x="178" y="594" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#16a085" font-weight="bold" text-anchor="start">Engine Core 1</text>
+<text x="288" y="594" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">CPU 1  •  pinned thread-2  •  tokio LocalSet  •  single-threaded async</text>
+<rect x="178" y="606" width="361" height="228" rx="6" fill="#ffffff" stroke="#27ae60" stroke-width="1.5"/>
+<text x="188" y="622" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#27ae60" font-weight="bold" text-anchor="start">Receiver: otlp</text>
+<text x="188" y="638" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">gRPC server</text>
+<text x="188" y="652" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">SO_REUSEPORT listener</text>
+<rect x="599" y="606" width="361" height="228" rx="6" fill="#ffffff" stroke="#8e44ad" stroke-width="1.5"/>
+<text x="609" y="622" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#8e44ad" font-weight="bold" text-anchor="start">Processor: batch</text>
+<text x="609" y="638" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">accumulate items</text>
+<text x="609" y="652" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">flush on timer/size</text>
+<rect x="1020" y="606" width="361" height="228" rx="6" fill="#ffffff" stroke="#c0392b" stroke-width="1.5"/>
+<text x="1030" y="622" font-family="Consolas, 'Courier New', monospace" font-size="11" fill="#c0392b" font-weight="bold" text-anchor="start">Exporter: otlp</text>
+<text x="1030" y="638" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">gRPC client</text>
+<text x="1030" y="652" font-family="Consolas, 'Courier New', monospace" font-size="9" fill="#7f8c8d" font-weight="normal" text-anchor="start">shared connection</text>
+<line x1="543" y1="720" x2="595" y2="720" stroke="#2ecc71" stroke-width="2.5" marker-end="url(#al)"/>
+<text x="569" y="712" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#2ecc71" font-weight="bold" text-anchor="middle">local MPSC</text>
+<text x="569" y="732" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="middle">!Send, single-thread</text>
+<line x1="964" y1="720" x2="1016" y2="720" stroke="#2ecc71" stroke-width="2.5" marker-end="url(#al)"/>
+<text x="990" y="712" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#2ecc71" font-weight="bold" text-anchor="middle">local MPSC</text>
+<text x="990" y="732" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#7f8c8d" font-weight="normal" text-anchor="middle">!Send, single-thread</text>
+<rect x="178" y="814" width="1204" height="56" rx="4" fill="#f4f4f4" stroke="#7f8c8d" stroke-width="0.8"/>
+<text x="186" y="827" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#7f8c8d" font-weight="bold" text-anchor="start">PipelineCtrl Task</text>
+<text x="186" y="840" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="start">per-node: ControlSender + ControlReceiver  •  CompletionSender + CompletionReceiver</text>
+<text x="186" y="852" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#7f8c8d" font-weight="normal" text-anchor="start">timer scheduling &amp; expiry  •  ack/nack unwind  •  metrics reporting  •  memory pressure watch</text>
+<text x="186" y="864" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#95a5a6" font-weight="normal" text-anchor="start">channels to each node for out-of-band control &amp; completion</text>
+<line x1="358" y1="834" x2="358" y2="814" stroke="#95a5a6" stroke-width="1" stroke-dasharray="3,3"/>
+<line x1="779" y1="834" x2="779" y2="814" stroke="#95a5a6" stroke-width="1" stroke-dasharray="3,3"/>
+<line x1="1200" y1="834" x2="1200" y2="814" stroke="#95a5a6" stroke-width="1" stroke-dasharray="3,3"/>
 <line x1="140" y1="720" x2="174" y2="720" stroke="#555555" stroke-width="2" marker-end="url(#an)"/>
 <line x1="1385" y1="720" x2="1420" y2="720" stroke="#555555" stroke-width="2" marker-end="url(#an)"/>
-<line x1="1352" y1="550" x2="1352" y2="222" stroke="#999999" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#ac)"/>
-<text x="1357" y="544" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#999999" font-weight="normal" text-anchor="start">ctrl</text>
-<line x1="1322" y1="864" x2="1322" y2="222" stroke="#999999" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#ac)"/>
-<text x="1327" y="858" font-family="Consolas, 'Courier New', monospace" font-size="7" fill="#999999" font-weight="normal" text-anchor="start">ctrl</text>
-<line x1="40" y1="892" x2="68" y2="892" stroke="#333333" stroke-width="2"/>
-<text x="74" y="896" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#222222" font-weight="normal" text-anchor="start">Local channel (MPSC, single-thread, !Send)</text>
-<line x1="380" y1="892" x2="408" y2="892" stroke="#666666" stroke-width="2"/>
-<text x="414" y="896" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#222222" font-weight="normal" text-anchor="start">Shared resource (cross-thread, Send+Sync)</text>
-<line x1="720" y1="892" x2="748" y2="892" stroke="#999999" stroke-width="2"/>
-<text x="754" y="896" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#222222" font-weight="normal" text-anchor="start">Control channel (to/from controller)</text>
-<line x1="1060" y1="892" x2="1088" y2="892" stroke="#555555" stroke-width="2"/>
-<text x="1094" y="896" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#222222" font-weight="normal" text-anchor="start">Network data flow (ingress / egress)</text>
+<path d="M 1526,224 L 158,224 L 158,872 L 1526,872" fill="none" stroke="#34495e" stroke-width="1" stroke-dasharray="4,3"/>
+<text x="154" y="544" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#34495e" font-weight="normal" text-anchor="end">Controller holds</text>
+<text x="154" y="556" font-family="Consolas, 'Courier New', monospace" font-size="8" fill="#34495e" font-weight="normal" text-anchor="end">JoinHandle per core</text>
+<line x1="40" y1="892" x2="68" y2="892" stroke="#2ecc71" stroke-width="2"/>
+<text x="74" y="896" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#2c3e50" font-weight="normal" text-anchor="start">Local channel (MPSC, single-thread, !Send)</text>
+<line x1="380" y1="892" x2="408" y2="892" stroke="#e67e22" stroke-width="2"/>
+<text x="414" y="896" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#2c3e50" font-weight="normal" text-anchor="start">Shared resource (cross-thread, Send+Sync)</text>
+<line x1="720" y1="892" x2="748" y2="892" stroke="#95a5a6" stroke-width="2"/>
+<text x="754" y="896" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#2c3e50" font-weight="normal" text-anchor="start">Control channel (to/from controller)</text>
+<line x1="1060" y1="892" x2="1088" y2="892" stroke="#2980b9" stroke-width="2"/>
+<text x="1094" y="896" font-family="Consolas, 'Courier New', monospace" font-size="10" fill="#2c3e50" font-weight="normal" text-anchor="start">Network data flow (ingress / egress)</text>
 </svg>

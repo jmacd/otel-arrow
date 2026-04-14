@@ -21,30 +21,31 @@ import os
 FONT = "Consolas, 'Courier New', monospace"
 FONT_SANS = "'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
 
-# ── Colors (greyscale) ──────────────────────────────────────────────
+# ── Colors ──────────────────────────────────────────────────────────
 
-C_BG = "#f5f5f5"
-C_ENGINE = "#333333"         # engine border
+C_BG = "#f8f9fa"
+C_ENGINE = "#2c3e50"         # engine border
 C_ENGINE_BG = "#ffffff"
-C_CTRL = "#444444"           # controller
-C_CTRL_BG = "#e8e8e8"
-C_GROUP = "#555555"          # pipeline group
-C_GROUP_BG = "#efefef"
-C_CORE = "#444444"           # engine core / CPU
-C_CORE_BG = "#f7f7f7"
-C_NODE_RCV = "#555555"       # receiver
-C_NODE_PROC = "#555555"      # processor
-C_NODE_EXP = "#555555"       # exporter
+C_CTRL = "#34495e"           # controller
+C_CTRL_BG = "#ecf0f1"
+C_GROUP = "#2980b9"          # pipeline group
+C_GROUP_BG = "#eaf2f8"
+C_CORE = "#16a085"           # engine core / CPU
+C_CORE_BG = "#e8f8f5"
+C_NODE_RCV = "#27ae60"       # receiver
+C_NODE_PROC = "#8e44ad"      # processor
+C_NODE_EXP = "#c0392b"       # exporter
 C_NODE_BG = "#ffffff"
-C_CHANNEL_LOCAL = "#333333"  # local channel (MPSC, single-thread)
-C_CHANNEL_SHARED = "#666666" # shared channel (cross-thread)
-C_CHANNEL_CTRL = "#999999"   # control channel
-C_TOPIC = "#555555"          # topic / cross-pipeline
-C_TEXT = "#222222"
-C_SUBTEXT = "#777777"
-C_PIPELINE_CTRL = "#888888"
-C_ACCESSORY = "#bbbbbb"
-C_ACCESSORY_BG = "#f0f0f0"
+C_CHANNEL_LOCAL = "#2ecc71"  # local channel (MPSC, single-thread)
+C_CHANNEL_SHARED = "#e67e22" # shared channel (cross-thread)
+C_CHANNEL_CTRL = "#95a5a6"   # control channel
+C_TOPIC = "#3498db"          # topic / cross-pipeline
+C_TEXT = "#2c3e50"
+C_SUBTEXT = "#7f8c8d"
+C_PIPELINE_CTRL = "#7f8c8d"
+C_ACCESSORY = "#bdc3c7"
+C_ACCESSORY_BG = "#f4f4f4"
+C_NET = "#555555"            # network ingress/egress
 
 
 def xml_esc(s):
@@ -140,9 +141,9 @@ def make_engine_diagram():
     for i, (name, desc) in enumerate(acc_tasks):
         ax = CX + 12 + i * (acc_w + 8)
         is_its = i == len(acc_tasks) - 1
-        bg = "#e8e8e8" if is_its else C_ACCESSORY_BG
-        bdr = "#888888" if is_its else C_ACCESSORY
-        tc = "#444444" if is_its else C_TEXT
+        bg = "#fef9e7" if is_its else C_ACCESSORY_BG
+        bdr = "#f39c12" if is_its else C_ACCESSORY
+        tc = "#e67e22" if is_its else C_TEXT
         parts.append(rect(ax, acc_y, acc_w, acc_h, bg, bdr, 1, 5))
         lines = name.split("\n")
         for li, line in enumerate(lines):
@@ -177,7 +178,7 @@ def make_engine_diagram():
     net_area_top = GY + 32
     net_area_h = GH - 46
     parts.append(rect(NET_IN_X, net_area_top, NET_IN_W, net_area_h,
-                       C_CORE_BG, C_CHANNEL_SHARED, 1.5, 6, dash="6,3"))
+                       "#f9f9f9", C_NET, 1.5, 6, dash="6,3"))
     parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 18, "Network", 11, C_GROUP,
                        "bold", "middle"))
     parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 32, "Ingress", 11, C_GROUP,
@@ -195,7 +196,7 @@ def make_engine_diagram():
     NET_OUT_W = 90
     NET_OUT_X = GX + GW - 14 - NET_OUT_W
     parts.append(rect(NET_OUT_X, net_area_top, NET_OUT_W, net_area_h,
-                       C_CORE_BG, C_CHANNEL_SHARED, 1.5, 6, dash="6,3"))
+                       "#f9f9f9", C_NET, 1.5, 6, dash="6,3"))
     parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 18, "Network", 11, C_GROUP,
                        "bold", "middle"))
     parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 32, "Egress", 11, C_GROUP,
@@ -245,17 +246,14 @@ def make_engine_diagram():
             ("Receiver", "otlp", C_NODE_RCV, [
                 "gRPC server",
                 "SO_REUSEPORT listener",
-                "output →",
             ]),
             ("Processor", "batch", C_NODE_PROC, [
                 "accumulate items",
                 "flush on timer/size",
-                "← input  output →",
             ]),
             ("Exporter", "otlp", C_NODE_EXP, [
                 "gRPC client",
                 "shared connection",
-                "← input",
             ]),
         ]
 
@@ -270,8 +268,7 @@ def make_engine_diagram():
             parts.append(rect(nx, ny, nw, nh, C_NODE_BG, ncolor, 1.5, 6))
             parts.append(text(nx + 10, ny + 16, f"{ntype}: {nname}", 11, ncolor, "bold"))
             for di, d in enumerate(descs):
-                color = C_CHANNEL_LOCAL if "→" in d or "←" in d else C_SUBTEXT
-                parts.append(text(nx + 10, ny + 32 + di * 14, d, 9, color))
+                parts.append(text(nx + 10, ny + 32 + di * 14, d, 9, C_SUBTEXT))
 
             node_centers.append((nx, nx + nw, ny + nh // 2))
 
@@ -288,39 +285,60 @@ def make_engine_diagram():
             parts.append(text(mid_x, ay + 12, "!Send, single-thread", 7, C_SUBTEXT, "normal",
                                "middle"))
 
-        # PipelineCtrl Task (small box at bottom of core)
+        # PipelineCtrl Task (box at bottom of core showing per-node channels)
         pct_w = cw - 20
-        pct_h = 24
+        pct_h = 56
         pct_x = cx + 10
-        pct_y = pipe_label_y
+        pct_y = pipe_label_y - 30
         parts.append(rect(pct_x, pct_y, pct_w, pct_h, "#f4f4f4", C_PIPELINE_CTRL, 0.8, 4))
-        parts.append(text(pct_x + pct_w // 2, pct_y + 15,
-                           "PipelineCtrl: timers  •  ack/nack dispatch  •  "
-                           "metrics reporting  •  memory pressure",
-                           8, C_PIPELINE_CTRL, "normal", "middle"))
+        parts.append(text(pct_x + 8, pct_y + 13, "PipelineCtrl Task", 10, C_PIPELINE_CTRL,
+                           "bold"))
+        parts.append(text(pct_x + 8, pct_y + 26,
+                           "per-node: ControlSender + ControlReceiver  "
+                           "•  CompletionSender + CompletionReceiver",
+                           8, C_PIPELINE_CTRL))
+        parts.append(text(pct_x + 8, pct_y + 38,
+                           "timer scheduling & expiry  •  ack/nack unwind  •  "
+                           "metrics reporting  •  memory pressure watch",
+                           8, C_PIPELINE_CTRL))
+        parts.append(text(pct_x + 8, pct_y + 50,
+                           "channels to each node for out-of-band control & completion",
+                           8, C_CHANNEL_CTRL))
+
+        # Dashed lines from PipelineCtrl up to each node
+        for ni in range(len(nodes)):
+            node_cx = node_x_start + ni * (node_w + arrow_gap) + node_w // 2
+            node_bot = node_area_y + node_h
+            pct_top = pct_y
+            parts.append(f'<line x1="{node_cx}" y1="{node_bot}" '
+                         f'x2="{node_cx}" y2="{pct_top}" '
+                         f'stroke="{C_CHANNEL_CTRL}" stroke-width="1" '
+                         f'stroke-dasharray="3,3"/>')
 
         # ── Network ingress arrow into receiver ──
         rcv_left = node_x_start
         rcv_cy = node_area_y + node_h // 2
         net_in_right = NET_IN_X + NET_IN_W
         parts.append(arrow_h(net_in_right + 2, rcv_cy, rcv_left - 4, rcv_cy,
-                              C_GROUP, 2, marker_id="an"))
+                              C_NET, 2, marker_id="an"))
 
         # ── Network egress arrow from exporter ──
         exp_right = node_x_start + 2 * (node_w + arrow_gap) + node_w
         exp_cy = rcv_cy
         parts.append(arrow_h(exp_right + 4, exp_cy, NET_OUT_X - 2, exp_cy,
-                              C_GROUP, 2, marker_id="an"))
+                              C_NET, 2, marker_id="an"))
 
-    # ── Control channel arrows from cores back to controller ──
-    for core_idx in range(2):
-        cy = net_area_top + core_idx * (core_h + core_gap) + core_h - 8
-        # small upward dashed arrow from top of core to controller strip
-        arr_x = core_left + core_w - 40 - core_idx * 30
-        parts.append(f'<line x1="{arr_x}" y1="{cy}" x2="{arr_x}" y2="{ctrl_y + 12}" '
-                     f'stroke="{C_CHANNEL_CTRL}" stroke-width="1" stroke-dasharray="3,3" '
-                     f'marker-end="url(#ac)"/>')
-        parts.append(text(arr_x + 5, cy - 6, "ctrl", 7, C_CHANNEL_CTRL))
+    # ── Controller holds references to each engine core ──
+    # Draw a bracket from controller down to the core area
+    ref_x = core_left - 10
+    ref_y1 = ctrl_y + 14
+    ref_y2 = net_area_top + 2 * (core_h + core_gap) - core_gap
+    ref_mid_y = (ref_y1 + ref_y2) // 2
+    parts.append(f'<path d="M {CX + CW},{ref_y1} '
+                 f'L {ref_x},{ref_y1} L {ref_x},{ref_y2} L {CX + CW},{ref_y2}" '
+                 f'fill="none" stroke="{C_CTRL}" stroke-width="1" stroke-dasharray="4,3"/>')
+    parts.append(text(ref_x - 4, ref_mid_y - 4, "Controller holds", 8, C_CTRL, "normal", "end"))
+    parts.append(text(ref_x - 4, ref_mid_y + 8, "JoinHandle per core", 8, C_CTRL, "normal", "end"))
 
     # ═══════════════════════════════════════════════════════════════
     # LEGEND at bottom
