@@ -225,21 +225,21 @@ def make_engine_diagram():
         cw = core_w
         ch = core_h
 
-        parts.append(rect(cx, cy, cw, ch, C_CORE_BG, C_CORE, 1.5, 8))
-        parts.append(text(cx + 10, cy + 16, f"Engine Core {core_idx}", 12, C_CORE, "bold",
+        parts.append(rect(cx, cy, cw, ch, C_CORE_BG, C_CORE, 2, 8))
+        parts.append(text(cx + 12, cy + 18, f"Engine Core {core_idx}", 14, C_CORE, "bold",
                            font=FONT_SANS))
-        parts.append(text(cx + 120, cy + 16,
+        parts.append(text(cx + 140, cy + 18,
                            f"CPU {core_idx}  •  pinned thread-{core_idx + 1}  •  "
                            f"tokio LocalSet  •  single-threaded async",
-                           9, C_SUBTEXT))
+                           10, C_SUBTEXT))
 
         # Layout: nodes in top portion, gap, PipelineCtrl at bottom
-        node_area_y = cy + 28
-        node_h = ch - 110         # smaller nodes to leave room
-        ctrl_gap = 50             # vertical gap for control arrows
+        node_area_y = cy + 30
+        node_h = ch - 120         # compact nodes
+        ctrl_gap = 58             # vertical gap for control arrows
 
         # PipelineCtrl position
-        pct_h = 22
+        pct_h = 26
         pct_x = cx + 10
         pct_w = cw - 20
         pct_y = node_area_y + node_h + ctrl_gap
@@ -278,10 +278,10 @@ def make_engine_diagram():
             nw = node_w
             nh = node_h
 
-            parts.append(rect(nx, ny, nw, nh, C_NODE_BG, ncolor, 1.5, 6))
-            parts.append(text(nx + 10, ny + 16, f"{ntype}: {nname}", 11, ncolor, "bold"))
+            parts.append(rect(nx, ny, nw, nh, C_NODE_BG, ncolor, 2, 6))
+            parts.append(text(nx + 12, ny + 22, f"{ntype}: {nname}", 14, ncolor, "bold"))
             for di, d in enumerate(descs):
-                parts.append(text(nx + 10, ny + 32 + di * 14, d, 9, C_SUBTEXT))
+                parts.append(text(nx + 12, ny + 42 + di * 18, d, 11, C_SUBTEXT))
 
             node_centers.append((nx, nx + nw, ny + nh // 2))
 
@@ -293,16 +293,16 @@ def make_engine_diagram():
             ay = (y1 + y2) // 2
             label, sublabel, color, marker = channel_labels[ni]
             parts.append(arrow_h(x1_right + 4, ay, x2_left - 4, ay,
-                                  color, 2.5, marker_id=marker))
-            parts.append(text(mid_x, ay - 8, label, 8, color, "bold", "middle"))
-            parts.append(text(mid_x, ay + 12, sublabel, 7, C_SUBTEXT, "normal", "middle"))
+                                  color, 3, marker_id=marker))
+            parts.append(text(mid_x, ay - 10, label, 10, color, "bold", "middle"))
+            parts.append(text(mid_x, ay + 14, sublabel, 9, C_SUBTEXT, "normal", "middle"))
 
         # PipelineCtrl Task box
-        parts.append(rect(pct_x, pct_y, pct_w, pct_h, "#f4f4f4", C_PIPELINE_CTRL, 0.8, 4))
-        parts.append(text(pct_x + pct_w // 2, pct_y + 14,
+        parts.append(rect(pct_x, pct_y, pct_w, pct_h, "#f4f4f4", C_PIPELINE_CTRL, 1, 4))
+        parts.append(text(pct_x + pct_w // 2, pct_y + 16,
                            "PipelineCtrl: timers  •  ack/nack unwind  •  "
                            "telemetry  •  memory pressure",
-                           8, C_PIPELINE_CTRL, "normal", "middle"))
+                           10, C_PIPELINE_CTRL, "normal", "middle"))
 
         # Per-node: 4 arrows (2 pairs × 2 directions)
         #   NodeControlMsg:       PipelineCtrl → Node (send)  and  Node → PipelineCtrl (recv)
@@ -324,29 +324,29 @@ def make_engine_diagram():
 
             # NodeControlMsg send: PipelineCtrl → Node
             parts.append(f'<line x1="{x1}" y1="{pct_top}" x2="{x1}" y2="{node_bot}" '
-                         f'stroke="{C_CTRL_DOWN}" stroke-width="1.2" '
-                         f'stroke-dasharray="4,2" marker-end="url(#acd)"/>')
+                         f'stroke="{C_CTRL_DOWN}" stroke-width="1.8" '
+                         f'stroke-dasharray="5,3" marker-end="url(#acd)"/>')
             # NodeControlMsg recv: Node → PipelineCtrl (RuntimeCtrlMsg)
             parts.append(f'<line x1="{x2}" y1="{node_bot}" x2="{x2}" y2="{pct_top}" '
-                         f'stroke="{C_CTRL_UP}" stroke-width="1.2" '
-                         f'stroke-dasharray="4,2" marker-end="url(#acu)"/>')
+                         f'stroke="{C_CTRL_UP}" stroke-width="1.8" '
+                         f'stroke-dasharray="5,3" marker-end="url(#acu)"/>')
             # CompletionMsg send: Node → PipelineCtrl
             parts.append(f'<line x1="{x3}" y1="{node_bot}" x2="{x3}" y2="{pct_top}" '
-                         f'stroke="{C_CTRL_UP}" stroke-width="1.2" '
-                         f'stroke-dasharray="4,2" marker-end="url(#acu)"/>')
+                         f'stroke="{C_CTRL_UP}" stroke-width="1.8" '
+                         f'stroke-dasharray="5,3" marker-end="url(#acu)"/>')
             # CompletionMsg recv: PipelineCtrl → Node (Ack/Nack delivery)
             parts.append(f'<line x1="{x4}" y1="{pct_top}" x2="{x4}" y2="{node_bot}" '
-                         f'stroke="{C_CTRL_DOWN}" stroke-width="1.2" '
-                         f'stroke-dasharray="4,2" marker-end="url(#acd)"/>')
+                         f'stroke="{C_CTRL_DOWN}" stroke-width="1.8" '
+                         f'stroke-dasharray="5,3" marker-end="url(#acd)"/>')
 
         # Channel direction legend (between first two nodes, in the ctrl_gap area)
         label_y = node_bot + 8
         label_x1 = node_x_start + node_w * 2 // 9
         label_x2 = node_x_start + node_w * 6 // 9
-        parts.append(text(label_x1, label_y + 8, "control", 7, C_CTRL_DOWN, "bold"))
-        parts.append(text(label_x1, label_y + 18, "timers, telemetry, config", 7, C_SUBTEXT))
-        parts.append(text(label_x2, label_y + 8, "completion", 7, C_CTRL_UP, "bold"))
-        parts.append(text(label_x2, label_y + 18, "ack/nack", 7, C_SUBTEXT))
+        parts.append(text(label_x1, label_y + 10, "control", 9, C_CTRL_DOWN, "bold"))
+        parts.append(text(label_x1, label_y + 24, "timers, telemetry, config", 8, C_SUBTEXT))
+        parts.append(text(label_x2, label_y + 10, "completion", 9, C_CTRL_UP, "bold"))
+        parts.append(text(label_x2, label_y + 24, "ack/nack", 8, C_SUBTEXT))
 
         # ── Network ingress arrow into receiver ──
         rcv_left = node_x_start
@@ -362,16 +362,21 @@ def make_engine_diagram():
                               C_NET, 2, marker_id="an"))
 
     # ── Controller holds references to each engine core ──
-    # Draw a bracket from controller down to the core area
-    ref_x = core_left - 10
-    ref_y1 = ctrl_y + 14
-    ref_y2 = net_area_top + 2 * (core_h + core_gap) - core_gap
+    # Small bracket on the left margin connecting controller strip to the cores
+    ref_x = core_left - 14
+    ref_y1 = net_area_top + 10
+    ref_y2 = net_area_top + 2 * (core_h + core_gap) - core_gap - 10
     ref_mid_y = (ref_y1 + ref_y2) // 2
-    parts.append(f'<path d="M {CX + CW},{ref_y1} '
-                 f'L {ref_x},{ref_y1} L {ref_x},{ref_y2} L {CX + CW},{ref_y2}" '
-                 f'fill="none" stroke="{C_CTRL}" stroke-width="1" stroke-dasharray="4,3"/>')
-    parts.append(text(ref_x - 4, ref_mid_y - 4, "Controller holds", 8, C_CTRL, "normal", "end"))
-    parts.append(text(ref_x - 4, ref_mid_y + 8, "JoinHandle per core", 8, C_CTRL, "normal", "end"))
+    # Vertical line with small horizontal ticks
+    parts.append(f'<line x1="{ref_x}" y1="{ref_y1}" x2="{ref_x}" y2="{ref_y2}" '
+                 f'stroke="{C_CTRL}" stroke-width="1" stroke-dasharray="4,3"/>')
+    parts.append(f'<line x1="{ref_x}" y1="{ref_y1}" x2="{ref_x + 8}" y2="{ref_y1}" '
+                 f'stroke="{C_CTRL}" stroke-width="1"/>')
+    parts.append(f'<line x1="{ref_x}" y1="{ref_y2}" x2="{ref_x + 8}" y2="{ref_y2}" '
+                 f'stroke="{C_CTRL}" stroke-width="1"/>')
+    parts.append(text(ref_x - 4, ref_mid_y - 4, "Controller", 7, C_CTRL, "normal", "end"))
+    parts.append(text(ref_x - 4, ref_mid_y + 6, "JoinHandle", 7, C_CTRL, "normal", "end"))
+    parts.append(text(ref_x - 4, ref_mid_y + 16, "per core", 7, C_CTRL, "normal", "end"))
 
     # ═══════════════════════════════════════════════════════════════
     # LEGEND at bottom
