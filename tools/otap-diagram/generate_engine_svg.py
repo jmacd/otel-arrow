@@ -21,30 +21,30 @@ import os
 FONT = "Consolas, 'Courier New', monospace"
 FONT_SANS = "'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
 
-# ── Colors ──────────────────────────────────────────────────────────
+# ── Colors (greyscale) ──────────────────────────────────────────────
 
-C_BG = "#f8f9fa"
-C_ENGINE = "#2c3e50"         # engine border
+C_BG = "#f5f5f5"
+C_ENGINE = "#333333"         # engine border
 C_ENGINE_BG = "#ffffff"
-C_CTRL = "#34495e"           # controller
-C_CTRL_BG = "#ecf0f1"
-C_GROUP = "#2980b9"          # pipeline group
-C_GROUP_BG = "#eaf2f8"
-C_CORE = "#16a085"           # engine core / CPU
-C_CORE_BG = "#e8f8f5"
-C_NODE_RCV = "#27ae60"       # receiver
-C_NODE_PROC = "#8e44ad"      # processor
-C_NODE_EXP = "#c0392b"       # exporter
+C_CTRL = "#444444"           # controller
+C_CTRL_BG = "#e8e8e8"
+C_GROUP = "#555555"          # pipeline group
+C_GROUP_BG = "#efefef"
+C_CORE = "#444444"           # engine core / CPU
+C_CORE_BG = "#f7f7f7"
+C_NODE_RCV = "#555555"       # receiver
+C_NODE_PROC = "#555555"      # processor
+C_NODE_EXP = "#555555"       # exporter
 C_NODE_BG = "#ffffff"
-C_CHANNEL_LOCAL = "#2ecc71"  # local channel (MPSC, single-thread)
-C_CHANNEL_SHARED = "#e67e22" # shared channel (cross-thread)
-C_CHANNEL_CTRL = "#95a5a6"   # control channel
-C_TOPIC = "#3498db"          # topic / cross-pipeline
-C_TEXT = "#2c3e50"
-C_SUBTEXT = "#7f8c8d"
-C_PIPELINE_CTRL = "#7f8c8d"
-C_ACCESSORY = "#bdc3c7"
-C_ACCESSORY_BG = "#f4f4f4"
+C_CHANNEL_LOCAL = "#333333"  # local channel (MPSC, single-thread)
+C_CHANNEL_SHARED = "#666666" # shared channel (cross-thread)
+C_CHANNEL_CTRL = "#999999"   # control channel
+C_TOPIC = "#555555"          # topic / cross-pipeline
+C_TEXT = "#222222"
+C_SUBTEXT = "#777777"
+C_PIPELINE_CTRL = "#888888"
+C_ACCESSORY = "#bbbbbb"
+C_ACCESSORY_BG = "#f0f0f0"
 
 
 def xml_esc(s):
@@ -103,7 +103,7 @@ def make_engine_diagram():
     parts.append(arrow_marker("as", C_CHANNEL_SHARED, 8))
     parts.append(arrow_marker("ac", C_CHANNEL_CTRL, 6))
     parts.append(arrow_marker("at", C_TOPIC, 8))
-    parts.append(arrow_marker("an", "#555555", 9))  # network arrow
+    parts.append(arrow_marker("an", C_GROUP, 9))  # network arrow
 
     # ── Title ──
     parts.append(text(W // 2, 32, "OTAP Dataflow Engine Architecture", 20, C_ENGINE, "bold",
@@ -140,9 +140,9 @@ def make_engine_diagram():
     for i, (name, desc) in enumerate(acc_tasks):
         ax = CX + 12 + i * (acc_w + 8)
         is_its = i == len(acc_tasks) - 1
-        bg = "#fef9e7" if is_its else C_ACCESSORY_BG
-        bdr = "#f39c12" if is_its else C_ACCESSORY
-        tc = "#e67e22" if is_its else C_TEXT
+        bg = "#e8e8e8" if is_its else C_ACCESSORY_BG
+        bdr = "#888888" if is_its else C_ACCESSORY
+        tc = "#444444" if is_its else C_TEXT
         parts.append(rect(ax, acc_y, acc_w, acc_h, bg, bdr, 1, 5))
         lines = name.split("\n")
         for li, line in enumerate(lines):
@@ -177,10 +177,10 @@ def make_engine_diagram():
     net_area_top = GY + 32
     net_area_h = GH - 46
     parts.append(rect(NET_IN_X, net_area_top, NET_IN_W, net_area_h,
-                       "#f9f9f9", "#888888", 1.5, 6, dash="6,3"))
-    parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 18, "Network", 11, "#555555",
+                       C_CORE_BG, C_CHANNEL_SHARED, 1.5, 6, dash="6,3"))
+    parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 18, "Network", 11, C_GROUP,
                        "bold", "middle"))
-    parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 32, "Ingress", 11, "#555555",
+    parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 32, "Ingress", 11, C_GROUP,
                        "bold", "middle"))
     parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 52, "gRPC :4317", 9,
                        C_SUBTEXT, "normal", "middle"))
@@ -195,10 +195,10 @@ def make_engine_diagram():
     NET_OUT_W = 90
     NET_OUT_X = GX + GW - 14 - NET_OUT_W
     parts.append(rect(NET_OUT_X, net_area_top, NET_OUT_W, net_area_h,
-                       "#f9f9f9", "#888888", 1.5, 6, dash="6,3"))
-    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 18, "Network", 11, "#555555",
+                       C_CORE_BG, C_CHANNEL_SHARED, 1.5, 6, dash="6,3"))
+    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 18, "Network", 11, C_GROUP,
                        "bold", "middle"))
-    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 32, "Egress", 11, "#555555",
+    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 32, "Egress", 11, C_GROUP,
                        "bold", "middle"))
     parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 52, "gRPC client", 9,
                        C_SUBTEXT, "normal", "middle"))
@@ -304,13 +304,13 @@ def make_engine_diagram():
         rcv_cy = node_area_y + node_h // 2
         net_in_right = NET_IN_X + NET_IN_W
         parts.append(arrow_h(net_in_right + 2, rcv_cy, rcv_left - 4, rcv_cy,
-                              "#555555", 2, marker_id="an"))
+                              C_GROUP, 2, marker_id="an"))
 
         # ── Network egress arrow from exporter ──
         exp_right = node_x_start + 2 * (node_w + arrow_gap) + node_w
         exp_cy = rcv_cy
         parts.append(arrow_h(exp_right + 4, exp_cy, NET_OUT_X - 2, exp_cy,
-                              "#555555", 2, marker_id="an"))
+                              C_GROUP, 2, marker_id="an"))
 
     # ── Control channel arrows from cores back to controller ──
     for core_idx in range(2):
@@ -331,7 +331,7 @@ def make_engine_diagram():
         (C_CHANNEL_LOCAL, "──", "Local channel (MPSC, single-thread, !Send)"),
         (C_CHANNEL_SHARED, "- -", "Shared resource (cross-thread, Send+Sync)"),
         (C_CHANNEL_CTRL, "···", "Control channel (to/from controller)"),
-        ("#555555", "──▶", "Network data flow (ingress / egress)"),
+        (C_GROUP, "──▶", "Network data flow (ingress / egress)"),
     ]
     for color, style, desc in legend_items:
         parts.append(f'<line x1="{lx}" y1="{LY}" x2="{lx + 28}" y2="{LY}" '
