@@ -104,7 +104,9 @@ def make_engine_diagram():
     parts.append(arrow_marker("as", C_CHANNEL_SHARED, 8))
     parts.append(arrow_marker("ac", C_CHANNEL_CTRL, 6))
     parts.append(arrow_marker("at", C_TOPIC, 8))
-    parts.append(arrow_marker("an", C_GROUP, 9))  # network arrow
+    parts.append(arrow_marker("an", C_NET, 9))
+    parts.append(arrow_marker("acd", "#e74c3c", 6))  # NodeControlMsg down
+    parts.append(arrow_marker("acu", "#3498db", 6))   # RuntimeCtrl+Completion up
 
     # ── Title ──
     parts.append(text(W // 2, 32, "OTAP Dataflow Engine Architecture", 20, C_ENGINE, "bold",
@@ -179,9 +181,9 @@ def make_engine_diagram():
     net_area_h = GH - 46
     parts.append(rect(NET_IN_X, net_area_top, NET_IN_W, net_area_h,
                        "#f9f9f9", C_NET, 1.5, 6, dash="6,3"))
-    parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 18, "Network", 11, C_GROUP,
+    parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 18, "Network", 11, C_NET,
                        "bold", "middle"))
-    parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 32, "Ingress", 11, C_GROUP,
+    parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 32, "Ingress", 11, C_NET,
                        "bold", "middle"))
     parts.append(text(NET_IN_X + NET_IN_W // 2, net_area_top + 52, "gRPC :4317", 9,
                        C_SUBTEXT, "normal", "middle"))
@@ -197,17 +199,17 @@ def make_engine_diagram():
     NET_OUT_X = GX + GW - 14 - NET_OUT_W
     parts.append(rect(NET_OUT_X, net_area_top, NET_OUT_W, net_area_h,
                        "#f9f9f9", C_NET, 1.5, 6, dash="6,3"))
-    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 18, "Network", 11, C_GROUP,
+    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 18, "Network", 11, C_NET,
                        "bold", "middle"))
-    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 32, "Egress", 11, C_GROUP,
+    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 32, "Egress", 11, C_NET,
                        "bold", "middle"))
     parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 52, "gRPC client", 9,
                        C_SUBTEXT, "normal", "middle"))
-    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 66, "Arc<Channel>", 8,
-                       C_CHANNEL_SHARED, "bold", "middle"))
-    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 80, "shared conn", 8,
+    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 66, "independent", 8,
                        C_SUBTEXT, "normal", "middle"))
-    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 92, "across cores", 8,
+    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 80, "connection", 8,
+                       C_SUBTEXT, "normal", "middle"))
+    parts.append(text(NET_OUT_X + NET_OUT_W // 2, net_area_top + 92, "per core", 8,
                        C_SUBTEXT, "normal", "middle"))
 
     # ── Two Engine Core rows (horizontal pipeline flow) ──
@@ -244,8 +246,9 @@ def make_engine_diagram():
 
         nodes = [
             ("Receiver", "otlp", C_NODE_RCV, [
-                "gRPC server",
-                "SO_REUSEPORT listener",
+                "gRPC server (Tonic)",
+                "SO_REUSEPORT shared listener",
+                "Tonic closure makes node shared",
             ]),
             ("Processor", "batch", C_NODE_PROC, [
                 "accumulate items",
@@ -253,8 +256,15 @@ def make_engine_diagram():
             ]),
             ("Exporter", "otlp", C_NODE_EXP, [
                 "gRPC client",
-                "shared connection",
+                "independent per core",
             ]),
+        ]
+
+        # Channel types: receiver→processor is shared (Tonic closure),
+        # processor→exporter is local
+        channel_labels = [
+            ("shared MPSC", "Send+Sync (Tonic)", C_CHANNEL_SHARED, "as"),
+            ("local MPSC", "!Send, single-thread", C_CHANNEL_LOCAL, "al"),
         ]
 
         node_centers = []  # (right_edge_x, center_y) for arrows
@@ -272,48 +282,60 @@ def make_engine_diagram():
 
             node_centers.append((nx, nx + nw, ny + nh // 2))
 
-        # Arrows between nodes (horizontal)
+        # Arrows between nodes (horizontal) with per-edge channel type
         for ni in range(len(nodes) - 1):
             _, x1_right, y1 = node_centers[ni]
             x2_left, _, y2 = node_centers[ni + 1]
             mid_x = (x1_right + x2_left) // 2
             ay = (y1 + y2) // 2
+            label, sublabel, color, marker = channel_labels[ni]
             parts.append(arrow_h(x1_right + 4, ay, x2_left - 4, ay,
-                                  C_CHANNEL_LOCAL, 2.5, marker_id="al"))
-            parts.append(text(mid_x, ay - 8, "local MPSC", 8, C_CHANNEL_LOCAL, "bold",
-                               "middle"))
-            parts.append(text(mid_x, ay + 12, "!Send, single-thread", 7, C_SUBTEXT, "normal",
-                               "middle"))
+                                  color, 2.5, marker_id=marker))
+            parts.append(text(mid_x, ay - 8, label, 8, color, "bold", "middle"))
+            parts.append(text(mid_x, ay + 12, sublabel, 7, C_SUBTEXT, "normal", "middle"))
 
-        # PipelineCtrl Task (box at bottom of core showing per-node channels)
+        # PipelineCtrl Task (single-line box at bottom of core)
         pct_w = cw - 20
-        pct_h = 56
+        pct_h = 22
         pct_x = cx + 10
-        pct_y = pipe_label_y - 30
+        pct_y = pipe_label_y
         parts.append(rect(pct_x, pct_y, pct_w, pct_h, "#f4f4f4", C_PIPELINE_CTRL, 0.8, 4))
-        parts.append(text(pct_x + 8, pct_y + 13, "PipelineCtrl Task", 10, C_PIPELINE_CTRL,
-                           "bold"))
-        parts.append(text(pct_x + 8, pct_y + 26,
-                           "per-node: ControlSender + ControlReceiver  "
-                           "•  CompletionSender + CompletionReceiver",
-                           8, C_PIPELINE_CTRL))
-        parts.append(text(pct_x + 8, pct_y + 38,
-                           "timer scheduling & expiry  •  ack/nack unwind  •  "
-                           "metrics reporting  •  memory pressure watch",
-                           8, C_PIPELINE_CTRL))
-        parts.append(text(pct_x + 8, pct_y + 50,
-                           "channels to each node for out-of-band control & completion",
-                           8, C_CHANNEL_CTRL))
+        parts.append(text(pct_x + pct_w // 2, pct_y + 14,
+                           "PipelineCtrl: timers  •  ack/nack unwind  •  "
+                           "telemetry  •  memory pressure",
+                           8, C_PIPELINE_CTRL, "normal", "middle"))
 
-        # Dashed lines from PipelineCtrl up to each node
+        # Per-node control channels illustrated as two arrows per node:
+        #   DOWN (left):  NodeControlMsg  PipelineCtrl → Node
+        #                 (Ack, Nack, TimerTick, Shutdown, Config, DelayedData)
+        #   UP (right):   RuntimeControlMsg + PipelineCompletionMsg  Node → PipelineCtrl
+        #                 (StartTimer, DelayData, Shutdown, DeliverAck, DeliverNack)
+        C_CTRL_DOWN = "#e74c3c"  # red-ish for control down
+        C_CTRL_UP = "#3498db"    # blue-ish for runtime/completion up
         for ni in range(len(nodes)):
-            node_cx = node_x_start + ni * (node_w + arrow_gap) + node_w // 2
+            node_left = node_x_start + ni * (node_w + arrow_gap)
             node_bot = node_area_y + node_h
             pct_top = pct_y
-            parts.append(f'<line x1="{node_cx}" y1="{node_bot}" '
-                         f'x2="{node_cx}" y2="{pct_top}" '
-                         f'stroke="{C_CHANNEL_CTRL}" stroke-width="1" '
-                         f'stroke-dasharray="3,3"/>')
+
+            # NodeControlMsg: down arrow (left side of node)
+            dx = node_left + node_w * 3 // 8
+            parts.append(f'<line x1="{dx}" y1="{pct_top}" x2="{dx}" y2="{node_bot}" '
+                         f'stroke="{C_CTRL_DOWN}" stroke-width="1.2" '
+                         f'stroke-dasharray="4,2" marker-end="url(#acd)"/>')
+
+            # RuntimeCtrlMsg + CompletionMsg: up arrow (right side of node)
+            ux = node_left + node_w * 5 // 8
+            parts.append(f'<line x1="{ux}" y1="{node_bot}" x2="{ux}" y2="{pct_top}" '
+                         f'stroke="{C_CTRL_UP}" stroke-width="1.2" '
+                         f'stroke-dasharray="4,2" marker-end="url(#acu)"/>')
+
+        # Labels for the two channel directions (once per core, between nodes)
+        label_x = node_x_start + node_w + arrow_gap // 2
+        label_y = node_area_y + node_h + 10
+        parts.append(text(label_x, label_y, "↓ NodeControlMsg", 7, C_CTRL_DOWN, "normal",
+                           "middle"))
+        parts.append(text(label_x, label_y + 10, "↑ RuntimeCtrl + Completion", 7, C_CTRL_UP,
+                           "normal", "middle"))
 
         # ── Network ingress arrow into receiver ──
         rcv_left = node_x_start
@@ -347,9 +369,9 @@ def make_engine_diagram():
     lx = 40
     legend_items = [
         (C_CHANNEL_LOCAL, "──", "Local channel (MPSC, single-thread, !Send)"),
-        (C_CHANNEL_SHARED, "- -", "Shared resource (cross-thread, Send+Sync)"),
-        (C_CHANNEL_CTRL, "···", "Control channel (to/from controller)"),
-        (C_GROUP, "──▶", "Network data flow (ingress / egress)"),
+        (C_CHANNEL_SHARED, "- -", "Shared channel (cross-thread, Send+Sync, e.g. Tonic gRPC receiver)"),
+        (C_CHANNEL_CTRL, "···", "Control/completion channels (per-node, out-of-band)"),
+        (C_NET, "──▶", "Network data flow (ingress / egress)"),
     ]
     for color, style, desc in legend_items:
         parts.append(f'<line x1="{lx}" y1="{LY}" x2="{lx + 28}" y2="{LY}" '
