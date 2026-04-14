@@ -96,7 +96,7 @@ def rounded_label(x, y, w, h, label, bg, border, text_color, font_size=11):
 
 def make_engine_diagram():
     W = 1560
-    H = 920
+    H = 1060
     parts = []
 
     # Markers
@@ -233,22 +233,27 @@ def make_engine_diagram():
                            f"tokio LocalSet  •  single-threaded async",
                            9, C_SUBTEXT))
 
-        # Horizontal pipeline: Receiver → Processor → Exporter
+        # Layout: nodes in top portion, gap, PipelineCtrl at bottom
         node_area_y = cy + 28
-        node_h = ch - 66
-        pipe_label_y = cy + ch - 28
+        node_h = ch - 110         # smaller nodes to leave room
+        ctrl_gap = 50             # vertical gap for control arrows
 
-        # Three nodes equally spaced with gaps for arrows
-        arrow_gap = 60   # space between nodes for arrow + label
-        available = cw - 20  # padding inside core
+        # PipelineCtrl position
+        pct_h = 22
+        pct_x = cx + 10
+        pct_w = cw - 20
+        pct_y = node_area_y + node_h + ctrl_gap
+
+        # Three nodes equally spaced with gaps for data arrows
+        arrow_gap = 60
+        available = cw - 20
         node_w = (available - 2 * arrow_gap) // 3
         node_x_start = cx + 10
 
         nodes = [
             ("Receiver", "otlp", C_NODE_RCV, [
                 "gRPC server (Tonic)",
-                "SO_REUSEPORT shared listener",
-                "Tonic closure makes node shared",
+                "Tonic requires shared receiver",
             ]),
             ("Processor", "batch", C_NODE_PROC, [
                 "accumulate items",
@@ -260,14 +265,12 @@ def make_engine_diagram():
             ]),
         ]
 
-        # Channel types: receiver→processor is shared (Tonic closure),
-        # processor→exporter is local
         channel_labels = [
             ("shared MPSC", "Send+Sync (Tonic)", C_CHANNEL_SHARED, "as"),
             ("local MPSC", "!Send, single-thread", C_CHANNEL_LOCAL, "al"),
         ]
 
-        node_centers = []  # (right_edge_x, center_y) for arrows
+        node_centers = []
 
         for ni, (ntype, nname, ncolor, descs) in enumerate(nodes):
             nx = node_x_start + ni * (node_w + arrow_gap)
@@ -282,7 +285,7 @@ def make_engine_diagram():
 
             node_centers.append((nx, nx + nw, ny + nh // 2))
 
-        # Arrows between nodes (horizontal) with per-edge channel type
+        # Data arrows between nodes (horizontal)
         for ni in range(len(nodes) - 1):
             _, x1_right, y1 = node_centers[ni]
             x2_left, _, y2 = node_centers[ni + 1]
@@ -294,48 +297,56 @@ def make_engine_diagram():
             parts.append(text(mid_x, ay - 8, label, 8, color, "bold", "middle"))
             parts.append(text(mid_x, ay + 12, sublabel, 7, C_SUBTEXT, "normal", "middle"))
 
-        # PipelineCtrl Task (single-line box at bottom of core)
-        pct_w = cw - 20
-        pct_h = 22
-        pct_x = cx + 10
-        pct_y = pipe_label_y
+        # PipelineCtrl Task box
         parts.append(rect(pct_x, pct_y, pct_w, pct_h, "#f4f4f4", C_PIPELINE_CTRL, 0.8, 4))
         parts.append(text(pct_x + pct_w // 2, pct_y + 14,
                            "PipelineCtrl: timers  •  ack/nack unwind  •  "
                            "telemetry  •  memory pressure",
                            8, C_PIPELINE_CTRL, "normal", "middle"))
 
-        # Per-node control channels illustrated as two arrows per node:
-        #   DOWN (left):  NodeControlMsg  PipelineCtrl → Node
-        #                 (Ack, Nack, TimerTick, Shutdown, Config, DelayedData)
-        #   UP (right):   RuntimeControlMsg + PipelineCompletionMsg  Node → PipelineCtrl
-        #                 (StartTimer, DelayData, Shutdown, DeliverAck, DeliverNack)
-        C_CTRL_DOWN = "#e74c3c"  # red-ish for control down
-        C_CTRL_UP = "#3498db"    # blue-ish for runtime/completion up
-        for ni in range(len(nodes)):
-            node_left = node_x_start + ni * (node_w + arrow_gap)
-            node_bot = node_area_y + node_h
-            pct_top = pct_y
+        # Per-node: 4 arrows (2 pairs × 2 directions)
+        #   NodeControlMsg:       PipelineCtrl → Node (send)  and  Node → PipelineCtrl (recv)
+        #   CompletionMsg:        Node → PipelineCtrl (send)  and  PipelineCtrl → Node (recv)
+        #
+        # Visually: two down-arrows and two up-arrows spaced across the node width
+        C_CTRL_DOWN = "#e74c3c"
+        C_CTRL_UP = "#3498db"
+        node_bot = node_area_y + node_h
+        pct_top = pct_y
 
-            # NodeControlMsg: down arrow (left side of node)
-            dx = node_left + node_w * 3 // 8
-            parts.append(f'<line x1="{dx}" y1="{pct_top}" x2="{dx}" y2="{node_bot}" '
+        for ni in range(len(nodes)):
+            nl = node_x_start + ni * (node_w + arrow_gap)
+            # Four positions across the node width
+            x1 = nl + node_w * 2 // 9      # ctrl send (down)
+            x2 = nl + node_w * 3 // 9      # ctrl recv (up)
+            x3 = nl + node_w * 6 // 9      # completion send (up)
+            x4 = nl + node_w * 7 // 9      # completion recv (down)
+
+            # NodeControlMsg send: PipelineCtrl → Node
+            parts.append(f'<line x1="{x1}" y1="{pct_top}" x2="{x1}" y2="{node_bot}" '
+                         f'stroke="{C_CTRL_DOWN}" stroke-width="1.2" '
+                         f'stroke-dasharray="4,2" marker-end="url(#acd)"/>')
+            # NodeControlMsg recv: Node → PipelineCtrl (RuntimeCtrlMsg)
+            parts.append(f'<line x1="{x2}" y1="{node_bot}" x2="{x2}" y2="{pct_top}" '
+                         f'stroke="{C_CTRL_UP}" stroke-width="1.2" '
+                         f'stroke-dasharray="4,2" marker-end="url(#acu)"/>')
+            # CompletionMsg send: Node → PipelineCtrl
+            parts.append(f'<line x1="{x3}" y1="{node_bot}" x2="{x3}" y2="{pct_top}" '
+                         f'stroke="{C_CTRL_UP}" stroke-width="1.2" '
+                         f'stroke-dasharray="4,2" marker-end="url(#acu)"/>')
+            # CompletionMsg recv: PipelineCtrl → Node (Ack/Nack delivery)
+            parts.append(f'<line x1="{x4}" y1="{pct_top}" x2="{x4}" y2="{node_bot}" '
                          f'stroke="{C_CTRL_DOWN}" stroke-width="1.2" '
                          f'stroke-dasharray="4,2" marker-end="url(#acd)"/>')
 
-            # RuntimeCtrlMsg + CompletionMsg: up arrow (right side of node)
-            ux = node_left + node_w * 5 // 8
-            parts.append(f'<line x1="{ux}" y1="{node_bot}" x2="{ux}" y2="{pct_top}" '
-                         f'stroke="{C_CTRL_UP}" stroke-width="1.2" '
-                         f'stroke-dasharray="4,2" marker-end="url(#acu)"/>')
-
-        # Labels for the two channel directions (once per core, between nodes)
-        label_x = node_x_start + node_w + arrow_gap // 2
-        label_y = node_area_y + node_h + 10
-        parts.append(text(label_x, label_y, "↓ NodeControlMsg", 7, C_CTRL_DOWN, "normal",
-                           "middle"))
-        parts.append(text(label_x, label_y + 10, "↑ RuntimeCtrl + Completion", 7, C_CTRL_UP,
-                           "normal", "middle"))
+        # Channel direction legend (between first two nodes, in the ctrl_gap area)
+        label_y = node_bot + 8
+        label_x1 = node_x_start + node_w * 2 // 9
+        label_x2 = node_x_start + node_w * 6 // 9
+        parts.append(text(label_x1, label_y + 8, "control", 7, C_CTRL_DOWN, "bold"))
+        parts.append(text(label_x1, label_y + 18, "send/recv", 7, C_SUBTEXT))
+        parts.append(text(label_x2, label_y + 8, "completion", 7, C_CTRL_UP, "bold"))
+        parts.append(text(label_x2, label_y + 18, "send/recv", 7, C_SUBTEXT))
 
         # ── Network ingress arrow into receiver ──
         rcv_left = node_x_start
