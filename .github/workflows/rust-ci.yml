@@ -423,6 +423,18 @@ jobs:
       matrix:
         folder: [otap-dataflow]
         os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            # Linux builds with all features (includes dev-tools, all crypto backends, Geneva exporter).
+            cargo-features: --all-features
+          - os: windows-latest
+            # Windows avoids --all-features because dev-tools (weaver) and
+            # geneva-exporter (geneva-uploader) transitively pull openssl-sys,
+            # which requires building OpenSSL from source.  Uses SymCrypt for
+            # TLS and mimalloc instead of jemalloc.
+            cargo-features: >-
+              --no-default-features
+              --features=crypto-symcrypt,mimalloc,azure,aws,azure-monitor-exporter,contrib-processors,unsafe-optimizations
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -434,13 +446,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: stable
-      - name: Install OpenSSL (Windows)
-        if: runner.os == 'Windows'
-        # Required for the crypto-openssl feature (rustls-openssl -> openssl-sys).
-        run: |
-          vcpkg install openssl:x64-windows-static-md
-          echo "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" >> $env:GITHUB_ENV
-        shell: pwsh
       - name: Install SymCrypt (Windows)
         if: runner.os == 'Windows'
         uses: ./.github/actions/install-symcrypt
@@ -465,7 +470,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Build and archive tests
-        run: cargo nextest archive --all-features --workspace --archive-file nextest-archive.tar.zst
+        run: cargo nextest archive ${{ matrix.cargo-features }} --workspace --archive-file nextest-archive.tar.zst
         working-directory: ./rust/${{ matrix.folder }}
       - name: Upload nextest archive
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -591,6 +596,14 @@ jobs:
       matrix:
         folder: [otap-dataflow]
         os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            cargo-features: --all-features
+          - os: windows-latest
+            # See build_required for rationale on Windows feature selection.
+            cargo-features: >-
+              --no-default-features
+              --features=crypto-symcrypt,mimalloc,azure,aws,azure-monitor-exporter,contrib-processors,unsafe-optimizations
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -606,19 +619,12 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: ./rust/${{ matrix.folder }}
-      - name: Install OpenSSL (Windows)
-        if: runner.os == 'Windows'
-        # Required for the crypto-openssl feature (rustls-openssl -> openssl-sys).
-        run: |
-          vcpkg install openssl:x64-windows-static-md
-          echo "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" >> $env:GITHUB_ENV
-        shell: pwsh
       - name: Install SymCrypt (Windows)
         if: runner.os == 'Windows'
         uses: ./.github/actions/install-symcrypt
       - name: cargo clippy ${{ matrix.folder }}
         run: |
-          cargo clippy --all-targets --all-features --workspace -- -D warnings
+          cargo clippy --all-targets ${{ matrix.cargo-features }} --workspace -- -D warnings
         working-directory: ./rust/${{ matrix.folder }}
 
   # Required matrix combinations for deny: otap-dataflow only
