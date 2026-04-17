@@ -1073,7 +1073,9 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         let admin_tracing_setup = telemetry_system.admin_tracing_setup();
         let internal_tracing_setup = telemetry_system.internal_tracing_setup();
 
-        let metrics_dispatcher = telemetry_system.dispatcher();
+        let metrics_tap = telemetry_system.metrics_tap();
+        let metrics_provider_mode = telemetry_system.metrics_provider_mode();
+        let metrics_reporting_interval = telemetry_system.reporting_interval();
         let metrics_reporter = telemetry_system.reporter();
         let controller_ctx = ControllerContext::new(telemetry_system.registry());
         let memory_pressure_state = controller_ctx.memory_pressure_state();
@@ -1252,15 +1254,40 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             move |cancellation_token| internal_collector.run(cancellation_token),
         )?;
 
-        // Start the metrics dispatcher only if there are metric readers configured.
-        let metrics_dispatcher_handle = if telemetry_config.metrics.has_readers() {
-            Some(spawn_thread_local_task(
-                "metrics-dispatcher",
-                admin_tracing_setup.clone(),
-                move |cancellation_token| metrics_dispatcher.run_dispatch_loop(cancellation_token),
-            )?)
-        } else {
-            None
+        // Start the metrics collection task based on provider mode.
+        // In Admin mode, a periodic task reads the registry and feeds MetricsTap.
+        // In ITS mode, the internal_telemetry_receiver owns the loop.
+        // In None mode, no metrics task is started.
+        let metrics_dispatch_handle = {
+            use otap_df_config::pipeline::telemetry::metrics::ProviderMode as MetricsMode;
+            match metrics_provider_mode {
+                MetricsMode::Admin => {
+                    let registry = telemetry_system.registry();
+                    let tap = metrics_tap.clone();
+                    let interval = metrics_reporting_interval;
+                    Some(spawn_thread_local_task(
+                        "metrics-admin",
+                        admin_tracing_setup.clone(),
+                        move |cancellation_token| async move {
+                            use tokio::time::{MissedTickBehavior, interval as tokio_interval};
+                            let mut ticker = tokio_interval(interval);
+                            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = cancellation_token.cancelled() => {
+                                        return Ok::<(), otap_df_telemetry::error::Error>(());
+                                    }
+                                    _ = ticker.tick() => {
+                                        tap.lock().feed_from_registry(&registry);
+                                    }
+                                }
+                            }
+                        },
+                    )?)
+                }
+                MetricsMode::ITS | MetricsMode::None => None,
+            }
         };
 
         // Start the observed state store background task
@@ -1454,6 +1481,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                     obs_state_handle,
                     admin_senders,
                     telemetry_registry,
+                    metrics_tap,
                     memory_pressure_state,
                     log_tap_handle,
                     cancellation_token,
@@ -1517,11 +1545,11 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         }
         admin_server_handle.shutdown_and_join()?;
         metrics_agg_handle.shutdown_and_join()?;
-        if let Some(handle) = metrics_dispatcher_handle {
+        if let Some(handle) = metrics_dispatch_handle {
             handle.shutdown_and_join()?;
         }
         obs_state_join_handle.shutdown_and_join()?;
-        telemetry_system.shutdown_otel()?;
+        telemetry_system.shutdown()?;
 
         Ok(())
     }

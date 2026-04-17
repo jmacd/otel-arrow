@@ -150,7 +150,15 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                             return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
                         }
                         Ok(NodeControlMsg::CollectTelemetry { .. }) => {
-                            // No metrics to report for now
+                            // Feed MetricsTap from registry for Prometheus.
+                            if let Some(tap) = &self.internal_telemetry.metrics_tap {
+                                tap.lock().feed_from_registry(
+                                    &self.internal_telemetry.registry,
+                                );
+                            }
+                            // TODO: Encode OTAP Arrow batches and send through pipeline.
+                            // This requires building UnivariateMetrics, NumberDataPoint,
+                            // and HistogramDataPoint tables from the metric snapshots.
                         }
                         Err(e) => {
                             return Err(Error::ChannelRecvError(e));

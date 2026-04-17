@@ -294,11 +294,13 @@ async fn get_metrics(
             Ok(resp)
         }
         OutputFormat::Prometheus => {
-            let body = if q.reset {
-                format_prometheus_text(&state.metrics_registry, true, Some(now.timestamp_millis()))
-            } else {
-                format_prometheus_text(&state.metrics_registry, false, Some(now.timestamp_millis()))
-            };
+            // Prometheus format uses MetricsTap's accumulated cumulative state.
+            // reset=true is not supported for tap-backed Prometheus (cumulative
+            // counters are always cumulative); the parameter is ignored.
+            let body = state
+                .metrics_tap
+                .lock()
+                .render_prometheus(Some(now.timestamp_millis()));
             let mut resp = body.into_response();
             // Prometheus text exposition format 0.0.4
             let _ = resp.headers_mut().insert(
@@ -991,130 +993,6 @@ fn format_line_protocol(
     out
 }
 
-fn format_prometheus_text(
-    telemetry_registry: &TelemetryRegistryHandle,
-    reset: bool,
-    timestamp_millis: Option<i64>,
-) -> String {
-    let mut out = String::new();
-    let ts_suffix = timestamp_millis
-        .map(|ms| format!(" {ms}"))
-        .unwrap_or_default();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    let mut visit = |descriptor: &'static MetricsDescriptor,
-                     attributes: &dyn AttributeSetHandler,
-                     metrics_iter: MetricsIterator<'_>| {
-        // Render labels from attributes + set label
-        let mut base_labels = String::new();
-        if !descriptor.name.is_empty() {
-            let _ = write!(
-                &mut base_labels,
-                "set=\"{}\"",
-                escape_prom_label_value(descriptor.name)
-            );
-        }
-        for (key, value) in attributes.iter_attributes() {
-            if !base_labels.is_empty() {
-                base_labels.push(',');
-            }
-            let _ = write!(
-                &mut base_labels,
-                "{}=\"{}\"",
-                sanitize_prom_label_key(key),
-                escape_prom_label_value(&value.to_string_value())
-            );
-        }
-
-        for (field, value) in metrics_iter {
-            let metric_name = sanitize_prom_metric_name(field.name);
-
-            match value {
-                MetricValue::U64(_) | MetricValue::F64(_) => {
-                    // HELP/TYPE once per metric name
-                    if seen.insert(metric_name.clone()) {
-                        if !field.brief.is_empty() {
-                            let _ = writeln!(
-                                &mut out,
-                                "# HELP {} {}",
-                                metric_name,
-                                escape_prom_help(field.brief)
-                            );
-                        }
-                        let prom_type = match field.instrument {
-                            Instrument::Counter => "counter",
-                            Instrument::UpDownCounter => "gauge",
-                            Instrument::Gauge => "gauge",
-                            Instrument::Histogram => "gauge",
-                            Instrument::Mmsc => unreachable!("MMSC is not a scalar"),
-                        };
-                        let _ = writeln!(&mut out, "# TYPE {metric_name} {prom_type}");
-                    }
-                    let value_str = format_prom_value(value, Some(field.value_type));
-                    if base_labels.is_empty() {
-                        let _ = writeln!(&mut out, "{metric_name} {value_str}{ts_suffix}");
-                    } else {
-                        let _ = writeln!(
-                            &mut out,
-                            "{metric_name}{{{base_labels}}} {value_str}{ts_suffix}"
-                        );
-                    }
-                }
-                MetricValue::Mmsc(s) => {
-                    if s.count == 0 {
-                        continue;
-                    }
-                    let brief = escape_prom_help(field.brief);
-                    for (suffix, prom_type, val) in [
-                        ("_min", "gauge", s.min),
-                        ("_max", "gauge", s.max),
-                        ("_sum", "counter", s.sum),
-                    ] {
-                        let sub_name = format!("{metric_name}{suffix}");
-                        if seen.insert(sub_name.clone()) {
-                            if !field.brief.is_empty() {
-                                let _ = writeln!(&mut out, "# HELP {sub_name} {brief}");
-                            }
-                            let _ = writeln!(&mut out, "# TYPE {sub_name} {prom_type}");
-                        }
-                        if base_labels.is_empty() {
-                            let _ = writeln!(&mut out, "{sub_name} {val}{ts_suffix}");
-                        } else {
-                            let _ =
-                                writeln!(&mut out, "{sub_name}{{{base_labels}}} {val}{ts_suffix}");
-                        }
-                    }
-                    // _count as counter with integer value
-                    let count_name = format!("{metric_name}_count");
-                    if seen.insert(count_name.clone()) {
-                        if !field.brief.is_empty() {
-                            let _ = writeln!(&mut out, "# HELP {count_name} {brief}");
-                        }
-                        let _ = writeln!(&mut out, "# TYPE {count_name} counter");
-                    }
-                    if base_labels.is_empty() {
-                        let _ = writeln!(&mut out, "{count_name} {}{ts_suffix}", s.count);
-                    } else {
-                        let _ = writeln!(
-                            &mut out,
-                            "{count_name}{{{base_labels}}} {}{ts_suffix}",
-                            s.count
-                        );
-                    }
-                }
-            }
-        }
-    };
-
-    if reset {
-        telemetry_registry.visit_metrics_and_reset(|d, a, m| visit(d, a, m));
-    } else {
-        telemetry_registry.visit_current_metrics(|d, a, m| visit(d, a, m));
-    }
-
-    out
-}
-
 fn escape_lp_measurement(s: &str) -> String {
     // Fast path: no escaping needed
     if !s.as_bytes().iter().any(|&b| b == b',' || b == b' ') {
@@ -1750,9 +1628,15 @@ mod tests {
         let observed_state_store =
             ObservedStateStore::new(&ObservedStateSettings::default(), metrics_registry.clone());
 
+        use otap_df_telemetry::self_metrics::metrics_tap::MetricsTap;
+        use otap_df_telemetry::self_metrics::views::ViewResolver;
+
         AppState {
             observed_state_store: observed_state_store.handle(),
             metrics_registry,
+            metrics_tap: Arc::new(parking_lot::Mutex::new(MetricsTap::new(
+                ViewResolver::default(),
+            ))),
             log_tap: None,
             ctrl_msg_senders: Arc::new(Mutex::new(Vec::new())),
             memory_pressure_state: MemoryPressureState::default(),

@@ -26,6 +26,7 @@ use otap_df_engine::memory_limiter::MemoryPressureState;
 use otap_df_state::store::ObservedStateHandle;
 use otap_df_telemetry::log_tap::InternalLogTapHandle;
 use otap_df_telemetry::registry::TelemetryRegistryHandle;
+use otap_df_telemetry::self_metrics::metrics_tap::MetricsTap;
 use otap_df_telemetry::{otel_info, otel_warn};
 
 /// Shared state for the HTTP admin server.
@@ -36,6 +37,9 @@ struct AppState {
 
     /// The metrics registry for querying current metrics.
     metrics_registry: TelemetryRegistryHandle,
+
+    /// Shared metrics tap for Prometheus exposition.
+    metrics_tap: Arc<parking_lot::Mutex<MetricsTap>>,
 
     /// Optional internal log tap for querying retained internal logs.
     log_tap: Option<InternalLogTapHandle>,
@@ -53,6 +57,7 @@ pub async fn run(
     observed_store: ObservedStateHandle,
     ctrl_msg_senders: Vec<Arc<dyn PipelineAdminSender>>,
     metrics_registry: TelemetryRegistryHandle,
+    metrics_tap: Arc<parking_lot::Mutex<MetricsTap>>,
     memory_pressure_state: MemoryPressureState,
     log_tap: Option<InternalLogTapHandle>,
     cancel: CancellationToken,
@@ -60,6 +65,7 @@ pub async fn run(
     let app_state = AppState {
         observed_state_store: observed_store,
         metrics_registry,
+        metrics_tap,
         log_tap,
         ctrl_msg_senders: Arc::new(Mutex::new(ctrl_msg_senders)),
         memory_pressure_state,

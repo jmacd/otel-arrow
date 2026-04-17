@@ -11,10 +11,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::pipeline::telemetry::metrics::views::ViewConfig;
 
-/// OpenTelemetry Metrics configuration.
+/// Metrics provider mode — single global setting that determines how
+/// internal metrics are collected and exported.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderMode {
+    /// No metrics collection or export.
+    None,
+    /// Prometheus + console reporting without an internal pipeline.
+    /// Metrics are collected by an admin-side periodic task.
+    #[default]
+    Admin,
+    /// Prometheus + OTAP encoding routed through the internal telemetry
+    /// pipeline (Internal Telemetry System).
+    ITS,
+}
+
+/// Internal metrics configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq)]
 pub struct MetricsConfig {
-    /// The list of metrics readers to configure.
+    /// The metrics provider mode.
+    #[serde(default)]
+    pub provider: ProviderMode,
+
+    /// The list of metrics readers to configure (legacy OTel SDK readers).
     #[serde(default)]
     pub readers: Vec<readers::MetricsReaderConfig>,
 
@@ -30,7 +50,13 @@ impl MetricsConfig {
         !self.readers.is_empty()
     }
 
-    /// Validates every configured metric reader's exporter configuration.
+    /// Returns `true` if the provider mode uses the internal telemetry system.
+    #[must_use]
+    pub const fn uses_its_provider(&self) -> bool {
+        matches!(self.provider, ProviderMode::ITS)
+    }
+
+    /// Validates the metrics configuration.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
         let mut errors = Vec::new();
         for reader in &self.readers {
@@ -49,6 +75,40 @@ impl MetricsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_provider_mode_default() {
+        let config = MetricsConfig::default();
+        assert_eq!(config.provider, ProviderMode::Admin);
+    }
+
+    #[test]
+    fn test_provider_mode_deserialize() {
+        for (yaml, expected) in [
+            ("provider: none", ProviderMode::None),
+            ("provider: admin", ProviderMode::Admin),
+            ("provider: its", ProviderMode::ITS),
+        ] {
+            let config: MetricsConfig = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(config.provider, expected, "yaml: {yaml}");
+        }
+    }
+
+    #[test]
+    fn test_provider_mode_default_when_omitted() {
+        let config: MetricsConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config.provider, ProviderMode::Admin);
+    }
+
+    #[test]
+    fn test_uses_its_provider() {
+        assert!(!MetricsConfig::default().uses_its_provider());
+        let config = MetricsConfig {
+            provider: ProviderMode::ITS,
+            ..Default::default()
+        };
+        assert!(config.uses_its_provider());
+    }
 
     #[test]
     fn test_metrics_config_deserialize() {
