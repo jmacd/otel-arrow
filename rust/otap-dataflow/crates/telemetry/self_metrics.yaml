@@ -1,0 +1,89 @@
+# Self-Metrics Schema: Consumer/Producer Counters
+#
+# This is the pilot schema for the OTAP metrics SDK codegen. It defines
+# the consumer and producer item counters with level-aware dimensions.
+#
+# Format: OTel SemConv YAML with x-otap-levels extensions.
+# See: metrics-sdk-plan-apr2.md for design context.
+
+groups:
+  # Shared attribute definitions
+  - id: registry.outcome
+    type: attribute_group
+    brief: "Request outcome attribute."
+    attributes:
+      - id: outcome
+        type: string
+        stability: experimental
+        brief: "The outcome of a request."
+        examples: ["success", "failure", "refused"]
+        enum:
+          members:
+            - id: success
+              value: success
+            - id: failure
+              value: failure
+            - id: refused
+              value: refused
+
+  - id: registry.signal_type
+    type: attribute_group
+    brief: "Signal type attribute."
+    attributes:
+      - id: signal_type
+        type: string
+        stability: experimental
+        brief: "The telemetry signal type."
+        examples: ["traces", "metrics", "logs"]
+        enum:
+          members:
+            - id: traces
+              value: traces
+            - id: metrics
+              value: metrics
+            - id: logs
+              value: logs
+
+  # Consumer counter metric
+  - id: metric.node.consumer.items
+    type: metric
+    metric_name: node.consumer.items
+    instrument: counter
+    unit: "{item}"
+    brief: "Items consumed by this node."
+    stability: experimental
+    attributes:
+      - ref: outcome
+        requirement_level: required
+      - ref: signal_type
+        requirement_level:
+          conditionally_required: "when metric_level >= normal"
+    x-otap-levels:
+      basic:
+        dimensions: [outcome]
+      normal:
+        dimensions: [outcome, signal_type]
+      detailed:
+        dimensions: [outcome, signal_type]
+
+  # Producer counter metric
+  - id: metric.node.producer.items
+    type: metric
+    metric_name: node.producer.items
+    instrument: counter
+    unit: "{item}"
+    brief: "Items produced by this node."
+    stability: experimental
+    attributes:
+      - ref: outcome
+        requirement_level: required
+      - ref: signal_type
+        requirement_level:
+          conditionally_required: "when metric_level >= normal"
+    x-otap-levels:
+      basic:
+        dimensions: [outcome]
+      normal:
+        dimensions: [outcome, signal_type]
+      detailed:
+        dimensions: [outcome, signal_type]

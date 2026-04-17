@@ -165,7 +165,7 @@ pub(crate) fn with_node_telemetry_handle<T>(
 /// Handle for per-node telemetry state, including entity keys, metric sets,
 /// channel associations, and custom log record attributes.
 #[derive(Clone)]
-pub(crate) struct NodeTelemetryHandle {
+#[pub(crate) struct NodeTelemetryHandle {
     registry: TelemetryRegistryHandle,
     state: Rc<RefCell<NodeTelemetryState>>,
 }

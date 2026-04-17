@@ -28,6 +28,7 @@
 use crate::error::Error;
 use crate::event::{ObservedEvent, ObservedEventReporter};
 use crate::registry::TelemetryRegistryHandle;
+use crate::self_metrics::collectable::MetricSetCollector;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use otap_df_config::observed_state::SendPolicy;
 use otap_df_config::pipeline::telemetry::TelemetryConfig;
@@ -56,6 +57,8 @@ pub mod self_tracing;
 pub mod semconv;
 /// Tokio tracing subscriber initialization.
 pub mod tracing_init;
+
+pub mod self_metrics;
 
 // Re-export tracing setup types for per-thread subscriber configuration.
 pub use tracing_init::TracingSetup;
@@ -145,6 +148,10 @@ pub struct InternalTelemetrySettings {
     pub registry: TelemetryRegistryHandle,
     /// Optional retained-log sink shared with admin consumers.
     pub log_tap: Option<log_tap::InternalLogTapHandle>,
+    /// OTAP metric set collectors for direct Arrow encoding.
+    /// Each collector holds a precomputed schema and a reference to
+    /// the counter struct it collects from.
+    pub otap_metrics_collectors: Vec<Arc<parking_lot::Mutex<MetricSetCollector>>>,
 }
 
 impl std::fmt::Debug for InternalTelemetrySettings {
@@ -274,6 +281,7 @@ impl InternalTelemetrySystem {
                     resource_bytes,
                     registry: telemetry_registry.clone(),
                     log_tap: log_tap_handle.clone(),
+                    otap_metrics_collectors: Vec::new(),
                 }),
             )
         } else {

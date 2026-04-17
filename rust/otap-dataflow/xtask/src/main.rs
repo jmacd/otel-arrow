@@ -20,6 +20,7 @@ use std::thread;
 use std::time::Instant;
 
 mod diagnostics;
+mod generate_metrics;
 mod genproto;
 mod structure_check;
 
@@ -44,6 +45,10 @@ fn main() -> anyhow::Result<()> {
                 ensure_no_extra_args("compile-proto", &args.collect::<Vec<_>>())?;
                 genproto::compile_proto()?;
                 Ok(())
+            }
+            "generate-metrics" => {
+                ensure_no_extra_args("generate-metrics", &args.collect::<Vec<_>>())?;
+                generate_metrics::run()
             }
             "structure-check" => {
                 ensure_no_extra_args("structure-check", &args.collect::<Vec<_>>())?;
@@ -74,6 +79,7 @@ Tasks:
   - check-benches: Lint and compile bench targets only.
   - structure-check: Validate the entire structure of the project.
   - compile-proto: Compile the protobufs files
+  - generate-metrics: Generate Rust code from metrics schema YAML files
 "
     );
     Ok(())
