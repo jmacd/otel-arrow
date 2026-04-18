@@ -465,11 +465,8 @@ impl From<f64> for Gauge<f64> {
 /// exact MMSC values. This is a delta instrument — values are reset after each
 /// reporting interval.
 ///
-/// The dispatcher uses `.with_boundaries(vec![])` when building the OTel
-/// histogram to disable bucket counting, so only min, max, sum, and count
-/// are exported. See [`record_synthetic_histogram`] for details.
-///
-/// [`record_synthetic_histogram`]: crate::metrics::dispatcher::MetricsDispatcher
+/// The OTAP-native metrics pipeline exports `Mmsc` values as histogram
+/// data points with min, max, sum, and count fields.
 #[derive(Clone, Copy)]
 pub struct Mmsc {
     min: f64,

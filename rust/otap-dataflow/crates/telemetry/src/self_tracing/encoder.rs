@@ -310,7 +310,7 @@ pub const fn level_to_severity_number(level: &Level) -> u8 {
 /// The buffer is NOT cleared; bytes are appended.
 fn encode_resource<'a, I>(buf: &mut ProtoBuffer, attrs: I, schema_url: Option<&str>)
 where
-    I: Iterator<Item = (&'a opentelemetry::Key, &'a opentelemetry::Value)>,
+    I: Iterator<Item = (&'a str, &'a otap_df_config::pipeline::telemetry::AttributeValue)>,
 {
     // ResourceLogs.resource (field 1, Resource message)
     proto_encode_len_delimited_small!(
@@ -318,7 +318,7 @@ where
         {
             // Encode each attribute as a KeyValue
             for (key, value) in attrs {
-                encode_resource_attribute(buf, key.as_str(), value);
+                encode_resource_attribute(buf, key, value);
             }
         },
         buf
@@ -330,18 +330,36 @@ where
     }
 }
 
-/// Encode an SDK Resource to bytes for later reuse.
+/// Pre-encode resource bytes from config for internal telemetry (ITR).
+///
+/// This encodes the given resource attributes directly to OTLP protobuf
+/// bytes without going through the OpenTelemetry SDK.
 #[must_use]
-pub fn encode_resource_to_bytes(resource: &opentelemetry_sdk::Resource) -> Bytes {
+pub fn encode_resource_to_bytes(
+    resource_attributes: &HashMap<
+        String,
+        otap_df_config::pipeline::telemetry::AttributeValue,
+    >,
+) -> Bytes {
     let mut buf = ProtoBuffer::with_capacity(256);
-    encode_resource(&mut buf, resource.iter(), resource.schema_url());
+    encode_resource(
+        &mut buf,
+        resource_attributes
+            .iter()
+            .map(|(k, v)| (k.as_str(), v)),
+        None,
+    );
     buf.into_bytes()
 }
 
 /// Encode a single resource attribute as a KeyValue message.
 #[inline]
-fn encode_resource_attribute(buf: &mut ProtoBuffer, key: &str, value: &opentelemetry::Value) {
-    use opentelemetry::Value;
+fn encode_resource_attribute(
+    buf: &mut ProtoBuffer,
+    key: &str,
+    value: &otap_df_config::pipeline::telemetry::AttributeValue,
+) {
+    use otap_df_config::pipeline::telemetry::AttributeValue;
 
     proto_encode_len_delimited_small!(
         RESOURCE_ATTRIBUTES,
@@ -351,24 +369,27 @@ fn encode_resource_attribute(buf: &mut ProtoBuffer, key: &str, value: &opentelem
                 KEY_VALUE_VALUE,
                 {
                     match value {
-                        Value::String(s) => {
+                        AttributeValue::String(s) => {
                             buf.encode_string(ANY_VALUE_STRING_VALUE, s.as_str());
                         }
-                        Value::Bool(b) => {
+                        AttributeValue::Bool(b) => {
                             buf.encode_field_tag(ANY_VALUE_BOOL_VALUE, wire_types::VARINT);
                             buf.encode_varint(u64::from(*b));
                         }
-                        Value::I64(i) => {
+                        AttributeValue::I64(i) => {
                             buf.encode_field_tag(ANY_VALUE_INT_VALUE, wire_types::VARINT);
                             buf.encode_varint(*i as u64);
                         }
-                        Value::F64(f) => {
+                        AttributeValue::F64(f) => {
                             buf.encode_field_tag(ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64);
                             buf.extend_from_slice(&f.to_le_bytes());
                         }
-                        _ => {
-                            // TODO: share the encoding logic used somewhere else, somehow.
-                            crate::raw_error!("cannot encode SDK resource value", value = ?value);
+                        AttributeValue::Array(_) => {
+                            // Array attributes are not yet supported for resource encoding.
+                            crate::raw_error!(
+                                "cannot encode array resource value",
+                                key = key
+                            );
                         }
                     }
                 },
@@ -583,8 +604,7 @@ mod tests {
     use crate::descriptor::{AttributeField, AttributeValueType, AttributesDescriptor};
     use crate::event::LogEvent;
     use crate::self_tracing::formatter::format_log_record_to_string;
-    use opentelemetry::KeyValue as OTelKeyValue;
-    use opentelemetry_sdk::Resource as OTelResource;
+    use otap_df_config::pipeline::telemetry::AttributeValue as ConfigAttributeValue;
     use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
     use otap_df_pdata::proto::opentelemetry::common::v1::{
         AnyValue, InstrumentationScope, KeyValue,
@@ -643,14 +663,16 @@ mod tests {
     #[test]
     fn encode_resource_to_bytes_encodes_attributes() {
         // Empty resource produces output
-        let empty = encode_resource_to_bytes(&OTelResource::builder_empty().build());
+        let empty = encode_resource_to_bytes(&HashMap::new());
         assert!(!empty.is_empty());
 
         // Resource with attributes contains encoded values
-        let resource = OTelResource::builder_empty()
-            .with_attributes([OTelKeyValue::new("service.name", "test-svc")])
-            .build();
-        let bytes = encode_resource_to_bytes(&resource);
+        let mut attrs = HashMap::new();
+        let _ = attrs.insert(
+            "service.name".to_string(),
+            ConfigAttributeValue::String("test-svc".to_string()),
+        );
+        let bytes = encode_resource_to_bytes(&attrs);
         assert!(bytes.windows(8).any(|w| w == b"test-svc"));
     }
 
@@ -669,7 +691,7 @@ mod tests {
         let time = SystemTime::UNIX_EPOCH + Duration::from_nanos(timestamp_ns);
         let log_event = LogEvent { time, record };
 
-        let resource_bytes = encode_resource_to_bytes(&OTelResource::builder_empty().build());
+        let resource_bytes = encode_resource_to_bytes(&HashMap::new());
 
         let mut buf = ProtoBuffer::with_capacity(512);
         encode_export_logs_request(&mut buf, &log_event, &resource_bytes, &mut scope_cache);
@@ -774,7 +796,7 @@ mod tests {
         let time = SystemTime::UNIX_EPOCH + Duration::from_nanos(timestamp_ns);
         let log_event = LogEvent { time, record };
 
-        let resource_bytes = encode_resource_to_bytes(&OTelResource::builder_empty().build());
+        let resource_bytes = encode_resource_to_bytes(&HashMap::new());
         let mut buf = ProtoBuffer::with_capacity(512);
         encode_export_logs_request(&mut buf, &log_event, &resource_bytes, &mut scope_cache);
 

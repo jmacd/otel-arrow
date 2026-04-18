@@ -50,8 +50,6 @@ pub mod internal_events;
 /// Internal log tap for admin-side log queries.
 pub mod log_tap;
 pub mod metrics;
-/// OpenTelemetry SDK provider configuration.
-pub mod otel_sdk;
 pub mod registry;
 pub mod reporter;
 /// OTAP-native metrics SDK for internal self-observability.
@@ -273,7 +271,8 @@ impl InternalTelemetrySystem {
             } else {
                 ObservedEventReporter::new(SendPolicy::default(), sender)
             };
-            let resource_bytes = otel_sdk::encode_resource_bytes(&config.resource);
+            let resource_bytes =
+                self_tracing::encode_resource_to_bytes(&config.resource);
 
             let its_metrics_tap = if config.metrics.uses_its_provider() {
                 Some(metrics_tap.clone())

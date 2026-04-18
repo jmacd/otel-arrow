@@ -7,8 +7,6 @@
 //! live in their respective nodes/crates and implement the `MetricSetHandler` trait defined
 //! here.
 
-pub mod dispatcher;
-
 use crate::attributes::AttributeSetHandler;
 use crate::descriptor::{Instrument, MetricsDescriptor, MetricsField, Temporality};
 use crate::entity::EntityRegistry;
