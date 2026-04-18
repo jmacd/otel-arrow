@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use crate::attributes::AttributeSetHandler;
-use crate::descriptor::{Instrument, MetricsDescriptor, Temporality};
+use crate::descriptor::{Instrument, MetricsDescriptor, MetricsField, Temporality};
 use crate::instrument::MmscSnapshot;
 use crate::metrics::{MetricValue, MetricsIterator};
 use crate::self_metrics::views::ViewResolver;
@@ -115,65 +115,70 @@ impl MetricsTap {
                 field_name: field.name,
                 labels: labels.clone(),
             };
+            self.feed_scalar_or_mmsc(field, value, key);
+        }
+    }
 
-            match value {
-                MetricValue::U64(v) => {
-                    let entry = self
-                        .scalars
-                        .entry(key)
-                        .or_insert_with(|| match field.instrument {
-                            Instrument::Counter | Instrument::UpDownCounter => {
-                                match field.temporality {
-                                    Some(Temporality::Delta) => AccumulatedValue::CumulativeU64(0),
-                                    _ => AccumulatedValue::GaugeU64(0),
-                                }
+    /// Accumulate a single metric value into the tap.
+    fn feed_scalar_or_mmsc(
+        &mut self,
+        field: &MetricsField,
+        value: MetricValue,
+        key: TimeseriesKey,
+    ) {
+        match value {
+            MetricValue::U64(v) => {
+                let entry = self
+                    .scalars
+                    .entry(key)
+                    .or_insert_with(|| match field.instrument {
+                        Instrument::Counter | Instrument::UpDownCounter => {
+                            match field.temporality {
+                                Some(Temporality::Delta) => AccumulatedValue::CumulativeU64(0),
+                                _ => AccumulatedValue::GaugeU64(0),
                             }
-                            Instrument::Gauge | Instrument::Histogram => {
-                                AccumulatedValue::GaugeU64(0)
-                            }
-                            Instrument::Mmsc => unreachable!("U64 value for Mmsc instrument"),
-                        });
-                    match entry {
-                        AccumulatedValue::CumulativeU64(acc) => *acc += v,
-                        AccumulatedValue::GaugeU64(acc) => *acc = v,
-                        AccumulatedValue::CumulativeF64(acc) => *acc += v as f64,
-                        AccumulatedValue::GaugeF64(acc) => *acc = v as f64,
-                    }
-                }
-                MetricValue::F64(v) => {
-                    let entry = self
-                        .scalars
-                        .entry(key)
-                        .or_insert_with(|| match field.instrument {
-                            Instrument::Counter | Instrument::UpDownCounter => {
-                                match field.temporality {
-                                    Some(Temporality::Delta) => {
-                                        AccumulatedValue::CumulativeF64(0.0)
-                                    }
-                                    _ => AccumulatedValue::GaugeF64(0.0),
-                                }
-                            }
-                            Instrument::Gauge | Instrument::Histogram => {
-                                AccumulatedValue::GaugeF64(0.0)
-                            }
-                            Instrument::Mmsc => unreachable!("F64 value for Mmsc instrument"),
-                        });
-                    match entry {
-                        AccumulatedValue::CumulativeF64(acc) => *acc += v,
-                        AccumulatedValue::GaugeF64(acc) => *acc = v,
-                        AccumulatedValue::CumulativeU64(acc) => *acc += v as u64,
-                        AccumulatedValue::GaugeU64(acc) => *acc = v as u64,
-                    }
-                }
-                MetricValue::Mmsc(s) => {
-                    let entry = self.mmscs.entry(key).or_insert(AccumulatedMmsc {
-                        min: f64::MAX,
-                        max: f64::MIN,
-                        sum: 0.0,
-                        count: 0,
+                        }
+                        Instrument::Gauge | Instrument::Histogram => AccumulatedValue::GaugeU64(0),
+                        Instrument::Mmsc => unreachable!("U64 value for Mmsc instrument"),
                     });
-                    entry.merge(&s);
+                match entry {
+                    AccumulatedValue::CumulativeU64(acc) => *acc += v,
+                    AccumulatedValue::GaugeU64(acc) => *acc = v,
+                    AccumulatedValue::CumulativeF64(acc) => *acc += v as f64,
+                    AccumulatedValue::GaugeF64(acc) => *acc = v as f64,
                 }
+            }
+            MetricValue::F64(v) => {
+                let entry = self
+                    .scalars
+                    .entry(key)
+                    .or_insert_with(|| match field.instrument {
+                        Instrument::Counter | Instrument::UpDownCounter => {
+                            match field.temporality {
+                                Some(Temporality::Delta) => AccumulatedValue::CumulativeF64(0.0),
+                                _ => AccumulatedValue::GaugeF64(0.0),
+                            }
+                        }
+                        Instrument::Gauge | Instrument::Histogram => {
+                            AccumulatedValue::GaugeF64(0.0)
+                        }
+                        Instrument::Mmsc => unreachable!("F64 value for Mmsc instrument"),
+                    });
+                match entry {
+                    AccumulatedValue::CumulativeF64(acc) => *acc += v,
+                    AccumulatedValue::GaugeF64(acc) => *acc = v,
+                    AccumulatedValue::CumulativeU64(acc) => *acc += v as u64,
+                    AccumulatedValue::GaugeU64(acc) => *acc = v as u64,
+                }
+            }
+            MetricValue::Mmsc(s) => {
+                let entry = self.mmscs.entry(key).or_insert(AccumulatedMmsc {
+                    min: f64::MAX,
+                    max: f64::MIN,
+                    sum: 0.0,
+                    count: 0,
+                });
+                entry.merge(&s);
             }
         }
     }
@@ -183,12 +188,92 @@ impl MetricsTap {
     /// This is a convenience method: the caller passes their registry
     /// handle and this method drives the visit.
     pub fn feed_from_registry(&mut self, registry: &crate::registry::TelemetryRegistryHandle) {
-        // We need to collect first because `feed` borrows `self` mutably
-        // and `visit_metrics_and_reset` borrows the registry.
-        // Use a lightweight approach: feed directly in the closure.
         registry.visit_metrics_and_reset(|desc, attrs, iter| {
             self.feed(desc, attrs, iter);
         });
+    }
+
+    /// Feed from registry and return a console-formatted string of the
+    /// delta values consumed in this tick.
+    ///
+    /// Unlike `render_console()` (which shows cumulative state), this
+    /// returns only the values from the current registry visit — what
+    /// changed since the last reset.
+    pub fn feed_from_registry_with_console(
+        &mut self,
+        registry: &crate::registry::TelemetryRegistryHandle,
+    ) -> String {
+        let mut out = String::new();
+        registry.visit_metrics_and_reset(|desc, attrs, iter| {
+            let labels = self.format_labels(desc, attrs);
+            for (field, value) in iter {
+                if value.is_zero() {
+                    // Still feed the tap for Prometheus accumulation.
+                    let key = TimeseriesKey {
+                        scope_name: desc.name,
+                        field_name: field.name,
+                        labels: labels.clone(),
+                    };
+                    self.feed_scalar_or_mmsc(field, value, key);
+                    continue;
+                }
+                let resolved = self.views.resolve(desc.name, field.name, "");
+                match value {
+                    MetricValue::U64(v) => {
+                        if labels.is_empty() {
+                            let _ = writeln!(&mut out, "{}: {v}", resolved.name);
+                        } else {
+                            let _ =
+                                writeln!(&mut out, "{}{{{}}} {v}", resolved.name, labels);
+                        }
+                    }
+                    MetricValue::F64(v) => {
+                        let v_str = format_f64(v);
+                        if labels.is_empty() {
+                            let _ = writeln!(&mut out, "{}: {v_str}", resolved.name);
+                        } else {
+                            let _ = writeln!(
+                                &mut out,
+                                "{}{{{}}} {v_str}",
+                                resolved.name, labels
+                            );
+                        }
+                    }
+                    MetricValue::Mmsc(s) => {
+                        if labels.is_empty() {
+                            let _ = writeln!(
+                                &mut out,
+                                "{}: min={} max={} sum={} count={}",
+                                resolved.name,
+                                format_f64(s.min),
+                                format_f64(s.max),
+                                format_f64(s.sum),
+                                s.count
+                            );
+                        } else {
+                            let _ = writeln!(
+                                &mut out,
+                                "{}{{{}}} min={} max={} sum={} count={}",
+                                resolved.name,
+                                labels,
+                                format_f64(s.min),
+                                format_f64(s.max),
+                                format_f64(s.sum),
+                                s.count
+                            );
+                        }
+                    }
+                }
+                // Also feed the tap for Prometheus accumulation.
+                let key = TimeseriesKey {
+                    scope_name: desc.name,
+                    field_name: field.name,
+                    labels: labels.clone(),
+                };
+                self.feed_scalar_or_mmsc(field, value, key);
+            }
+        });
+        out
     }
 
     /// Render Prometheus text exposition format.

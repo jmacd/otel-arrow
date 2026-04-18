@@ -1279,7 +1279,15 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                                         return Ok::<(), otap_df_telemetry::error::Error>(());
                                     }
                                     _ = ticker.tick() => {
-                                        tap.lock().feed_from_registry(&registry);
+                                        let mut guard = tap.lock();
+                                        let console = guard.feed_from_registry_with_console(&registry);
+                                        drop(guard);
+                                        if !console.is_empty() {
+                                            otap_df_telemetry::otel_info!(
+                                                "metrics.console",
+                                                output = console.as_str(),
+                                            );
+                                        }
                                     }
                                 }
                             }
