@@ -69,8 +69,8 @@ pub fn print_help() -> anyhow::Result<()> {
 Usage: Execute the command using `cargo xtask <task>`, e.g., `cargo xtask check`.
 
 Tasks:
-  - check [--diagnostics]: Run the required full validation suite: structure check, cargo fmt --all, cargo clippy --workspace --all-targets, and cargo test --workspace. The optional diagnostics flag prints end-of-run timing and hotspot summaries.
-  - quick-check: Run a faster iterative subset: structure check, cargo fmt --all, cargo clippy --workspace --lib --bins --tests, and cargo test --workspace --lib --bins --tests --no-run. This is not a replacement for `cargo xtask check`.
+  - check [--diagnostics]: Run the required full validation suite: structure check, cargo fmt --all, cargo clippy --workspace --all-targets, cargo test --workspace, and binary crypto-ring check. The optional diagnostics flag prints end-of-run timing and hotspot summaries.
+  - quick-check: Run a faster iterative subset: structure check, cargo fmt --all, cargo clippy --workspace --lib --bins --tests, cargo test --workspace --lib --bins --tests --no-run, and binary crypto-ring check. This is not a replacement for `cargo xtask check`.
   - check-benches: Lint and compile bench targets only.
   - structure-check: Validate the entire structure of the project.
   - compile-proto: Compile the protobufs files
@@ -115,6 +115,7 @@ fn check_all(options: CheckOptions) -> anyhow::Result<()> {
     format_all(diagnostics.as_mut())?;
     clippy_all(options, diagnostics.as_mut())?;
     test_all(options, diagnostics.as_mut())?;
+    check_binary_crypto()?;
 
     if let Some(diagnostics) = diagnostics.as_ref() {
         diagnostics.print_summary();
@@ -128,6 +129,25 @@ fn quick_check() -> anyhow::Result<()> {
     format_all(None)?;
     clippy_quick()?;
     test_quick()?;
+    check_binary_crypto()?;
+    Ok(())
+}
+
+/// Verify the binary crate compiles with the `crypto-ring` feature.
+///
+/// The workspace compiles without any crypto feature because TLS types
+/// are conditionally compiled behind feature gates. However, the
+/// shipped binary always needs a crypto backend, and feature wiring
+/// bugs (e.g., a crypto feature forgetting to forward a transitive
+/// dependency like `tonic/tls-native-roots`) are only caught when
+/// building with that feature enabled.
+fn check_binary_crypto() -> anyhow::Result<()> {
+    println!("🚀 Checking binary compiles with crypto-ring...");
+    run(
+        "cargo",
+        &["check", "-p", "otap-df", "--features", "crypto-ring"],
+    )?;
+    println!("✅ Binary crypto-ring check passed.\n");
     Ok(())
 }
 
