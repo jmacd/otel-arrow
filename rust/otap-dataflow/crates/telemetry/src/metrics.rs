@@ -495,12 +495,40 @@ impl MetricSetRegistry {
         for<'a> F:
             FnMut(&'static MetricsDescriptor, &'a dyn AttributeSetHandler, MetricsIterator<'a>),
     {
+        self.visit_metrics_and_reset_with_entity(
+            entities,
+            |desc, _entity_key, attrs, iter| f(desc, attrs, iter),
+            keep_all_zeroes,
+        );
+    }
+
+    /// Like `visit_metrics_and_reset` but also passes the `EntityKey`
+    /// for each metric set. This is needed by OTAP encoding to cache
+    /// per-entity scope attributes.
+    pub(crate) fn visit_metrics_and_reset_with_entity<F>(
+        &mut self,
+        entities: &EntityRegistry,
+        mut f: F,
+        keep_all_zeroes: bool,
+    ) where
+        for<'a> F: FnMut(
+            &'static MetricsDescriptor,
+            EntityKey,
+            &'a dyn AttributeSetHandler,
+            MetricsIterator<'a>,
+        ),
+    {
         for entry in self.metrics.values_mut() {
             let values = &mut entry.metric_values;
             if keep_all_zeroes || values.iter().any(|&v| !v.is_zero()) {
                 let desc = entry.metrics_descriptor;
                 if let Some(attrs) = entities.get(entry.entity_key) {
-                    f(desc, attrs, MetricsIterator::new(desc.metrics, values));
+                    f(
+                        desc,
+                        entry.entity_key,
+                        attrs,
+                        MetricsIterator::new(desc.metrics, values),
+                    );
                 }
 
                 // Zero after reporting.

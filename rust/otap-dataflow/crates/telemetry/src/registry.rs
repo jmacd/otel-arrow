@@ -181,6 +181,23 @@ impl TelemetryRegistryHandle {
         metrics.visit_metrics_and_reset(entities, f, keep_all_zeroes);
     }
 
+    /// Like `visit_metrics_and_reset` but also passes the `EntityKey`
+    /// for each metric set. Needed for OTAP encoding to cache per-entity
+    /// scope attributes.
+    pub fn visit_metrics_and_reset_with_entity<F>(&self, f: F)
+    where
+        for<'a> F: FnMut(
+            &'static MetricsDescriptor,
+            EntityKey,
+            &'a dyn AttributeSetHandler,
+            MetricsIterator<'a>,
+        ),
+    {
+        let mut reg = self.registry.lock();
+        let TelemetryRegistry { entities, metrics } = &mut *reg;
+        metrics.visit_metrics_and_reset_with_entity(entities, f, false);
+    }
+
     /// Generates a SemConvRegistry from the current MetricSetRegistry.
     /// AttributeFields are deduplicated based on their key.
     #[must_use]

@@ -8,5 +8,7 @@
 //! telemetry registry and serves Prometheus text exposition. The
 //! [`ViewResolver`] applies scoped instrument renaming at export time.
 
+pub mod bridge;
 pub mod metrics_tap;
+pub mod precomputed;
 pub mod views;
