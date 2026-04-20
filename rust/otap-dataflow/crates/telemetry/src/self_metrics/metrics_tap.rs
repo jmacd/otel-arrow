@@ -119,6 +119,29 @@ impl MetricsTap {
         }
     }
 
+    /// Feed a metric set from pre-collected values.
+    ///
+    /// Like `feed`, but takes a `MetricValue` slice instead of a
+    /// `MetricsIterator`. Used when values have been collected during
+    /// a registry visit and need to be fed to the tap afterwards.
+    pub fn feed_values(
+        &mut self,
+        descriptor: &'static MetricsDescriptor,
+        attributes: &dyn AttributeSetHandler,
+        values: &[MetricValue],
+    ) {
+        let labels = self.format_labels(descriptor, attributes);
+
+        for (field, value) in descriptor.metrics.iter().zip(values) {
+            let key = TimeseriesKey {
+                scope_name: descriptor.name,
+                field_name: field.name,
+                labels: labels.clone(),
+            };
+            self.feed_scalar_or_mmsc(field, *value, key);
+        }
+    }
+
     /// Accumulate a single metric value into the tap.
     fn feed_scalar_or_mmsc(
         &mut self,

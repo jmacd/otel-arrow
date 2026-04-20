@@ -150,6 +150,13 @@ pub struct InternalTelemetrySettings {
     /// Shared metrics tap for Prometheus and console output.
     /// Present when metrics provider mode is ITS.
     pub metrics_tap: Option<Arc<parking_lot::Mutex<MetricsTap>>>,
+    /// Resource attributes from config, used to build OTAP ResourceAttrs.
+    pub resource_config: std::collections::HashMap<
+        String,
+        otap_df_config::pipeline::telemetry::AttributeValue,
+    >,
+    /// View configurations for metric renaming.
+    pub views: Vec<otap_df_config::pipeline::telemetry::metrics::views::ViewConfig>,
 }
 
 impl std::fmt::Debug for InternalTelemetrySettings {
@@ -288,6 +295,8 @@ impl InternalTelemetrySystem {
                     registry: telemetry_registry.clone(),
                     log_tap: log_tap_handle.clone(),
                     metrics_tap: its_metrics_tap,
+                    resource_config: config.resource.clone(),
+                    views: config.metrics.views.clone(),
                 }),
             )
         } else {
