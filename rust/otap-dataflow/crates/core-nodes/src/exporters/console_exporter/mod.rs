@@ -22,11 +22,13 @@ use otap_df_otap::OTAP_EXPORTER_FACTORIES;
 use otap_df_otap::pdata::OtapPdata;
 use otap_df_pdata::OtapPayload;
 use otap_df_pdata::views::otap::OtapLogsView;
+use otap_df_pdata::views::otap::OtapMetricsView;
 use otap_df_pdata::views::otlp::bytes::logs::RawLogsData;
 use otap_df_pdata_views::views::common::InstrumentationScopeView;
 use otap_df_pdata_views::views::logs::{
     LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView,
 };
+use otap_df_pdata_views::views::metrics::{DataType, Value};
 use otap_df_pdata_views::views::resource::ResourceView;
 use otap_df_telemetry::otel_error;
 use otap_df_telemetry::self_tracing::{AnsiCode, ColorMode, LOG_BUFFER_SIZE, StyledBufWriter};
@@ -157,12 +159,22 @@ impl ConsoleExporter {
         );
     }
 
-    async fn export_metrics(&self, _payload: &OtapPayload) {
-        // TODO: Implement metrics formatting.
-        otel_error!(
-            "console.metrics.not_implemented",
-            message = "Metrics formatting not yet implemented"
-        );
+    async fn export_metrics(&self, payload: &OtapPayload) {
+        match payload {
+            OtapPayload::OtapArrowRecords(records) => {
+                match OtapMetricsView::try_from(records) {
+                    Ok(metrics_view) => {
+                        self.formatter.print_metrics_data(&metrics_view).await;
+                    }
+                    Err(e) => {
+                        otel_error!("console.metrics_view.otap_create_failed", error = ?e);
+                    }
+                }
+            }
+            _ => {
+                // OTLP bytes metrics not yet supported for console.
+            }
+        }
     }
 }
 
@@ -220,6 +232,169 @@ impl HierarchicalFormatter {
 
         if let Err(err) = tokio::io::stdout().write_all(&output).await {
             otel_error!("console.write_failed", error = ?err, message = "Could not write to console");
+        }
+    }
+
+    /// Format metrics data to stdout.
+    pub async fn print_metrics_data(&self, metrics_data: &OtapMetricsView<'_>) {
+        let mut output = Vec::new();
+        self.format_metrics_data_to(metrics_data, &mut output);
+
+        use tokio::io::AsyncWriteExt;
+
+        if let Err(err) = tokio::io::stdout().write_all(&output).await {
+            otel_error!("console.write_failed", error = ?err, message = "Could not write metrics to console");
+        }
+    }
+
+    /// Format metrics from an OtapMetricsView to a writer.
+    fn format_metrics_data_to(
+        &self,
+        metrics_data: &OtapMetricsView<'_>,
+        output: &mut Vec<u8>,
+    ) {
+        use otap_df_pdata_views::views::metrics::{
+            DataView, GaugeView, HistogramDataPointView, HistogramView, MetricView, MetricsView,
+            NumberDataPointView, ResourceMetricsView, ScopeMetricsView, SumView,
+        };
+
+        let now = SystemTime::now();
+
+        for resource_metrics in metrics_data.resources() {
+            // Resource header
+            self.format_line(output, |w| {
+                w.format_header_line(
+                    Some(now),
+                    resource_metrics
+                        .resource()
+                        .iter()
+                        .flat_map(|r| r.attributes()),
+                    |w| {
+                        w.write_styled(AnsiCode::Cyan, |w| {
+                            let _ = w.write_all(b"RESOURCE");
+                        });
+                        let _ = w.write_all(b"   ");
+                    },
+                    |w| {
+                        let _ = w.write_all(b"v1.Resource");
+                    },
+                    |_| {},
+                );
+            });
+
+            let tree = self.tree;
+
+            for scope_metrics in resource_metrics.scopes() {
+                // Scope header
+                let scope = scope_metrics.scope();
+                let name = scope.as_ref().and_then(|s| s.name());
+                let version = scope.as_ref().and_then(|s| s.version());
+
+                self.format_line(output, |w| {
+                    w.format_header_line(
+                        Some(now),
+                        scope.iter().flat_map(|s| s.attributes()),
+                        |w| {
+                            let _ = w.write_all(tree.vertical.as_bytes());
+                            let _ = w.write_all(b" ");
+                            w.write_styled(AnsiCode::Magenta, |w| {
+                                let _ = w.write_all(b"SCOPE");
+                            });
+                            let _ = w.write_all(b"    ");
+                        },
+                        |w| match (name, version) {
+                            (Some(n), Some(v)) => {
+                                let _ = w.write_all(n);
+                                let _ = w.write_all(b"/");
+                                let _ = w.write_all(v);
+                            }
+                            (Some(n), None) => {
+                                let _ = w.write_all(n);
+                            }
+                            _ => {
+                                let _ = w.write_all(b"v1.InstrumentationScope");
+                            }
+                        },
+                        |_| {},
+                    );
+                });
+
+                // Metrics
+                let mut metrics = scope_metrics.metrics().peekable();
+                while let Some(metric) = metrics.next() {
+                    let is_last = metrics.peek().is_none();
+                    let name = metric.name();
+                    let unit = metric.unit();
+
+                    self.format_line(output, |w| {
+                        let _ = w.write_all(tree.vertical.as_bytes());
+                        let _ = w.write_all(b" ");
+                        if is_last {
+                            let _ = w.write_all(tree.corner.as_bytes());
+                        } else {
+                            let _ = w.write_all(tree.tee.as_bytes());
+                        }
+                        let _ = w.write_all(b" ");
+
+                        // Metric type and name
+                        if let Some(data) = metric.data() {
+                            let type_label = match data.value_type() {
+                                DataType::Gauge => "GAUGE",
+                                DataType::Sum => "SUM",
+                                DataType::Histogram => "HISTO",
+                                DataType::ExponentialHistogram => "EHIST",
+                                DataType::Summary => "SUMRY",
+                            };
+                            w.write_styled(AnsiCode::Yellow, |w| {
+                                let _ = w.write_all(type_label.as_bytes());
+                            });
+                        }
+                        let _ = w.write_all(b"  ");
+
+                        let _ = w.write_all(name);
+                        if !unit.is_empty() {
+                            let _ = w.write_all(b" (");
+                            let _ = w.write_all(unit);
+                            let _ = w.write_all(b")");
+                        }
+
+                        // Inline data point values
+                        if let Some(data) = metric.data() {
+                            let _ = w.write_all(b": ");
+                            if let Some(gauge) = data.as_gauge() {
+                                for dp in gauge.data_points() {
+                                    if let Some(v) = dp.value() {
+                                        format_value(w, v);
+                                        let _ = w.write_all(b" ");
+                                    }
+                                }
+                            } else if let Some(sum) = data.as_sum() {
+                                for dp in sum.data_points() {
+                                    if let Some(v) = dp.value() {
+                                        format_value(w, v);
+                                        let _ = w.write_all(b" ");
+                                    }
+                                }
+                            } else if let Some(hist) = data.as_histogram() {
+                                for dp in hist.data_points() {
+                                    let _ = write!(w, "count={}", dp.count());
+                                    if let Some(sum) = dp.sum() {
+                                        let _ = write!(w, " sum={sum:.2}");
+                                    }
+                                    if let Some(min) = dp.min() {
+                                        let _ = write!(w, " min={min:.2}");
+                                    }
+                                    if let Some(max) = dp.max() {
+                                        let _ = write!(w, " max={max:.2}");
+                                    }
+                                    let _ = w.write_all(b" ");
+                                }
+                            }
+                        }
+                        let _ = w.write_all(b"\n");
+                    });
+                }
+            }
         }
     }
 
@@ -400,6 +575,23 @@ impl HierarchicalFormatter {
 #[inline]
 fn nanos_to_time(nanos: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos)
+}
+
+/// Write a metric value to the output.
+#[inline]
+fn format_value(w: &mut impl Write, v: Value) {
+    match v {
+        Value::Integer(i) => {
+            let _ = write!(w, "{i}");
+        }
+        Value::Double(f) => {
+            if f == f.trunc() && f.abs() < 1e15 {
+                let _ = write!(w, "{f:.0}");
+            } else {
+                let _ = write!(w, "{f}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
