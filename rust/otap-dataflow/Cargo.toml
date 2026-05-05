@@ -44,6 +44,10 @@ cfg-if.workspace = true
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 
+[dev-dependencies]
+otap-df-telemetry.workspace = true
+rand.workspace = true
+
 [workspace.dependencies]
 otap-df-admin-api = { path = "crates/admin-api" }
 otap-df-admin-types = { path = "crates/admin-types" }

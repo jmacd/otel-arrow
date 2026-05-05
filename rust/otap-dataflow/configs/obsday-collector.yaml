@@ -1,0 +1,34 @@
+version: otel_dataflow/v1
+
+# obsday-collector.yaml
+#
+# Stand-alone collector for the obsday logging-overhead experiment.
+# Receives OTLP/gRPC logs from the `obsday_logger` example and discards them.
+
+engine:
+  http_admin:
+    bind_address: "127.0.0.1:9877"
+
+groups:
+  default:
+    pipelines:
+      main:
+        policies:
+          channel_capacity:
+            control:
+              node: 100
+              pipeline: 100
+            pdata: 128
+        nodes:
+          receiver:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:4317"
+          exporter:
+            type: exporter:noop
+            config: {}
+        connections:
+          - from: receiver
+            to: exporter
