@@ -8,8 +8,7 @@
 #
 # Usage:
 #   tools/obsday/measure.sh --name LABEL [--rate N] [--duration S] \
-#                           [--workers N] [--attrs N] [--mean F] \
-#                           [--stddev F] [--min N] [--seed N] \
+#                           [--workers N] [--attrs N] [--seed N] \
 #                           [--outdir DIR] [--logger-config PATH] \
 #                           [--collector-config PATH] [--no-flame]
 #
@@ -30,9 +29,6 @@ RATE=50000
 DURATION=120
 WORKERS=2
 ATTRS=8
-MEAN=24
-STDDEV=8
-MIN=1
 SEED=1
 OUTDIR="./obsday-out/measure"
 LOGGER_CFG="configs/obsday-logger.yaml"
@@ -47,9 +43,6 @@ while [[ $# -gt 0 ]]; do
     --duration)         DURATION="$2";      shift 2 ;;
     --workers)          WORKERS="$2";       shift 2 ;;
     --attrs)            ATTRS="$2";         shift 2 ;;
-    --mean)             MEAN="$2";          shift 2 ;;
-    --stddev)           STDDEV="$2";        shift 2 ;;
-    --min)              MIN="$2";           shift 2 ;;
     --seed)             SEED="$2";          shift 2 ;;
     --outdir)           OUTDIR="$2";        shift 2 ;;
     --logger-config)    LOGGER_CFG="$2";    shift 2 ;;
@@ -87,7 +80,7 @@ COLLECTOR_ADMIN=$(awk '/http_admin:/{f=1;next} f && /bind_address/{
 LOGGER_PORT="${LOGGER_ADMIN##*:}"
 COLLECTOR_PORT="${COLLECTOR_ADMIN##*:}"
 
-echo "[measure:$NAME] rate=$RATE duration=${DURATION}s workers=$WORKERS attrs=$ATTRS mean=$MEAN stddev=$STDDEV"
+echo "[measure:$NAME] rate=$RATE duration=${DURATION}s workers=$WORKERS attrs=$ATTRS"
 echo "[measure:$NAME] logger admin: $LOGGER_ADMIN; collector admin: $COLLECTOR_ADMIN"
 
 for port in 4317 "$LOGGER_PORT" "$COLLECTOR_PORT"; do
@@ -132,8 +125,7 @@ LOG_ARGS=(
   --config "$LOGGER_CFG"
   --num-cores "$NUM_CORES"
   --rate "$RATE" --duration "$DURATION" --workers "$WORKERS"
-  --attrs "$ATTRS" --attr-size-mean "$MEAN" --attr-size-stddev "$STDDEV"
-  --attr-size-min "$MIN" --seed "$SEED"
+  --attrs "$ATTRS" --seed "$SEED"
 )
 if [[ "$WANT_FLAME" -eq 1 ]]; then
   samply record --save-only --unstable-presymbolicate -o "$LOG_PROFILE" \
@@ -193,10 +185,10 @@ cleanup
 trap - EXIT
 
 # 5. Report.
-python3 - "$RUNDIR" "$NAME" "$RATE" "$DURATION" "$ATTRS" "$MEAN" "$STDDEV" "$WORKERS" <<'PY'
+python3 - "$RUNDIR" "$NAME" "$RATE" "$DURATION" "$ATTRS" "$WORKERS" <<'PY'
 import os, re, sys
 
-run, name, rate, dur, attrs, mean, stddev, workers = sys.argv[1:9]
+run, name, rate, dur, attrs, workers = sys.argv[1:7]
 
 def read(path):
     try: return open(path).read()
@@ -312,7 +304,7 @@ lines = []
 lines.append(f"# obsday measurement: `{name}`\n")
 lines.append("## Configuration\n")
 lines.append(f"- target rate: **{int(rate):,}/s**, duration: **{dur}s**, workers: **{workers}**")
-lines.append(f"- attrs: **{attrs}**, attr size mean: **{mean}**, stddev: **{stddev}**")
+lines.append(f"- attrs: **{attrs}**  (semconv-pool values; see logger.log for pool size)")
 lines.append("")
 lines.append("## Window measurement (25% -> 75% of test)\n")
 lines.append(f"- window wall time: **{fmt(dwall, ' s')}**")

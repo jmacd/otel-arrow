@@ -4,7 +4,7 @@
 #
 # Usage:
 #   tools/obsday/flame.sh [--rate N] [--duration S] [--workers N] \
-#                         [--attrs N] [--mean F] [--stddev F] [--min N] \
+#                         [--attrs N] \
 #                         [--seed N] [--outdir DIR] [--thread NAME] \
 #                         [--no-open]
 #
@@ -22,9 +22,6 @@ RATE=50000
 DURATION=30
 WORKERS=2
 ATTRS=8
-MEAN=24
-STDDEV=8
-MIN=1
 SEED=1
 OUTDIR="./obsday-out"
 THREAD="all"
@@ -36,9 +33,6 @@ while [[ $# -gt 0 ]]; do
     --duration) DURATION="$2"; shift 2 ;;
     --workers)  WORKERS="$2";  shift 2 ;;
     --attrs)    ATTRS="$2";    shift 2 ;;
-    --mean)     MEAN="$2";     shift 2 ;;
-    --stddev)   STDDEV="$2";   shift 2 ;;
-    --min)      MIN="$2";      shift 2 ;;
     --seed)     SEED="$2";     shift 2 ;;
     --outdir)   OUTDIR="$2";   shift 2 ;;
     --thread)   THREAD="$2";   shift 2 ;;
@@ -62,7 +56,7 @@ RUN_LOG="$OUTDIR/flame.run.log"
 mkdir -p "$OUTDIR"
 if ! bash tools/obsday/run.sh \
        --rate "$RATE" --duration "$DURATION" --workers "$WORKERS" \
-       --attrs "$ATTRS" --mean "$MEAN" --stddev "$STDDEV" --min "$MIN" \
+       --attrs "$ATTRS"    \
        --seed "$SEED" --outdir "$OUTDIR" >"$RUN_LOG" 2>&1; then
   echo "[flame] ERROR: record step failed. Last lines of run.sh output:" >&2
   tail -n 30 "$RUN_LOG" | sed 's/^/    /' >&2
@@ -102,7 +96,7 @@ if ! grep -q "emission done:" "$OUTDIR/logger.log" 2>/dev/null; then
 fi
 
 # 2. fold + render the three views
-TITLE="obsday logger ${RATE}/s attrs=${ATTRS} mean=${MEAN} dur=${DURATION}s"
+TITLE="obsday logger ${RATE}/s attrs=${ATTRS} dur=${DURATION}s"
 python3 tools/obsday/fold_samply.py "$PROF" "$SYMS" \
   > "$OUTDIR/logger.folded"
 python3 tools/obsday/fold_samply.py "$PROF" "$SYMS" \

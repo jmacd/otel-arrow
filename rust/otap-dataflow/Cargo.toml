@@ -46,7 +46,13 @@ tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 otap-df-telemetry.workspace = true
+otap-df-core-nodes = { workspace = true, features = ["dev-tools"] }
 rand.workspace = true
+weaver_common.workspace = true
+weaver_forge.workspace = true
+weaver_resolver.workspace = true
+weaver_resolved_schema.workspace = true
+weaver_semconv.workspace = true
 
 [workspace.dependencies]
 otap-df-admin-api = { path = "crates/admin-api" }

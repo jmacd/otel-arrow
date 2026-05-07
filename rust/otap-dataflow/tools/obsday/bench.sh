@@ -4,7 +4,7 @@
 # /usr/bin/time -v to capture CPU time, peak RSS, and wall time.
 #
 # Usage: tools/obsday/bench.sh --name LABEL [--rate N] [--duration S] \
-#          [--workers N] [--attrs N] [--mean F] [--stddev F] [--min N] \
+#          [--workers N] [--attrs N] \
 #          [--seed N] [--outdir DIR]
 
 set -euo pipefail
@@ -15,9 +15,6 @@ RATE=10000
 DURATION=60
 WORKERS=2
 ATTRS=8
-MEAN=24
-STDDEV=8
-MIN=1
 SEED=1
 OUTDIR="./obsday-out/bench"
 
@@ -28,9 +25,6 @@ while [[ $# -gt 0 ]]; do
     --duration) DURATION="$2"; shift 2 ;;
     --workers)  WORKERS="$2";  shift 2 ;;
     --attrs)    ATTRS="$2";    shift 2 ;;
-    --mean)     MEAN="$2";     shift 2 ;;
-    --stddev)   STDDEV="$2";   shift 2 ;;
-    --min)      MIN="$2";      shift 2 ;;
     --seed)     SEED="$2";     shift 2 ;;
     --outdir)   OUTDIR="$2";   shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
@@ -99,12 +93,12 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 
-echo "[bench:$NAME] starting logger (rate=$RATE dur=${DURATION}s attrs=$ATTRS mean=$MEAN stddev=$STDDEV)..."
+echo "[bench:$NAME] starting logger (rate=$RATE dur=${DURATION}s attrs=$ATTRS)..."
 /usr/bin/time -v -o "$LOG_TIME" \
   "$LOGGER" --config configs/obsday-logger.yaml \
        --rate "$RATE" --duration "$DURATION" --workers "$WORKERS" \
-       --attrs "$ATTRS" --attr-size-mean "$MEAN" --attr-size-stddev "$STDDEV" \
-       --attr-size-min "$MIN" --seed "$SEED" \
+       --attrs "$ATTRS"  \
+        --seed "$SEED" \
   >"$LOG_LOG" 2>&1
 
 cleanup

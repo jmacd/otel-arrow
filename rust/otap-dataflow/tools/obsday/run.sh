@@ -6,7 +6,7 @@
 #
 # Usage:
 #   tools/obsday/run.sh [--rate N] [--duration S] [--workers N] \
-#                       [--attrs N] [--mean F] [--stddev F] [--min N] \
+#                       [--attrs N] \
 #                       [--seed N] [--outdir DIR]
 #
 # All flags have defaults. Profiles land in $OUTDIR (default: ./obsday-out).
@@ -19,9 +19,6 @@ RATE=10000
 DURATION=30
 WORKERS=2
 ATTRS=8
-MEAN=24
-STDDEV=8
-MIN=1
 SEED=1
 OUTDIR="./obsday-out"
 
@@ -31,9 +28,6 @@ while [[ $# -gt 0 ]]; do
     --duration) DURATION="$2"; shift 2 ;;
     --workers)  WORKERS="$2";  shift 2 ;;
     --attrs)    ATTRS="$2";    shift 2 ;;
-    --mean)     MEAN="$2";     shift 2 ;;
-    --stddev)   STDDEV="$2";   shift 2 ;;
-    --min)      MIN="$2";      shift 2 ;;
     --seed)     SEED="$2";     shift 2 ;;
     --outdir)   OUTDIR="$2";   shift 2 ;;
     -h|--help)  sed -n '1,15p' "$0"; exit 0 ;;
@@ -120,8 +114,8 @@ set +e
 samply record --save-only --unstable-presymbolicate -o "$LOGGER_PROFILE" --rate 999 \
   -- "$LOGGER" --config configs/obsday-logger.yaml \
        --rate "$RATE" --duration "$DURATION" --workers "$WORKERS" \
-       --attrs "$ATTRS" --attr-size-mean "$MEAN" --attr-size-stddev "$STDDEV" \
-       --attr-size-min "$MIN" --seed "$SEED" \
+       --attrs "$ATTRS"  \
+        --seed "$SEED" \
   >"$LOGGER_LOG" 2>&1
 LOGGER_RC=$?
 set -e

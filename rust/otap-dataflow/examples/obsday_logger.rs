@@ -37,6 +37,17 @@ use otap_df_otap::OTAP_PIPELINE_FACTORY;
 use otap_df_telemetry::otel_info;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use weaver_common::vdir::VirtualDirectoryPath;
+use weaver_forge::registry::ResolvedRegistry;
+use weaver_resolver::SchemaResolver;
+use weaver_semconv::attribute::{AttributeType, Examples, PrimitiveOrArrayTypeSpec};
+use weaver_semconv::group::GroupType;
+use weaver_semconv::registry_repo::RegistryRepo;
+
+/// Default URL of the semantic-conventions registry to use for the
+/// attribute value pool.
+const DEFAULT_SEMCONV_URL: &str =
+    "https://github.com/open-telemetry/semantic-conventions.git";
 
 /// A logging-overhead experiment driver for the OTAP dataflow engine.
 #[derive(Parser, Debug)]
@@ -80,18 +91,6 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     attrs: usize,
 
-    /// Mean attribute-value length in bytes (truncated normal distribution).
-    #[arg(long, default_value_t = 24.0)]
-    attr_size_mean: f64,
-
-    /// Standard deviation of attribute-value length in bytes.
-    #[arg(long, default_value_t = 8.0)]
-    attr_size_stddev: f64,
-
-    /// Minimum attribute-value length in bytes.
-    #[arg(long, default_value_t = 1)]
-    attr_size_min: usize,
-
     /// RNG seed (XOR-ed with worker id per worker).
     #[arg(long, default_value_t = 0xC0FFEE)]
     seed: u64,
@@ -133,35 +132,83 @@ fn parse_core_id_allocation(s: &str) -> Result<CoreAllocation, String> {
     Ok(CoreAllocation::core_set(ranges?))
 }
 
-const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+/// Build a pool of plausible attribute values from the OpenTelemetry
+/// semantic-conventions registry.
+///
+/// Walks `event` and `attribute_group` definitions and harvests every
+/// string value present in attribute `examples` (including string-typed
+/// `Any`). Empty entries and entries longer than 256 bytes are skipped.
+/// Falls back to a small built-in pool if the resulting set is empty.
+fn build_semconv_pool() -> Result<Vec<String>, String> {
+    let path = VirtualDirectoryPath::GitRepo {
+        url: DEFAULT_SEMCONV_URL.to_string(),
+        sub_folder: Some("model".to_string()),
+        refspec: None,
+    };
+    let repo = RegistryRepo::try_new("main", &path).map_err(|e| e.to_string())?;
+    let registry = match SchemaResolver::load_semconv_repository(repo, false) {
+        weaver_common::result::WResult::Ok(r) => r,
+        weaver_common::result::WResult::OkWithNFEs(r, _) => r,
+        weaver_common::result::WResult::FatalErr(e) => return Err(e.to_string()),
+    };
+    let resolved = match SchemaResolver::resolve(registry, true) {
+        weaver_common::result::WResult::Ok(r) => r,
+        weaver_common::result::WResult::OkWithNFEs(r, _) => r,
+        weaver_common::result::WResult::FatalErr(e) => return Err(e.to_string()),
+    };
+    let resolved_registry = ResolvedRegistry::try_from_resolved_registry(
+        &resolved.registry,
+        resolved.catalog(),
+    )
+    .map_err(|e| e.to_string())?;
 
-/// Box-Muller transform: draws one N(0, 1) sample from the RNG.
-fn standard_normal(rng: &mut StdRng) -> f64 {
-    use rand::RngExt;
-    // Avoid log(0) by clamping u1 to (0, 1].
-    let mut u1: f64 = rng.random_range(0.0..1.0);
-    if u1 <= 0.0 {
-        u1 = f64::MIN_POSITIVE;
+    let mut pool = Vec::<String>::new();
+    let mut push = |s: String| {
+        if !s.is_empty() && s.len() <= 256 {
+            pool.push(s);
+        }
+    };
+    for group in &resolved_registry.groups {
+        if !matches!(group.r#type, GroupType::Event | GroupType::AttributeGroup) {
+            continue;
+        }
+        for attr in &group.attributes {
+            let is_stringy = matches!(
+                &attr.r#type,
+                AttributeType::PrimitiveOrArray(
+                    PrimitiveOrArrayTypeSpec::String | PrimitiveOrArrayTypeSpec::Any,
+                )
+            );
+            if !is_stringy {
+                continue;
+            }
+            match &attr.examples {
+                Some(Examples::String(s)) => push(s.to_string()),
+                Some(Examples::Strings(ss)) => {
+                    for s in ss {
+                        push(s.to_string());
+                    }
+                }
+                _ => {}
+            }
+            // Also include the attribute name; in real telemetry the
+            // attribute names themselves repeat heavily and dedup well.
+            push(attr.name.clone());
+        }
     }
-    let u2: f64 = rng.random_range(0.0..1.0);
-    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    pool.sort();
+    pool.dedup();
+    if pool.is_empty() {
+        return Err("semconv pool came up empty".to_string());
+    }
+    Ok(pool)
 }
 
-fn next_value_len(rng: &mut StdRng, mean: f64, stddev: f64, min_len: usize) -> usize {
-    let cap_f = (mean + 6.0 * stddev).max(mean).max(min_len as f64);
-    let raw = mean + stddev * standard_normal(rng);
-    let clamped = raw.round().max(min_len as f64).min(cap_f);
-    clamped as usize
-}
-
-fn fill_value(rng: &mut StdRng, len: usize, buf: &mut String) {
+fn pick_from_pool(rng: &mut StdRng, pool: &[String], buf: &mut String) {
     use rand::RngExt;
+    let s = &pool[rng.random_range(0..pool.len())];
     buf.clear();
-    buf.reserve(len);
-    for _ in 0..len {
-        let idx = rng.random_range(0..BASE62.len());
-        buf.push(BASE62[idx] as char);
-    }
+    buf.push_str(s);
 }
 
 /// Emitter table: indexed by attribute count. `None` slots are unsupported.
@@ -278,16 +325,13 @@ fn emit_32(seq: u64, v: &[String]) {
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     worker_id: u64,
     seed: u64,
     period: Duration,
     deadline: Instant,
     attrs: usize,
-    attr_mean: f64,
-    attr_stddev: f64,
-    attr_min: usize,
+    pool: Arc<Vec<String>>,
     counter: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
@@ -306,8 +350,7 @@ fn worker_loop(
         next_tick += period;
 
         for buf in &mut values {
-            let len = next_value_len(&mut rng, attr_mean, attr_stddev, attr_min);
-            fill_value(&mut rng, len, buf);
+            pick_from_pool(&mut rng, &pool, buf);
         }
         // Encode worker id into the sequence so values are globally unique.
         let seq = (worker_id << 48) | local_seq;
@@ -390,6 +433,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Build the value pool up-front (the registry fetch is slow and does
+    // not belong in the measurement window).
+    println!("loading semconv registry from {DEFAULT_SEMCONV_URL} ...");
+    let pool_t0 = Instant::now();
+    let value_pool: Arc<Vec<String>> = Arc::new(
+        build_semconv_pool().map_err(|e| format!("semconv pool: {e}"))?,
+    );
+    println!(
+        "semconv pool ready: {} distinct values in {:.2}s",
+        value_pool.len(),
+        pool_t0.elapsed().as_secs_f64(),
+    );
+
     let admin_addr: SocketAddr = args
         .http_admin_bind
         .parse()
@@ -410,13 +466,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     thread::sleep(Duration::from_secs(args.warmup_secs));
 
     println!(
-        "starting emission: rate={}/s workers={} attrs={} mean={} stddev={} duration={}s",
+        "starting emission: rate={}/s workers={} attrs={} duration={}s pool_size={}",
         args.rate,
         args.workers,
         args.attrs,
-        args.attr_size_mean,
-        args.attr_size_stddev,
         args.duration,
+        value_pool.len(),
     );
 
     let per_worker_rate = (args.rate as f64) / (args.workers as f64);
@@ -430,17 +485,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for w in 0..args.workers {
         let counter = Arc::clone(&counter);
         let stop = Arc::clone(&stop);
+        let pool = Arc::clone(&value_pool);
         let attrs = args.attrs;
-        let mean = args.attr_size_mean;
-        let stddev = args.attr_size_stddev;
-        let min = args.attr_size_min;
         let seed = args.seed;
         handles.push(
             thread::Builder::new()
                 .name(format!("obsday-w{w}"))
                 .spawn(move || {
                     worker_loop(
-                        w as u64, seed, period, deadline, attrs, mean, stddev, min, counter, stop,
+                        w as u64, seed, period, deadline, attrs, pool, counter, stop,
                     );
                 })?,
         );
