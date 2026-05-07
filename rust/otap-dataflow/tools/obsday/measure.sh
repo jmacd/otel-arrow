@@ -38,6 +38,7 @@ OUTDIR="./obsday-out/measure"
 LOGGER_CFG="configs/obsday-logger.yaml"
 COLLECTOR_CFG="configs/obsday-collector.yaml"
 WANT_FLAME=1
+NUM_CORES=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -54,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --logger-config)    LOGGER_CFG="$2";    shift 2 ;;
     --collector-config) COLLECTOR_CFG="$2"; shift 2 ;;
     --no-flame)         WANT_FLAME=0;       shift ;;
+    --num-cores)        NUM_CORES="$2";     shift 2 ;;
     -h|--help)          sed -n '1,30p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
@@ -128,6 +130,7 @@ done
 LOG_PROFILE="$RUNDIR/logger.profile.json.gz"
 LOG_ARGS=(
   --config "$LOGGER_CFG"
+  --num-cores "$NUM_CORES"
   --rate "$RATE" --duration "$DURATION" --workers "$WORKERS"
   --attrs "$ATTRS" --attr-size-mean "$MEAN" --attr-size-stddev "$STDDEV"
   --attr-size-min "$MIN" --seed "$SEED"

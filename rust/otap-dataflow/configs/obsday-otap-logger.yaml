@@ -1,0 +1,63 @@
+version: otel_dataflow/v1
+
+# obsday-logger.yaml
+#
+# Engine config for the `obsday_logger` example.
+# The example process emits `otel_info!` calls; under ITS mode those events
+# are routed into the internal-telemetry receiver, batched, and exported as
+# OTLP/gRPC logs to a separate collector process (see obsday-collector.yaml).
+
+policies:
+  channel_capacity:
+    control:
+      node: 100
+      pipeline: 100
+    pdata: 128
+
+engine:
+  http_admin:
+    bind_address: "127.0.0.1:9876"
+  telemetry:
+    logs:
+      level: "info"
+      providers:
+        global: its
+        engine: its
+        internal: noop
+        admin: noop
+  observability:
+    pipeline:
+      policies:
+        channel_capacity:
+          control:
+            node: 64
+            pipeline: 64
+          pdata: 64
+      nodes:
+        itr:
+          type: receiver:internal_telemetry
+          config: {}
+        batch:
+          type: processor:batch
+          config:
+            format: otap
+            otap:
+              min_size: 8192
+              sizer: items
+            max_batch_duration: 1s
+        otlp:
+          type: exporter:otlp_grpc
+          config:
+            grpc_endpoint: "http://127.0.0.1:4317"
+      connections:
+        - from: itr
+          to: batch
+        - from: batch
+          to: otlp
+
+# `obsday_logger` does not emit pdata into a main pipeline; it drives the
+# observability pipeline through the global tracing dispatcher. A minimal
+# placeholder group is included so the engine spec validates.
+groups:
+  placeholder:
+    pipelines: {}
