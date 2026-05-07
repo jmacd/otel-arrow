@@ -62,7 +62,7 @@ COLLECTOR_LOG="$OUTDIR/collector.log"
 LOGGER_LOG="$OUTDIR/logger.log"
 
 echo "[obsday] starting collector under samply..."
-samply record --save-only -o "$COLLECTOR_PROFILE" --rate 999 \
+samply record --save-only --unstable-presymbolicate -o "$COLLECTOR_PROFILE" --rate 999 \
   -- "$DF_ENGINE" --config configs/obsday-collector.yaml \
   >"$COLLECTOR_LOG" 2>&1 &
 COLLECTOR_PID=$!
@@ -117,7 +117,7 @@ fi
 
 echo "[obsday] starting logger under samply..."
 set +e
-samply record --save-only -o "$LOGGER_PROFILE" --rate 999 \
+samply record --save-only --unstable-presymbolicate -o "$LOGGER_PROFILE" --rate 999 \
   -- "$LOGGER" --config configs/obsday-logger.yaml \
        --rate "$RATE" --duration "$DURATION" --workers "$WORKERS" \
        --attrs "$ATTRS" --attr-size-mean "$MEAN" --attr-size-stddev "$STDDEV" \

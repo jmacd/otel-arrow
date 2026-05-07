@@ -845,11 +845,7 @@ where
         ctx: Context,
         payload: T,
     ) -> Result<(), EngineError> {
-        // Compute weight in the active sizer's unit. For OTLP/bytes this is
-        // O(1) (just `bytes.len()`); for OTAP it is `num_rows()` which is
-        // also O(1). The expensive `OtlpProtoBytes::num_items()` walk is only
-        // paid when an OTLP-bytes pipeline is explicitly configured with
-        // Sizer::Items.
+        // Compute weight in the active sizer's unit.
         let weight = self.fmtcfg.sizer.batch_size(&payload)?;
 
         // If there are subscribers, calculate an inbound slot key.
@@ -1056,8 +1052,6 @@ where
 
         for records in output_batches {
             // Apportion ack/nack subscribers in the active sizer's unit
-            // (bytes for OTLP/bytes, items for OTAP). For OTLP/bytes this
-            // is O(1).
             let weight = self.fmtcfg.sizer.batch_size(&records)?;
             let mut pdata = OtapPdata::new(Context::default(), records.into());
 

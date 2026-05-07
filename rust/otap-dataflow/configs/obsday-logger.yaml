@@ -24,7 +24,7 @@ engine:
         global: its
         engine: its
         internal: noop
-        admin: console_direct
+        admin: noop
   observability:
     pipeline:
       policies:
@@ -40,9 +40,9 @@ engine:
         batch:
           type: processor:batch
           config:
-            otap:
-              min_size: 1000
-              sizer: items
+            otlp:
+              min_size: 262144
+              sizer: bytes
             max_batch_duration: 1s
         otlp:
           type: exporter:otlp_grpc
