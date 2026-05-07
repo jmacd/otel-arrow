@@ -411,9 +411,8 @@ struct BatchContext {
 struct BatchPortion {
     /// The number of these matches Signalbuffer.inbound[inkey]
     inkey: Option<SlotKey>,
-    /// Weight of this portion in the active sizer's unit (items, bytes,
-    /// or 1 per request). Used for ack apportionment across split outputs.
-    weight: usize,
+    /// Number of items
+    items: usize,
 }
 
 struct Inputs<T: OtapPayloadHelpers> {
@@ -423,9 +422,8 @@ struct Inputs<T: OtapPayloadHelpers> {
     /// Waiter context
     context: Vec<BatchPortion>,
 
-    /// Total weight across all pending portions, in the active sizer's unit
-    /// (sum of per-portion `weight`).
-    weight: usize,
+    /// A count defined by num_items(), number of spans, log records, or metric data points.
+    items: usize,
 }
 
 struct MultiContext {
@@ -498,6 +496,16 @@ enum FlushReason {
 #[metric_set(name = "otap.processor.batch")]
 #[derive(Debug, Default, Clone)]
 pub struct BatchProcessorMetrics {
+    /// Total items consumed for logs signal
+    #[metric(unit = "{item}")]
+    consumed_items_logs: Counter<u64>,
+    /// Total items consumed for metrics signal
+    #[metric(unit = "{item}")]
+    consumed_items_metrics: Counter<u64>,
+    /// Total items consumed for traces signal
+    #[metric(unit = "{item}")]
+    consumed_items_traces: Counter<u64>,
+
     /// Total batches consumed for logs signal
     #[metric(unit = "{item}")]
     consumed_batches_logs: Counter<u64>,
@@ -507,6 +515,16 @@ pub struct BatchProcessorMetrics {
     /// Total batches consumed for traces signal
     #[metric(unit = "{item}")]
     consumed_batches_traces: Counter<u64>,
+
+    /// Total items produced for logs signal
+    #[metric(unit = "{item}")]
+    produced_items_logs: Counter<u64>,
+    /// Total items produced for metrics signal
+    #[metric(unit = "{item}")]
+    produced_items_metrics: Counter<u64>,
+    /// Total items produced for traces signal
+    #[metric(unit = "{item}")]
+    produced_items_traces: Counter<u64>,
 
     /// Total batches produced for logs signal
     #[metric(unit = "{item}")]
@@ -528,6 +546,9 @@ pub struct BatchProcessorMetrics {
     /// Number of input requests pending at flush time
     #[metric(unit = "{request}")]
     flush_pending_requests: Mmsc,
+    /// Number of primary signal items pending at flush time
+    #[metric(unit = "{item}")]
+    flush_pending_items: Mmsc,
     /// Number of bytes pending at flush time when byte size is known
     #[metric(unit = "By")]
     flush_pending_bytes: Mmsc,
@@ -540,6 +561,9 @@ pub struct BatchProcessorMetrics {
     /// Number of output batches emitted by each flush
     #[metric(unit = "{batch}")]
     flush_output_batches: Mmsc,
+    /// Number of primary signal items emitted by each flush
+    #[metric(unit = "{item}")]
+    flush_output_items: Mmsc,
     /// Number of bytes emitted by each flush when byte size is known
     #[metric(unit = "By")]
     flush_output_bytes: Mmsc,
@@ -714,18 +738,30 @@ impl BatchProcessor {
         effect: &mut local::EffectHandler<OtapPdata>,
         request: OtapPdata,
     ) -> Result<(), EngineError> {
-        if request.is_empty() {
+        let items = request.num_items();
+
+        if items == 0 {
             self.metrics.dropped_empty_records.inc();
             // Note: Failure to Ack/Nack is an engine-level error.
             effect.notify_ack(AckMsg::new(request)).await?;
             return Ok(());
         }
 
+        // Increment consumed_items for the appropriate signal
         let signal = request.signal_type();
         match signal {
-            SignalType::Logs => self.metrics.consumed_batches_logs.add(1),
-            SignalType::Metrics => self.metrics.consumed_batches_metrics.add(1),
-            SignalType::Traces => self.metrics.consumed_batches_traces.add(1),
+            SignalType::Logs => {
+                self.metrics.consumed_items_logs.add(items as u64);
+                self.metrics.consumed_batches_logs.add(1);
+            }
+            SignalType::Metrics => {
+                self.metrics.consumed_items_metrics.add(items as u64);
+                self.metrics.consumed_batches_metrics.add(1);
+            }
+            SignalType::Traces => {
+                self.metrics.consumed_items_traces.add(items as u64);
+                self.metrics.consumed_batches_traces.add(1);
+            }
         };
 
         let (ctx, payload) = request.into_parts();
@@ -735,12 +771,12 @@ impl BatchProcessor {
                 if let Some(mut otap_format) = self.otap_format() {
                     otap_format
                         .for_signal(signal)
-                        .accept_payload(effect, ctx, otap)
+                        .accept_payload(effect, ctx, otap, items)
                         .await?
                 } else if let Some(mut otlp_format) = self.otlp_format() {
                     otlp_format
                         .for_signal(signal)
-                        .accept_payload(effect, ctx, otap.try_into_with_default()?)
+                        .accept_payload(effect, ctx, otap.try_into_with_default()?, items)
                         .await?
                 } else {
                     return Err(Self::no_active_format_error());
@@ -750,12 +786,12 @@ impl BatchProcessor {
                 if let Some(mut otlp_format) = self.otlp_format() {
                     otlp_format
                         .for_signal(signal)
-                        .accept_payload(effect, ctx, otlp)
+                        .accept_payload(effect, ctx, otlp, items)
                         .await?
                 } else if let Some(mut otap_format) = self.otap_format() {
                     otap_format
                         .for_signal(signal)
-                        .accept_payload(effect, ctx, otlp.try_into_with_default()?)
+                        .accept_payload(effect, ctx, otlp.try_into_with_default()?, items)
                         .await?
                 } else {
                     return Err(Self::no_active_format_error());
@@ -844,10 +880,8 @@ where
         effect: &mut local::EffectHandler<OtapPdata>,
         ctx: Context,
         payload: T,
+        items: usize,
     ) -> Result<(), EngineError> {
-        // Compute weight in the active sizer's unit.
-        let weight = self.fmtcfg.sizer.batch_size(&payload)?;
-
         // If there are subscribers, calculate an inbound slot key.
         let inkey = if ctx.has_subscribers() {
             let slot = self
@@ -886,7 +920,7 @@ where
 
         self.buffer
             .inputs
-            .accept(payload, BatchPortion::new(inkey, weight));
+            .accept(payload, BatchPortion::new(inkey, items));
 
         let pending_size = self.buffer.inputs.size_by(self.fmtcfg.sizer)?;
 
@@ -954,6 +988,9 @@ where
         self.metrics
             .flush_pending_requests
             .record(self.buffer.inputs.requests() as f64);
+        self.metrics
+            .flush_pending_items
+            .record(self.buffer.inputs.items as f64);
         if let Some(bytes) = self.buffer.inputs.known_bytes() {
             self.metrics.flush_pending_bytes.record(bytes as f64);
         }
@@ -1030,8 +1067,7 @@ where
                 .batch_size(&output_batches[num_output - 1])?;
 
             if last_batch_size < self.fmtcfg.lower_limit() {
-                self.buffer
-                    .take_remaining(self.fmtcfg.sizer, &mut inputs, &mut output_batches);
+                self.buffer.take_remaining(&mut inputs, &mut output_batches);
 
                 // We use the latest arrival time as the new arrival for timeout purposes.
                 self.buffer
@@ -1044,6 +1080,12 @@ where
         self.metrics
             .flush_output_batches
             .record(output_batches.len() as f64);
+        self.metrics.flush_output_items.record(
+            output_batches
+                .iter()
+                .map(OtapPayloadHelpers::num_items)
+                .sum::<usize>() as f64,
+        );
         if let Some(bytes) = known_total_bytes(&output_batches) {
             self.metrics.flush_output_bytes.record(bytes as f64);
         }
@@ -1051,19 +1093,27 @@ where
         let mut input_context = inputs.take_context();
 
         for records in output_batches {
-            // Apportion ack/nack subscribers in the active sizer's unit
-            let weight = self.fmtcfg.sizer.batch_size(&records)?;
+            let items = records.num_items();
             let mut pdata = OtapPdata::new(Context::default(), records.into());
 
+            // Increment produced_items for the appropriate signal
             match self.signal {
-                SignalType::Logs => self.metrics.produced_batches_logs.add(1),
-                SignalType::Metrics => self.metrics.produced_batches_metrics.add(1),
-                SignalType::Traces => self.metrics.produced_batches_traces.add(1),
+                SignalType::Logs => {
+                    self.metrics.produced_items_logs.add(items as u64);
+                    self.metrics.produced_batches_logs.add(1);
+                }
+                SignalType::Metrics => {
+                    self.metrics.produced_items_metrics.add(items as u64);
+                    self.metrics.produced_batches_metrics.add(1);
+                }
+                SignalType::Traces => {
+                    self.metrics.produced_items_traces.add(items as u64);
+                    self.metrics.produced_batches_traces.add(1);
+                }
             }
 
-            // If any inputs in this batch require notification, get an
-            // outbound slot and subscribe.
-            if let Some(ctxs) = self.buffer.drain_context(weight, &mut input_context) {
+            // If any items require notification, get an outbound slot and subscribe.
+            if let Some(ctxs) = self.buffer.drain_context(items, &mut input_context) {
                 match self.buffer.outbound.allocate_with_data(ctxs) {
                     Err(ctxs) => {
                         for bp in ctxs {
@@ -1299,7 +1349,7 @@ impl<T: OtapPayloadHelpers> Default for Inputs<T> {
         Self {
             pending: Vec::new(),
             context: Vec::new(),
-            weight: 0,
+            items: 0,
         }
     }
 }
@@ -1328,8 +1378,8 @@ where
 }
 
 impl BatchPortion {
-    const fn new(inkey: Option<SlotKey>, weight: usize) -> Self {
-        Self { inkey, weight }
+    const fn new(inkey: Option<SlotKey>, items: usize) -> Self {
+        Self { inkey, items }
     }
 }
 
@@ -1344,12 +1394,12 @@ impl<T: OtapPayloadHelpers> Inputs<T> {
         Self {
             pending: self.pending.drain(..).collect(),
             context: self.context.drain(..).collect(),
-            weight: std::mem::take(&mut self.weight),
+            items: std::mem::take(&mut self.items),
         }
     }
 
     const fn is_empty(&self) -> bool {
-        self.weight == 0
+        self.items == 0
     }
 
     const fn requests(&self) -> usize {
@@ -1363,14 +1413,15 @@ impl<T: OtapPayloadHelpers> Inputs<T> {
     fn size_by(&self, sizer: Sizer) -> Result<usize, PDataError> {
         match sizer {
             Sizer::Requests => Ok(self.requests()),
-            // For Sizer::Items / Sizer::Bytes, `weight` was accumulated in
-            // the active sizer's unit at accept() time, so this is exact.
-            Sizer::Items | Sizer::Bytes => Ok(self.weight),
+            Sizer::Items => Ok(self.items),
+            Sizer::Bytes => self.known_bytes().ok_or_else(|| PDataError::Format {
+                error: "bytes encoding not known".into(),
+            }),
         }
     }
 
     fn accept(&mut self, batch: T, part: BatchPortion) {
-        self.weight += part.weight;
+        self.items += part.items;
         self.pending.push(batch);
         self.context.push(part);
     }
@@ -1408,45 +1459,40 @@ where
     /// Takes the residual batch, used in case the final output is less than
     /// the lower bound. This removes the last output btach, the corresponding
     /// context, and places it back in the pending buffer as the first in line.
-    fn take_remaining(
-        &mut self,
-        sizer: Sizer,
-        from_inputs: &mut Inputs<T>,
-        output_batches: &mut Vec<T>,
-    ) {
+    fn take_remaining(&mut self, from_inputs: &mut Inputs<T>, output_batches: &mut Vec<T>) {
         // SAFETY: protected by output_batches.len() > 1.
         let remaining = output_batches.pop().expect("has last");
         let last_input = from_inputs.context.last().expect("has last");
-        let last_weight = sizer.batch_size(&remaining).expect("known size");
-        let new_part = BatchPortion::new(last_input.inkey, last_weight);
+        let last_items = remaining.num_items();
+        let new_part = BatchPortion::new(last_input.inkey, last_items);
 
-        from_inputs.weight -= last_weight;
+        from_inputs.items -= last_items;
 
         self.inputs.accept(remaining, new_part);
     }
 
     /// Using a multi-context corresponding with the input pending
-    /// data, and considering an output weight (in the active sizer's
-    /// unit) for a single output batch, this determines the set of
-    /// (maybe partial) pending batches that correspond. When merging
-    /// only (not splitting), this will return the entire set of pending
-    /// contexts; when splitting, this will return all except the portion
-    /// that was retained as first-in-line.
+    /// data, and considering an output item count for a single output
+    /// batch, this determines the set of (maybe partial) pending
+    /// batches that correspond. When merging only (not splitting),
+    /// this will return the entire set of pending contexts; when
+    /// splitting, this will return all except the portion that was
+    /// retained as first-in-line.
     fn drain_context(
         &mut self,
-        mut weight: usize,
+        mut items: usize,
         contexts: &mut MultiContext,
     ) -> Option<Vec<BatchPortion>> {
         let mut out = Vec::new();
 
-        while weight > 0 && contexts.pos < contexts.inputs.len() {
+        while items > 0 && contexts.pos < contexts.inputs.len() {
             let bp = contexts.inputs.get_mut(contexts.pos).expect("valid");
 
-            let take = bp.weight.min(weight);
-            bp.weight -= take;
-            weight -= take;
+            let take = bp.items.min(items);
+            bp.items -= take;
+            items -= take;
 
-            if bp.weight == 0 {
+            if bp.items == 0 {
                 contexts.pos += 1;
             }
 
@@ -1624,12 +1670,14 @@ mod tests {
         (telemetry_registry, metrics_reporter, phase)
     }
 
-    /// Helper to verify that batch counters were incremented.
+    /// Helper to verify consumed and produced item metrics
     fn verify_item_metrics(
         telemetry_registry: &TelemetryRegistryHandle,
         signal: SignalType,
-        _expected_items: usize,
+        expected_items: usize,
     ) {
+        let mut consumed_items = 0u64;
+        let mut produced_items = 0u64;
         let mut consumed_batches = 0u64;
         let mut produced_batches = 0u64;
 
@@ -1637,6 +1685,18 @@ mod tests {
             if desc.name == "otap.processor.batch" {
                 for (field, value) in iter {
                     match (signal, field.name) {
+                        (SignalType::Logs, "consumed.items.logs") => {
+                            consumed_items = value.to_u64_lossy()
+                        }
+                        (SignalType::Logs, "produced.items.logs") => {
+                            produced_items = value.to_u64_lossy()
+                        }
+                        (SignalType::Traces, "consumed.items.traces") => {
+                            consumed_items = value.to_u64_lossy()
+                        }
+                        (SignalType::Traces, "produced.items.traces") => {
+                            produced_items = value.to_u64_lossy()
+                        }
                         (SignalType::Logs, "consumed.batches.logs") => {
                             consumed_batches = value.to_u64_lossy()
                         }
@@ -1655,6 +1715,14 @@ mod tests {
             }
         });
 
+        assert_eq!(
+            consumed_items as usize, expected_items,
+            "consumed_items metric must match"
+        );
+        assert_eq!(
+            produced_items as usize, expected_items,
+            "produced_items metric must match"
+        );
         assert!(produced_batches != 0, "produced_batches != 0");
         assert!(consumed_batches != 0, "consumed_batches != 0");
     }
