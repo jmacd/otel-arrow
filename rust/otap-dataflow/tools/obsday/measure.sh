@@ -319,6 +319,14 @@ lines.append(f"- window wall time: **{fmt(dwall, ' s')}**")
 lines.append(f"- records sent: **{int(drec):,}**  -> **{fmt(recs_per_s, ' rec/s') if recs_per_s else 'n/a'}**")
 lines.append(f"- bytes sent (post-batch, OTLP wire): **{int(dbytes):,} B**  -> **{fmt(bytes_per_s, ' B/s') if bytes_per_s else 'n/a'}**")
 lines.append(f"- logger CPU usage: **{fmt(cpu_pct, '%') if cpu_pct is not None else 'n/a'}**  (sum of user+sys, divided by wall)")
+# Worker -> ITS channel drops: emit() either survives (one consumed batch)
+# or is dropped at try_send. Compare effective consumption rate (during the
+# 25%->75% window) to the logger self-reported emission rate.
+emit_rate = float(rate)
+drop_pct = None
+if recs_per_s is not None and emit_rate > 0:
+    drop_pct = max(0.0, 100.0 * (1.0 - recs_per_s / emit_rate))
+    lines.append(f"- ingest drops: **{drop_pct:.2f}%**  (1 - effective/target)")
 lines.append("")
 lines.append("## Memory (logger process)\n")
 for k in ("VmHWM", "VmRSS", "VmSize"):

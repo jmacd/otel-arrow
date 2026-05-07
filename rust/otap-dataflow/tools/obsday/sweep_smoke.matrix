@@ -1,0 +1,3 @@
+otlp_smoke_w1   configs/obsday-logger.yaml       1   10000
+otlp_smoke_w2   configs/obsday-logger.yaml       2   10000
+otap_smoke_w1   configs/obsday-otap-logger.yaml  1   10000

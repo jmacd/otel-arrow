@@ -1,0 +1,18 @@
+# Workers / rate sweep over both pipeline configs.
+# Goal: characterise effect of worker count and find drop-free operating range.
+# Format: NAME  CONFIG  WORKERS  RATE
+otlp_w1_1k     configs/obsday-logger.yaml       1   1000
+otlp_w2_1k     configs/obsday-logger.yaml       2   1000
+otlp_w4_1k     configs/obsday-logger.yaml       4   1000
+otlp_w1_10k    configs/obsday-logger.yaml       1   10000
+otlp_w2_10k    configs/obsday-logger.yaml       2   10000
+otlp_w4_10k    configs/obsday-logger.yaml       4   10000
+otlp_w1_50k    configs/obsday-logger.yaml       1   50000
+otlp_w2_50k    configs/obsday-logger.yaml       2   50000
+otlp_w4_50k    configs/obsday-logger.yaml       4   50000
+otap_w1_1k     configs/obsday-otap-logger.yaml  1   1000
+otap_w2_1k     configs/obsday-otap-logger.yaml  2   1000
+otap_w4_1k     configs/obsday-otap-logger.yaml  4   1000
+otap_w1_10k    configs/obsday-otap-logger.yaml  1   10000
+otap_w2_10k    configs/obsday-otap-logger.yaml  2   10000
+otap_w4_10k    configs/obsday-otap-logger.yaml  4   10000
