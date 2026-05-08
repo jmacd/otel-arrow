@@ -1,0 +1,1 @@
+powershell.exe -c "Start-Process msedge '$(wslpath -w experiments.svg)'"
