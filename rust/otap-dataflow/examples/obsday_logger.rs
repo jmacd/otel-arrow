@@ -147,6 +147,43 @@ struct EventTemplate {
     slot_pools: Vec<Vec<String>>,
 }
 
+/// Persistent path where we cache a clone of the semconv registry across
+/// runs so each `obsday_logger` invocation does not re-clone (which would
+/// otherwise pollute every CPU profile with `gix`/`mkdir`/`unlinkat`).
+fn semconv_cache_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
+    PathBuf::from(home).join(".cache/obsday/semantic-conventions")
+}
+
+/// Ensure a local clone of the OpenTelemetry semantic-conventions registry
+/// exists at `semconv_cache_dir()`; clone (shallow) if not. Returns the
+/// path to the cloned tree.
+fn ensure_semconv_clone() -> Result<PathBuf, String> {
+    let dir = semconv_cache_dir();
+    let model = dir.join("model");
+    if model.is_dir() {
+        return Ok(dir);
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
+    }
+    println!("cloning {DEFAULT_SEMCONV_URL} into {dir:?} (one-time) ...");
+    let status = std::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth=1",
+            "--single-branch",
+            DEFAULT_SEMCONV_URL,
+            dir.to_str().ok_or("invalid clone path")?,
+        ])
+        .status()
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if !status.success() {
+        return Err(format!("git clone failed with {status}"));
+    }
+    Ok(dir)
+}
+
 /// Build a list of realistic event templates from the OpenTelemetry
 /// semantic-conventions registry.
 ///
@@ -155,10 +192,13 @@ struct EventTemplate {
 /// single-entry pool. Empty entries and entries longer than 256 bytes
 /// are skipped. Returns an error if no usable templates were found.
 fn build_event_templates() -> Result<Vec<EventTemplate>, String> {
-    let path = VirtualDirectoryPath::GitRepo {
-        url: DEFAULT_SEMCONV_URL.to_string(),
-        sub_folder: Some("model".to_string()),
-        refspec: None,
+    let clone_dir = ensure_semconv_clone()?;
+    let model_dir = clone_dir.join("model");
+    let path = VirtualDirectoryPath::LocalFolder {
+        path: model_dir
+            .to_str()
+            .ok_or_else(|| format!("non-utf8 model path: {model_dir:?}"))?
+            .to_string(),
     };
     let repo = RegistryRepo::try_new("main", &path).map_err(|e| e.to_string())?;
     let registry = match SchemaResolver::load_semconv_repository(repo, false) {
