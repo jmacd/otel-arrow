@@ -165,8 +165,11 @@ snapshot() {
   date +%s.%N > "$RUNDIR/wall-${label}.txt"
   cp "/proc/$LOGGER_PID/stat" "$RUNDIR/stat-${label}.txt" 2>/dev/null || true
   cp "/proc/$LOGGER_PID/status" "$RUNDIR/status-${label}.txt" 2>/dev/null || true
+  cp "/proc/$LOGGER_PID/io" "$RUNDIR/io-${label}.txt" 2>/dev/null || true
   curl -fsS "http://${LOGGER_ADMIN}/api/v1/telemetry/metrics?format=prometheus" \
     > "$RUNDIR/prom-${label}.txt" 2>/dev/null || true
+  curl -fsS "http://${COLLECTOR_ADMIN}/api/v1/telemetry/metrics?format=prometheus" \
+    > "$RUNDIR/coll-prom-${label}.txt" 2>/dev/null || true
 }
 
 # 3. Scrape at 25% and 75% of duration.
@@ -258,6 +261,43 @@ _, bytes25, _ = parse_prom(os.path.join(run, "prom-25.txt"),
 _, bytes75, _ = parse_prom(os.path.join(run, "prom-75.txt"),
                            "flush_output_bytes_sum")
 
+def parse_io(path):
+    """Parse /proc/<pid>/io: returns (rchar, wchar) bytes."""
+    out = {}
+    for line in read(path).splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            try:
+                out[k.strip()] = int(v.strip())
+            except ValueError:
+                pass
+    return out.get("rchar", 0), out.get("wchar", 0)
+
+# Bytes-on-wire: prefer collector-side bytes (uniform across OTLP/OTAP).
+# Fall back to logger-side flush_output_bytes_sum (only available when
+# the batch processor's output is bytes, i.e. OTLP).
+_, coll_bytes25, _ = parse_prom(os.path.join(run, "coll-prom-25.txt"),
+                                "consumed_bytes_logs")
+_, coll_bytes75, _ = parse_prom(os.path.join(run, "coll-prom-75.txt"),
+                                "consumed_bytes_logs")
+if coll_bytes75 > 0 and coll_bytes25 >= 0:
+    bytes25, bytes75 = coll_bytes25, coll_bytes75
+    bytes_source = "collector receiver consumed_bytes_logs"
+elif bytes75 > 0:
+    bytes_source = "logger batch flush_output_bytes_sum"
+else:
+    # Final fallback: /proc/<pid>/io wchar on the logger. Counts every
+    # byte the process writes via syscalls; for both OTLP/proto and OTAP
+    # this is dominated by the writev() to the gRPC socket so it tracks
+    # wire bytes well (some small overhead from log writes / metrics).
+    _, io25 = parse_io(os.path.join(run, "io-25.txt"))
+    _, io75 = parse_io(os.path.join(run, "io-75.txt"))
+    if io75 > io25 > 0:
+        bytes25, bytes75 = io25, io75
+        bytes_source = "logger /proc/<pid>/io wchar"
+    else:
+        bytes_source = "(unavailable)"
+
 # Memory: VmHWM (peak RSS) and VmRSS (final). Take the latest snapshot
 # captured while the logger was still alive (75% mark, fall back to 25%).
 vm = {}
@@ -309,7 +349,7 @@ lines.append("")
 lines.append("## Window measurement (25% -> 75% of test)\n")
 lines.append(f"- window wall time: **{fmt(dwall, ' s')}**")
 lines.append(f"- records sent: **{int(drec):,}**  -> **{fmt(recs_per_s, ' rec/s') if recs_per_s else 'n/a'}**")
-lines.append(f"- bytes sent (post-batch, OTLP wire): **{int(dbytes):,} B**  -> **{fmt(bytes_per_s, ' B/s') if bytes_per_s else 'n/a'}**")
+lines.append(f"- bytes sent (post-batch, OTLP wire): **{int(dbytes):,} B**  -> **{fmt(bytes_per_s, ' B/s') if bytes_per_s else 'n/a'}**  *(source: {bytes_source})*")
 lines.append(f"- logger CPU usage: **{fmt(cpu_pct, '%') if cpu_pct is not None else 'n/a'}**  (sum of user+sys, divided by wall)")
 # Worker -> ITS channel drops: emit() either survives (one consumed batch)
 # or is dropped at try_send. Compare effective consumption rate (during the

@@ -1,0 +1,34 @@
+version: otel_dataflow/v1
+
+# obsday-otap-collector.yaml
+#
+# Stand-alone collector for the OTAP variant of the obsday experiment.
+# Receives OTAP/gRPC traffic from `obsday_logger` (configured via
+# obsday-otap-logger.yaml) and discards it.
+
+engine:
+  http_admin:
+    bind_address: "127.0.0.1:9877"
+
+groups:
+  default:
+    pipelines:
+      main:
+        policies:
+          channel_capacity:
+            control:
+              node: 100
+              pipeline: 100
+            pdata: 128
+        nodes:
+          receiver:
+            type: receiver:otap
+            config:
+              listening_addr: "127.0.0.1:4317"
+              response_stream_channel_size: 100
+          exporter:
+            type: exporter:noop
+            config: {}
+        connections:
+          - from: receiver
+            to: exporter

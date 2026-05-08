@@ -132,14 +132,29 @@ fn parse_core_id_allocation(s: &str) -> Result<CoreAllocation, String> {
     Ok(CoreAllocation::core_set(ranges?))
 }
 
-/// Build a pool of plausible attribute values from the OpenTelemetry
+/// One realistic log-event shape harvested from the OpenTelemetry
 /// semantic-conventions registry.
 ///
-/// Walks `event` and `attribute_group` definitions and harvests every
-/// string value present in attribute `examples` (including string-typed
-/// `Any`). Empty entries and entries longer than 256 bytes are skipped.
-/// Falls back to a small built-in pool if the resulting set is empty.
-fn build_semconv_pool() -> Result<Vec<String>, String> {
+/// `name` is the event name; `slot_pools[i]` contains the example values
+/// (or, when no examples are present, the attribute name itself) for the
+/// i-th attribute of the originating semconv group. At emit time, slot
+/// `j` of the fixed `emit_N` callsite is filled by drawing one value from
+/// `slot_pools[j % slot_pools.len()]`. Drawing values from the same
+/// template per emit keeps attributes correlated; the small example pools
+/// give downstream OTAP dictionary encoding real dedup opportunities.
+struct EventTemplate {
+    name: String,
+    slot_pools: Vec<Vec<String>>,
+}
+
+/// Build a list of realistic event templates from the OpenTelemetry
+/// semantic-conventions registry.
+///
+/// One template per `event` group. For each attribute we collect either
+/// the registered string examples or, if none, the attribute name as a
+/// single-entry pool. Empty entries and entries longer than 256 bytes
+/// are skipped. Returns an error if no usable templates were found.
+fn build_event_templates() -> Result<Vec<EventTemplate>, String> {
     let path = VirtualDirectoryPath::GitRepo {
         url: DEFAULT_SEMCONV_URL.to_string(),
         sub_folder: Some("model".to_string()),
@@ -162,57 +177,76 @@ fn build_semconv_pool() -> Result<Vec<String>, String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let mut pool = Vec::<String>::new();
-    let mut push = |s: String| {
-        if !s.is_empty() && s.len() <= 256 {
-            pool.push(s);
-        }
-    };
+    fn keep(s: &str) -> bool {
+        !s.is_empty() && s.len() <= 256
+    }
+
+    let mut templates: Vec<EventTemplate> = Vec::new();
     for group in &resolved_registry.groups {
-        if !matches!(group.r#type, GroupType::Event | GroupType::AttributeGroup) {
+        if !matches!(group.r#type, GroupType::Event) {
             continue;
         }
+        let event_name = group
+            .name
+            .clone()
+            .or_else(|| Some(group.id.clone()))
+            .unwrap_or_default();
+        if event_name.is_empty() || group.attributes.is_empty() {
+            continue;
+        }
+        let mut slot_pools: Vec<Vec<String>> = Vec::with_capacity(group.attributes.len());
         for attr in &group.attributes {
+            let mut examples: Vec<String> = Vec::new();
             let is_stringy = matches!(
                 &attr.r#type,
                 AttributeType::PrimitiveOrArray(
                     PrimitiveOrArrayTypeSpec::String | PrimitiveOrArrayTypeSpec::Any,
                 )
             );
-            if !is_stringy {
-                continue;
-            }
-            match &attr.examples {
-                Some(Examples::String(s)) => push(s.to_string()),
-                Some(Examples::Strings(ss)) => {
-                    for s in ss {
-                        push(s.to_string());
+            if is_stringy {
+                match &attr.examples {
+                    Some(Examples::String(s)) if keep(s) => examples.push(s.to_string()),
+                    Some(Examples::Strings(ss)) => {
+                        for s in ss {
+                            if keep(s) {
+                                examples.push(s.to_string());
+                            }
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-            // Also include the attribute name; in real telemetry the
-            // attribute names themselves repeat heavily and dedup well.
-            push(attr.name.clone());
+            if examples.is_empty() {
+                // Fall back to the attribute name so the slot still has a
+                // realistic, repeating value (real apps emit attribute
+                // names verbatim a lot anyway).
+                examples.push(attr.name.clone());
+            }
+            slot_pools.push(examples);
         }
+        templates.push(EventTemplate {
+            name: event_name,
+            slot_pools,
+        });
     }
-    pool.sort();
-    pool.dedup();
-    if pool.is_empty() {
-        return Err("semconv pool came up empty".to_string());
+    if templates.is_empty() {
+        return Err("no event templates found in semconv registry".to_string());
     }
-    Ok(pool)
+    Ok(templates)
 }
 
-fn pick_from_pool(rng: &mut StdRng, pool: &[String], buf: &mut String) {
+fn fill_from_template(rng: &mut StdRng, t: &EventTemplate, values: &mut [String]) {
     use rand::RngExt;
-    let s = &pool[rng.random_range(0..pool.len())];
-    buf.clear();
-    buf.push_str(s);
+    for (j, buf) in values.iter_mut().enumerate() {
+        let pool = &t.slot_pools[j % t.slot_pools.len()];
+        let s = &pool[rng.random_range(0..pool.len())];
+        buf.clear();
+        buf.push_str(s);
+    }
 }
 
 /// Emitter table: indexed by attribute count. `None` slots are unsupported.
-type Emitter = fn(u64, &[String]);
+type Emitter = fn(&str, u64, &[String]);
 
 const fn emitter_for(attrs: usize) -> Option<Emitter> {
     match attrs {
@@ -227,33 +261,40 @@ const fn emitter_for(attrs: usize) -> Option<Emitter> {
 }
 
 // Each emitter is a distinct `tracing` callsite with a fixed set of fields.
-// The `&[String]` slice must have at least the indicated number of entries.
+// The tracing event name (callsite metadata) must be a string literal, so
+// it is fixed at "obsday.log". The realistic semconv event name is passed
+// through as the `evt` attribute value; with a small set of templates the
+// `evt` strings repeat heavily and OTAP dictionary encoding deduplicates
+// them along with the per-slot k0..kN values.
 
-fn emit_1(seq: u64, v: &[String]) {
-    otel_info!("obsday.log", seq = seq, k0 = v[0].as_str());
+fn emit_1(evt: &str, seq: u64, v: &[String]) {
+    otel_info!("obsday.log", seq = seq, evt = evt, k0 = v[0].as_str());
 }
-fn emit_2(seq: u64, v: &[String]) {
+fn emit_2(evt: &str, seq: u64, v: &[String]) {
     otel_info!(
         "obsday.log",
         seq = seq,
+        evt = evt,
         k0 = v[0].as_str(),
         k1 = v[1].as_str()
     );
 }
-fn emit_4(seq: u64, v: &[String]) {
+fn emit_4(evt: &str, seq: u64, v: &[String]) {
     otel_info!(
         "obsday.log",
         seq = seq,
+        evt = evt,
         k0 = v[0].as_str(),
         k1 = v[1].as_str(),
         k2 = v[2].as_str(),
         k3 = v[3].as_str()
     );
 }
-fn emit_8(seq: u64, v: &[String]) {
+fn emit_8(evt: &str, seq: u64, v: &[String]) {
     otel_info!(
         "obsday.log",
         seq = seq,
+        evt = evt,
         k0 = v[0].as_str(),
         k1 = v[1].as_str(),
         k2 = v[2].as_str(),
@@ -264,10 +305,11 @@ fn emit_8(seq: u64, v: &[String]) {
         k7 = v[7].as_str()
     );
 }
-fn emit_16(seq: u64, v: &[String]) {
+fn emit_16(evt: &str, seq: u64, v: &[String]) {
     otel_info!(
         "obsday.log",
         seq = seq,
+        evt = evt,
         k0 = v[0].as_str(),
         k1 = v[1].as_str(),
         k2 = v[2].as_str(),
@@ -286,10 +328,11 @@ fn emit_16(seq: u64, v: &[String]) {
         k15 = v[15].as_str()
     );
 }
-fn emit_32(seq: u64, v: &[String]) {
+fn emit_32(evt: &str, seq: u64, v: &[String]) {
     otel_info!(
         "obsday.log",
         seq = seq,
+        evt = evt,
         k0 = v[0].as_str(),
         k1 = v[1].as_str(),
         k2 = v[2].as_str(),
@@ -331,10 +374,11 @@ fn worker_loop(
     period: Duration,
     deadline: Instant,
     attrs: usize,
-    pool: Arc<Vec<String>>,
+    templates: Arc<Vec<EventTemplate>>,
     counter: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
+    use rand::RngExt;
     let emit = emitter_for(attrs).expect("validated in main");
     let mut rng = StdRng::seed_from_u64(seed ^ worker_id);
     let mut values: Vec<String> = (0..attrs).map(|_| String::with_capacity(64)).collect();
@@ -349,12 +393,11 @@ fn worker_loop(
         }
         next_tick += period;
 
-        for buf in &mut values {
-            pick_from_pool(&mut rng, &pool, buf);
-        }
+        let t = &templates[rng.random_range(0..templates.len())];
+        fill_from_template(&mut rng, t, &mut values);
         // Encode worker id into the sequence so values are globally unique.
         let seq = (worker_id << 48) | local_seq;
-        emit(seq, &values);
+        emit(t.name.as_str(), seq, &values);
         local_seq += 1;
     }
     let _ = counter.fetch_add(local_seq, Ordering::Relaxed);
@@ -433,16 +476,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Build the value pool up-front (the registry fetch is slow and does
+    // Build event templates up-front (the registry fetch is slow and does
     // not belong in the measurement window).
     println!("loading semconv registry from {DEFAULT_SEMCONV_URL} ...");
     let pool_t0 = Instant::now();
-    let value_pool: Arc<Vec<String>> = Arc::new(
-        build_semconv_pool().map_err(|e| format!("semconv pool: {e}"))?,
+    let templates: Arc<Vec<EventTemplate>> = Arc::new(
+        build_event_templates().map_err(|e| format!("event templates: {e}"))?,
     );
+    let total_examples: usize = templates
+        .iter()
+        .flat_map(|t| t.slot_pools.iter().map(|p| p.len()))
+        .sum();
     println!(
-        "semconv pool ready: {} distinct values in {:.2}s",
-        value_pool.len(),
+        "event templates ready: {} events, {} slot-examples in {:.2}s",
+        templates.len(),
+        total_examples,
         pool_t0.elapsed().as_secs_f64(),
     );
 
@@ -466,12 +514,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     thread::sleep(Duration::from_secs(args.warmup_secs));
 
     println!(
-        "starting emission: rate={}/s workers={} attrs={} duration={}s pool_size={}",
+        "starting emission: rate={}/s workers={} attrs={} duration={}s templates={}",
         args.rate,
         args.workers,
         args.attrs,
         args.duration,
-        value_pool.len(),
+        templates.len(),
     );
 
     let per_worker_rate = (args.rate as f64) / (args.workers as f64);
@@ -485,7 +533,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for w in 0..args.workers {
         let counter = Arc::clone(&counter);
         let stop = Arc::clone(&stop);
-        let pool = Arc::clone(&value_pool);
+        let templates = Arc::clone(&templates);
         let attrs = args.attrs;
         let seed = args.seed;
         handles.push(
@@ -493,7 +541,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .name(format!("obsday-w{w}"))
                 .spawn(move || {
                     worker_loop(
-                        w as u64, seed, period, deadline, attrs, pool, counter, stop,
+                        w as u64, seed, period, deadline, attrs, templates, counter, stop,
                     );
                 })?,
         );

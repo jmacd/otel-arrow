@@ -45,15 +45,16 @@ engine:
               min_size: 8192
               sizer: items
             max_batch_duration: 1s
-        otlp:
-          type: exporter:otlp_grpc
+        otap:
+          type: exporter:otap
           config:
             grpc_endpoint: "http://127.0.0.1:4317"
+            compression_method: zstd
       connections:
         - from: itr
           to: batch
         - from: batch
-          to: otlp
+          to: otap
 
 # `obsday_logger` does not emit pdata into a main pipeline; it drives the
 # observability pipeline through the global tracing dispatcher. A minimal

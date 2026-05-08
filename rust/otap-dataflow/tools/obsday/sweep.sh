@@ -47,11 +47,12 @@ fi
 
 mkdir -p "$OUTDIR"
 
-# Collect runs in declared order.
+# Collect runs in declared order. Optional 5th column = collector config.
 runs=()
-while read -r name config workers rate _rest; do
+while read -r name config workers rate collector _rest; do
   [[ -z "$name" || "$name" =~ ^# ]] && continue
-  runs+=("$name|$config|$workers|$rate")
+  collector="${collector:-configs/obsday-collector.yaml}"
+  runs+=("$name|$config|$workers|$rate|$collector")
 done < "$MATRIX"
 
 echo "[sweep] ${#runs[@]} runs into $OUTDIR (duration=${DURATION}s, num_cores=$NUM_CORES)"
@@ -60,8 +61,8 @@ echo
 i=0
 for entry in "${runs[@]}"; do
   i=$((i+1))
-  IFS='|' read -r name config workers rate <<<"$entry"
-  echo "==== [$i/${#runs[@]}] $name (config=$config workers=$workers rate=$rate) ===="
+  IFS='|' read -r name config workers rate collector <<<"$entry"
+  echo "==== [$i/${#runs[@]}] $name (config=$config collector=$collector workers=$workers rate=$rate) ===="
   rm -rf "$OUTDIR/$name"
   bash tools/obsday/measure.sh \
       --name "$name" \
@@ -70,6 +71,7 @@ for entry in "${runs[@]}"; do
       --workers "$workers" \
       --num-cores "$NUM_CORES" \
       --logger-config "$config" \
+      --collector-config "$collector" \
       --outdir "$OUTDIR" \
     >"$OUTDIR/${name}.measure.log" 2>&1 || {
       echo "[sweep] WARN: measure.sh failed for $name (see $OUTDIR/${name}.measure.log)"
