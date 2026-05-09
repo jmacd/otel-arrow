@@ -28,6 +28,9 @@ OTLP-vs-OTAP story:
 | `gen_node_otlp_receiver.py` | `node_otlp_receiver.svg` | Per-node slide for `urn:otel:receiver:otlp` (`OTLPReceiver`). First receiver slide. Listens for OTLP/gRPC and OTLP/HTTP exports and admits each request as a lazily-decoded `OtlpProtoBytes` payload; the calldata chip carries a `SlotKey` so `wait_for_result` requests are paired with their downstream Ack/Nack. |
 | `gen_node_otlp_grpc_exporter.py` | `node_otlp_grpc_exporter.svg` | Per-node slide for `urn:otel:exporter:otlp_grpc` (`OTLPExporter`). First exporter slide. Encodes OTAP inputs to OTLP protobuf bytes and dispatches per-signal RPCs over a pooled tonic channel, capped by `max_in_flight`. The right-side port labels show `gRPC` / `gRPC status` because that side faces the network. |
 | `gen_node_otlp_http_exporter.py` | `node_otlp_http_exporter.svg` | Per-node slide for `urn:otel:exporter:otlp_http` (`OtlpHttpExporter`). HTTP/1.1 sibling of the gRPC exporter; pools hyper clients for SO_REUSEPORT load balancing and supports per-signal endpoint overrides. Right-side port labels show `HTTP` / `HTTP status`. |
+| `gen_engine_group.py` | `engine_group.svg` | Engine-architecture slide #1 — the **pipeline group**: one controller process (with its accessory thread-local tasks and shared resources), the `http-admin` thread, and the N per-core `RuntimePipeline` instances. Emphasises one OS thread per assigned core; cross-thread edges are dashed grey. |
+| `gen_engine_core.py`  | `engine_core.svg`  | Engine-architecture slide #2 — one **per-core pipeline thread**: the in-thread actors (`RuntimeCtrlMsgManager`, `PipelineCompletionMsgDispatcher`), a representative receiver→processor→exporter node chain, and the per-core `TopicSet` view of the cross-core `TopicBroker`. Boundary stubs identify every channel that crosses out of the thread. |
+| `gen_otap_pdata.py`   | `otap_pdata.svg`   | Anatomy of the in-flight `OtapPdata` value: `Context` (stack of `Frame`s + `transport_headers` + `flow_compute_ns`) plus a `payload: OtapPayload` (tagged enum: `OtapArrowRecords` / `OtlpBytes`). One `Frame` is exploded out to show `node_id` (return address / source node), `interests` (8 bitflags drawn as mini boxes), and the nested `RouteData` (`calldata`, `entry_time_ns`, `output_port_index`). |
 
 `gen_diagram.py` produces `experiments.svg`, a single-slide diagram that
 explains the OTLP-vs-OTAP conversion-cost experiments visually. The design
@@ -210,6 +213,13 @@ python3 gen_node_otlp_receiver.py         # writes node_otlp_receiver.svg
 # Exporters
 python3 gen_node_otlp_grpc_exporter.py    # writes node_otlp_grpc_exporter.svg
 python3 gen_node_otlp_http_exporter.py    # writes node_otlp_http_exporter.svg
+
+# Engine architecture
+python3 gen_engine_group.py               # writes engine_group.svg
+python3 gen_engine_core.py                # writes engine_core.svg
+
+# OtapPdata anatomy
+python3 gen_otap_pdata.py                 # writes otap_pdata.svg
 ```
 
 Open in a browser (on WSL):
@@ -847,3 +857,124 @@ if __name__ == "__main__":
 `gen_node_retry.py`, `gen_node_batch.py`, and
 `gen_node_transform.py` are the canonical references.
 
+## Engine architecture slides (`gen_engine_group.py`, `gen_engine_core.py`)
+
+These two slides describe the *runtime* — where threads live, which
+tasks run on which thread, and which channels cross thread
+boundaries. They are a parallel deck to the per-node slides and reuse
+`node_lib`'s palette, title bar, notes box, and arrow markers so they
+read like part of the same family.
+
+The pair is meant to be shown in zoom-in order:
+
+1. `engine_group.svg` — *one pipeline group at runtime*: the
+   controller process (with its accessory `spawn_thread_local_task`
+   tiles — `process-memory-limiter`, `metrics-aggregator`,
+   `metrics-dispatcher`, `observed-state-store`, `engine-metrics` —
+   plus shared resources `DeclaredTopics(TopicBroker)` and the
+   `memory_pressure` watch sender), the separate `http-admin` thread
+   reachable via `Arc<dyn ControlPlane>`, and the N per-core
+   `RuntimePipeline` instance tiles. The blue banner across the top
+   of the right column states the invariant out loud:
+   *"one OS thread → one tokio current_thread runtime → one core"*.
+2. `engine_core.svg` — *zoom in to one core*: a single big
+   blue-bordered box represents the OS thread + its
+   `tokio current_thread` + `LocalSet` (`!Send` node tasks). Inside
+   the box: `RuntimeCtrlMsgManager` and
+   `PipelineCompletionMsgDispatcher` on top, a representative
+   receiver→processor→exporter chain in the middle, and the per-core
+   `TopicSet` view at the bottom. Boundary stubs identify every
+   channel that crosses out of the thread.
+
+### Conventions specific to these slides
+
+1. **Color extends to the runtime plane.** OTAP-blue is reused as
+   the accent for "this is a pdata-carrying pipeline thread" — both
+   the per-core instance tiles on the group slide and the outer
+   thread frame on the per-core slide use it. Neutral grey is the
+   accent for the controller process; the warm context-chip color
+   is the accent for the admin thread (a non-pdata accessory
+   process).
+2. **Edge style = scope.** Thick colored = pdata; thin solid grey =
+   in-thread control / ack-nack; thin **dashed** grey = cross-thread
+   tokio channel (e.g. `RuntimeCtrlMsgSender`, `memory_pressure`
+   watch, `topics`); dotted thin = "weak handle / observation" (e.g.
+   `note_instance_exit`). The dashed-vs-solid distinction is the
+   only way the picture marks a thread boundary.
+3. **Accessory tiles.** Inside the controller box, each
+   `spawn_thread_local_task` is rendered as a compact pill with the
+   task name in monospace on the left and a one-line role on the
+   right. Each pill is itself an OS thread + a tokio
+   `current_thread` runtime — the tile chrome is intentionally
+   plain to avoid implying any are pipelines.
+4. **Per-core tile shape is repeated.** The group slide draws three
+   instances (Core 0, Core 1, vertical ellipsis, Core N) — the
+   pattern of channels between controller and one core is drawn in
+   full only against Core 0; Core 1 and Core N receive short
+   unlabelled stubs to communicate "every core has the same
+   relationship". Adding more cores means adding more stubs, never
+   more channel types.
+5. **Boundary stubs name the Rust channel type.** On the per-core
+   slide, every line that crosses the outer thread frame is labelled
+   with the Rust handle that owns that crossing
+   (`RuntimeCtrlMsgReceiver`, `PipelineCompletionMsgSender`,
+   `note_instance_exit (Weak)`, `memory_pressure (watch) rx`,
+   `topics (TopicBroker)`). Anything not crossing the frame is
+   in-thread and stays unlabelled at the boundary.
+6. **One source-of-truth comment block** sits at the top of each
+   generator listing the file:line citations the slide is built
+   from. When the runtime layout changes, update those citations
+   and re-run.
+
+
+## OtapPdata anatomy slide (`gen_otap_pdata.py`)
+
+A single slide that opens up the value carried on every pdata edge in
+the per-node deck. Reuses `node_lib`'s palette and chrome.
+
+Composition (left to right):
+
+1. **`OtapPdata` outer box** with the OTAP-blue accent stripe.
+   Contains a `Context` panel.
+2. **`Context` panel** holding three things:
+   - a vertical **`stack: Vec<Frame>`** drawn bottom-up (matching
+     Rust `Vec` push/pop), with the topmost frame tagged
+     *"top of stack — next to be popped on Ack/Nack"*;
+   - a **`transport_headers`** chip (preserved across topic hops);
+   - a **`flow_compute_ns`** chip (active flow_metric accumulator).
+3. **`payload: OtapPayload` panel** with a two-tone top stripe
+   (half OTAP-blue, half OTLP-red) and two variant chips:
+   `OtapArrowRecords` (blue) and `OtlpBytes` (red). Each variant
+   chip carries the same inverse-white `[OTAP]` / `[OTLP]` format
+   chip used on the per-node port lines, so the visual link is
+   explicit.
+4. **Exploded `Frame` panel** in the lower right, connected to the
+   middle frame in the stack by a dotted OTAP-blue leader. Lists
+   every field at its source-code identifier and Rust type:
+   `node_id: usize` (return address / source node), the eight
+   `Interests` bits drawn as mini boxes (filled = set in the
+   sample frame), and the nested `route: RouteData` with
+   `calldata: CallData` (`SmallVec<[Context8u8; 3]>`),
+   `entry_time_ns: u64`, `output_port_index: u16`.
+
+### Conventions specific to this slide
+
+1. **Stack grows upward.** Top of the column = top of the Rust
+   `Vec` = next frame to be popped during Ack/Nack unwind.
+2. **Color = format on the payload side.** The `payload` panel
+   is the only place in the deck where both OTAP-blue and OTLP-red
+   appear on the same object, because `OtapPayload` is a tagged
+   enum and the diagram needs to show that exactly one variant is
+   present at a time.
+3. **Bitflag boxes are mini, not full chips.** The eight `Interests`
+   bits are tiny rounded squares (filled when set, empty when
+   clear) with rotated mono labels under each. They are *not* the
+   per-node format chips — different shape, different scale, so
+   the viewer does not confuse "interest bit" with "pdata format".
+4. **One `Frame` is exploded; the others stay condensed.** The
+   middle frame is painted in the OTAP accent color and a dotted
+   leader runs to the explosion panel. The other frames keep the
+   neutral grey accent so the eye is drawn to the explosion.
+5. **Source citations on every panel.** Each box carries its
+   source file:line in the upper-right corner so the picture
+   stays auditable against the code.
