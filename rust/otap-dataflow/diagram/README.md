@@ -12,6 +12,19 @@ OTLP-vs-OTAP story:
 | `gen_node_retry.py`  | `node_retry.svg`   | Per-node slide for `urn:otel:processor:retry`. First instance of the per-node visual style described below. |
 | `gen_node_batch.py`  | `node_batch.svg`   | Per-node slide for `urn:otel:processor:batch`. Same per-node grammar; calldata chip carries a single `slot: SlotKey` so ack/nack on a coalesced batch fans back to its contributing inputs. |
 | `gen_node_transform.py` | `node_transform.svg` | Per-node slide for `urn:otel:processor:transform` (the "query" processor). Multi-language: today the `Query` config enum accepts a `kql_query` *or* an `opl_query` string (OTTL is a TODO). Both parsers produce the same `PipelineExpression` IR and feed the same OTAP/Arrow query engine, so language is a front-end choice only. Calldata chip carries `outbound: SlotKey` so Ack/Nack on each split-off batch (from a `route_to` operator) fans back to the original inbound. |
+| `gen_node_attributes.py` | `node_attributes.svg` | Per-node slide for `urn:otel:processor:attribute` (`AttributesProcessor`). Applies configured insert/update/delete edits to selected OTAP attribute domains (resource / scope / record). Output is OTAP because non-noop edits force conversion of OTLP inputs to OTAP records. |
+| `gen_node_content_router.py` | `node_content_router.svg` | Per-node slide for `urn:otel:processor:content_router` (`ContentRouter`). Routes each batch to one named output port keyed on a resource attribute value. Pure pass-through for both pdata formats. |
+| `gen_node_debug.py` | `node_debug.svg` | Per-node slide for `urn:otel:processor:debug` (`DebugProcessor`). Forwards pdata unchanged while emitting a decoded debug rendering of selected signals. Pass-through for both formats. |
+| `gen_node_delay.py` | `node_delay.svg` | Per-node slide for `urn:otel:processor:delay` (`DelayProcessor`). Sleeps for a configured duration before forwarding each pdata message — useful for back-pressure and ack-timing tests. Pass-through for both formats. |
+| `gen_node_durable_buffer.py` | `node_durable_buffer.svg` | Per-node slide for `urn:otel:processor:durable_buffer` (`DurableBufferProcessor`). Persists pdata to per-core durable storage before forwarding finalized bundles downstream so acks become *durable* receipts, not in-flight promises. Forwards both formats; OTLP handling is configurable. |
+| `gen_node_fanout.py` | `node_fanout.svg` | Per-node slide for `urn:otel:processor:fanout` (`FanoutProcessor`). Clones each pdata item to N configured output ports with optional ack aggregation and per-port fallbacks. Pass-through for both formats. |
+| `gen_node_filter.py` | `node_filter.svg` | Per-node slide for `urn:otel:processor:filter` (`FilterProcessor`). Drops log and trace records that match configured predicates. OTAP-only output: OTLP inputs are converted to OTAP Arrow records before filtering. |
+| `gen_node_log_sampling.py` | `node_log_sampling.svg` | Per-node slide for `urn:otel:processor:log_sampling` (`LogSamplingProcessor`). Reduces log volume with either a fixed sampling ratio or a per-window item budget. Forwards non-log signals unchanged, so both pdata formats appear on the output side. |
+| `gen_node_signal_type_router.py` | `node_signal_type_router.svg` | Per-node slide for `urn:otel:processor:type_router` (`SignalTypeRouter`). Routes pdata to `logs` / `metrics` / `traces` named output ports based on the inbound signal type. Pass-through for both formats. |
+| `gen_node_temporal_reaggregation.py` | `node_temporal_reaggregation.svg` | Per-node slide for `urn:otel:processor:temporal_reaggregation` (`TemporalReaggregationProcessor`). Reaggregates delta metrics over a configured period and flushes lower-frequency OTAP batches on a local scheduler wakeup. Non-metric signals pass through unchanged. |
+| `gen_node_condense_attributes.py` | `node_condense_attributes.svg` | Per-node slide for `urn:otel:processor:condense_attributes` (contrib). Condenses selected log attributes into a single destination attribute on the OTAP output records. OTAP-only output. |
+| `gen_node_recordset_kql.py` | `node_recordset_kql.svg` | Per-node slide for `urn:microsoft:processor:recordset_kql` (contrib). Runs a parsed RecordSet KQL pipeline over OTLP log records that arrive wrapped in OTAP pdata; emits OTLP bytes downstream. |
+| `gen_node_resource_validator.py` | `node_resource_validator.svg` | Per-node slide for `urn:otel:processor:resource_validator` (contrib). Validates required resource attributes and permanently Nacks data that fails policy. Pass-through for both formats when validation succeeds. |
 
 `gen_diagram.py` produces `experiments.svg`, a single-slide diagram that
 explains the OTLP-vs-OTAP conversion-cost experiments visually. The design
@@ -170,6 +183,23 @@ python3 gen_node_batch.py out.svg     # custom path
 
 python3 gen_node_transform.py             # writes node_transform.svg
 python3 gen_node_transform.py out.svg     # custom path
+
+# Remaining core processors
+python3 gen_node_attributes.py            # writes node_attributes.svg
+python3 gen_node_content_router.py        # writes node_content_router.svg
+python3 gen_node_debug.py                 # writes node_debug.svg
+python3 gen_node_delay.py                 # writes node_delay.svg
+python3 gen_node_durable_buffer.py        # writes node_durable_buffer.svg
+python3 gen_node_fanout.py                # writes node_fanout.svg
+python3 gen_node_filter.py                # writes node_filter.svg
+python3 gen_node_log_sampling.py          # writes node_log_sampling.svg
+python3 gen_node_signal_type_router.py    # writes node_signal_type_router.svg
+python3 gen_node_temporal_reaggregation.py  # writes node_temporal_reaggregation.svg
+
+# Contrib processors
+python3 gen_node_condense_attributes.py   # writes node_condense_attributes.svg
+python3 gen_node_recordset_kql.py         # writes node_recordset_kql.svg
+python3 gen_node_resource_validator.py    # writes node_resource_validator.svg
 ```
 
 Open in a browser (on WSL):
@@ -369,6 +399,28 @@ actually laid out.
   single inbound slot, and the inbound is only Ack'd / Nack'd
   once every outbound's Ack/Nack has decremented the refcount to
   zero (first error reason wins on Nack).
+- **Core processor coverage complete.** Remaining core processors
+  each have a SPEC + slide following the locked grammar:
+  `gen_node_attributes.py`, `gen_node_content_router.py`,
+  `gen_node_debug.py`, `gen_node_delay.py`,
+  `gen_node_durable_buffer.py`, `gen_node_fanout.py`,
+  `gen_node_filter.py`, `gen_node_log_sampling.py`,
+  `gen_node_signal_type_router.py`,
+  `gen_node_temporal_reaggregation.py`. Output-format chips
+  reflect the source: pure pass-through routers print
+  `[OTAP][OTLP]`, processors that normalise inputs to OTAP
+  before transforming (filter, attributes) print `[OTAP]` only.
+- **Contrib processor coverage complete.**
+  `gen_node_condense_attributes.py`,
+  `gen_node_recordset_kql.py`,
+  `gen_node_resource_validator.py`. The KQL recordset
+  processor's URN is `urn:microsoft:processor:recordset_kql` and
+  its output chip is `[OTLP]` because it returns
+  `OtlpProtoBytes` even though pdata is wrapped as OTAP.
+- Receivers and exporters are not yet covered by per-node slides.
+  Adding them follows the same recipe: source-walk for
+  config / state / effects / control-msgs / format chips, write
+  a `gen_node_<name>.py` SPEC, and re-run.
 
 The three slides are designed to be shown in sequence:
 
@@ -727,28 +779,3 @@ if __name__ == "__main__":
 `gen_node_retry.py`, `gen_node_batch.py`, and
 `gen_node_transform.py` are the canonical references.
 
-## Current project state
-
-- **`gen_diagram.py` / `experiments.svg`** — finished and stable.
-  Pipeline-conversion-cost timing diagram (4 scenarios A–D).
-- **`gen_otlp_bytes.py` / `otlp_bytes.svg`** — finished. Two batches
-  (`Batch A`: 65 bytes, 2 LogRecords; `Batch B`: 74 bytes, 1
-  LogRecord) shown as labeled byte rows with three tiers of nesting
-  brackets above (`Resource`/`Scope`/`LogRecord` →
-  `ScopeLogs` → `ResourceLogs`). Bytes always render as two-digit
-  hex; sections (resource attrs, scope name, scope attrs, log fields,
-  log attrs) are color-coded.
-- **`gen_otap_tables.py` / `otap_tables.svg`** — finished. Four
-  Arrow RecordBatches in framed boxes, columns drawn as separate
-  arrays with a downward-growth indicator under each. Mini copy of
-  the OTLP batches in the bottom-left for visual cross-reference.
-  Imports palette + `RECORDS` from `gen_otlp_bytes.py`; the table
-  contents are mirrored by hand from those records.
-
-The three slides are designed to be shown in sequence:
-
-1. `experiments.svg` — *why* we care about conversion costs.
-2. `otlp_bytes.svg`  — *what* the row format actually looks like on
-   the wire.
-3. `otap_tables.svg` — *how* OTAP rearranges those bytes into typed
-   columns.
