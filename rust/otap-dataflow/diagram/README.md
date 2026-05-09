@@ -25,6 +25,9 @@ OTLP-vs-OTAP story:
 | `gen_node_condense_attributes.py` | `node_condense_attributes.svg` | Per-node slide for `urn:otel:processor:condense_attributes` (contrib). Condenses selected log attributes into a single destination attribute on the OTAP output records. OTAP-only output. |
 | `gen_node_recordset_kql.py` | `node_recordset_kql.svg` | Per-node slide for `urn:microsoft:processor:recordset_kql` (contrib). Runs a parsed RecordSet KQL pipeline over OTLP log records that arrive wrapped in OTAP pdata; emits OTLP bytes downstream. |
 | `gen_node_resource_validator.py` | `node_resource_validator.svg` | Per-node slide for `urn:otel:processor:resource_validator` (contrib). Validates required resource attributes and permanently Nacks data that fails policy. Pass-through for both formats when validation succeeds. |
+| `gen_node_otlp_receiver.py` | `node_otlp_receiver.svg` | Per-node slide for `urn:otel:receiver:otlp` (`OTLPReceiver`). First receiver slide. Listens for OTLP/gRPC and OTLP/HTTP exports and admits each request as a lazily-decoded `OtlpProtoBytes` payload; the calldata chip carries a `SlotKey` so `wait_for_result` requests are paired with their downstream Ack/Nack. |
+| `gen_node_otlp_grpc_exporter.py` | `node_otlp_grpc_exporter.svg` | Per-node slide for `urn:otel:exporter:otlp_grpc` (`OTLPExporter`). First exporter slide. Encodes OTAP inputs to OTLP protobuf bytes and dispatches per-signal RPCs over a pooled tonic channel, capped by `max_in_flight`. The right-side port labels show `gRPC` / `gRPC status` because that side faces the network. |
+| `gen_node_otlp_http_exporter.py` | `node_otlp_http_exporter.svg` | Per-node slide for `urn:otel:exporter:otlp_http` (`OtlpHttpExporter`). HTTP/1.1 sibling of the gRPC exporter; pools hyper clients for SO_REUSEPORT load balancing and supports per-signal endpoint overrides. Right-side port labels show `HTTP` / `HTTP status`. |
 
 `gen_diagram.py` produces `experiments.svg`, a single-slide diagram that
 explains the OTLP-vs-OTAP conversion-cost experiments visually. The design
@@ -200,6 +203,13 @@ python3 gen_node_temporal_reaggregation.py  # writes node_temporal_reaggregation
 python3 gen_node_condense_attributes.py   # writes node_condense_attributes.svg
 python3 gen_node_recordset_kql.py         # writes node_recordset_kql.svg
 python3 gen_node_resource_validator.py    # writes node_resource_validator.svg
+
+# Receivers
+python3 gen_node_otlp_receiver.py         # writes node_otlp_receiver.svg
+
+# Exporters
+python3 gen_node_otlp_grpc_exporter.py    # writes node_otlp_grpc_exporter.svg
+python3 gen_node_otlp_http_exporter.py    # writes node_otlp_http_exporter.svg
 ```
 
 Open in a browser (on WSL):
@@ -417,10 +427,15 @@ actually laid out.
   processor's URN is `urn:microsoft:processor:recordset_kql` and
   its output chip is `[OTLP]` because it returns
   `OtlpProtoBytes` even though pdata is wrapped as OTAP.
-- Receivers and exporters are not yet covered by per-node slides.
-  Adding them follows the same recipe: source-walk for
-  config / state / effects / control-msgs / format chips, write
-  a `gen_node_<name>.py` SPEC, and re-run.
+- Receivers and exporters are now starting to be covered by per-node
+  slides. `gen_node_otlp_receiver.py` is the first receiver slide;
+  `gen_node_otlp_grpc_exporter.py` and `gen_node_otlp_http_exporter.py`
+  are the first exporter slides. Remaining receivers (OTAP,
+  internal-telemetry, syslog/CEF, traffic generator, host metrics,
+  topic) and exporters (OTAP, perf, parquet, console, noop, error,
+  topic, plus contrib azure_monitor / geneva) follow the same
+  recipe: source-walk for config / state / effects / control-msgs /
+  format chips, write a `gen_node_<name>.py` SPEC, and re-run.
 
 The three slides are designed to be shown in sequence:
 
@@ -553,9 +568,61 @@ Reading top-to-bottom, left-to-right:
      primary signal color, with a filled arrowhead on the
      downstream end.
    - **ack/nack in / ack/nack out** on the lower port row — thin
-     grey edges with an open arrowhead. (Some nodes have **named
-     out-ports** here, producing additional lines on the right
-     side; the same vocabulary still applies.)
+     grey edges with an open arrowhead.
+
+   When a node declares **named output ports** (via the SPEC's
+   `named_outputs` list — e.g. `signal_type_router` declares
+   `["logs", "metrics", "traces", "default"]`), the right-side
+   pdata edge fans out into N edges, centered on the canonical
+   pdata-out y with a fixed 22 px step (auto-shrunk if the span
+   would otherwise crowd the ack/nack rail; the cap keeps a 32 px
+   gap above it). Each port name is rendered in small (10 px)
+   monospace, anchored at the **box's right edge**, sitting in the
+   gap **below** its line — so labels read evenly distributed
+   between consecutive lines. The right-side `PData` row label
+   tracks the topmost output line, so it stays above the fan-out
+   band rather than landing under it. The single ack/nack rail
+   and the format chips on the topmost edge stay unchanged:
+   routing semantics live in the data plane, while the completion
+   plane remains uniform.
+
+   Currently five nodes use `named_outputs`:
+
+   - `signal_type_router` — `logs`, `metrics`, `traces`, `default`
+     (the three signals are fixed constants in the source; default
+     is whatever the pipeline config wires as the default output).
+   - `content_router` — illustrative `frontend`, `backend`,
+     `default_output` (real port names are user-supplied via the
+     `routes:` map plus optional `default_output`).
+   - `fanout_processor` — illustrative `primary`, `secondary`,
+     `fallback` (real port names come from each `destinations[]`
+     entry, with optional per-port `fallback_for`).
+   - `debug_processor` — illustrative `debug_a`, `debug_b` (only
+     when `output_mode = Outports([...])` is configured).
+   - `transform_processor` — illustrative `main`, `errors` (real
+     port names come from `route_to(<port>, ...)` operators in the
+     parsed query).
+
+   Port-row labels are **role-aware** because the *non-engine* side
+   of a receiver / exporter is talking to the network, not to
+   another node. The renderer chooses:
+
+   - **processor** — both rows uniform: left and right say
+     `PData` / `Ack/Nack`. The whole picture is engine-internal.
+   - **receiver** — *left* side is the transport (e.g.
+     `gRPC / HTTP` on the upper row, `gRPC / HTTP status` on the
+     lower row); *right* side is engine-facing (`PData` /
+     `Ack/Nack`). The lower-left edge is therefore the response
+     status the receiver writes back to the upstream client when
+     `wait_for_result` is enabled, *not* an Ack/Nack to a peer
+     node.
+   - **exporter** — mirror image: *right* side is the transport,
+     *left* side is engine-facing.
+
+   Per-node SPECs override the transport text via
+   `transport_pdata_label` and `transport_status_label`. Defaults
+   are `request` / `response status` so a receiver/exporter that
+   does not set them still reads correctly.
 8. **Context (CallData) chip** floating above the outgoing pdata
    edge. A small dashed-bordered box listing the names and Rust
    types of the calldata fields the node attaches via
@@ -770,6 +837,7 @@ SPEC = NodeSlideSpec(
     calldata=[("name", "Type"), ...],   # optional
     control_msgs=["..."],     # NodeControlMsg variants with body
     notes=["..."],            # operator-relevant facts
+    named_outputs=["..."],    # optional; right-side fan-out per port
 )
 
 if __name__ == "__main__":

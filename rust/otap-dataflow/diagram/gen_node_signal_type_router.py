@@ -39,6 +39,7 @@ SPEC = NodeSlideSpec(
     ],
     role="processor",
     output_formats=["OTAP", "OTLP"],
+    named_outputs=["logs", "metrics", "traces", "default"],
     calldata=[],
     control_msgs=["CollectTelemetry", "Shutdown", "Wakeup"],
     notes=[

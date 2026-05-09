@@ -44,6 +44,7 @@ SPEC = NodeSlideSpec(
     ],
     role="processor",
     output_formats=["OTAP", "OTLP"],
+    named_outputs=["debug_a", "debug_b"],
     calldata=[("micros", "u128")],
     control_msgs=[
         "CollectTelemetry",

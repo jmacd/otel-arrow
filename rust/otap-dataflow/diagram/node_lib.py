@@ -594,24 +594,48 @@ def state_hint(x: float, y: float, lines: List[str],
 def port_row_labels(x_left: float, y_pdata: float, y_ctrl: float,
                     pdata_text: str = "PData",
                     ctrl_text: str = "Ack/Nack",
+                    pdata_text_right: Optional[str] = None,
+                    ctrl_text_right: Optional[str] = None,
+                    x_right: Optional[float] = None,
+                    y_pdata_right: Optional[float] = None,
                     above_offset: float = 8,
                     size: float = 14) -> str:
     """Fine-print labels for the standard pair of port rows.
 
-    Left-justified to ``x_left`` (typically the page margin), sitting
-    just above each port line. Used on every per-node slide so that a
-    viewer can disambiguate the upper (pdata) and lower (ack/nack)
-    rows at a glance. Calling this from one place means a later
-    relabel touches all slides.
+    The left-side labels (``pdata_text`` / ``ctrl_text``) are
+    left-justified to ``x_left`` (typically the page margin), sitting
+    just above each port line. When the inbound and outbound sides of
+    a row carry different semantics -- e.g. a receiver whose left side
+    is gRPC/HTTP traffic and whose right side is engine pdata -- the
+    optional ``pdata_text_right`` / ``ctrl_text_right`` are
+    right-justified to ``x_right`` (typically ``PAGE_W - MARGIN_X``).
+
+    Calling this from one place means a later relabel touches all
+    slides.
     """
-    return (
+    parts = [
         f'<text x="{x_left}" y="{y_pdata - above_offset}" '
         f'text-anchor="start" font-size="{size}" '
-        f'fill="{COLOR_LABEL}">{_esc(pdata_text)}</text>'
+        f'fill="{COLOR_LABEL}">{_esc(pdata_text)}</text>',
         f'<text x="{x_left}" y="{y_ctrl - above_offset}" '
         f'text-anchor="start" font-size="{size}" '
-        f'fill="{COLOR_LABEL}">{_esc(ctrl_text)}</text>'
-    )
+        f'fill="{COLOR_LABEL}">{_esc(ctrl_text)}</text>',
+    ]
+    if x_right is not None:
+        right_y_pdata = y_pdata_right if y_pdata_right is not None else y_pdata
+        if pdata_text_right is not None:
+            parts.append(
+                f'<text x="{x_right}" y="{right_y_pdata - above_offset}" '
+                f'text-anchor="end" font-size="{size}" '
+                f'fill="{COLOR_LABEL}">{_esc(pdata_text_right)}</text>'
+            )
+        if ctrl_text_right is not None:
+            parts.append(
+                f'<text x="{x_right}" y="{y_ctrl - above_offset}" '
+                f'text-anchor="end" font-size="{size}" '
+                f'fill="{COLOR_LABEL}">{_esc(ctrl_text_right)}</text>'
+            )
+    return "".join(parts)
 
 
 def notes_box(x: float, y: float, w: float, h: float,
@@ -762,6 +786,18 @@ class NodeSlideSpec:
     control_msgs:   List[str] = None        # type: ignore[assignment]
     notes:          List[str] = None        # type: ignore[assignment]
     signal:         str = "otap"
+    # Optional transport labels for the *non-engine* side of the box.
+    # For receivers this labels the left-side ports (the network /
+    # transport facing the upstream client); for exporters it labels
+    # the right-side ports (facing the downstream backend). Defaults
+    # vary by role -- see render_node_slide.
+    transport_pdata_label:  Optional[str] = None
+    transport_status_label: Optional[str] = None
+    # Named output ports (e.g. ["logs", "metrics", "traces", "default"]
+    # for signal_type_router). When non-empty, the right-side pdata
+    # edge fans out into one labelled edge per port; the single
+    # ack/nack rail is unchanged.
+    named_outputs:          List[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.input_formats is None:
@@ -772,6 +808,8 @@ class NodeSlideSpec:
             self.control_msgs = []
         if self.notes is None:
             self.notes = []
+        if self.named_outputs is None:
+            self.named_outputs = []
 
 
 # ---- color resolver for chip rows ---------------------------------------
@@ -866,8 +904,16 @@ def render_node_slide(spec: NodeSlideSpec) -> str:
     parts.append("</text>")
 
     # --- upper-right config field listing ----------------------------
+    # Compute the gap dynamically so longer Rust types (e.g.
+    # ``Option<GrpcServerSettings>``) cannot crowd the field name on
+    # the right. Monospace at FS=17 is roughly 10.5px / glyph.
     type_x = PAGE_W - MARGIN_X
-    name_x = type_x - _CFG_NAME_TYPE_GAP
+    char_w = 10.5
+    longest_type = max(
+        (len(ctype) for _, ctype in spec.config_fields), default=0,
+    )
+    cfg_gap = max(_CFG_NAME_TYPE_GAP, int(longest_type * char_w + 24))
+    name_x = type_x - cfg_gap
     for i, (cname, ctype) in enumerate(spec.config_fields):
         y = _CFG_TOP_Y + i * _CFG_LINE_H
         parts.append(
@@ -936,23 +982,69 @@ def _render_overhead_panel(spec: NodeSlideSpec,
 
     parts.append(pdata_edge(upstream_x, in_y_pdata, nx, in_y_pdata,
                             signal=spec.signal))
-    parts.append(pdata_edge(nx + _NODE_W, in_y_pdata, downstream_x,
-                            in_y_pdata, signal=spec.signal))
+    if spec.named_outputs:
+        # Fan the right-side pdata edge into N labelled edges, one per
+        # named output port. Use a comfortable fixed step centered on
+        # the canonical pdata-out y, capped so the bottom edge stays
+        # well clear of the ack/nack rail. Labels go *below* each line
+        # (in the gap toward the next line), small print, anchored to
+        # the box's right edge so all labels left-justify there.
+        n = len(spec.named_outputs)
+        step = 22
+        max_bot = in_y_ctrl - 32
+        max_top = ny + _NODE_H * 0.18
+        if n == 1:
+            ys = [in_y_pdata]
+        else:
+            half = (n - 1) / 2
+            top = in_y_pdata - half * step
+            bot = in_y_pdata + half * step
+            # Squeeze the step if either end overshoots the safe band.
+            if bot > max_bot or top < max_top:
+                step = min(
+                    (max_bot - in_y_pdata) / half,
+                    (in_y_pdata - max_top) / half,
+                )
+            ys = [in_y_pdata + (i - half) * step for i in range(n)]
+        label_x = nx + _NODE_W + 6
+        for i, (port, y) in enumerate(zip(spec.named_outputs, ys)):
+            parts.append(pdata_edge(nx + _NODE_W, y, downstream_x, y,
+                                    signal=spec.signal))
+            # Place the label centered in the vertical gap below this
+            # line; for the bottom line, use step/2 below.
+            if i + 1 < n:
+                label_y = (y + ys[i + 1]) / 2
+            else:
+                label_y = y + step / 2
+            parts.append(
+                f'<text x="{label_x}" y="{label_y + 3}" '
+                f'text-anchor="start" font-size="10" '
+                f'font-family="{FONT_MONO}" fill="{COLOR_LABEL}">'
+                f'{_esc(port)}</text>'
+            )
+        # Use the topmost output line as the anchor for format chips.
+        out_chip_y_anchor = ys[0]
+    else:
+        parts.append(pdata_edge(nx + _NODE_W, in_y_pdata, downstream_x,
+                                in_y_pdata, signal=spec.signal))
+        out_chip_y_anchor = in_y_pdata
 
     # Format chips. Output side anchored just right of the box; input
     # side (if any -- only set for converters/exporters) anchored just
     # left of the box.
-    chip_y = in_y_pdata - _CHIP_H - _CHIP_OFFSET_Y
+    chip_y = out_chip_y_anchor - _CHIP_H - _CHIP_OFFSET_Y
     if spec.output_formats:
         parts.append(_format_chip_row(
             spec.output_formats,
             anchor_x=nx + _NODE_W + _CHIP_OFFSET_X,
             chip_y=chip_y, anchor="left"))
     if spec.input_formats:
+        # Input chips always sit on the single left-side pdata edge.
+        in_chip_y = in_y_pdata - _CHIP_H - _CHIP_OFFSET_Y
         parts.append(_format_chip_row(
             spec.input_formats,
             anchor_x=nx - _CHIP_OFFSET_X,
-            chip_y=chip_y, anchor="right"))
+            chip_y=in_chip_y, anchor="right"))
 
     # ack/nack edges (thin grey).
     parts.append(ctrl_edge(downstream_x, in_y_ctrl, nx + _NODE_W,
@@ -961,10 +1053,31 @@ def _render_overhead_panel(spec: NodeSlideSpec,
                            arrow_at="end"))
 
     # Fine-print row labels above each port row, page-margin-anchored.
+    # For receivers the *left* side of each row is transport-facing
+    # (network request + status response back to the client); for
+    # exporters the *right* side is transport-facing. Processors keep
+    # the uniform engine-pdata labels on both ends.
+    role = spec.role.lower()
+    pdata_left  = "PData"
+    ctrl_left   = "Ack/Nack"
+    pdata_right = "PData"
+    ctrl_right  = "Ack/Nack"
+    if role == "receiver":
+        pdata_left = spec.transport_pdata_label  or "request"
+        ctrl_left  = spec.transport_status_label or "response status"
+    elif role == "exporter":
+        pdata_right = spec.transport_pdata_label  or "request"
+        ctrl_right  = spec.transport_status_label or "response status"
     parts.append(port_row_labels(
         x_left=MARGIN_X,
         y_pdata=in_y_pdata,
         y_ctrl=in_y_ctrl,
+        pdata_text=pdata_left,
+        ctrl_text=ctrl_left,
+        pdata_text_right=pdata_right,
+        ctrl_text_right=ctrl_right,
+        x_right=PAGE_W - MARGIN_X,
+        y_pdata_right=out_chip_y_anchor,
     ))
 
     # Calldata chip: floats above the outgoing pdata edge with its
@@ -985,7 +1098,7 @@ def _render_overhead_panel(spec: NodeSlideSpec,
         # Dotted leader from chip down to outgoing pdata edge.
         parts.append(
             f'<line x1="{chip_cx}" y1="{chip_cy + ctx_h / 2}" '
-            f'x2="{chip_cx}" y2="{in_y_pdata - 4}" '
+            f'x2="{chip_cx}" y2="{out_chip_y_anchor - 4}" '
             f'stroke="{COLOR_CTX}" stroke-width="1" '
             f'stroke-dasharray="2,2"/>'
         )

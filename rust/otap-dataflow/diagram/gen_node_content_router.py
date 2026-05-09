@@ -41,6 +41,7 @@ SPEC = NodeSlideSpec(
     ],
     role="processor",
     output_formats=["OTAP", "OTLP"],
+    named_outputs=["frontend", "backend", "default_output"],
     control_msgs=["CollectTelemetry", "Shutdown", "Wakeup"],
     notes=[
         "All resources in a batch must resolve to the same destination; mixed-route batches are permanently nacked.",

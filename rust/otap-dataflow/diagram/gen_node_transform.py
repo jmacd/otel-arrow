@@ -48,6 +48,7 @@ SPEC = NodeSlideSpec(
     ],
     role="processor",
     output_formats=["OTAP"],
+    named_outputs=["main", "errors"],
     calldata=[("outbound", "SlotKey")],
     control_msgs=["CollectTelemetry"],
     notes=[

@@ -43,6 +43,7 @@ SPEC = NodeSlideSpec(
     ],
     role="processor",
     output_formats=["OTAP", "OTLP"],
+    named_outputs=["primary", "secondary", "fallback"],
     calldata=[
         ("request_id", "u64"),
         ("dest_index", "usize"),
