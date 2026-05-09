@@ -21,12 +21,11 @@
 </g>
 <rect x="310" y="235.0" width="153.0" height="45.0" fill="url(#hash)" stroke="#9aa5b1" stroke-width="1" opacity="0.9"/>
 <line x1="310" y1="184" x2="310" y2="286" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
-<text x="386.5" y="176" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Worker</text>
+<text x="386.5" y="176" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Logs API</text>
 <text x="386.5" y="227.0" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#52606d" font-style="italic">struct/bytes</text>
 <line x1="463.0" y1="280" x2="701.0" y2="280" stroke="#b15a4f" stroke-width="3.0" stroke-linecap="square"/>
 <line x1="463.0" y1="184" x2="463.0" y2="286" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
-<text x="582.0" y="176" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Receiver</text>
-<text x="582.0" y="160" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Internal Telemetry</text>
+<text x="582.0" y="176" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Logs SDK</text>
 <line x1="701.0" y1="280" x2="888.0" y2="280" stroke="#b15a4f" stroke-width="3.0" stroke-linecap="square"/>
 <line x1="701.0" y1="184" x2="701.0" y2="286" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
 <text x="794.5" y="176" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Batch</text>
@@ -54,12 +53,11 @@
 </g>
 <rect x="310" y="475.0" width="153.0" height="45.0" fill="url(#hash)" stroke="#9aa5b1" stroke-width="1" opacity="0.9"/>
 <line x1="310" y1="424" x2="310" y2="526" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
-<text x="386.5" y="416" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Worker</text>
+<text x="386.5" y="416" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Logs API</text>
 <text x="386.5" y="467.0" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#52606d" font-style="italic">struct/bytes</text>
 <line x1="463.0" y1="520" x2="701.0" y2="520" stroke="#b15a4f" stroke-width="3.0" stroke-linecap="square"/>
 <line x1="463.0" y1="424" x2="463.0" y2="526" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
-<text x="582.0" y="416" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Receiver</text>
-<text x="582.0" y="400" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Internal Telemetry</text>
+<text x="582.0" y="416" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Logs SDK</text>
 <line x1="701.0" y1="520" x2="875.9422863405995" y2="520" stroke="#b15a4f" stroke-width="3.0" stroke-linecap="square"/>
 <line x1="701.0" y1="424" x2="701.0" y2="526" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
 <text x="794.5" y="416" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Batch</text>
@@ -88,12 +86,11 @@
 </g>
 <rect x="310" y="715.0" width="153.0" height="45.0" fill="url(#hash)" stroke="#9aa5b1" stroke-width="1" opacity="0.9"/>
 <line x1="310" y1="664" x2="310" y2="766" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
-<text x="386.5" y="656" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Worker</text>
+<text x="386.5" y="656" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Logs API</text>
 <text x="386.5" y="707.0" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#52606d" font-style="italic">struct/bytes</text>
 <line x1="463.0" y1="760" x2="688.9422863405995" y2="760" stroke="#b15a4f" stroke-width="3.0" stroke-linecap="square"/>
 <line x1="463.0" y1="664" x2="463.0" y2="766" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
-<text x="582.0" y="656" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Receiver</text>
-<text x="582.0" y="640" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Internal Telemetry</text>
+<text x="582.0" y="656" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Logs SDK</text>
 <line x1="713.0577136594005" y1="670" x2="888.0" y2="670" stroke="#4f7a8a" stroke-width="3.0" stroke-linecap="square"/>
 <line x1="688.9422863405995" y1="760" x2="713.0577136594005" y2="670" stroke="#1f2933" stroke-width="3.0" stroke-linecap="round"/>
 <line x1="701.0" y1="664" x2="701.0" y2="766" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
@@ -122,12 +119,11 @@
 </g>
 <rect x="310" y="955.0" width="153.0" height="45.0" fill="url(#hash)" stroke="#9aa5b1" stroke-width="1" opacity="0.9"/>
 <line x1="310" y1="904" x2="310" y2="1006" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
-<text x="386.5" y="896" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Worker</text>
+<text x="386.5" y="896" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Logs API</text>
 <text x="386.5" y="947.0" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#52606d" font-style="italic">struct/bytes</text>
 <line x1="463.0" y1="1000" x2="688.9422863405995" y2="1000" stroke="#b15a4f" stroke-width="3.0" stroke-linecap="square"/>
 <line x1="463.0" y1="904" x2="463.0" y2="1006" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
-<text x="582.0" y="896" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Receiver</text>
-<text x="582.0" y="880" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Internal Telemetry</text>
+<text x="582.0" y="896" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="14" fill="#1f2933" font-weight="600">Logs SDK</text>
 <line x1="713.0577136594005" y1="910" x2="875.9422863405995" y2="910" stroke="#4f7a8a" stroke-width="3.0" stroke-linecap="square"/>
 <line x1="688.9422863405995" y1="1000" x2="713.0577136594005" y2="910" stroke="#1f2933" stroke-width="3.0" stroke-linecap="round"/>
 <line x1="701.0" y1="904" x2="701.0" y2="1006" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
