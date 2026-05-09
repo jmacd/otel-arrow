@@ -203,8 +203,8 @@ def _render_controller(out: List[str]) -> None:
     out.append(_process_box(
         CONTROLLER_X, CONTROLLER_Y, CONTROLLER_W, CONTROLLER_H,
         title="Controller process",
-        sub="single process; spawns and supervises every other thread",
-        struct_name="ControllerRuntime<PData>",
+        sub="",
+        struct_name="ControllerRuntime",
         accent=COLOR_CTRL,
     ))
 
@@ -220,22 +220,16 @@ def _render_controller(out: List[str]) -> None:
         f'font-weight="700" fill="{COLOR_LABEL}">'
         f'thread-local accessory tasks</text>'
     )
-    out.append(
-        f'<text x="{tile_x}" y="{section_y + 16}" font-size="{FS_TINY - 2}" '
-        f'font-style="italic" fill="{COLOR_SUBLABEL}">'
-        f'each tile = own OS thread + own tokio current_thread runtime'
-        f'</text>'
-    )
-    accessory: List[Tuple[str, str]] = [
-        ("process-memory-limiter", "watches RSS"),
-        ("metrics-aggregator",     "merges per-core snapshots"),
-        ("metrics-dispatcher",     "fans aggregates to readers"),
-        ("observed-state-store",   "rolls up lifecycle state"),
-        ("engine-metrics",         "control-plane metrics ingest"),
+    accessory: List[str] = [
+        "process-memory-limiter",
+        "metrics-aggregator",
+        "metrics-dispatcher",
+        "observed-state-store",
+        "engine-metrics",
     ]
-    ay = section_y + 28
-    for name, sub in accessory:
-        out.append(_accessory_tile(tile_x, ay, tile_w, tile_h, name, sub))
+    ay = section_y + 14
+    for name in accessory:
+        out.append(_accessory_tile(tile_x, ay, tile_w, tile_h, name))
         ay += tile_h + tile_gap
 
     # Shared resources block at the bottom of the controller box.
@@ -245,13 +239,13 @@ def _render_controller(out: List[str]) -> None:
         f'font-weight="700" fill="{COLOR_LABEL}">'
         f'shared resources</text>'
     )
-    shared: List[Tuple[str, str]] = [
-        ("DeclaredTopics(TopicBroker)", "only cross-core path"),
-        ("memory_pressure tx (watch)", "broadcast to every core"),
+    shared: List[str] = [
+        "TopicBroker",
+        "memory_pressure watch",
     ]
     sy = shared_y + 14
-    for name, sub in shared:
-        out.append(_accessory_tile(tile_x, sy, tile_w, tile_h, name, sub))
+    for name in shared:
+        out.append(_accessory_tile(tile_x, sy, tile_w, tile_h, name))
         sy += tile_h + tile_gap
 
 
@@ -259,7 +253,7 @@ def _render_admin(out: List[str]) -> None:
     out.append(_process_box(
         ADMIN_X, ADMIN_Y, ADMIN_W, ADMIN_H,
         title="http-admin",
-        sub="own OS thread + own tokio current_thread runtime",
+        sub="",
         struct_name="otap_df_admin::run",
         accent=COLOR_CTX,
     ))
@@ -280,14 +274,13 @@ def _render_admin(out: List[str]) -> None:
 def _render_instances(out: List[str]) -> List[float]:
     """Draw the three per-core instance tiles. Returns their center y values."""
     centers: List[float] = []
-    # Three rows: Core 0 (top), Core 1, vertical ellipsis, Core N.
     y = INSTANCE_Y0
     for label in ("Core 0", "Core 1"):
         out.append(_instance_tile(
             INSTANCE_X, y, INSTANCE_W, INSTANCE_H,
             core_label=label,
-            struct_name="RuntimePipeline<PData>",
-            sub="tokio current_thread \u00b7 LocalSet \u00b7 !Send node tasks",
+            struct_name="RuntimePipeline",
+            sub="",
         ))
         centers.append(y + INSTANCE_H / 2)
         y += INSTANCE_H + INSTANCE_GAP
@@ -299,8 +292,8 @@ def _render_instances(out: List[str]) -> List[float]:
     out.append(_instance_tile(
         INSTANCE_X, y, INSTANCE_W, INSTANCE_H,
         core_label="Core N",
-        struct_name="RuntimePipeline<PData>",
-        sub="tokio current_thread \u00b7 LocalSet \u00b7 !Send node tasks",
+        struct_name="RuntimePipeline",
+        sub="",
     ))
     centers.append(y + INSTANCE_H / 2)
     return centers

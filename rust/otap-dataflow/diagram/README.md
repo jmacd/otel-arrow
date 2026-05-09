@@ -30,7 +30,7 @@ OTLP-vs-OTAP story:
 | `gen_node_otlp_http_exporter.py` | `node_otlp_http_exporter.svg` | Per-node slide for `urn:otel:exporter:otlp_http` (`OtlpHttpExporter`). HTTP/1.1 sibling of the gRPC exporter; pools hyper clients for SO_REUSEPORT load balancing and supports per-signal endpoint overrides. Right-side port labels show `HTTP` / `HTTP status`. |
 | `gen_engine_group.py` | `engine_group.svg` | Engine-architecture slide #1 — the **pipeline group**: one controller process (with its accessory thread-local tasks and shared resources), the `http-admin` thread, and the N per-core `RuntimePipeline` instances. Emphasises one OS thread per assigned core; cross-thread edges are dashed grey. |
 | `gen_engine_core.py`  | `engine_core.svg`  | Engine-architecture slide #2 — one **per-core pipeline thread**: the in-thread actors (`RuntimeCtrlMsgManager`, `PipelineCompletionMsgDispatcher`), a representative receiver→processor→exporter node chain, and the per-core `TopicSet` view of the cross-core `TopicBroker`. Boundary stubs identify every channel that crosses out of the thread. |
-| `gen_otap_pdata.py`   | `otap_pdata.svg`   | Anatomy of the in-flight `OtapPdata` value: `Context` (stack of `Frame`s + `transport_headers` + `flow_compute_ns`) plus a `payload: OtapPayload` (tagged enum: `OtapArrowRecords` / `OtlpBytes`). One `Frame` is exploded out to show `node_id` (return address / source node), `interests` (8 bitflags drawn as mini boxes), and the nested `RouteData` (`calldata`, `entry_time_ns`, `output_port_index`). |
+| `gen_otap_pdata.py`   | `otap_pdata.svg`   | Anatomy of the in-flight `OtapPdata` value: one box containing a `Context` (stack of `Frame`s with `transport_headers` and `flow_compute_ns`) on the left and the `payload: OtapPayload` tagged enum on the right. Both `OTAP records` and `OTLP bytes` variants are tagged "reference-counted · zero-copy transit". A compact `Frame` anatomy strip below lists the per-frame fields. |
 
 `gen_diagram.py` produces `experiments.svg`, a single-slide diagram that
 explains the OTLP-vs-OTAP conversion-cost experiments visually. The design
@@ -929,52 +929,51 @@ The pair is meant to be shown in zoom-in order:
 
 ## OtapPdata anatomy slide (`gen_otap_pdata.py`)
 
-A single slide that opens up the value carried on every pdata edge in
-the per-node deck. Reuses `node_lib`'s palette and chrome.
+A single, deliberately sparse slide that opens up the value carried on
+every pdata edge in the per-node deck. Reuses `node_lib`'s palette
+and chrome.
 
-Composition (left to right):
+Composition:
 
-1. **`OtapPdata` outer box** with the OTAP-blue accent stripe.
-   Contains a `Context` panel.
-2. **`Context` panel** holding three things:
-   - a vertical **`stack: Vec<Frame>`** drawn bottom-up (matching
-     Rust `Vec` push/pop), with the topmost frame tagged
-     *"top of stack — next to be popped on Ack/Nack"*;
-   - a **`transport_headers`** chip (preserved across topic hops);
-   - a **`flow_compute_ns`** chip (active flow_metric accumulator).
-3. **`payload: OtapPayload` panel** with a two-tone top stripe
-   (half OTAP-blue, half OTLP-red) and two variant chips:
-   `OtapArrowRecords` (blue) and `OtlpBytes` (red). Each variant
-   chip carries the same inverse-white `[OTAP]` / `[OTLP]` format
-   chip used on the per-node port lines, so the visual link is
-   explicit.
-4. **Exploded `Frame` panel** in the lower right, connected to the
-   middle frame in the stack by a dotted OTAP-blue leader. Lists
-   every field at its source-code identifier and Rust type:
-   `node_id: usize` (return address / source node), the eight
-   `Interests` bits drawn as mini boxes (filled = set in the
-   sample frame), and the nested `route: RouteData` with
-   `calldata: CallData` (`SmallVec<[Context8u8; 3]>`),
-   `entry_time_ns: u64`, `output_port_index: u16`.
+1. **One `OtapPdata` outer box** with the OTAP-blue accent stripe,
+   containing both halves side-by-side.
+2. **`context: Context` column (left)** — the frame stack drawn as
+   a `top` `Frame` tile, three small geometrically-centered dots
+   (not the unicode `⋮`, whose vertical anchor is unreliable), and
+   a `bottom` `Frame` tile. Each tile shows example `node_id` and
+   `interests` values so the reader sees what a frame *contains*,
+   not just that it exists. Underneath, two slim chips for
+   `transport_headers: Option<TransportHeaders>` and
+   `flow_compute_ns: Option<NonZeroU64>`. The top frame is painted
+   in the OTAP accent color so the eye lands on it first.
+3. **`payload: OtapPayload` column (right)** — two large variant
+   tiles stacked vertically. The upper tile reads
+   **`OTAP records`** in big bold (blue), the lower tile reads
+   **`OTLP bytes`** (red). Both tiles carry an inverse-white
+   `[OTAP]` / `[OTLP]` format chip in the upper-right and the
+   tag-line *"reference-counted · zero-copy transit"*. Between
+   them sits a small **`one of`** badge with short connecting
+   leaders, making the tagged-enum invariant explicit: the
+   payload field is exactly one of the two, never both.
+4. **`Frame` anatomy panel (below the box)** — full source-
+   faithful field listing on the left (`node_id: usize`,
+   `interests: Interests`, `route.calldata: CallData =
+   SmallVec<[Context8u8; 3]>`, `route.entry_time_ns: u64`,
+   `route.output_port_index: u16`) and a 2 × 4 grid of all eight
+   `Interests` bitflag chips on the right, each labelled with
+   its identifier and bit position (`1<<0` ... `1<<7`).
 
 ### Conventions specific to this slide
 
-1. **Stack grows upward.** Top of the column = top of the Rust
-   `Vec` = next frame to be popped during Ack/Nack unwind.
-2. **Color = format on the payload side.** The `payload` panel
-   is the only place in the deck where both OTAP-blue and OTLP-red
-   appear on the same object, because `OtapPayload` is a tagged
-   enum and the diagram needs to show that exactly one variant is
-   present at a time.
-3. **Bitflag boxes are mini, not full chips.** The eight `Interests`
-   bits are tiny rounded squares (filled when set, empty when
-   clear) with rotated mono labels under each. They are *not* the
-   per-node format chips — different shape, different scale, so
-   the viewer does not confuse "interest bit" with "pdata format".
-4. **One `Frame` is exploded; the others stay condensed.** The
-   middle frame is painted in the OTAP accent color and a dotted
-   leader runs to the explosion panel. The other frames keep the
-   neutral grey accent so the eye is drawn to the explosion.
-5. **Source citations on every panel.** Each box carries its
-   source file:line in the upper-right corner so the picture
-   stays auditable against the code.
+1. **No notes box, no parentheticals.** Everything that needs
+   saying is said by a label or a colored chip.
+2. **Payload variants live inside the OtapPdata box**, not in a
+   separate panel — the slide's point is that Context and Payload
+   are two halves of the *same* value.
+3. **Color = format on the payload side**, same as the per-node
+   slides: blue = OTAP, red = OTLP. Both variants are equally
+   prominent because both are common in production pipelines.
+4. **Stack as top + ellipsis + bottom.** The slide does not try to
+   show every frame; it shows that there is a stack with a top and
+   a bottom, and which one is popped first on Ack/Nack (the top,
+   in OTAP-blue).
