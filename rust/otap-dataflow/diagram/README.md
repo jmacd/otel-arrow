@@ -3,11 +3,29 @@
 This directory holds the slide-generating Python scripts for the
 OTLP-vs-OTAP story:
 
+## Building
+
+All generators write into `out/`. Use the wrapper script — it is the
+single source of truth for which generators are wired up and what
+their output filenames are, so renaming a slide is a one-line edit
+there with no changes to the generator script:
+
+```bash
+./regenerate.sh             # wipe out/*.svg and rebuild every slide
+./regenerate.sh --no-clean  # rebuild without wiping (faster iteration)
+```
+
+A new `gen_*.py` that is not listed in `regenerate.sh` makes the
+script exit non-zero, so a missing wiring entry can't go unnoticed.
+
+The `Output` column below is the basename written into `out/`.
+
 | Script               | Output             | Slide                                   |
 |----------------------|--------------------|-----------------------------------------|
 | `gen_diagram.py`     | `experiments.svg`  | End-to-end pipeline conversion-cost experiments (TI-style timing diagram). |
 | `gen_otlp_bytes.py`  | `otlp_bytes.svg`   | OTLP Logs on the wire — protobuf bytes color-coded by section, with brackets above naming each region. The "row-oriented" half of the OTLP→OTAP transformation story. |
 | `gen_otap_tables.py` | `otap_tables.svg`  | OTAP Logs — the same two records as `gen_otlp_bytes.py`, rendered as the four columnar tables (`resource_attrs`, `scope_attrs`, `log_attrs`, `logs`). Colors match the OTLP slide so each byte run is visually traceable to its destination column. |
+| `gen_zero_copy.py`   | `zero_copy.svg`    | **Zero-copy & Arrow IPC** scenario slide. Reuses the timing-diagram conventions from `experiments.svg` (LOW = OTLP, HIGH = OTAP, MID = framed bytes) but draws a single illustrative pipeline with a node strip aligned above the trace: `otlp_receiver → batch → filter → durable_buffer → otap_exporter ⇢ network ⇢ otap_receiver`. The trace shows OTLP in, OTLP through batch, raise to OTAP at filter, drop to MID for the durable_buffer Quiver spool (sublabel "Arrow IPC · Quiver disk"), zero-copy back to OTAP on the read side, OTAP across the wire encoded as Arrow IPC + zstd, and decoded back to OTAP at the next collector's receiver. A teal underline beneath the in-process portion labels the first zero-copy hop (`Arc<OtapArrowRecords> / bytes::Bytes`); two callouts beneath the trace pin the Quiver disk hop and the Arrow IPC wire hop. |
 | `node_lib.py`        | (library)          | Shared SVG primitives + palette imports for every per-node slide. |
 | `gen_node_retry.py`  | `node_retry.svg`   | Per-node slide for `urn:otel:processor:retry`. First instance of the per-node visual style described below. |
 | `gen_node_batch.py`  | `node_batch.svg`   | Per-node slide for `urn:otel:processor:batch`. Same per-node grammar; calldata chip carries a single `slot: SlotKey` so ack/nack on a coalesced batch fans back to its contributing inputs. |
@@ -29,8 +47,18 @@ OTLP-vs-OTAP story:
 | `gen_node_otap_receiver.py` | `node_otap_receiver.svg` | Per-node slide for `urn:otel:receiver:otap` (`OTAPReceiver`). gRPC-only receiver hosting the three Arrow services (logs / metrics / traces); decoded record batches are emitted as OTAP pdata. Same calldata pattern as the OTLP receiver (`SlotKey` for `wait_for_result`). Marked **SHARED · Send** — the EffectHandler is cloned into Tonic per-stream handlers; the upper-left foreign-entities panel calls out the Tower `MemoryPressureLayer` semaphore and the zstd middleware. |
 | `gen_node_otlp_grpc_exporter.py` | `node_otlp_grpc_exporter.svg` | Per-node slide for `urn:otel:exporter:otlp_grpc` (`OTLPExporter`). First exporter slide. Encodes OTAP inputs to OTLP protobuf bytes and dispatches per-signal RPCs over a pooled tonic channel, capped by `max_in_flight`. The right-side port labels show `gRPC` / `gRPC status` because that side faces the network. |
 | `gen_node_otlp_http_exporter.py` | `node_otlp_http_exporter.svg` | Per-node slide for `urn:otel:exporter:otlp_http` (`OtlpHttpExporter`). HTTP/1.1 sibling of the gRPC exporter; pools hyper clients for SO_REUSEPORT load balancing and supports per-signal endpoint overrides. Right-side port labels show `HTTP` / `HTTP status`. |
-| `gen_engine_group.py` | `engine_group.svg` | **Dataflow Engine** zoom-out: one `ControllerRuntime` process (with accessory thread-local tasks and shared resources), the `http-admin` thread, and N `Engine Core` boxes on the right — each core hosts one or more `RuntimePipeline` threads, drawn as small per-pipeline DAGs with a faint intra-core connector showing they form a group. Banner: *"one tokio single-threaded runtime per pipeline"*. Cross-thread channels are dashed grey, labelled at the controller-side end. |
-| `gen_engine_core.py`  | `engine_core.svg`  | **Pipeline thread** zoom-in: one `RuntimePipeline` (single OS thread + tokio single-threaded runtime + LocalSet). Top row: `RuntimeCtrlMsgManager` and `PipelineCompletionMsgDispatcher`, each with a bidirectional `↕` channel-type label above. Middle: a 6-node DAG with branching (`receiver → fanout → {processor, processor} → {exporter, exporter}`); every adjacent pair is connected by a heavy OTAP-blue pdata line on top and a thin grey ack/nack line below. Three asymmetric arrows from the dispatcher into `receiver`, `fanout`, and one `exporter` show that simple pass-through nodes need no completion-path connection. Boundary stubs all sit on the left side, going to the controller. |
+| `gen_node_host_metrics_receiver.py` | `node_host_metrics_receiver.svg` | Per-node slide for `urn:otel:receiver:host_metrics` (`HostMetricsReceiver`). Linux-only periodic scraper of /proc + /sys driven by a `FamilyScheduler`; emits OTAP record batches. Must run in a one-core source pipeline. |
+| `gen_node_internal_telemetry_receiver.py` | `node_internal_telemetry_receiver.svg` | Per-node slide for `urn:otel:receiver:internal_telemetry` (`InternalTelemetryReceiver`). Drains the in-process logging channel (ITS mode of the metrics provider) and emits each `LogEvent` as an OTLP `ExportLogsRequest`. Resource bytes are pre-encoded; per-scope encodings are memoized. |
+| `gen_node_syslog_cef_receiver.py` | `node_syslog_cef_receiver.svg` | Per-node slide for `urn:otel:receiver:syslog_cef` (`SyslogCefReceiver`). Listens on TCP (with optional TLS, RFC 5425) or UDP for RFC 5424 syslog and ArcSight CEF; emits coalesced OTAP log batches with size + duration cutoffs. |
+| `gen_node_topic_receiver.py` | `node_topic_receiver.svg` | Per-node slide for `urn:otel:receiver:topic` (`TopicReceiver`). Subscribes to an in-process `TopicBroker` topic in either `broadcast` or `balanced` consumer-group mode; pass-through for both pdata variants; calldata carries the topic message_id so downstream Ack/Nack bridges back to the topic runtime. |
+| `gen_node_otap_exporter.py` | `node_otap_exporter.svg` | Per-node slide for `urn:otel:exporter:otap` (`OTAPExporter`). Streams OTAP record batches over per-signal Arrow gRPC streams (`streams_per_signal`); server `BatchStatus` responses correlate back to the originating pdata for ack/nack. Double-compression by default (gRPC + Arrow IPC zstd). |
+| `gen_node_parquet_exporter.py` | `node_parquet_exporter.svg` | Per-node slide for `urn:otel:exporter:parquet` (`ParquetExporter`). Writes OTAP Arrow batches as partitioned Parquet via the `object_store` abstraction (file / S3 / Azure Blob / GCS). Files flush on `target_rows_per_file`, `flush_when_older_than` (`TimerTick`), or shutdown. |
+| `gen_node_topic_exporter.py` | `node_topic_exporter.svg` | Per-node slide for `urn:otel:exporter:topic` (`TopicExporter`). Publishes pdata into an in-process `TopicBroker`; tracked publishes bridge the `TrackedPublishOutcome` back to upstream as ack/nack when the topic declares Auto ack propagation. `queue_on_full` (block / drop_newest / drop_oldest) overrides the topic's declared policy. |
+| `gen_node_azure_monitor_exporter.py` | `node_azure_monitor_exporter.svg` | Per-node slide for `urn:microsoft:exporter:azure_monitor` (`AzureMonitorExporter`, contrib). Sends OpenTelemetry **logs only** to Azure Monitor via the Data Collection Rules (DCR) Logs Ingestion API; metrics and traces are dropped with a warning. Two log paths (OTAP via `OtapLogsView`, OTLP bytes via `RawLogsData`); managed-identity / dev-cli auth with token-refresh scheduling. |
+| `gen_node_geneva_exporter.py` | `node_geneva_exporter.svg` | Per-node slide for `urn:microsoft:exporter:geneva` (`GenevaExporter`, contrib). Encodes and uploads OpenTelemetry logs and traces to Microsoft Geneva via the `geneva-uploader` client (no metrics support). Logs use a zero-copy view path; traces fall back to OTLP-bytes encoding. Auth supports certificate, managed identity (system / user / ARM-resource-id), and workload identity. |
+| `gen_engine_group.py` | `dataflow_engine.svg` | **Dataflow Engine** zoom-out: one `ControllerRuntime` process (with accessory thread-local tasks and shared resources), the `http-admin` thread, and N `Engine Core` boxes on the right — each core hosts one or more `RuntimePipeline` threads, drawn as small per-pipeline DAGs with a faint intra-core connector showing they form a group. Banner: *"one tokio single-threaded runtime per pipeline"*. Cross-thread channels are dashed grey, labelled at the controller-side end. The two genuinely cross-thread shared resources (`TopicBroker`, `memory_pressure watch`) render as red-tinted bubbles, matching the SHARED-badge convention used on per-node slides. |
+| `gen_memory_pressure.py` | `memory_pressure.svg` | **Memory pressure & backpressure** overhead slide: the controller's `process-memory-limiter` accessory task with the full `MemoryPressureState` atomics list and the three classified pressure levels (Normal / Soft / Hard) on the left, three `Engine Core` tiles stacked on the right each holding the same illustrative pipeline (`otap_receiver → batch → retry → otlp_grpc_exporter`). Above each node a small dashed callout lists the *fixed* pieces of state the node holds; bounded inter-node channels are drawn as capsules with three slot-tick marks; an ack/nack rail at the bottom of each core shows backpressure draining the slots. Dashed `memory_pressure watch` arrows fan out from the shared bubble in the controller box to every core. A bottom strip pins three takeaways: all buffers are sized at construction, ack/nack drives backpressure, hard pressure sheds at ingress with Retry-After. |
+| `gen_engine_core.py`  | `pipeline_engine.svg`  | **Pipeline thread** zoom-in: one `RuntimePipeline` (single OS thread + tokio single-threaded runtime + LocalSet). Top row: `RuntimeCtrlMsgManager` (left) and `PipelineCompletionMsgDispatcher` (right), each with a bidirectional `↕` channel-type label above. Middle: a 6-node DAG with branching (`receiver → fanout → {processor, processor} → {exporter, exporter}`); every adjacent pair is connected by a heavy OTAP-blue pdata line on top and a thin grey ack/nack line below. Three asymmetric arrows from the dispatcher into `receiver`, `fanout`, and one `exporter` show that simple pass-through nodes need no completion-path connection. Boundary stubs are grouped by direction-of-traffic: dashed-grey **runtime** stubs on the left terminate at the manager box edge, **topic** stubs go vertically below the box into `TopicSet`. The dispatcher has *no* outside-thread stub because `PipelineCompletionMsg` is purely intra-pipeline. The receiver and each exporter sport a closely-spaced parallel bundle of 4 OTAP-blue arrows on their outside edge, conveying "many concurrent connections". |
 | `gen_otap_pdata.py`   | `otap_pdata.svg`   | Anatomy of the in-flight `OtapPdata` value: one rounded box split by a thin vertical divider into two halves. Left half shows a `top` `Frame` (highlighted in OTAP-blue) with example `node_id` and `interests` values, three small geometrically-centered dots, a `bottom` `Frame` with its own example values, and two slim chips for `transport_headers` and `flow_compute_ns`. Right half shows two large variant tiles `OTAP records` and `OTLP bytes` with inverse-white `[OTAP]` / `[OTLP]` chips and the tagline *"reference-counted · zero-copy transit"*; a small `one of` badge between them makes the tagged-enum invariant explicit. Below the box, a `Frame` anatomy panel lists every field at its source-code identifier and Rust type plus all eight `Interests` bitflag chips. |
 
 `gen_diagram.py` produces `experiments.svg`, a single-slide diagram that
@@ -172,61 +200,22 @@ without touching layout code.
 
 ## Regeneration
 
+The canonical entry point is `./regenerate.sh` (documented in
+[Building](#building) at the top of this file). A new `gen_*.py` that is
+not registered there is detected at runtime so the wiring can't drift.
+
+For one-off iteration on a single slide (without wiping the rest), call
+the generator directly with an explicit output path:
+
 ```bash
-python3 gen_diagram.py            # writes experiments.svg
-python3 gen_diagram.py out.svg    # custom path
-
-python3 gen_otlp_bytes.py             # writes otlp_bytes.svg
-python3 gen_otlp_bytes.py out.svg     # custom path
-
-python3 gen_otap_tables.py            # writes otap_tables.svg
-python3 gen_otap_tables.py out.svg    # custom path
-
-python3 gen_node_retry.py             # writes node_retry.svg
-python3 gen_node_retry.py out.svg     # custom path
-
-python3 gen_node_batch.py             # writes node_batch.svg
-python3 gen_node_batch.py out.svg     # custom path
-
-python3 gen_node_transform.py             # writes node_transform.svg
-python3 gen_node_transform.py out.svg     # custom path
-
-# Remaining core processors
-python3 gen_node_attributes.py            # writes node_attributes.svg
-python3 gen_node_content_router.py        # writes node_content_router.svg
-python3 gen_node_debug.py                 # writes node_debug.svg
-python3 gen_node_delay.py                 # writes node_delay.svg
-python3 gen_node_durable_buffer.py        # writes node_durable_buffer.svg
-python3 gen_node_fanout.py                # writes node_fanout.svg
-python3 gen_node_filter.py                # writes node_filter.svg
-python3 gen_node_log_sampling.py          # writes node_log_sampling.svg
-python3 gen_node_signal_type_router.py    # writes node_signal_type_router.svg
-python3 gen_node_temporal_reaggregation.py  # writes node_temporal_reaggregation.svg
-
-# Contrib processors
-python3 gen_node_condense_attributes.py   # writes node_condense_attributes.svg
-python3 gen_node_recordset_kql.py         # writes node_recordset_kql.svg
-python3 gen_node_resource_validator.py    # writes node_resource_validator.svg
-
-# Receivers
-python3 gen_node_otlp_receiver.py         # writes node_otlp_receiver.svg
-
-# Exporters
-python3 gen_node_otlp_grpc_exporter.py    # writes node_otlp_grpc_exporter.svg
-python3 gen_node_otlp_http_exporter.py    # writes node_otlp_http_exporter.svg
-
-# Engine architecture
-python3 gen_engine_group.py               # writes engine_group.svg
-python3 gen_engine_core.py                # writes engine_core.svg
-
-# OtapPdata anatomy
-python3 gen_otap_pdata.py                 # writes otap_pdata.svg
+python3 gen_node_retry.py out/node_retry.svg
+python3 gen_engine_core.py out/pipeline_engine.svg
 ```
 
 Open in a browser (on WSL):
 
 ```bash
-powershell.exe -c "Start-Process msedge '$(wslpath -w experiments.svg)'"
+powershell.exe -c "Start-Process msedge '$(wslpath -w out/experiments.svg)'"
 ```
 
 ## OTLP byte-layout slide (`gen_otlp_bytes.py`)
@@ -376,6 +365,62 @@ actually laid out.
 
 ## Current project state
 
+### Recent updates (design-system pass)
+
+- **Output relocation.** Every generator now writes into `out/` and is
+  driven by `regenerate.sh`, which is the single source of truth for
+  which generators are wired up and what their output filenames are.
+  Renaming a slide is a one-line edit there. The script wipes
+  `out/*.svg` first so renamed slides can't leave stale copies behind.
+- **Renames.** `engine_core.svg` → `pipeline_engine.svg`,
+  `engine_group.svg` → `dataflow_engine.svg`. The generator
+  filenames stay; only the output basenames changed.
+- **Node-slide layout reorganized.** Foreign-entities panel now sits
+  in the **upper-left** below the subtitle, operator notes box now
+  sits in the **lower-left**, the control + ack/nack columns under the
+  node box are right-aligned to the box's right edge, and the calldata
+  chip lives in the bottom-right corner with a dashed leader rising
+  through the ack/nack rail to the outgoing pdata edge.
+- **Color discipline.** Per-node slides reserve OTAP-blue and OTLP-red
+  exclusively for the inverse-white format chips on the port lines.
+  The title-bar accent rule, the node-box top stripe, and every pdata
+  edge are now neutral grey, so the eye reads format from the chips
+  and never from a per-node primary color. The new `"neutral"` signal
+  passed to `node_box` and `pdata_edge` resolves to `COLOR_CTRL`.
+- **Shared (Send-required) nodes are flagged emphatically.** A red
+  `SHARED · Send` badge sits next to the node name above the box, and
+  a foreign-entities panel in the upper-left lists the outside-the-
+  engine objects the node holds Send references to. `NodeSlideSpec`
+  now exposes `shared: bool` and `foreign_entities: List[(name,
+  description)]`. Today's two qualifying nodes are `otlp_receiver`
+  (Tonic gRPC server, axum/hyper HTTP server) and `otap_receiver`
+  (Tonic gRPC server, ZstdRequestHeaderAdapter middleware). The OTLP /
+  OTAP exporters and parquet/topic/azure_monitor/geneva exporters
+  intentionally stay on the `local::*` traits because their tonic /
+  hyper / reqwest clients run inside the pipeline's single-threaded
+  runtime — no SHARED badge and no foreign-entities panel for them.
+- **Node coverage is largely complete.** 20 per-node slides exist
+  today: 6 receivers (`otlp`, `otap`, `host_metrics`,
+  `internal_telemetry`, `syslog_cef`, `topic`); all 13 core processors;
+  all 3 contrib processors; 5 core exporters (`otlp_grpc`,
+  `otlp_http`, `otap`, `parquet`, `topic`); 2 contrib exporters
+  (`azure_monitor`, `geneva`). **Intentional skips** (low value
+  relative to slide budget): `traffic_generator` receiver and the
+  terminal exporters `console`, `error`, `noop`, `perf`.
+- **Engine architecture slides.** `dataflow_engine.svg` now flags the
+  two genuinely cross-thread shared resources (`TopicBroker`,
+  `memory_pressure watch`) as red-tinted bubbles to match the SHARED
+  badge convention. `pipeline_engine.svg` regrouped its boundary
+  stubs by direction-of-traffic — runtime control on the left
+  (terminating at `RuntimeCtrlMsgManager`'s left edge), topic stubs
+  vertically below the box (terminating at `TopicSet`), and **no**
+  outside-thread stub on the dispatcher (`PipelineCompletionMsg` is
+  purely intra-pipeline). The receiver and each exporter sport a
+  closely-spaced parallel bundle of OTAP-blue arrows on their outside
+  edge to convey "many concurrent connections".
+
+### Per-asset status
+
 - **`gen_diagram.py` / `experiments.svg`** — finished and stable.
   Pipeline-conversion-cost timing diagram (4 scenarios A–D).
 - **`gen_otlp_bytes.py` / `otlp_bytes.svg`** — finished. Two batches
@@ -438,15 +483,19 @@ actually laid out.
   processor's URN is `urn:microsoft:processor:recordset_kql` and
   its output chip is `[OTLP]` because it returns
   `OtlpProtoBytes` even though pdata is wrapped as OTAP.
-- Receivers and exporters are now starting to be covered by per-node
-  slides. `gen_node_otlp_receiver.py` is the first receiver slide;
-  `gen_node_otlp_grpc_exporter.py` and `gen_node_otlp_http_exporter.py`
-  are the first exporter slides. Remaining receivers (OTAP,
-  internal-telemetry, syslog/CEF, traffic generator, host metrics,
-  topic) and exporters (OTAP, perf, parquet, console, noop, error,
-  topic, plus contrib azure_monitor / geneva) follow the same
-  recipe: source-walk for config / state / effects / control-msgs /
-  format chips, write a `gen_node_<name>.py` SPEC, and re-run.
+- Receivers and exporters are largely covered now. The two **shared**
+  receivers (`otlp_receiver`, `otap_receiver`) carry the upper-left
+  foreign-entities panel because they hand the `EffectHandler` into
+  Tonic / hyper worker threads; every other node uses the `local::*`
+  trait variants. Slides exist today for: receivers `otlp`, `otap`,
+  `host_metrics`, `internal_telemetry`, `syslog_cef`, `topic`;
+  exporters `otlp_grpc`, `otlp_http`, `otap`, `parquet`, `topic`,
+  plus contrib `azure_monitor` and `geneva`. **Not yet covered**
+  (intentional skip for now): `traffic_generator` receiver and the
+  terminal exporters `console`, `error`, `noop`, `perf`. Adding any of
+  them follows the same recipe: source-walk for config / state /
+  effects / control-msgs / format chips, write a `gen_node_<name>.py`
+  SPEC, and re-run.
 
 The three slides are designed to be shown in sequence:
 
@@ -910,7 +959,7 @@ needs saying is said by a label or a chip.
 
 The pair is meant to be shown in zoom-in order:
 
-1. `engine_group.svg` — **Dataflow Engine**, zoomed out:
+1. `dataflow_engine.svg` — **Dataflow Engine**, zoomed out:
    - Left column: the `ControllerRuntime` process. Inside, two
      groups of compact tiles — *thread-local accessory tasks*
      (`process-memory-limiter`, `metrics-aggregator`,
@@ -936,7 +985,7 @@ The pair is meant to be shown in zoom-in order:
      Labels are left-justified and offset 30 px from the
      controller-side rail so they breathe.
 
-2. `engine_core.svg` — **Pipeline thread**, zoomed in to one
+2. `pipeline_engine.svg` — **Pipeline thread**, zoomed in to one
    `RuntimePipeline`:
    - Big OTAP-blue-bordered outer box = one OS thread + one
      single-threaded tokio runtime + `LocalSet` (`!Send` node tasks).

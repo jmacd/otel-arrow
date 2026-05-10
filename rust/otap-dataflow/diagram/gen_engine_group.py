@@ -115,11 +115,28 @@ def _process_box(x: float, y: float, w: float, h: float,
 
 
 def _accessory_tile(x: float, y: float, w: float, h: float,
-                    name: str, sub: str = "") -> str:
-    """A compact tile for an accessory thread-local task or shared resource."""
+                    name: str, sub: str = "",
+                    shared: bool = False) -> str:
+    """A compact tile for an accessory thread-local task or shared resource.
+
+    When ``shared=True``, the tile renders as a red-shaded bubble to
+    flag that the resource is reachable from multiple pipeline threads
+    (and therefore subject to Send-required cross-thread access). The
+    color matches the SHARED badge convention used on the per-node
+    slides for the same reason.
+    """
+    if shared:
+        bg_fill = "#fbf3f2"          # warm tint matching the SHARED badge
+        stroke_color = COLOR_OTLP    # red outline -> Send-required
+        stroke_width = 1.4
+    else:
+        bg_fill = "#f4f6f8"
+        stroke_color = COLOR_CTRL_SOFT
+        stroke_width = 1.0
     parts = [
-        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="6" ry="6" '
-        f'fill="#f4f6f8" stroke="{COLOR_CTRL_SOFT}" stroke-width="1"/>',
+        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="14" ry="14" '
+        f'fill="{bg_fill}" stroke="{stroke_color}" '
+        f'stroke-width="{stroke_width}"/>',
         f'<text x="{x + 12}" y="{y + h/2 + 5}" font-size="{FS_LABEL}" '
         f'font-family="{FONT_MONO}" font-weight="600" '
         f'fill="{COLOR_LABEL}">{_esc(name)}</text>',
@@ -287,7 +304,8 @@ def _render_controller(out: List[str]) -> None:
     ]
     sy = shared_y + 14
     for name in shared:
-        out.append(_accessory_tile(tile_x, sy, tile_w, tile_h, name))
+        out.append(_accessory_tile(tile_x, sy, tile_w, tile_h, name,
+                                   shared=True))
         sy += tile_h + tile_gap
 
 

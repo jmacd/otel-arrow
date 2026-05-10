@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 842" width="1600" height="842">
+<defs><marker id="tip" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1f2933"/></marker></defs>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="80" y="50" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="28" font-weight="800" fill="#1f2933">Zero-copy &amp; Arrow IPC: OTAP through Quiver and on the wire</text>
+<text x="80" y="78" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="17" font-style="italic" fill="#52606d">One batch, three zero-copy hops: in-process · Quiver disk · Arrow IPC wire.</text>
+<rect x="106" y="220" width="215.906976744186" height="70" rx="8" ry="8" fill="white" stroke="#1f2933" stroke-width="1.4"/>
+<rect x="106" y="220" width="215.906976744186" height="4" rx="2" ry="2" fill="#52606d"/>
+<text x="213.953488372093" y="260.0" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="17" font-weight="700" fill="#1f2933">otlp_receiver</text>
+<rect x="333.906976744186" y="220" width="134.51162790697674" height="70" rx="8" ry="8" fill="white" stroke="#1f2933" stroke-width="1.4"/>
+<rect x="333.906976744186" y="220" width="134.51162790697674" height="4" rx="2" ry="2" fill="#52606d"/>
+<text x="401.1627906976744" y="260.0" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="17" font-weight="700" fill="#1f2933">batch</text>
+<rect x="480.41860465116275" y="220" width="134.5116279069768" height="70" rx="8" ry="8" fill="white" stroke="#1f2933" stroke-width="1.4"/>
+<rect x="480.41860465116275" y="220" width="134.5116279069768" height="4" rx="2" ry="2" fill="#52606d"/>
+<text x="547.6744186046511" y="260.0" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="17" font-weight="700" fill="#1f2933">filter</text>
+<rect x="626.9302325581396" y="220" width="313.5813953488372" height="70" rx="8" ry="8" fill="white" stroke="#1f2933" stroke-width="1.4"/>
+<rect x="626.9302325581396" y="220" width="313.5813953488372" height="4" rx="2" ry="2" fill="#52606d"/>
+<text x="783.7209302325582" y="260.0" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="17" font-weight="700" fill="#1f2933">durable_buffer</text>
+<rect x="952.5116279069767" y="220" width="134.51162790697674" height="70" rx="8" ry="8" fill="white" stroke="#1f2933" stroke-width="1.4"/>
+<rect x="952.5116279069767" y="220" width="134.51162790697674" height="4" rx="2" ry="2" fill="#52606d"/>
+<text x="1019.7674418604652" y="260.0" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="17" font-weight="700" fill="#1f2933">otap_exporter</text>
+<rect x="1278.093023255814" y="220" width="215.90697674418607" height="70" rx="8" ry="8" fill="white" stroke="#1f2933" stroke-width="1.4"/>
+<rect x="1278.093023255814" y="220" width="215.90697674418607" height="4" rx="2" ry="2" fill="#52606d"/>
+<text x="1386.046511627907" y="260.0" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="17" font-weight="700" fill="#1f2933">otap_receiver</text>
+<line x1="321.906976744186" y1="255.0" x2="333.906976744186" y2="255.0" stroke="#1f2933" stroke-width="1.4" marker-end="url(#tip)"/>
+<line x1="468.41860465116275" y1="255.0" x2="480.41860465116275" y2="255.0" stroke="#1f2933" stroke-width="1.4" marker-end="url(#tip)"/>
+<line x1="614.9302325581396" y1="255.0" x2="626.9302325581396" y2="255.0" stroke="#1f2933" stroke-width="1.4" marker-end="url(#tip)"/>
+<line x1="940.5116279069767" y1="255.0" x2="952.5116279069767" y2="255.0" stroke="#1f2933" stroke-width="1.4" marker-end="url(#tip)"/>
+<line x1="1087.0232558139535" y1="255.0" x2="1278.093023255814" y2="255.0" stroke="#8a929c" stroke-width="1.4" stroke-dasharray="6,4" marker-end="url(#tip)"/>
+<text x="1182.5581395348836" y="247.0" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="13" fill="#52606d">network</text>
+<line x1="114" y1="312" x2="451.41860465116275" y2="312" stroke="#b15a4f" stroke-width="2"/>
+<path d="M450.41860465116275,304 L460.41860465116275,312 L450.41860465116275,320 z" fill="#b15a4f"/>
+<text x="287.20930232558135" y="334" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#b15a4f">zero-copy · bytes::Bytes</text>
+<line x1="488.41860465116275" y1="312" x2="597.9302325581396" y2="312" stroke="#1f2933" stroke-width="2"/>
+<path d="M596.9302325581396,304 L606.9302325581396,312 L596.9302325581396,320 z" fill="#1f2933"/>
+<text x="547.6744186046511" y="334" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#1f2933">OTLP to OTAP</text>
+<line x1="814.0" y1="312" x2="1070.0232558139535" y2="312" stroke="#4f7a8a" stroke-width="2"/>
+<path d="M1069.0232558139535,304 L1079.0232558139535,312 L1069.0232558139535,320 z" fill="#4f7a8a"/>
+<text x="946.5116279069767" y="334" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#4f7a8a">zero-copy · Arc&lt;OtapArrowRecords&gt;</text>
+<line x1="1107.0232558139535" y1="312" x2="1249.093023255814" y2="312" stroke="#8a929c" stroke-width="2"/>
+<path d="M1248.093023255814,304 L1258.093023255814,312 L1248.093023255814,320 z" fill="#8a929c"/>
+<text x="1182.5581395348836" y="334" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#8a929c">Arrow IPC (zstd)</text>
+<line x1="701.4651162790698" y1="294" x2="701.4651162790698" y2="428" stroke="#8a929c" stroke-width="1.6"/>
+<path d="M696.4651162790698,428 L701.4651162790698,436 L706.4651162790698,428 z" fill="#8a929c"/>
+<line x1="719.4651162790698" y1="436" x2="719.4651162790698" y2="302" stroke="#4f7a8a" stroke-width="1.6"/>
+<path d="M714.4651162790698,302 L719.4651162790698,294 L724.4651162790698,302 z" fill="#4f7a8a"/>
+<text x="687.4651162790698" y="357.0" text-anchor="end" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="14" fill="#1f2933">Arrow IPC</text>
+<text x="687.4651162790698" y="373.0" text-anchor="end" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="14" fill="#1f2933">uncompressed</text>
+<text x="733.4651162790698" y="357.0" text-anchor="start" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="14" fill="#1f2933">Zero-copy</text>
+<text x="733.4651162790698" y="373.0" text-anchor="start" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="14" fill="#1f2933">mmap</text>
+<rect x="678.4651162790698" y="440" width="64" height="36" fill="white" stroke="none"/>
+<line x1="678.4651162790698" y1="440" x2="678.4651162790698" y2="476" stroke="#8a929c" stroke-width="1.4"/>
+<line x1="742.4651162790698" y1="440" x2="742.4651162790698" y2="476" stroke="#8a929c" stroke-width="1.4"/>
+<path d="M678.4651162790698,476 A32.0,6 0 0 0 742.4651162790698,476" fill="none" stroke="#8a929c" stroke-width="1.4"/>
+<ellipse cx="710.4651162790698" cy="440" rx="32.0" ry="6" fill="white" stroke="#8a929c" stroke-width="1.4"/>
+<text x="710.4651162790698" y="494" text-anchor="middle" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="13" fill="#52606d">Quiver spool</text>
+<line x1="100" y1="590" x2="1500" y2="590" stroke="#d9e1ec" stroke-width="1.0" stroke-dasharray="2,4"/>
+<line x1="100" y1="700" x2="1500" y2="700" stroke="#d9e1ec" stroke-width="1.0" stroke-dasharray="2,4"/>
+<line x1="100" y1="645.0" x2="1500" y2="645.0" stroke="#d9e1ec" stroke-width="1.0" stroke-dasharray="1,5"/>
+<text x="90" y="595" text-anchor="end" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#4f7a8a">OTAP</text>
+<text x="90" y="705" text-anchor="end" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#b15a4f">OTLP</text>
+<line x1="100.0" y1="700" x2="327.906976744186" y2="700" stroke="#b15a4f" stroke-width="3.0" stroke-linecap="square"/>
+<line x1="100" y1="584" x2="100" y2="706" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
+<line x1="327.906976744186" y1="700" x2="459.681399067451" y2="700" stroke="#b15a4f" stroke-width="3.0" stroke-linecap="square"/>
+<line x1="327.906976744186" y1="584" x2="327.906976744186" y2="706" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
+<line x1="489.1558102348745" y1="590" x2="613.5616297662837" y2="590" stroke="#4f7a8a" stroke-width="3.0" stroke-linecap="square"/>
+<line x1="459.681399067451" y1="700" x2="489.1558102348745" y2="590" stroke="#1f2933" stroke-width="3.0" stroke-linecap="round"/>
+<line x1="474.41860465116275" y1="584" x2="474.41860465116275" y2="706" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
+<line x1="628.2988353499954" y1="645.0" x2="792.6313972081441" y2="645.0" stroke="#8a929c" stroke-width="3.0" stroke-linecap="square"/>
+<line x1="613.5616297662837" y1="590" x2="628.2988353499954" y2="645.0" stroke="#1f2933" stroke-width="3.0" stroke-linecap="round"/>
+<line x1="620.9302325581396" y1="584" x2="620.9302325581396" y2="706" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
+<line x1="807.3686027918559" y1="590" x2="946.5116279069767" y2="590" stroke="#4f7a8a" stroke-width="3.0" stroke-linecap="square"/>
+<line x1="792.6313972081441" y1="645.0" x2="807.3686027918559" y2="590" stroke="#1f2933" stroke-width="3.0" stroke-linecap="round"/>
+<line x1="800.0" y1="584" x2="800.0" y2="706" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
+<line x1="946.5116279069767" y1="590" x2="1085.6546530220976" y2="590" stroke="#4f7a8a" stroke-width="3.0" stroke-linecap="square"/>
+<line x1="946.5116279069767" y1="584" x2="946.5116279069767" y2="706" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
+<line x1="1100.3918586058094" y1="645.0" x2="1264.724420463958" y2="645.0" stroke="#8a929c" stroke-width="3.0" stroke-linecap="square"/>
+<line x1="1085.6546530220976" y1="590" x2="1100.3918586058094" y2="645.0" stroke="#1f2933" stroke-width="3.0" stroke-linecap="round"/>
+<line x1="1093.0232558139535" y1="584" x2="1093.0232558139535" y2="706" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
+<line x1="1279.4616260476698" y1="590" x2="1500.0" y2="590" stroke="#4f7a8a" stroke-width="3.0" stroke-linecap="square"/>
+<line x1="1264.724420463958" y1="645.0" x2="1279.4616260476698" y2="590" stroke="#1f2933" stroke-width="3.0" stroke-linecap="round"/>
+<line x1="1272.093023255814" y1="584" x2="1272.093023255814" y2="706" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
+<line x1="1500.0" y1="584" x2="1500.0" y2="706" stroke="#b0b8c4" stroke-width="0.75" stroke-dasharray="2,3"/>
+</svg>

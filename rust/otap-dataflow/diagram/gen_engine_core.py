@@ -43,16 +43,22 @@ TITLE_X = SLIDE_MARGIN_X
 TITLE_Y = 60
 SUBTITLE_Y = 90
 
-# Boundary stubs are drawn ONLY on the left side of the thread box,
-# all going to / coming from the controller process. This avoids the
-# previous design where stubs exited both left and right, which read
-# as if the thread had two different external worlds.
-STUB_LEN = 200
+# Boundary stubs are grouped by direction-of-traffic so the eye reads
+# each group as one logical channel set:
+#   - Runtime control on the LEFT, terminating at RuntimeCtrlMsgManager.
+#   - Pipeline completion on the RIGHT, terminating at the dispatcher.
+#   - Topic traffic BELOW the thread box, terminating at TopicSet.
+# Receiver ingress and exporter egress (the data plane) use the same
+# left/right edges as the Runtime/Completion stubs but at the DAG row
+# height, drawn as multi-line fans to convey "many connections".
+STUB_LEN = 180
 STUB_FS  = 12
 
 THREAD_X = SLIDE_MARGIN_X + STUB_LEN + 24
-THREAD_Y = 130
-THREAD_W = PAGE_W - SLIDE_MARGIN_X - THREAD_X
+THREAD_Y = 175
+THREAD_W = PAGE_W - SLIDE_MARGIN_X - STUB_LEN - 24 - THREAD_X
+# Note: extra STUB_LEN reserved on the right so the exporter egress
+# fan and the completion stubs both have room outside the thread box.
 THREAD_H = 580
 THREAD_BANNER_H = 36
 
@@ -249,9 +255,12 @@ def _dag(out: List[str]) -> dict:
     edge(prB, eB)
 
     return {
-        "receiver_top": (rx[0], rx[1] - NODE_H / 2),
-        "fanout_top":   (fo[0], fo[1] - NODE_H / 2),
-        "expA_top":     (eA[0], eA[1] - NODE_H / 2),
+        "receiver_top":  (rx[0], rx[1] - NODE_H / 2),
+        "receiver_left": (rx[0] - NODE_W / 2, rx[1]),
+        "fanout_top":    (fo[0], fo[1] - NODE_H / 2),
+        "expA_top":      (eA[0], eA[1] - NODE_H / 2),
+        "expA_right":    (eA[0] + NODE_W / 2, eA[1]),
+        "expB_right":    (eB[0] + NODE_W / 2, eB[1]),
     }
 
 
@@ -322,64 +331,151 @@ def _topic_tile(out: List[str]) -> None:
     )
 
 
-def _boundary_stubs(out: List[str]) -> None:
-    """All boundary stubs on the LEFT side, going to the controller.
+def _boundary_stubs(out: List[str],
+                    rtc_anchor: Tuple[float, float],
+                    disp_anchor: Tuple[float, float]) -> None:
+    """Three grouped stub renderings, no caption.
 
-    Removes the previous left/right split which suggested the thread
-    talked to two different external worlds. Everything outside the
-    thread box is the controller process.
+    - **Runtime arrows** on the LEFT, terminating at the
+      ``RuntimeCtrlMsgManager`` box (left upper area).
+    - **Completion arrows** on the RIGHT, terminating at the
+      ``PipelineCompletionMsgDispatcher`` box (right upper area).
+    - **Topic arrows** BELOW the thread box, terminating at the
+      ``TopicSet`` tile.
+
+    The thread-box outline still bounds the inside of the runtime;
+    arrows now visibly land on the actor that owns the channel
+    instead of being captioned 'to controller process', which made
+    the picture read like the thread had a generic outside world.
     """
-    items: List[Tuple[str, str]] = [
-        ("RuntimeCtrlMsgReceiver",      "in"),
-        ("PipelineCompletionMsgSender", "out"),
-        ("note_instance_exit",          "out"),
-        ("memory_pressure rx",          "in"),
-        ("topics",                      "both"),
-    ]
-    x_in   = THREAD_X
-    x_out  = THREAD_X - STUB_LEN
-    y0     = ACTOR_TOP_Y + 40
-    step   = 30
+    rcx, rcy = rtc_anchor
+    dcx, dcy = disp_anchor
+    # Connections terminate on the actual edge of the actor box, not
+    # in the middle of the box (which read as floating in space).
+    rtc_left_x  = RTC_X
+    disp_right_x = DISP_X + DISP_W
 
-    for i, (label, direction) in enumerate(items):
-        y = y0 + i * step
+    # ---- Runtime arrows (LEFT, into the manager) -------------------
+    # Stack vertically; the bundle's center aligns with the manager
+    # box. Names are anchored to the page-margin side so they read
+    # left-to-right into the arrow.
+    runtime_items: List[Tuple[str, str]] = [
+        ("RuntimeCtrlMsgReceiver", "in"),
+        ("note_instance_exit",     "out"),
+        ("memory_pressure rx",     "in"),
+    ]
+    bundle_h = (len(runtime_items) - 1) * 24
+    # Center the bundle vertically on the manager box rather than
+    # hanging off its bottom edge (which left the lowest arrow below
+    # the box).
+    base_y = (ACTOR_TOP_Y + ACTOR_H / 2) - bundle_h / 2
+    for i, (label, direction) in enumerate(runtime_items):
+        y = base_y + i * 24
+        x_outside = SLIDE_MARGIN_X
         if direction == "in":
             out.append(
-                f'<line x1="{x_out}" y1="{y}" x2="{x_in}" y2="{y}" '
+                f'<line x1="{x_outside}" y1="{y}" x2="{rtc_left_x}" y2="{y}" '
                 f'stroke="{COLOR_CTRL}" stroke-width="{W_CTRL}" '
                 f'stroke-dasharray="4,3" marker-end="url(#ah-ctrl)"/>'
             )
-        elif direction == "out":
+        else:  # out
             out.append(
-                f'<line x1="{x_in}" y1="{y}" x2="{x_out}" y2="{y}" '
+                f'<line x1="{rtc_left_x}" y1="{y}" x2="{x_outside}" y2="{y}" '
                 f'stroke="{COLOR_CTRL}" stroke-width="{W_CTRL}" '
                 f'stroke-dasharray="4,3" marker-end="url(#ah-ctrl)"/>'
             )
-        else:  # both
-            out.append(
-                f'<line x1="{x_in}" y1="{y - 2}" x2="{x_out}" y2="{y - 2}" '
-                f'stroke="{COLOR_CTRL}" stroke-width="{W_CTRL}" '
-                f'stroke-dasharray="4,3" marker-end="url(#ah-ctrl)"/>'
-            )
-            out.append(
-                f'<line x1="{x_out}" y1="{y + 2}" x2="{x_in}" y2="{y + 2}" '
-                f'stroke="{COLOR_CTRL}" stroke-width="{W_CTRL}" '
-                f'stroke-dasharray="4,3" marker-end="url(#ah-ctrl)"/>'
-            )
+        # Label sits above the line, near the page-margin end so the
+        # eye picks up the channel name before tracking the arrow.
+        label_x = SLIDE_MARGIN_X + 4
         out.append(
-            f'<text x="{x_in - 6}" y="{y - 4}" text-anchor="end" '
+            f'<text x="{label_x}" y="{y - 4}" text-anchor="start" '
             f'font-size="{STUB_FS}" font-family="{FONT_MONO}" '
             f'fill="{COLOR_LABEL}">{_esc(label)}</text>'
         )
+        # Drop a tiny tick on the manager box edge so the visual link
+        # to the actor is unambiguous.
+        out.append(
+            f'<circle cx="{rtc_left_x}" cy="{y}" r="2" '
+            f'fill="{COLOR_CTRL}"/>'
+        )
 
-    # Single caption pointing back to the controller world.
+    # ---- Completion: NO outside-of-thread stub. -------------------
+    # PipelineCompletionMsg is purely intra-pipeline: nodes inside the
+    # thread send DeliverAck/DeliverNack to the dispatcher, and the
+    # dispatcher routes them to preceding subscribers in the same
+    # pipeline. The intra-thread arrows are drawn by
+    # _actor_to_node_links; nothing crosses the thread boundary on
+    # the right side.
+
+    # ---- Topic arrows (BELOW, into the TopicSet tile) -------------
+    # Bidirectional pair drawn vertically below the thread box, with
+    # arrowheads pointing both directions to convey the topic
+    # interaction model.
+    topic_cx = TOPIC_X + TOPIC_W / 2
+    topic_label_x = topic_cx + 14
+    y_top = TOPIC_Y + TOPIC_H        # bottom edge of TopicSet tile
+    y_bot = y_top + 60
+    # Down arrow (out): publish-side
     out.append(
-        f'<text x="{x_in - 6}" y="{y0 + len(items) * step + 10}" '
-        f'text-anchor="end" font-size="{STUB_FS}" font-style="italic" '
-        f'fill="{COLOR_SUBLABEL}">'
-        f'\u2190 to controller process'
-        f'</text>'
+        f'<line x1="{topic_cx - 6}" y1="{y_top}" x2="{topic_cx - 6}" '
+        f'y2="{y_bot}" stroke="{COLOR_CTRL}" stroke-width="{W_CTRL}" '
+        f'stroke-dasharray="4,3" marker-end="url(#ah-ctrl)"/>'
     )
+    # Up arrow (in): subscribe-side
+    out.append(
+        f'<line x1="{topic_cx + 6}" y1="{y_bot}" x2="{topic_cx + 6}" '
+        f'y2="{y_top}" stroke="{COLOR_CTRL}" stroke-width="{W_CTRL}" '
+        f'stroke-dasharray="4,3" marker-end="url(#ah-ctrl)"/>'
+    )
+    out.append(
+        f'<text x="{topic_label_x}" y="{y_bot - 2}" '
+        f'font-size="{STUB_FS}" font-family="{FONT_MONO}" '
+        f'fill="{COLOR_LABEL}">topics \u2195</text>'
+    )
+
+
+def _data_plane_fans(out: List[str], dag_anchors: dict) -> None:
+    """Multi-arrow fans on the receiver (incoming, left) and the
+    exporter (outgoing, right) to indicate that the receiver typically
+    accepts many concurrent connections and the exporter typically
+    holds many concurrent outbound connections.
+
+    Drawn in the OTAP pdata color and weight so they read as the
+    *data plane* extending out of the thread, in contrast to the
+    dashed grey runtime/completion stubs above.
+    """
+    fan_count = 4
+    fan_step = 6
+    fan_len = STUB_LEN - 8
+
+    # Receiver ingress -- closely-spaced parallel arrows entering the
+    # receiver's left edge from the page margin. Each arrow keeps the
+    # same y on both ends so they read as a parallel bundle, not a
+    # fan converging on a single point.
+    rxx, rxy = dag_anchors["receiver_left"]
+    x_outside = SLIDE_MARGIN_X
+    base_y = rxy - ((fan_count - 1) * fan_step) / 2
+    for i in range(fan_count):
+        y = base_y + i * fan_step
+        out.append(
+            f'<line x1="{x_outside}" y1="{y}" x2="{rxx - 2}" y2="{y}" '
+            f'stroke="{COLOR_OTAP}" stroke-width="{W_PDATA - 0.6}" '
+            f'stroke-linecap="round" marker-end="url(#ah-pdata)"/>'
+        )
+
+    # Exporter egress -- same parallel-bundle convention on the
+    # right side of each exporter.
+    x_outside = PAGE_W - SLIDE_MARGIN_X
+    for key in ("expA_right", "expB_right"):
+        ex, ey = dag_anchors[key]
+        base_y = ey - ((fan_count - 1) * fan_step) / 2
+        for i in range(fan_count):
+            y = base_y + i * fan_step
+            out.append(
+                f'<line x1="{ex + 2}" y1="{y}" x2="{x_outside}" y2="{y}" '
+                f'stroke="{COLOR_OTAP}" stroke-width="{W_PDATA - 0.6}" '
+                f'stroke-linecap="round" marker-end="url(#ah-pdata)"/>'
+            )
 
 
 def render() -> str:
@@ -398,7 +494,8 @@ def render() -> str:
     dag_anchors = _dag(out)
     _actor_to_node_links(out, rtc_anchor, disp_anchor, dag_anchors)
     _topic_tile(out)
-    _boundary_stubs(out)
+    _boundary_stubs(out, rtc_anchor, disp_anchor)
+    _data_plane_fans(out, dag_anchors)
     out.append(page_close())
     return "".join(out)
 
