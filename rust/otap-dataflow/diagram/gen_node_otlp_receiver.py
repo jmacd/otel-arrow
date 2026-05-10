@@ -40,6 +40,11 @@ SPEC = NodeSlideSpec(
     ],
     role="receiver",
     output_formats=["OTLP"],
+    shared=True,
+    foreign_entities=[
+        ("Tonic gRPC server", "OTLP/gRPC; Send EffectHandler clones."),
+        ("axum / hyper HTTP server", "OTLP/HTTP; Send handler shared."),
+    ],
     calldata=[
         ("slot", "SlotKey"),
     ],

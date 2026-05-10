@@ -68,12 +68,20 @@ def _esc(s: str) -> str:
 
 
 def color_for_signal(signal: str) -> str:
-    """Return the pdata color for a signal type name."""
+    """Return the pdata color for a signal type name.
+
+    The ``"neutral"`` (and ``"grey"``) sentinel returns the neutral
+    control-plane color so that the per-node deck can keep box
+    accents and pdata edges colorless and reserve OTAP/OTLP color
+    purely for the inverse-white chips on the port lines.
+    """
     s = signal.lower()
     if s in ("otap", "blue"):
         return COLOR_OTAP
     if s in ("otlp", "red"):
         return COLOR_OTLP
+    if s in ("neutral", "grey", "gray"):
+        return COLOR_CTRL
     return COLOR_CTRL
 
 
@@ -694,6 +702,93 @@ def notes_box(x: float, y: float, w: float, h: float,
     return "".join(parts)
 
 
+# Color used to flag the "shared" exception to the share-nothing
+# doctrine. Distinct from OTAP/OTLP signal colors so it cannot be
+# confused with a pdata variant; reuses the warm OTLP red because both
+# convey "this costs you something".
+COLOR_SHARED = COLOR_OTLP
+
+
+def shared_badge(cx: float, cy: float,
+                 w: float = 168, h: float = 28) -> str:
+    """A red inverse-style chip that flags a Shared (Send-required) node.
+
+    Drawn as a filled rounded rectangle in :data:`COLOR_SHARED` with
+    inverse-white text reading ``SHARED  Send``. Anchored on its
+    geometric center ``(cx, cy)`` so the caller can place it next to
+    the node-name label without doing arithmetic.
+    """
+    x = cx - w / 2
+    y = cy - h / 2
+    parts = [
+        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="6" ry="6" '
+        f'fill="{COLOR_SHARED}" stroke="none"/>',
+        f'<text x="{cx}" y="{cy + 5}" text-anchor="middle" '
+        f'font-size="14" font-weight="700" font-family="{FONT_MONO}" '
+        f'fill="#ffffff">SHARED \u00b7 Send</text>',
+    ]
+    return "".join(parts)
+
+
+def foreign_entities_panel(x: float, y: float, w: float, h: float,
+                           items: List[Tuple[str, str]],
+                           title: str = "Foreign entities (Send refs)",
+                           pad: float = 18,
+                           size: float = 14) -> str:
+    """Lower-left panel listing the non-engine objects a Shared node
+    holds Send references to (typically a transport runtime such as
+    Tonic or hyper). Draws as a lightly-shaded rounded rectangle with a
+    small title in mono and a numbered list of ``(name, description)``
+    rows.
+
+    The panel is intentionally styled like :func:`notes_box` so the two
+    lower corners read as siblings; the warm shared-color outline
+    distinguishes it from the cool notes box.
+    """
+    parts = [
+        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="10" ry="10" '
+        f'fill="#fbf3f2" stroke="{COLOR_SHARED}" stroke-width="1.2"/>',
+        f'<text x="{x + pad}" y="{y + pad + size}" '
+        f'font-size="{size}" font-weight="700" '
+        f'font-family="{FONT_MONO}" fill="{COLOR_SHARED}">'
+        f'{_esc(title)}</text>',
+    ]
+    line_h = size + 6
+    cy = y + pad + size + line_h + 4
+    name_x = x + pad
+    desc_x = x + pad + 12
+    text_w = w - 2 * pad - 12
+    char_w = size * 0.50
+    max_chars = max(1, int(text_w / char_w))
+    for name, desc in items:
+        parts.append(
+            f'<text x="{name_x}" y="{cy}" font-size="{size}" '
+            f'font-weight="700" font-family="{FONT_MONO}" '
+            f'fill="{COLOR_LABEL}">\u2022 {_esc(name)}</text>'
+        )
+        cy += line_h
+        words = desc.split()
+        cur = ""
+        lines: List[str] = []
+        for word in words:
+            cand = (cur + " " + word).strip()
+            if len(cand) <= max_chars or not cur:
+                cur = cand
+            else:
+                lines.append(cur)
+                cur = word
+        if cur:
+            lines.append(cur)
+        for line in lines:
+            parts.append(
+                f'<text x="{desc_x}" y="{cy}" font-size="{size}" '
+                f'fill="{COLOR_SUBLABEL}">{_esc(line)}</text>'
+            )
+            cy += line_h
+        cy += 4
+    return "".join(parts)
+
+
 # ============================================================ slide spec
 #
 # A per-node slide is fully described by a NodeSlideSpec: identity,
@@ -715,6 +810,12 @@ _NODE_W            = 720
 _NODE_H            = 320
 _OVERHEAD_TOP_Y    = 170
 _OVERHEAD_BOX_GAP  = 60       # space between overhead-panel top and node box top
+# Shift the centered node box right and down so the upper-left
+# foreign-entities panel (and its pdata-in line below the panel)
+# breathes. Affects only the inner panel; title, config listing, and
+# notes box keep their existing margins.
+_NODE_OFFSET_X     = 80
+_NODE_OFFSET_Y     = 50
 _BOX_NAME_GAP      = 18       # gap between node-name label and box top
 _INNER_TOP_PAD     = 38       # from box top to first line of inner cols
 _INNER_LEFT_PAD    = 20
@@ -730,18 +831,33 @@ _CHIP_OFFSET_Y     = 6
 _CTX_CHIP_W        = 220
 _CTX_CHIP_PAD_Y    = 12
 _CTX_CHIP_LINE_H   = 22       # FS_TINY + 6, see context_chip()
-_CTRL_COL_DX       = 0        # control column at left of box
-_ACK_COL_DX        = 240      # ack column offset right from box left
+_CTRL_COL_DX       = 410      # control column shifted right; right edge ~box right
+_ACK_COL_DX        = 640      # ack column near right edge of box
 
 # Top-of-page config-listing geometry.
 _CFG_TOP_Y         = 104
 _CFG_LINE_H        = 22
 _CFG_NAME_TYPE_GAP = 200      # px between right-justified name and right-justified type
 
-# Notes-box geometry (lower portion of the slide). Wider and taller
-# than the original placement so longer operator notes wrap cleanly.
-_NOTES_X           = 820
-_NOTES_Y           = 640
+# Subtitle wrap width is decoupled from the notes-box position so
+# subtitle behavior is stable as the layout evolves. The subtitle
+# still anchors at the left margin; this is just the wrap width.
+_SUBTITLE_WRAP_W   = 700
+
+# Notes-box geometry (lower-LEFT corner). Width sized so the notes
+# box ends well before the below-box columns on the right side.
+# _NOTES_Y is set far enough down to clear the shifted node box.
+_NOTES_X           = 80       # SLIDE_MARGIN_X
+_NOTES_Y           = 680
+_NOTES_W           = 700
+
+# Foreign-entities panel (upper-LEFT corner, shared nodes only).
+# Sized to clear the pdata input line and its label below the panel,
+# while leaving the centered node box room to breathe to the right.
+_FE_X              = 80
+_FE_Y              = 215
+_FE_W              = 320
+_FE_H              = 170
 
 
 @dataclass
@@ -798,6 +914,17 @@ class NodeSlideSpec:
     # edge fans out into one labelled edge per port; the single
     # ack/nack rail is unchanged.
     named_outputs:          List[str] = None  # type: ignore[assignment]
+    # ``Shared`` (Send-required) nodes are an exception to the
+    # share-nothing doctrine: their effect handler is ``Send``, so the
+    # node task can hand references to objects that run on other
+    # threads (typically a transport runtime such as Tonic or hyper).
+    # When ``shared=True``, the slide grows a red "SHARED  Send" badge
+    # next to the node name and (if ``foreign_entities`` is non-empty)
+    # a "Foreign entities" panel in the lower-left corner listing the
+    # cross-thread holders the node interacts with via shared
+    # references.
+    shared:                 bool = False
+    foreign_entities:       List[Tuple[str, str]] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.input_formats is None:
@@ -810,6 +937,8 @@ class NodeSlideSpec:
             self.notes = []
         if self.named_outputs is None:
             self.named_outputs = []
+        if self.foreign_entities is None:
+            self.foreign_entities = []
 
 
 # ---- color resolver for chip rows ---------------------------------------
@@ -870,18 +999,18 @@ def render_node_slide(spec: NodeSlideSpec) -> str:
         x=MARGIN_X, y=80, w=PAGE_W - 2 * MARGIN_X,
         title=spec.name,
         urn=spec.urn,
-        accent=color_for_signal(spec.signal),
+        accent=COLOR_CTRL,
     ))
     parts.append(
         f'<text x="{MARGIN_X}" y="{120}" font-size="24" '
         f'font-style="italic" fill="{COLOR_SUBLABEL}">'
     )
-    # Wrap the subtitle to the same width as the notes box in the
-    # lower-right corner so it never collides with the upper-right
-    # config-field listing.
+    # Wrap the subtitle to a fixed left-anchored width so it never
+    # collides with the upper-right config-field listing nor with
+    # any panel placed on the upper-left below it.
     sub_fs = 24
     sub_line_h = sub_fs + 4
-    sub_max_w = (PAGE_W - MARGIN_X) - _NOTES_X
+    sub_max_w = _SUBTITLE_WRAP_W
     sub_char_w = sub_fs * 0.50
     sub_max_chars = max(1, int(sub_max_w / sub_char_w))
     sub_words = spec.subtitle.split()
@@ -932,11 +1061,17 @@ def render_node_slide(spec: NodeSlideSpec) -> str:
     # --- overhead panel ---------------------------------------------
     parts.append(_render_overhead_panel(spec, PAGE_W, MARGIN_X))
 
-    # --- notes (lower-right) ----------------------------------------
-    notes_w = (PAGE_W - MARGIN_X) - _NOTES_X
+    # --- foreign-entities panel (upper-LEFT, shared nodes only) -----
+    if spec.shared and spec.foreign_entities:
+        parts.append(foreign_entities_panel(
+            _FE_X, _FE_Y, _FE_W, _FE_H,
+            items=spec.foreign_entities,
+        ))
+
+    # --- notes (lower-LEFT) -----------------------------------------
     notes_h = (PAGE_H - MARGIN_Y) - _NOTES_Y
     parts.append(notes_box(
-        _NOTES_X, _NOTES_Y, notes_w, notes_h,
+        _NOTES_X, _NOTES_Y, _NOTES_W, notes_h,
         size=16,
         items=spec.notes,
     ))
@@ -953,16 +1088,32 @@ def _render_overhead_panel(spec: NodeSlideSpec,
     panel_x = MARGIN_X
     panel_w = PAGE_W - 2 * MARGIN_X
 
-    nx = panel_x + (panel_w - _NODE_W) / 2
-    ny = _OVERHEAD_TOP_Y + _OVERHEAD_BOX_GAP + int(_NODE_H * 0.15)
+    nx = panel_x + (panel_w - _NODE_W) / 2 + _NODE_OFFSET_X
+    ny = (_OVERHEAD_TOP_Y + _OVERHEAD_BOX_GAP + int(_NODE_H * 0.15)
+          + _NODE_OFFSET_Y)
     cx = nx + _NODE_W / 2
 
     # Node name above the box.
     parts.append(node_name_label(cx, ny - _BOX_NAME_GAP, spec.name))
 
-    # The node itself.
+    # SHARED  Send badge: when this node is one of the rare exceptions
+    # to the share-nothing doctrine (Send-required effect handler),
+    # call it out emphatically right of the node name so the viewer
+    # cannot miss it.
+    if spec.shared:
+        # Estimate the name's rendered width so the badge sits just
+        # past it (FS_NODE = 26, ~0.55 em average glyph).
+        name_w = len(spec.name) * FS_NODE * 0.55
+        badge_cx = cx + name_w / 2 + 18 + 84  # name half + gap + badge half
+        parts.append(shared_badge(badge_cx, ny - _BOX_NAME_GAP - 8))
+
+    # The node itself. Color is intentionally neutral on the box
+    # stripe and on every pdata edge below; only the OTAP/OTLP chips
+    # carry the signal color, so the eye can read variant from the
+    # chip without first having to puzzle out a per-node primary
+    # color.
     parts.append(node_box(nx, ny, _NODE_W, _NODE_H,
-                          title="", sub="", signal=spec.signal))
+                          title="", sub="", signal="neutral"))
 
     # Inside-box content: state (left) + effect-handler list (right).
     inner_top_y = ny + _INNER_TOP_PAD
@@ -981,7 +1132,7 @@ def _render_overhead_panel(spec: NodeSlideSpec,
     downstream_x = panel_x + panel_w
 
     parts.append(pdata_edge(upstream_x, in_y_pdata, nx, in_y_pdata,
-                            signal=spec.signal))
+                            signal="neutral"))
     if spec.named_outputs:
         # Fan the right-side pdata edge into N labelled edges, one per
         # named output port. Use a comfortable fixed step centered on
@@ -1009,7 +1160,7 @@ def _render_overhead_panel(spec: NodeSlideSpec,
         label_x = nx + _NODE_W + 6
         for i, (port, y) in enumerate(zip(spec.named_outputs, ys)):
             parts.append(pdata_edge(nx + _NODE_W, y, downstream_x, y,
-                                    signal=spec.signal))
+                                    signal="neutral"))
             # Place the label centered in the vertical gap below this
             # line; for the bottom line, use step/2 below.
             if i + 1 < n:
@@ -1026,7 +1177,7 @@ def _render_overhead_panel(spec: NodeSlideSpec,
         out_chip_y_anchor = ys[0]
     else:
         parts.append(pdata_edge(nx + _NODE_W, in_y_pdata, downstream_x,
-                                in_y_pdata, signal=spec.signal))
+                                in_y_pdata, signal="neutral"))
         out_chip_y_anchor = in_y_pdata
 
     # Format chips. Output side anchored just right of the box; input
@@ -1080,25 +1231,30 @@ def _render_overhead_panel(spec: NodeSlideSpec,
         y_pdata_right=out_chip_y_anchor,
     ))
 
-    # Calldata chip: floats above the outgoing pdata edge with its
-    # right edge aligned to the page margin.
+    # Calldata chip: anchored in the bottom-RIGHT corner with a
+    # dashed leader rising up through the ack/nack rail to the
+    # outgoing pdata edge. The dashed style keeps the crossing
+    # readable; placing the chip down here keeps it from crowding
+    # the upper-right config-field listing.
     if spec.calldata:
         ctx_w = _CTX_CHIP_W
         chip_cx = (PAGE_W - MARGIN_X) - ctx_w / 2
         ctx_h = 2 * _CTX_CHIP_PAD_Y + _CTX_CHIP_LINE_H * len(spec.calldata)
-        # Anchor the chip's bottom edge a clear gap above the format
-        # chips so they do not touch.
-        chip_bottom = chip_y - 28
+        # Bottom edge of chip sits a hair above the page bottom so it
+        # mirrors the notes-box bottom on the left.
+        chip_bottom = SLIDE_PAGE_H - SLIDE_MARGIN_Y - 8
         chip_cy = chip_bottom - ctx_h / 2
         parts.append(context_chip(
             cx=chip_cx, cy=chip_cy,
             kvs=spec.calldata,
             width=ctx_w,
         ))
-        # Dotted leader from chip down to outgoing pdata edge.
+        # Dashed leader from chip top straight up to the outgoing
+        # pdata edge. It deliberately crosses the ack/nack rail; the
+        # dashes keep the relationship readable.
         parts.append(
-            f'<line x1="{chip_cx}" y1="{chip_cy + ctx_h / 2}" '
-            f'x2="{chip_cx}" y2="{out_chip_y_anchor - 4}" '
+            f'<line x1="{chip_cx}" y1="{chip_cy - ctx_h / 2}" '
+            f'x2="{chip_cx}" y2="{out_chip_y_anchor + 4}" '
             f'stroke="{COLOR_CTX}" stroke-width="1" '
             f'stroke-dasharray="2,2"/>'
         )

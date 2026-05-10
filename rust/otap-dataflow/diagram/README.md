@@ -25,12 +25,13 @@ OTLP-vs-OTAP story:
 | `gen_node_condense_attributes.py` | `node_condense_attributes.svg` | Per-node slide for `urn:otel:processor:condense_attributes` (contrib). Condenses selected log attributes into a single destination attribute on the OTAP output records. OTAP-only output. |
 | `gen_node_recordset_kql.py` | `node_recordset_kql.svg` | Per-node slide for `urn:microsoft:processor:recordset_kql` (contrib). Runs a parsed RecordSet KQL pipeline over OTLP log records that arrive wrapped in OTAP pdata; emits OTLP bytes downstream. |
 | `gen_node_resource_validator.py` | `node_resource_validator.svg` | Per-node slide for `urn:otel:processor:resource_validator` (contrib). Validates required resource attributes and permanently Nacks data that fails policy. Pass-through for both formats when validation succeeds. |
-| `gen_node_otlp_receiver.py` | `node_otlp_receiver.svg` | Per-node slide for `urn:otel:receiver:otlp` (`OTLPReceiver`). First receiver slide. Listens for OTLP/gRPC and OTLP/HTTP exports and admits each request as a lazily-decoded `OtlpProtoBytes` payload; the calldata chip carries a `SlotKey` so `wait_for_result` requests are paired with their downstream Ack/Nack. |
+| `gen_node_otlp_receiver.py` | `node_otlp_receiver.svg` | Per-node slide for `urn:otel:receiver:otlp` (`OTLPReceiver`). First receiver slide. Listens for OTLP/gRPC and OTLP/HTTP exports and admits each request as a lazily-decoded `OtlpProtoBytes` payload; the calldata chip carries a `SlotKey` so `wait_for_result` requests are paired with their downstream Ack/Nack. Marked **SHARED · Send** because the effect handler is handed into Tonic and axum/hyper worker threads — see the upper-left foreign-entities panel. |
+| `gen_node_otap_receiver.py` | `node_otap_receiver.svg` | Per-node slide for `urn:otel:receiver:otap` (`OTAPReceiver`). gRPC-only receiver hosting the three Arrow services (logs / metrics / traces); decoded record batches are emitted as OTAP pdata. Same calldata pattern as the OTLP receiver (`SlotKey` for `wait_for_result`). Marked **SHARED · Send** — the EffectHandler is cloned into Tonic per-stream handlers; the upper-left foreign-entities panel calls out the Tower `MemoryPressureLayer` semaphore and the zstd middleware. |
 | `gen_node_otlp_grpc_exporter.py` | `node_otlp_grpc_exporter.svg` | Per-node slide for `urn:otel:exporter:otlp_grpc` (`OTLPExporter`). First exporter slide. Encodes OTAP inputs to OTLP protobuf bytes and dispatches per-signal RPCs over a pooled tonic channel, capped by `max_in_flight`. The right-side port labels show `gRPC` / `gRPC status` because that side faces the network. |
 | `gen_node_otlp_http_exporter.py` | `node_otlp_http_exporter.svg` | Per-node slide for `urn:otel:exporter:otlp_http` (`OtlpHttpExporter`). HTTP/1.1 sibling of the gRPC exporter; pools hyper clients for SO_REUSEPORT load balancing and supports per-signal endpoint overrides. Right-side port labels show `HTTP` / `HTTP status`. |
-| `gen_engine_group.py` | `engine_group.svg` | Engine-architecture slide #1 — the **pipeline group**: one controller process (with its accessory thread-local tasks and shared resources), the `http-admin` thread, and the N per-core `RuntimePipeline` instances. Emphasises one OS thread per assigned core; cross-thread edges are dashed grey. |
-| `gen_engine_core.py`  | `engine_core.svg`  | Engine-architecture slide #2 — one **per-core pipeline thread**: the in-thread actors (`RuntimeCtrlMsgManager`, `PipelineCompletionMsgDispatcher`), a representative receiver→processor→exporter node chain, and the per-core `TopicSet` view of the cross-core `TopicBroker`. Boundary stubs identify every channel that crosses out of the thread. |
-| `gen_otap_pdata.py`   | `otap_pdata.svg`   | Anatomy of the in-flight `OtapPdata` value: one box containing a `Context` (stack of `Frame`s with `transport_headers` and `flow_compute_ns`) on the left and the `payload: OtapPayload` tagged enum on the right. Both `OTAP records` and `OTLP bytes` variants are tagged "reference-counted · zero-copy transit". A compact `Frame` anatomy strip below lists the per-frame fields. |
+| `gen_engine_group.py` | `engine_group.svg` | **Dataflow Engine** zoom-out: one `ControllerRuntime` process (with accessory thread-local tasks and shared resources), the `http-admin` thread, and N `Engine Core` boxes on the right — each core hosts one or more `RuntimePipeline` threads, drawn as small per-pipeline DAGs with a faint intra-core connector showing they form a group. Banner: *"one tokio single-threaded runtime per pipeline"*. Cross-thread channels are dashed grey, labelled at the controller-side end. |
+| `gen_engine_core.py`  | `engine_core.svg`  | **Pipeline thread** zoom-in: one `RuntimePipeline` (single OS thread + tokio single-threaded runtime + LocalSet). Top row: `RuntimeCtrlMsgManager` and `PipelineCompletionMsgDispatcher`, each with a bidirectional `↕` channel-type label above. Middle: a 6-node DAG with branching (`receiver → fanout → {processor, processor} → {exporter, exporter}`); every adjacent pair is connected by a heavy OTAP-blue pdata line on top and a thin grey ack/nack line below. Three asymmetric arrows from the dispatcher into `receiver`, `fanout`, and one `exporter` show that simple pass-through nodes need no completion-path connection. Boundary stubs all sit on the left side, going to the controller. |
+| `gen_otap_pdata.py`   | `otap_pdata.svg`   | Anatomy of the in-flight `OtapPdata` value: one rounded box split by a thin vertical divider into two halves. Left half shows a `top` `Frame` (highlighted in OTAP-blue) with example `node_id` and `interests` values, three small geometrically-centered dots, a `bottom` `Frame` with its own example values, and two slim chips for `transport_headers` and `flow_compute_ns`. Right half shows two large variant tiles `OTAP records` and `OTLP bytes` with inverse-white `[OTAP]` / `[OTLP]` chips and the tagline *"reference-counted · zero-copy transit"*; a small `one of` badge between them makes the tagged-enum invariant explicit. Below the box, a `Frame` anatomy panel lists every field at its source-code identifier and Rust type plus all eight `Interests` bitflag chips. |
 
 `gen_diagram.py` produces `experiments.svg`, a single-slide diagram that
 explains the OTLP-vs-OTAP conversion-cost experiments visually. The design
@@ -480,21 +481,22 @@ every per-node slide. Four distinct regions:
 │  italic subtitle                              cfg_field_1   Type1   │
 │                                               cfg_field_2   Type2   │
 │                                               cfg_field_3   Type3   │
-│                                                                      │
-│   PData                          node_name (bold)        ╔═══════╗  │
-│   ───────────▶┌────────────────────────────────┐──────▶ [OTAP][OTLP]║ ctx ║│
-│               │  state            effects       │                 ╚═══════╝│
-│   Ack/Nack    │  local timer ...  notify_ack    │  ack/nack            │
-│   ◀────────── │                   notify_nack   │ ◀──────────          │
-│               │                   ...           │                      │
-│               └────────────────────────────────┘                      │
-│                ↑ ↓                  ↑ ↓                               │
-│                control              ack/nack                          │
-│                Variant1             Receive    ┌────── notes ───────┐ │
-│                Variant2             Send       │ 1. ...             │ │
-│                Variant3                        │ 2. ...             │ │
-│                                                │ 3. ...             │ │
-│                                                └────────────────────┘ │
+│  ┌── foreign entities ──┐                                            │
+│  │ (shared nodes only)  │                                            │
+│  │ • Tonic gRPC server  │     PData            node_name  [SHARED]  │
+│  │ • hyper HTTP server  │     ──────▶┌──────────────────┐──▶ [OTAP] │
+│  │ • SharedAdmission    │            │ state    effects │           │
+│  └──────────────────────┘     Ack/Nk │ ...      ...     │  ack/nack │
+│                               ◀──────│                  │ ◀──────── │
+│                                      └──────────────────┘            │
+│                                              ↑ ↓        ↑ ↓         │
+│                                              control    ack/nack    │
+│                                              Variant1   Receive     │
+│  ┌────── operator notes ───────┐             Variant2   Send        │
+│  │ 1. ...                      │             Variant3              │
+│  │ 2. ...                      │                                    │
+│  │ 3. ...                      │                                    │
+│  └─────────────────────────────┘                                    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -514,12 +516,10 @@ Reading top-to-bottom, left-to-right:
    signal color (blue for OTAP, red for OTLP).
 2. **Italic one-sentence subtitle**, left-justified under the title.
    One sentence: this is a tagline, not a description. The renderer
-   wraps the subtitle to the **same pixel width as the notes box** in
-   the lower-right corner, so a longer tagline grows downward into
-   empty space rather than colliding with the upper-right config
-   listing. (Width is derived from the same `_NOTES_X` constant used
-   to place the notes box, so a future tweak re-flows both regions
-   in lockstep.)
+   wraps the subtitle to a fixed left-anchored width
+   (`_SUBTITLE_WRAP_W`, currently 700 px) so it never collides with
+   the upper-right config listing nor with the upper-left
+   foreign-entities panel placed below it on shared-node slides.
 3. **Right-aligned config field listing**, just under the rule on
    the right margin. Two columns matching the calldata chip's
    layout below: **field name on the left** (bold mono, the
@@ -644,23 +644,27 @@ Reading top-to-bottom, left-to-right:
    Placement matters: a chip on the **right** = "this node
    *attaches* state going downstream"; a chip on the **left** would
    mean "this node *consumes* state arriving from upstream".
-9. **Below-box: two columns of arrows + lists.**
-   - **Control column (left).** A pair of thin-grey ↑/↓ arrows
-     (same style as the horizontal ack/nack edges), an italic
-     `control` label below the arrows, and a sorted bold-monospace
-     list of the `NodeControlMsg` variant names the node handles
-     **with a non-empty body**. Skip variants that fall through to
-     `Ok(())` or are `unreachable!`. **Skip `Ack` and `Nack`**: the
-     completion-queue / ack-nack flow is universal and automatic on
-     every node and would just add noise.
+9. **Below-box: two columns of arrows + lists, anchored to the
+   right edge of the node box.** Both columns sit under the right
+   half of the node box so the lower-left corner is reserved for
+   the operator notes; the rightmost column's text aligns with the
+   box's right edge.
+   - **Control column.** A pair of thin-grey ↑/↓ arrows (same
+     style as the horizontal ack/nack edges), an italic `control`
+     label below the arrows, and a sorted bold-monospace list of
+     the `NodeControlMsg` variant names the node handles **with a
+     non-empty body**. Skip variants that fall through to `Ok(())`
+     or are `unreachable!`. **Skip `Ack` and `Nack`**: the
+     completion-queue / ack-nack flow is universal and automatic
+     on every node and would just add noise.
      For `retry_processor` this column lists `CollectTelemetry`,
      `Config`, `DelayedData`.
-   - **Ack/nack column (right).** A role-dependent set of
-     thin-grey ↑/↓ arrows (same style as the control column,
-     because ack/nack is also control plane), an italic `ack/nack`
-     label below the arrows, and a short text list of `recv`
-     and/or `send` entries. Arrows and entries encode the same
-     information for redundancy:
+   - **Ack/nack column (rightmost, near box right edge).** A
+     role-dependent set of thin-grey ↑/↓ arrows (same style as the
+     control column, because ack/nack is also control plane), an
+     italic `ack/nack` label below the arrows, and a short text
+     list of `recv` and/or `send` entries. Arrows and entries
+     encode the same information for redundancy:
      - **processor** — both ↑/↓ arrows; entries `recv`, `send`
      - **receiver**  — only ↑ arrow ; entry `recv` (downstream's
        responses arrive; receivers have no upstream peer to send
@@ -671,7 +675,9 @@ Reading top-to-bottom, left-to-right:
      ↑ = receive (ack/nack arriving from downstream), ↓ = send
      (ack/nack propagating to upstream).
 
-   ASCII reminder of the bottom region:
+   ASCII reminder of the bottom region (note the right-side
+   anchoring of the columns; the lower-LEFT below the box is
+   reserved for the operator notes box):
 
    ```text
    ┌── retry_processor ──────────────────────────────────┐
@@ -682,18 +688,21 @@ Reading top-to-bottom, left-to-right:
    │                             send_message            │
    │                             subscribe_to            │
    └─────────────────────────────────────────────────────┘
-     ↑ ↓                           ↑ ↓
-     control                       ack/nack
-     CollectTelemetry              Receive
-     Config                        Send
-     DelayedData
+                            ↑ ↓               ↑ ↓
+                            control           ack/nack
+                            CollectTelemetry  Receive
+                            Config            Send
+                            DelayedData
    ```
-10. **Operator notes (lower-right).** A lightly-shaded rounded box
+10. **Operator notes (lower-LEFT).** A lightly-shaded rounded box
     (`#f4f6f8` fill, fine `COLOR_CTRL_SOFT` outline, 10-px corner
     radius) holding a numbered list of operator-relevant notes
     about how the node behaves. The same style and chrome on
     every slide. Items are short factual sentences, not marketing
-    copy. Naively word-wrapped.
+    copy. Naively word-wrapped. The notes box is anchored at
+    `(_NOTES_X, _NOTES_Y) = (MARGIN_X, 640)` with a fixed
+    `_NOTES_W = 700` so the below-box columns can claim the
+    right-side area without colliding.
 
 ### State analysis (where the node's state actually lives)
 
@@ -782,7 +791,7 @@ Render this with `state_hint(x, y, lines)` from `node_lib.py`.
    (no `node: none` placeholder). An empty struct does not mean
    a stateless node — call out engine-held state explicitly when
    it exists.
-8. **Notes box is the same on every slide.** Position (lower-right
+8. **Notes box is the same on every slide.** Position (lower-LEFT
    corner with comfortable margin from the node box), shading,
    outline, corner radius, numbering style — all locked. Only the
    item text varies per node.
@@ -796,6 +805,37 @@ Render this with `state_hint(x, y, lines)` from `node_lib.py`.
     `Ok(())` or `unreachable!` are also skipped — only
     `NodeControlMsg` variants the node handles with a meaningful
     non-empty body appear in the control list.
+11. **Shared (Send-required) nodes are called out emphatically.**
+    The pipeline runtime is share-nothing by default: every node
+    task is `!Send` and runs on a single-threaded tokio runtime
+    inside one OS thread. A small number of nodes are exceptions
+    because they must hand references to objects living on other
+    threads — typically a multi-threaded transport runtime such as
+    Tonic (gRPC) or hyper (HTTP). These nodes implement the
+    `shared::receiver` / `shared::processor` / `shared::exporter`
+    trait variants instead of the `local::*` ones, and their
+    `EffectHandler` is `Send`. On the slide this is signalled two
+    ways:
+
+    - A red **`SHARED · Send`** badge sits next to the node-name
+      label above the box. Use the warm OTLP-red color
+      deliberately — Send-bound code pays for memory-safety
+      enforcement at the type system level *and* incurs cache /
+      atomic costs at runtime.
+    - A **Foreign entities (Send refs)** panel in the upper-LEFT
+      corner (just below the title/subtitle area, to the left of
+      the centered node box) lists the outside-of-engine objects
+      the node holds Send references to, one bullet per holder with
+      a short description. Placing it in the upper-left puts the
+      cross-thread relationship right next to the node it modifies
+      while leaving the lower-LEFT for the operator notes box.
+
+    Set `shared=True` on the SPEC and supply
+    `foreign_entities=[(name, description), ...]` to opt in. Today
+    the OTLP receiver and OTAP receiver are the only nodes that
+    qualify; the OTLP gRPC / HTTP exporters spawn tonic / hyper
+    clients but stay on the local trait because their clients run
+    inside the pipeline's single-threaded runtime.
 
 ### Library (`node_lib.py`)
 
@@ -824,7 +864,8 @@ Exports:
   available for one-off panels) — `node_box`, `pdata_edge`,
   `ctrl_edge`, `signal_chip`, `node_name_label`, `state_hint`,
   `effect_list`, `controller_list`, `mono_list`, `control_column`,
-  `ack_column`, `context_chip`, `port_row_labels`, `notes_box`.
+  `ack_column`, `context_chip`, `port_row_labels`, `notes_box`,
+  `shared_badge`, `foreign_entities_panel`.
 - **Misc / leftover** — `curvy_loop`, `puck`, `callout`,
   `mini_panel`, `glyph_check`, `glyph_cross`, `glyph_hourglass`
   remain available for future per-node panels but are not part of
@@ -861,67 +902,102 @@ if __name__ == "__main__":
 
 These two slides describe the *runtime* — where threads live, which
 tasks run on which thread, and which channels cross thread
-boundaries. They are a parallel deck to the per-node slides and reuse
-`node_lib`'s palette, title bar, notes box, and arrow markers so they
-read like part of the same family.
+boundaries. They reuse `node_lib`'s palette, title bar, and arrow
+markers so they read like part of the per-node deck. Both slides are
+deliberately spare: no notes box, no parentheticals, no struct-name
+generic suffixes, no descriptive sub-captions on tiles. Anything that
+needs saying is said by a label or a chip.
 
 The pair is meant to be shown in zoom-in order:
 
-1. `engine_group.svg` — *one pipeline group at runtime*: the
-   controller process (with its accessory `spawn_thread_local_task`
-   tiles — `process-memory-limiter`, `metrics-aggregator`,
-   `metrics-dispatcher`, `observed-state-store`, `engine-metrics` —
-   plus shared resources `DeclaredTopics(TopicBroker)` and the
-   `memory_pressure` watch sender), the separate `http-admin` thread
-   reachable via `Arc<dyn ControlPlane>`, and the N per-core
-   `RuntimePipeline` instance tiles. The blue banner across the top
-   of the right column states the invariant out loud:
-   *"one OS thread → one tokio current_thread runtime → one core"*.
-2. `engine_core.svg` — *zoom in to one core*: a single big
-   blue-bordered box represents the OS thread + its
-   `tokio current_thread` + `LocalSet` (`!Send` node tasks). Inside
-   the box: `RuntimeCtrlMsgManager` and
-   `PipelineCompletionMsgDispatcher` on top, a representative
-   receiver→processor→exporter chain in the middle, and the per-core
-   `TopicSet` view at the bottom. Boundary stubs identify every
-   channel that crosses out of the thread.
+1. `engine_group.svg` — **Dataflow Engine**, zoomed out:
+   - Left column: the `ControllerRuntime` process. Inside, two
+     groups of compact tiles — *thread-local accessory tasks*
+     (`process-memory-limiter`, `metrics-aggregator`,
+     `metrics-dispatcher`, `observed-state-store`, `engine-metrics`)
+     and *shared resources* (`TopicBroker`, `memory_pressure watch`).
+     Below the controller, the separate `http-admin` thread, linked
+     up to the controller by a vertical `Arc<dyn ControlPlane>`
+     edge.
+   - Right column: three `Engine Core` boxes (Core 0, Core 1, ⋮,
+     Core N). **Each engine core is a host for one or more
+     `RuntimePipeline` threads, drawn as small per-pipeline DAGs**
+     (4–5 nodes, OTAP-blue circles connected by short arrows). A
+     faint dashed S-curve connector between the two visible
+     pipelines inside each core conveys *"these pipelines form a
+     group within the core"*.
+   - A blue banner across the right column reads
+     *"one tokio single-threaded runtime per pipeline"*.
+   - Five labelled cross-thread channels run between controller and
+     Core 0 (`RuntimeCtrlMsgSender`, `PipelineCompletionMsgSender`,
+     `memory_pressure watch`, `topics`, `note_instance_exit`); the
+     same pattern is repeated against Core 1 and Core N as short
+     unlabelled stubs to convey *"every core has the same set"*.
+     Labels are left-justified and offset 30 px from the
+     controller-side rail so they breathe.
+
+2. `engine_core.svg` — **Pipeline thread**, zoomed in to one
+   `RuntimePipeline`:
+   - Big OTAP-blue-bordered outer box = one OS thread + one
+     single-threaded tokio runtime + `LocalSet` (`!Send` node tasks).
+     The thread-banner at the top spells out the invariant.
+   - Top row: slim `RuntimeCtrlMsgManager` (left) and
+     `PipelineCompletionMsgDispatcher` (right). Above each box,
+     the channel-type label with a `↕` glyph
+     (`NodeControlMsg ↕`, `PipelineCompletionMsg ↕`) — both
+     channels carry traffic in both directions.
+   - Middle: a 6-node DAG, geometrically centered in the box:
+     `receiver → fanout → {processorA, processorB} → {exporterA,
+     exporterB}`. Every adjacent pair is connected by a **two-line
+     pair**: a heavy OTAP-blue pdata line on top (forward, filled
+     arrowhead) and a thin grey ack/nack line below (backward,
+     open arrowhead). Heavy-on-top, thin-on-bottom matches the
+     pdata-row / ack-row convention from the per-node slides.
+   - Manager → receiver: one curved control arrow.
+     Dispatcher ← `{receiver, fanout, exporterA}`: three curved
+     completion arrows. The processors and `exporterB` are
+     intentionally *not* connected to the dispatcher — simple
+     pass-through nodes do not interact with the completion path.
+   - `TopicSet` tile at the bottom = the per-pipeline view of the
+     controller-owned `TopicBroker`.
+   - All boundary stubs sit on the **left side** of the thread
+     box, going to the controller process: `RuntimeCtrlMsgReceiver`
+     in, `PipelineCompletionMsgSender` out, `note_instance_exit`
+     out, `memory_pressure rx` in, `topics` bidirectional. A
+     single trailing caption *"← to controller process"*
+     identifies the world they cross into.
 
 ### Conventions specific to these slides
 
 1. **Color extends to the runtime plane.** OTAP-blue is reused as
    the accent for "this is a pdata-carrying pipeline thread" — both
-   the per-core instance tiles on the group slide and the outer
+   the per-core mini-DAG circles on the group slide and the outer
    thread frame on the per-core slide use it. Neutral grey is the
    accent for the controller process; the warm context-chip color
-   is the accent for the admin thread (a non-pdata accessory
-   process).
+   is the accent for the admin thread.
 2. **Edge style = scope.** Thick colored = pdata; thin solid grey =
    in-thread control / ack-nack; thin **dashed** grey = cross-thread
-   tokio channel (e.g. `RuntimeCtrlMsgSender`, `memory_pressure`
-   watch, `topics`); dotted thin = "weak handle / observation" (e.g.
-   `note_instance_exit`). The dashed-vs-solid distinction is the
-   only way the picture marks a thread boundary.
-3. **Accessory tiles.** Inside the controller box, each
-   `spawn_thread_local_task` is rendered as a compact pill with the
-   task name in monospace on the left and a one-line role on the
-   right. Each pill is itself an OS thread + a tokio
-   `current_thread` runtime — the tile chrome is intentionally
-   plain to avoid implying any are pipelines.
-4. **Per-core tile shape is repeated.** The group slide draws three
-   instances (Core 0, Core 1, vertical ellipsis, Core N) — the
-   pattern of channels between controller and one core is drawn in
-   full only against Core 0; Core 1 and Core N receive short
-   unlabelled stubs to communicate "every core has the same
-   relationship". Adding more cores means adding more stubs, never
-   more channel types.
-5. **Boundary stubs name the Rust channel type.** On the per-core
-   slide, every line that crosses the outer thread frame is labelled
-   with the Rust handle that owns that crossing
-   (`RuntimeCtrlMsgReceiver`, `PipelineCompletionMsgSender`,
-   `note_instance_exit (Weak)`, `memory_pressure (watch) rx`,
-   `topics (TopicBroker)`). Anything not crossing the frame is
-   in-thread and stays unlabelled at the boundary.
-6. **One source-of-truth comment block** sits at the top of each
+   tokio channel. The dashed-vs-solid distinction is how the picture
+   marks a thread boundary.
+3. **No parentheticals, no descriptive sub-captions.** Tiles show
+   identifiers; banners say one short factual sentence. If a thing
+   needs explaining it gets a label, not prose.
+4. **Per-core tile shape repeats.** The group slide draws three
+   engine-core boxes; the labelled channel pattern is shown in full
+   only against Core 0, with short unlabelled stubs against Core 1
+   and Core N to convey *"every core has the same set"*.
+5. **Two-line forward/back convention.** On the per-core slide,
+   every adjacent node pair has a heavy OTAP-blue pdata line on top
+   and a thin grey ack/nack line below, parallel via a pure
+   y-offset so the convention reads the same on horizontal and
+   diagonal edges.
+6. **All boundary stubs on one side.** On the per-core slide, every
+   line that crosses the outer thread frame exits to the same side
+   (left, towards the controller) — the previous left/right split
+   wrongly suggested two different external worlds.
+7. **Channel-type labels float above the actor row** so they never
+   cross the curved arrows that fan in / fan out below them.
+8. **One source-of-truth comment block** sits at the top of each
    generator listing the file:line citations the slide is built
    from. When the runtime layout changes, update those citations
    and re-run.
@@ -935,33 +1011,34 @@ and chrome.
 
 Composition:
 
-1. **One `OtapPdata` outer box** with the OTAP-blue accent stripe,
-   containing both halves side-by-side.
-2. **`context: Context` column (left)** — the frame stack drawn as
-   a `top` `Frame` tile, three small geometrically-centered dots
-   (not the unicode `⋮`, whose vertical anchor is unreliable), and
-   a `bottom` `Frame` tile. Each tile shows example `node_id` and
-   `interests` values so the reader sees what a frame *contains*,
-   not just that it exists. Underneath, two slim chips for
-   `transport_headers: Option<TransportHeaders>` and
-   `flow_compute_ns: Option<NonZeroU64>`. The top frame is painted
-   in the OTAP accent color so the eye lands on it first.
-3. **`payload: OtapPayload` column (right)** — two large variant
-   tiles stacked vertically. The upper tile reads
-   **`OTAP records`** in big bold (blue), the lower tile reads
-   **`OTLP bytes`** (red). Both tiles carry an inverse-white
-   `[OTAP]` / `[OTLP]` format chip in the upper-right and the
-   tag-line *"reference-counted · zero-copy transit"*. Between
-   them sits a small **`one of`** badge with short connecting
-   leaders, making the tagged-enum invariant explicit: the
-   payload field is exactly one of the two, never both.
+1. **One `OtapPdata` outer box** with the OTAP-blue accent stripe.
+   A thin grey vertical divider down the middle separates the two
+   halves; no column headings are needed because the divider is
+   self-evident.
+2. **Left half — Context** — the frame stack drawn as a `top`
+   `Frame` tile (highlighted in the OTAP accent color), three small
+   geometrically-centered dots (not the unicode `⋮`, whose vertical
+   anchor is unreliable across renderers), and a `bottom` `Frame`
+   tile. Each tile shows example `node_id` and `interests` values
+   so the reader sees what a frame *contains*, not just that it
+   exists. Underneath, two slim chips for `transport_headers:
+   Option<TransportHeaders>` and `flow_compute_ns:
+   Option<NonZeroU64>`.
+3. **Right half — Payload** — two large variant tiles stacked
+   vertically. The upper tile reads **`OTAP records`** in big bold
+   (blue), the lower tile reads **`OTLP bytes`** (red). Both tiles
+   carry an inverse-white `[OTAP]` / `[OTLP]` format chip in the
+   upper-right and the tagline *"reference-counted · zero-copy
+   transit"*. Between them sits a small **`one of`** badge with
+   short connecting leaders, making the tagged-enum invariant
+   explicit: the payload field is exactly one of the two.
 4. **`Frame` anatomy panel (below the box)** — full source-
    faithful field listing on the left (`node_id: usize`,
    `interests: Interests`, `route.calldata: CallData =
    SmallVec<[Context8u8; 3]>`, `route.entry_time_ns: u64`,
    `route.output_port_index: u16`) and a 2 × 4 grid of all eight
-   `Interests` bitflag chips on the right, each labelled with
-   its identifier and bit position (`1<<0` ... `1<<7`).
+   `Interests` bitflag chips on the right, each labelled with its
+   identifier and bit position (`1<<0` ... `1<<7`).
 
 ### Conventions specific to this slide
 
