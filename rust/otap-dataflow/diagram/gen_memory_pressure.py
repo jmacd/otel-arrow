@@ -21,12 +21,12 @@ Composition:
 - Right: three ``Engine Core`` tiles stacked vertically. Each holds the
   same illustrative pipeline (``otap_receiver -> batch -> retry ->
   otlp_grpc_exporter``) drawn as four node boxes with bounded
-  inter-node channel capsules between them. Above each node we hang a
-  compact list of the *fixed* state the node holds (struct fields +
-  engine-held state from the per-node SPECs). The intent is that a
+  inter-node channel capsules between them. The intent is that a
   viewer can count the boxes and channels and convince themselves the
   total memory footprint of one core is bounded by the sum of those
-  named pieces.
+  named pieces. (Per-node fixed-state lists are tracked in
+  ``PIPELINE_NODES`` for reference but are intentionally not drawn on
+  this slide -- they made the right column too busy.)
 - Cross-thread broadcast arrows (dashed grey) run from the
   ``memory_pressure watch`` resource into each core, conveying that
   every receiver subscribes and that admission decisions are made
@@ -92,8 +92,8 @@ LEFT_H = 600
 # Right: stack of three engine cores.
 RIGHT_X = LEFT_X + LEFT_W + 60
 RIGHT_W = PAGE_W - RIGHT_X - SLIDE_MARGIN_X    # 940 with default margins
-CORE_H = 180
-CORE_GAP = 18
+CORE_H = 175
+CORE_GAP = 26
 CORE_Y0 = LEFT_Y
 
 # Bottom takeaway strip.
@@ -208,13 +208,7 @@ def _render_controller_left(out: List[str]) -> Tuple[float, float]:
         f'font-weight="700" fill="{COLOR_LABEL}">'
         f'process-memory-limiter</text>'
     )
-    out.append(
-        f'<text x="{inner_x + inner_w - 12}" y="{lim_y + 22}" '
-        f'text-anchor="end" font-size="{FS_TINY}" font-style="italic" '
-        f'fill="{COLOR_SUBLABEL}">thread-local accessory task</text>'
-    )
-
-    # MemoryPressureState atomics list
+    # ---- MemoryPressureState atomics list --------------------------
     state_y = lim_y + 48
     out.append(_section_label(
         inner_x + 12, state_y, "MemoryPressureState"))
@@ -251,13 +245,6 @@ def _render_controller_left(out: List[str]) -> Tuple[float, float]:
                            chip_w, chip_h, "Soft", "#c9943a"))
     out.append(_level_chip(cx + 2 * (chip_w + chip_gap), chip_y,
                            chip_w, chip_h, "Hard", COLOR_OTLP))
-    # Caption under the chips
-    out.append(
-        f'<text x="{inner_x + 12}" y="{chip_y + chip_h + 16}" '
-        f'font-size="{FS_TINY}" font-style="italic" '
-        f'fill="{COLOR_SUBLABEL}">'
-        f'classified per tick from sampled usage</text>'
-    )
 
     # ---- MemoryLimiterPolicy summary -------------------------------
     pol_y = lim_y + lim_h + 22
@@ -297,9 +284,11 @@ def _render_controller_left(out: List[str]) -> Tuple[float, float]:
 
 # One illustrative pipeline shared across all three cores. Each entry:
 #   (display_name, role, struct/module, [bounded state lines])
-# State lines are mirrored from the per-node SPECs in this directory.
+# The state-lines column is preserved for documentation purposes; the
+# slide intentionally does not draw it any more (it was too busy in
+# the engine-core tiles).
 PIPELINE_NODES: List[Tuple[str, str, str, List[str]]] = [
-    ("otap_receiver", "receiver", "OTAPReceiver",
+    ("receiver", "receiver", "OTAPReceiver",
      ["shared admission state",
       "ack subscription registry",
       "rejection counters"]),
@@ -310,7 +299,7 @@ PIPELINE_NODES: List[Tuple[str, str, str, List[str]]] = [
     ("retry", "processor", "RetryProcessor",
      ["local timer wheel",
       "(engine-held payload)"]),
-    ("otlp_grpc_exporter", "exporter", "OTLPExporter",
+    ("exporter", "exporter", "OTLPExporter",
      ["in-flight queue (max_in_flight)",
       "parked-message slot",
       "proto encoders + buffers"]),
@@ -378,25 +367,34 @@ def _channel_capsule(x: float, y: float, w: float, h: float) -> str:
     return "".join(parts)
 
 
-def _state_callout(x: float, y: float, w: float, h: float,
-                   lines: List[str]) -> str:
-    """Lightly-shaded box hung above a node listing its fixed state.
+def _slotmap_rect(x: float, y: float, w: float, h: float,
+                  label: str) -> str:
+    """Small labeled rectangle representing an internal slotmap that
+    a node uses to track per-message state. The shape is intentionally
+    minimal -- the point is to make visible that the node's tracking
+    storage is itself a finite, named structure.
     """
     parts = [
-        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="6" ry="6" '
-        f'fill="#fafbfc" stroke="{COLOR_CTRL_SOFT}" stroke-width="1" '
-        f'stroke-dasharray="2,2"/>',
+        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="4" ry="4" '
+        f'fill="#f4f6f8" stroke="{COLOR_CTRL}" stroke-width="1"/>',
+        f'<text x="{x + w/2}" y="{y + h/2 + 4}" text-anchor="middle" '
+        f'font-size="{FS_TINY - 2}" font-family="{FONT_MONO}" '
+        f'fill="{COLOR_LABEL}">{_esc(label)}</text>',
+        f'<text x="{x + w/2}" y="{y - 4}" text-anchor="middle" '
+        f'font-size="{FS_TINY - 4}" font-style="italic" '
+        f'fill="{COLOR_SUBLABEL}">slotmap</text>',
     ]
-    line_h = 13
-    ly = y + 14
-    for s in lines:
-        parts.append(
-            f'<text x="{x + 8}" y="{ly}" font-size="{FS_TINY - 4}" '
-            f'font-family="{FONT_MONO}" fill="{COLOR_LABEL}">'
-            f'{_esc(s)}</text>'
-        )
-        ly += line_h
     return "".join(parts)
+
+
+# Internal-state slotmaps to draw above each node. A node not present
+# in this mapping gets nothing drawn above it (the retry node holds
+# its parked payload in the engine, not in a node-local slotmap).
+NODE_SLOTMAPS: dict = {
+    "receiver": ["pending"],
+    "batch":    ["inbound", "outbound"],
+    "exporter": ["inflight"],
+}
 
 
 def _render_one_core(out: List[str], y: float,
@@ -421,22 +419,16 @@ def _render_one_core(out: List[str], y: float,
         f'<text x="{x + 16}" y="{y + 30}" font-size="{FS_NODE_SUB}" '
         f'font-weight="700" fill="{COLOR_LABEL}">{_esc(core_label)}</text>'
     )
-    out.append(
-        f'<text x="{x + w - 14}" y="{y + 30}" text-anchor="end" '
-        f'font-size="{FS_TINY}" font-style="italic" '
-        f'fill="{COLOR_SUBLABEL}">'
-        f'one tokio single-threaded runtime per pipeline</text>'
-    )
 
     # Pipeline strip geometry
     n = len(PIPELINE_NODES)
-    pad_l = 60       # leave room for the broadcast arrow tip on the left
-    pad_r = 22
+    pad_l = 90       # leave room for the broadcast arrow tip on the left
+    pad_r = 40
     strip_x = x + pad_l
     strip_w = w - pad_l - pad_r
     node_w = 132
     cap_h = 24
-    cap_gap = 8
+    cap_gap = 14
     total_caps_w = (n - 1) * (cap_gap + 70 + cap_gap)
     # Recompute: distribute remaining horizontal space to capsules
     remaining = strip_w - n * node_w
@@ -444,33 +436,41 @@ def _render_one_core(out: List[str], y: float,
     cap_w = max(60, (remaining - 2 * cap_gap * (n - 1)) / (n - 1))
 
     node_h = 50
-    strip_y_mid = y + CORE_H - 40       # pipeline center near the bottom
-    node_y = strip_y_mid - node_h / 2
-
-    # State callouts above the nodes
-    callout_h = 60
-    callout_y = node_y - callout_h - 10
+    # Place the pipeline strip near the bottom of the core so we have
+    # room above each node to hang slotmap rectangles.
+    slotmap_h = 32
+    slotmap_top_pad = 14            # gap below the header
+    slotmap_to_node_gap = 22        # gap between slotmap row and nodes
+    node_y = y + 36 + slotmap_top_pad + slotmap_h + slotmap_to_node_gap
+    strip_y_mid = node_y + node_h / 2
+    slotmap_y = node_y - slotmap_to_node_gap - slotmap_h
 
     # Walk left to right placing nodes + capsules
     cx = strip_x
     receiver_left_x = strip_x       # for the broadcast arrow
-    for i, (name, role, _struct, state_lines) in enumerate(PIPELINE_NODES):
+    for i, (name, role, _struct, _state_lines) in enumerate(PIPELINE_NODES):
         # Node accent: receiver/exporter neutral grey, processors too
         # (all neutral; format chips would distract from the memory
         # story).
         out.append(_node_tile(cx, node_y, node_w, node_h,
                               name=name, role=role,
                               accent=COLOR_CTRL))
-        # State callout above
-        out.append(_state_callout(cx - 4, callout_y, node_w + 8,
-                                  callout_h, state_lines))
-        # Dotted leader from callout down to node
-        out.append(
-            f'<line x1="{cx + node_w/2}" y1="{callout_y + callout_h}" '
-            f'x2="{cx + node_w/2}" y2="{node_y}" '
-            f'stroke="{COLOR_CTRL_SOFT}" stroke-width="1" '
-            f'stroke-dasharray="2,2"/>'
-        )
+        # Slotmap rectangle(s) above the node (if any)
+        labels = NODE_SLOTMAPS.get(name, [])
+        if labels:
+            inner_gap = 8
+            sm_w = (node_w - inner_gap * (len(labels) - 1)) / len(labels)
+            for j, lbl in enumerate(labels):
+                sx = cx + j * (sm_w + inner_gap)
+                out.append(_slotmap_rect(sx, slotmap_y, sm_w, slotmap_h,
+                                         lbl))
+                # Thin connector down to the node body
+                out.append(
+                    f'<line x1="{sx + sm_w/2}" y1="{slotmap_y + slotmap_h}" '
+                    f'x2="{sx + sm_w/2}" y2="{node_y}" '
+                    f'stroke="{COLOR_CTRL_SOFT}" stroke-width="1" '
+                    f'stroke-dasharray="2,2"/>'
+                )
         # Capsule between this node and the next
         if i < n - 1:
             cap_x = cx + node_w + cap_gap
@@ -493,24 +493,6 @@ def _render_one_core(out: List[str], y: float,
         else:
             cx = cx + node_w
 
-    # Ack/nack return rail (one thin grey arrow under the strip going
-    # right-to-left), to make backpressure visible. Anchored near the
-    # bottom of the core so it never collides with the node tiles.
-    rail_y = y + CORE_H - 12
-    rail_x1 = strip_x + 8
-    rail_x2 = cx - 8
-    out.append(
-        f'<line x1="{rail_x2}" y1="{rail_y}" x2="{rail_x1}" y2="{rail_y}" '
-        f'stroke="{COLOR_CTRL}" stroke-width="1.0" stroke-dasharray="4,2" '
-        f'marker-end="url(#ah-ctrl)"/>'
-    )
-    out.append(
-        f'<text x="{(rail_x1 + rail_x2)/2}" y="{rail_y - 4}" '
-        f'text-anchor="middle" font-size="{FS_TINY - 4}" '
-        f'font-style="italic" fill="{COLOR_SUBLABEL}">'
-        f'ack / nack drains the slots</text>'
-    )
-
     return (receiver_left_x, strip_y_mid)
 
 
@@ -530,29 +512,27 @@ def _render_broadcast(out: List[str],
                       origin: Tuple[float, float],
                       anchors: List[Tuple[float, float]]) -> None:
     """Dashed arrows from the ``memory_pressure watch`` shared bubble
-    out to each core's receiver-side port. One representative label
-    above the topmost arrow keeps the chrome quiet.
+    out to each core's left wall. The vertical trunk is centered in
+    the gap between the controller panel and the engine cores so it
+    doesn't crowd either side, and arrowheads terminate on the core
+    boundary (not inside it).
     """
     ox, oy = origin
-    for i, (ax, ay) in enumerate(anchors):
-        # Manhattan-style: short horizontal out of bubble, vertical to
-        # the core's mid y, short horizontal into the receiver.
-        mid_x = (ox + ax) / 2
+    # Center the vertical trunk in the gap between the controller
+    # panel and the engine cores.
+    trunk_x = (LEFT_X + LEFT_W + RIGHT_X) / 2
+    # Terminate arrows on the core's outer left wall.
+    core_left = RIGHT_X
+    for i, (_ax, ay) in enumerate(anchors):
         path = (
-            f'M{ox},{oy} L{mid_x},{oy} '
-            f'L{mid_x},{ay} L{ax - 6},{ay}'
+            f'M{ox},{oy} L{trunk_x},{oy} '
+            f'L{trunk_x},{ay} L{core_left - 4},{ay}'
         )
         out.append(
             f'<path d="{path}" fill="none" stroke="{COLOR_OTLP}" '
             f'stroke-width="1.2" stroke-dasharray="5,3" '
             f'marker-end="url(#ah-ctrl)" opacity="0.85"/>'
         )
-        if i == 0:
-            out.append(
-                f'<text x="{mid_x + 6}" y="{oy - 8}" '
-                f'font-size="{FS_TINY}" font-family="{FONT_MONO}" '
-                f'fill="{COLOR_OTLP}">memory_pressure watch \u2192 every core</text>'
-            )
 
 
 # ---------------------------------------------------------- takeaways
@@ -569,7 +549,7 @@ def _render_takeaways(out: List[str]) -> None:
     )
     items: List[Tuple[str, str]] = [
         ("All buffers are sized at construction.",
-         "no unbounded growth anywhere"),
+         "avoid unbounded growth"),
         ("Backpressure flows backwards via Ack/Nack.",
          "drains the in-flight slots"),
         ("Hard pressure sheds at ingress.",
@@ -619,7 +599,7 @@ def render() -> str:
     out.append(arrow_marker_defs())
     out.append(title_bar(
         TITLE_X, TITLE_Y, PAGE_W - 2 * SLIDE_MARGIN_X,
-        title="Memory pressure & backpressure",
+        title="Memory and backpressure",
         urn="MemoryPressureState + bounded per-node state",
         accent=COLOR_OTAP,
     ))
