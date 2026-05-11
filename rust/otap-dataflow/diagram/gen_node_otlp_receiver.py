@@ -22,8 +22,8 @@ from node_lib import NodeSlideSpec, render_node_slide
 SPEC = NodeSlideSpec(
     name="otlp_receiver",
     urn="urn:otel:receiver:otlp",
-    subtitle="Ingests OTLP/gRPC and OTLP/HTTP exports as lazily-decoded "
-             "OTLP byte payloads.",
+    subtitle="Ingests OTLP/gRPC and OTLP/HTTP exports as "
+             "OTLP bytes payloads.",
     config_fields=[
         ("protocols.grpc", "Option<GrpcServerSettings>"),
         ("protocols.http", "Option<HttpServerSettings>"),
@@ -42,7 +42,7 @@ SPEC = NodeSlideSpec(
     output_formats=["OTLP"],
     shared=True,
     foreign_entities=[
-        ("Tonic gRPC server", "OTLP/gRPC; Send EffectHandler clones."),
+        ("Tonic gRPC server", "OTLP/gRPC; Send EffectHandler shared."),
         ("axum / hyper HTTP server", "OTLP/HTTP; Send handler shared."),
     ],
     calldata=[
@@ -58,8 +58,7 @@ SPEC = NodeSlideSpec(
     transport_pdata_label="gRPC / HTTP",
     transport_status_label="gRPC / HTTP status",
     notes=[
-        "At least one protocol (gRPC and/or HTTP) must be configured; "
-        "default ports mirror the Go collector (4317 / 4318).",
+        "At least one protocol (gRPC and/or HTTP) must be configured.`",
         "Request bodies stay in serialized OTLP form via OtlpBytesCodec; "
         "downstream stages decode lazily.",
         "wait_for_result holds the response until the immediate "

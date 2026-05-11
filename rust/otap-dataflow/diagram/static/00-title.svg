@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="850" viewBox="0 0 1600 850" font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+  <rect width="1600" height="850" fill="#ffffff"/>
+  <rect x="80" y="60" width="1440" height="2" fill="#4f7a8a"/>
+  <rect x="80" y="788" width="1440" height="2" fill="#4f7a8a"/>
+
+  <g transform="translate(800 360)" text-anchor="middle">
+    <text y="0"   font-size="84" font-weight="700" fill="#1f2933">OpenTelemetry Arrow</text>
+    <text y="80"  font-size="36" font-style="italic" fill="#52606d">Microsoft Observability</text>
+  </g>
+
+  <g transform="translate(800 720)" text-anchor="middle">
+    <text y="0"  font-size="22" font-family="'JetBrains Mono', Menlo, Consolas, monospace" fill="#1f2933">Joshua MacDonald &lt;jmacdonald@microsoft.com&gt;</text>
+    <text y="34" font-size="20" fill="#52606d">May 11, 2026</text>
+  </g>
+</svg>

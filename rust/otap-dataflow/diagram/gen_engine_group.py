@@ -448,7 +448,7 @@ def _render_subtitle(out: List[str]) -> None:
     out.append(
         f'<text x="{TITLE_X}" y="{SUBTITLE_Y}" font-size="{FS_SUBTITLE}" '
         f'font-style="italic" fill="{COLOR_SUBLABEL}">'
-        f'One controller, one engine group per CPU, one thread per pipeline.'
+        f'Single controller, one engine per CPU, one thread per pipeline.'
         f'</text>'
     )
 
@@ -460,7 +460,7 @@ def render() -> str:
     out.append(title_bar(
         TITLE_X, TITLE_Y, PAGE_W - 2 * SLIDE_MARGIN_X,
         title="OpenTelemetry Arrow Dataflow Engine",
-        urn="ControllerRuntime + N \u00d7 RuntimePipeline",
+        urn="ControllerRuntime + N \u00d7 g \u00d7 RuntimePipeline",
         accent=COLOR_OTAP,
     ))
     _render_subtitle(out)

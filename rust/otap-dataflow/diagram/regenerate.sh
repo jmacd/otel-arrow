@@ -37,6 +37,7 @@ GENERATORS=(
     "gen_engine_core.py        07-pipeline-engine.svg"
     "gen_zero_copy.py          08-zero-copy.svg"
     "gen_memory_pressure.py    09-memory-pressure.svg"
+    "gen_roadmap.py            09b-roadmap.svg"
 
     "gen_node_otlp_receiver.py               10-node-otlp-receiver.svg"
     "gen_node_syslog_cef_receiver.py         11-node-syslog-cef-receiver.svg"

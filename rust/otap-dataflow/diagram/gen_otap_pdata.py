@@ -244,7 +244,7 @@ def _variant(x: float, y: float, w: float, h: float,
         f'<text x="{x + 22}" y="{y + h - 18}" '
         f'font-size="{FS_LABEL}" font-style="italic" '
         f'fill="{COLOR_SUBLABEL}">'
-        f'reference-counted \u00b7 zero-copy transit'
+        f'reference-counted \u00b7 immutable'
         f'</text>',
     ]
     # Inverse-white format chip in upper-right.
@@ -342,7 +342,7 @@ def _anatomy(out: List[str]) -> None:
     out.append(
         f'<text x="{ANATOMY_X + 88}" y="{ANATOMY_Y + 26}" '
         f'font-size="{FS_TINY}" font-style="italic" '
-        f'fill="{COLOR_SUBLABEL}">all fields, exact source-code names</text>'
+        f'fill="{COLOR_SUBLABEL}"></text>'
     )
 
     # Two columns of "name : type" rows.
@@ -382,7 +382,7 @@ def _anatomy(out: List[str]) -> None:
     out.append(
         f'<text x="{bits_x}" y="{bits_y - 16}" font-size="{FS_TINY}" '
         f'font-style="italic" fill="{COLOR_SUBLABEL}">'
-        f'Interests \u2014 8 bitflags</text>'
+        f'Interests</text>'
     )
     for i, name in enumerate(INTERESTS_BITS):
         row = i // cols
@@ -413,7 +413,7 @@ def _subtitle(out: List[str]) -> None:
     out.append(
         f'<text x="{TITLE_X}" y="{SUBTITLE_Y}" font-size="{FS_SUBTITLE}" '
         f'font-style="italic" fill="{COLOR_SUBLABEL}">'
-        f'The value carried on every pdata edge.'
+        f'Pipeline data is payload and context, each carries its own callstack'
         f'</text>'
     )
 
@@ -424,7 +424,7 @@ def render() -> str:
     out.append(arrow_marker_defs())
     out.append(title_bar(
         TITLE_X, TITLE_Y, PAGE_W - 2 * SLIDE_MARGIN_X,
-        title="OtapPdata",
+        title="Pipeline Data",
         urn="Context + payload",
         accent=COLOR_OTAP,
     ))

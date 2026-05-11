@@ -33,10 +33,17 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 import os, sys
 
+from node_lib import (
+    page_open, page_close, title_bar,
+    COLOR_OTLP, COLOR_SUBLABEL,
+    FS_SUBTITLE,
+    SLIDE_PAGE_H,
+)
+
 # ---------------------------------------------------------------- geometry
 PAGE_W           = 1600
 PAGE_MARGIN_X    = 60
-TOP_MARGIN       = 110
+TOP_MARGIN       = 130
 BOTTOM_MARGIN    = 110
 
 LEFT_RAIL_W      = 200          # per-record description column
@@ -376,38 +383,42 @@ def render_svg(records: List[Record]) -> str:
     page_w = max(PAGE_W, int(needed_w))
 
     row_height = ROW_TOP_PAD + BYTE_H + 30  # bytes + small bottom pad
-    page_h = (TOP_MARGIN
-              + len(records) * row_height
-              + (len(records) - 1) * ROW_GAP
-              + BOTTOM_MARGIN)
+    natural_h = (TOP_MARGIN
+                 + len(records) * row_height
+                 + (len(records) - 1) * ROW_GAP
+                 + BOTTOM_MARGIN)
+    # Pin to the deck-standard page height. Distribute any slack as extra
+    # spacing between rows (and trailing bottom margin) so the content
+    # spreads vertically instead of letterboxing in the slideshow.
+    page_h = max(natural_h, SLIDE_PAGE_H)
+    slack  = page_h - natural_h
+    n_gaps = max(1, len(records))
+    row_gap = ROW_GAP + slack / n_gaps
 
     out: List[str] = []
-    out.append(f'<svg xmlns="http://www.w3.org/2000/svg" '
-               f'width="{page_w}" height="{page_h}" '
-               f'viewBox="0 0 {page_w} {page_h}">')
-    out.append(f'<rect width="100%" height="100%" fill="{COLOR_BG}"/>')
+    out.append(page_open(page_w, page_h))
 
-    # Title.
-    out.append(f'<g font-family="{FONT}" fill="{COLOR_TEXT}">')
-    out.append(f'<text x="{PAGE_MARGIN_X}" y="50" '
-               f'font-size="26" font-weight="700">'
-               f'OTLP Logs in protocol buffer bytes'
-               f'</text>')
-    out.append(f'<text x="{PAGE_MARGIN_X}" y="78" font-size="14" '
-               f'fill="{COLOR_SUB}">'
-               f'LogsData → ResourceLogs → ScopeLogs → LogRecord (with '
-               f'attributes nested at each level). Each box is one wire byte.'
-               f'</text>')
-    out.append('</g>')
+    out.append(title_bar(
+        PAGE_MARGIN_X, 60, page_w - 2 * PAGE_MARGIN_X,
+        title="OTLP Logs",
+        urn="protocol buffer bytes",
+        accent=COLOR_OTLP,
+    ))
+    out.append(
+        f'<text x="{PAGE_MARGIN_X}" y="90" font-size="{FS_SUBTITLE}" '
+        f'font-style="italic" fill="{COLOR_SUBLABEL}">'
+        f'OTLP structure LogsData → ResourceLogs → ScopeLogs → LogRecord'
+        f'</text>'
+    )
 
     y = TOP_MARGIN
     for rec, blk in zip(records, blocks):
         render_record(out, y, x_bytes, rec, blk)
-        y += row_height + ROW_GAP
+        y += row_height + row_gap
 
     render_legend(out, page_h - BOTTOM_MARGIN / 2)
 
-    out.append('</svg>')
+    out.append(page_close())
     return "\n".join(out)
 
 # ---------------------------------------------------------------- main

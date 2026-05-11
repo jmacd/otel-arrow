@@ -118,7 +118,24 @@ def _thread_box(out: List[str]) -> None:
 
 def _slim_box(x: float, y: float, w: float, h: float,
               title: str,
-              accent: str = COLOR_CTRL) -> str:
+              accent: str = COLOR_CTRL,
+              subtitle: str = "") -> str:
+    if subtitle:
+        title_y = y + h / 2 - 2
+        sub_y   = y + h / 2 + 18
+        parts = [
+            f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" ry="8" '
+            f'fill="white" stroke="{COLOR_CTRL}" stroke-width="{W_FRAME}"/>',
+            f'<rect x="{x}" y="{y}" width="{w}" height="5" rx="2.5" ry="2.5" '
+            f'fill="{accent}"/>',
+            f'<text x="{x + w/2}" y="{title_y}" text-anchor="middle" '
+            f'font-size="{FS_NODE_SUB}" font-weight="700" '
+            f'fill="{COLOR_LABEL}">{_esc(title)}</text>',
+            f'<text x="{x + w/2}" y="{sub_y}" text-anchor="middle" '
+            f'font-size="{FS_TINY - 1}" font-style="italic" '
+            f'fill="{COLOR_SUBLABEL}">{_esc(subtitle)}</text>',
+        ]
+        return "".join(parts)
     return (
         f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" ry="8" '
         f'fill="white" stroke="{COLOR_CTRL}" stroke-width="{W_FRAME}"/>'
@@ -183,7 +200,7 @@ def _subtitle(out: List[str]) -> None:
     out.append(
         f'<text x="{TITLE_X}" y="{SUBTITLE_Y}" font-size="{FS_SUBTITLE}" '
         f'font-style="italic" fill="{COLOR_SUBLABEL}">'
-        f'One pipeline. One OS thread. One tokio runtime.'
+        f'Thread-per-core. Single-threaded async runtime.'
         f'</text>'
     )
 
@@ -192,10 +209,12 @@ def _actors(out: List[str]) -> Tuple[Tuple[float, float], Tuple[float, float]]:
     out.append(_slim_box(
         RTC_X, ACTOR_TOP_Y, RTC_W, ACTOR_H,
         title="RuntimeCtrlMsgManager",
+        subtitle="lifecycle events",
     ))
     out.append(_slim_box(
         DISP_X, ACTOR_TOP_Y, DISP_W, ACTOR_H,
         title="PipelineCompletionMsgDispatcher",
+        subtitle="ack/nack routing",
     ))
     rtc_anchor  = (RTC_X + RTC_W / 2, ACTOR_TOP_Y + ACTOR_H)
     disp_anchor = (DISP_X + DISP_W / 2, ACTOR_TOP_Y + ACTOR_H)
@@ -484,7 +503,7 @@ def render() -> str:
     out.append(arrow_marker_defs())
     out.append(title_bar(
         TITLE_X, TITLE_Y, PAGE_W - 2 * SLIDE_MARGIN_X,
-        title="Pipeline thread",
+        title="Pipeline Engine",
         urn="RuntimePipeline",
         accent=COLOR_OTAP,
     ))

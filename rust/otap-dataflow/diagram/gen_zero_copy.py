@@ -62,6 +62,12 @@ from gen_diagram import (
     COLOR_GRID, COLOR_LABEL, COLOR_SUBLABEL, COLOR_BOUNDARY,
     FONT, FONT_MONO, LINE_W, GRID_W, RAMP_ANGLE_DEG,
 )
+from node_lib import (
+    page_open, page_close, title_bar,
+    COLOR_OTAP,
+    FS_SUBTITLE,
+    SLIDE_PAGE_H,
+)
 
 
 # ----------------------------------------------------------------- layout
@@ -69,8 +75,8 @@ from gen_diagram import (
 PAGE_W            = 1600
 PAGE_MARGIN_X     = 80
 
-TITLE_Y           = 50
-SUBTITLE_Y        = 78
+TITLE_Y           = 60
+SUBTITLE_Y        = 90
 
 ZONE_HEADER_Y     = 110
 ZONE_HEADER_H     = 0           # zone header removed
@@ -565,7 +571,7 @@ def _spool_loop(out: List[str], xs: List[float]) -> None:
     out.append(
         f'<text x="{disk_cx}" y="{disk_top + disk_h + 18}" '
         f'text-anchor="middle" font-family="{FONT_MONO}" font-size="13" '
-        f'fill="{COLOR_SUBLABEL}">Quiver spool</text>'
+        f'fill="{COLOR_SUBLABEL}">Quiver</text>'
     )
 
 
@@ -591,14 +597,11 @@ def render() -> str:
     band_bot = band_top + TRACK_BAND
     mid_y = (band_top + band_bot) / 2
 
-    page_h = (band_bot + TRACK_BOT_PAD + ANNOTATION_H + PAGE_BOTTOM_PAD)
+    page_h = max(SLIDE_PAGE_H,
+                 band_bot + TRACK_BOT_PAD + ANNOTATION_H + PAGE_BOTTOM_PAD)
 
     out: List[str] = []
-    out.append(
-        f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'viewBox="0 0 {PAGE_W} {page_h}" '
-        f'width="{PAGE_W}" height="{page_h}">'
-    )
+    out.append(page_open(PAGE_W, page_h))
     # Arrow tip marker for the node-strip connectors.
     out.append(
         '<defs>'
@@ -608,20 +611,19 @@ def render() -> str:
         '</marker>'
         '</defs>'
     )
-    out.append(f'<rect width="100%" height="100%" fill="{COLOR_BG}"/>')
 
-    # Title + subtitle
-    out.append(
-        f'<text x="{PAGE_MARGIN_X}" y="{TITLE_Y}" font-family="{FONT}" '
-        f'font-size="28" font-weight="800" fill="{COLOR_LABEL}">'
-        f'Zero-copy &amp; Arrow IPC: OTAP through Quiver and on the wire'
-        f'</text>'
-    )
+    # Title bar -- same chrome as the rest of the deck.
+    out.append(title_bar(
+        PAGE_MARGIN_X, TITLE_Y, PAGE_W - 2 * PAGE_MARGIN_X,
+        title="Zero-copy & Arrow IPC",
+        urn="signal level view",
+        accent=COLOR_OTAP,
+    ))
     out.append(
         f'<text x="{PAGE_MARGIN_X}" y="{SUBTITLE_Y}" font-family="{FONT}" '
-        f'font-size="17" font-style="italic" fill="{COLOR_SUBLABEL}">'
-        f'One batch, three zero-copy hops: in-process \u00b7 Quiver disk '
-        f'\u00b7 Arrow IPC wire.'
+        f'font-size="{FS_SUBTITLE}" font-style="italic" '
+        f'fill="{COLOR_SUBLABEL}">'
+        f'OTLP to OTAP on demand, Arrow IPC serialization'
         f'</text>'
     )
 
@@ -632,7 +634,7 @@ def render() -> str:
     _level_legend(out, track_x0, band_top, band_bot)
     _trace(out, xs, band_top, band_bot)
 
-    out.append('</svg>')
+    out.append(page_close())
     return "\n".join(out)
 
 

@@ -25,10 +25,17 @@ import os, sys
 
 import gen_otlp_bytes as otlp  # encoder, palette, RECORDS
 
+from node_lib import (
+    page_open, page_close, title_bar,
+    COLOR_OTAP, COLOR_SUBLABEL,
+    FS_SUBTITLE,
+    SLIDE_PAGE_H,
+)
+
 # ---------------------------------------------------------------- geometry
 PAGE_W            = 1600
 PAGE_MARGIN_X     = 60
-TOP_MARGIN        = 110
+TOP_MARGIN        = 130
 BOTTOM_MARGIN     = 60
 
 TABLE_GAP         = 40
@@ -89,10 +96,10 @@ class Table:
     def width(self) -> int:
         return self.inner_w() + 2 * FRAME_PAD_X
 
-    def height(self) -> int:
+    def height(self, extra_ghost_rows: int = 0) -> int:
         return (FRAME_PAD_Y_TOP + HEADER_TEXT_H + HEADER_RULE_GAP
                 + len(self.rows) * CELL_H
-                + GHOST_GAP + GHOST_CELL_H
+                + GHOST_GAP + (1 + extra_ghost_rows) * GHOST_CELL_H
                 + FRAME_PAD_Y_BOT)
 
 # ---------------------------------------------------------------- data
@@ -155,12 +162,13 @@ def build_tables() -> List[Table]:
     return [res_attrs, scope_attrs, log_attrs, logs]
 
 # ---------------------------------------------------------------- render
-def render_table(out: List[str], x0: float, y0: float, t: Table) -> None:
+def render_table(out: List[str], x0: float, y0: float, t: Table,
+                 extra_ghost_rows: int = 0) -> None:
     widths = t.widths()
 
     # ---- frame around the whole RecordBatch ----
     frame_w = t.width()
-    frame_h = t.height()
+    frame_h = t.height(extra_ghost_rows)
     out.append(f'<rect x="{x0:.1f}" y="{y0:.1f}" '
                f'width="{frame_w}" height="{frame_h}" rx="6" ry="6" '
                f'fill="{COLOR_FRAME_FILL}" stroke="{COLOR_FRAME_LINE}" '
@@ -200,15 +208,20 @@ def render_table(out: List[str], x0: float, y0: float, t: Table) -> None:
                        f'text-anchor="middle" font-family="{FONT_MONO}" '
                        f'font-size="11" fill="{COLOR_TEXT}">{cell.text}</text>')
 
-        # Continuation: dashed ghost cell + ⋮ + downward chevron, in the
-        # column's stroke color, to convey "this array grows downward."
-        gy = cells_y0 + len(t.rows) * CELL_H + GHOST_GAP
-        out.append(f'<rect x="{cx:.1f}" y="{gy:.1f}" '
-                   f'width="{w}" height="{GHOST_CELL_H}" '
-                   f'fill="none" stroke="{stroke}" stroke-width="0.7" '
-                   f'stroke-dasharray="3,3"/>')
+        # Continuation: a stack of dashed ghost cells (showing the array
+        # extends downward), with the ⋮ glyph in the bottom-most cell.
+        gy_top = cells_y0 + len(t.rows) * CELL_H + GHOST_GAP
+        n_ghost = 1 + extra_ghost_rows
+        for gi in range(n_ghost):
+            gy = gy_top + gi * GHOST_CELL_H
+            out.append(f'<rect x="{cx:.1f}" y="{gy:.1f}" '
+                       f'width="{w}" height="{GHOST_CELL_H}" '
+                       f'fill="none" stroke="{stroke}" stroke-width="0.7" '
+                       f'stroke-dasharray="3,3"/>')
+        # ⋮ glyph centered in the last ghost cell.
+        gy_last = gy_top + (n_ghost - 1) * GHOST_CELL_H
         out.append(f'<text x="{cx_center:.1f}" '
-                   f'y="{gy + GHOST_CELL_H/2 + 4:.1f}" '
+                   f'y="{gy_last + GHOST_CELL_H/2 + 4:.1f}" '
                    f'text-anchor="middle" font-family="{FONT_MONO}" '
                    f'font-size="11" fill="{stroke}">⋮</text>')
 
@@ -265,27 +278,46 @@ def render_svg() -> str:
     table_h_max = max(t.height() for t in tables)
     table_y     = TOP_MARGIN
 
-    mini_y0 = table_y + table_h_max + MINI_TOP_GAP
-
     record_h = MINI_BYTE_H + MINI_RECORD_GAP
+    natural_legend_y = (table_y + table_h_max + MINI_TOP_GAP
+                        + len(blocks) * record_h + 50)
+    natural_h = natural_legend_y + BOTTOM_MARGIN
+    # Pin to deck-standard page height; absorb the slack by extending
+    # each table's dashed continuation downward (more ghost cells per
+    # array). Anything that doesn't fit a whole ghost row stays as
+    # extra spacing between the tables and the OTLP recap.
+    page_h = max(natural_h, SLIDE_PAGE_H)
+    slack  = page_h - natural_h
+    extra_ghost_rows = max(0, int(slack // GHOST_CELL_H))
+    used_by_ghosts   = extra_ghost_rows * GHOST_CELL_H
+    leftover_slack   = slack - used_by_ghosts
+
+    table_h_max = max(t.height(extra_ghost_rows) for t in tables)
+    mini_y0  = table_y + table_h_max + MINI_TOP_GAP + leftover_slack
     legend_y = mini_y0 + len(blocks) * record_h + 50
-    page_h   = legend_y + BOTTOM_MARGIN
 
     out: List[str] = []
-    out.append(f'<svg xmlns="http://www.w3.org/2000/svg" '
-               f'width="{PAGE_W}" height="{page_h}" '
-               f'viewBox="0 0 {PAGE_W} {page_h}">')
-    out.append(f'<rect width="100%" height="100%" fill="{COLOR_BG}"/>')
+    out.append(page_open(PAGE_W, page_h))
+
+    out.append(title_bar(
+        PAGE_MARGIN_X, 60, PAGE_W - 2 * PAGE_MARGIN_X,
+        title="OTAP Logs",
+        urn="4 x RecordBatch",
+        accent=COLOR_OTAP,
+    ))
+    out.append(
+        f'<text x="{PAGE_MARGIN_X}" y="90" font-size="{FS_SUBTITLE}" '
+        f'font-style="italic" fill="{COLOR_SUBLABEL}">'
+        f'Row-oriented OTLP becomes columnar Arrow tables joined by id.'
+        f'</text>'
+    )
 
     out.append(f'<g font-family="{FONT}" fill="{COLOR_TEXT}">')
-    out.append(f'<text x="{PAGE_MARGIN_X}" y="50" font-size="26" '
-               f'font-weight="700">OTAP Logs in four Arrow RecordBatches'
-               f'</text>')
     out.append('</g>')
 
     cx = tables_x0
     for t in tables:
-        render_table(out, cx, table_y, t)
+        render_table(out, cx, table_y, t, extra_ghost_rows)
         cx += t.width() + TABLE_GAP
 
     out.append(f'<text x="{PAGE_MARGIN_X}" y="{mini_y0 - 18:.1f}" '
@@ -301,7 +333,7 @@ def render_svg() -> str:
 
     render_legend(out, PAGE_MARGIN_X, legend_y)
 
-    out.append('</svg>')
+    out.append(page_close())
     return "\n".join(out)
 
 # ---------------------------------------------------------------- main
