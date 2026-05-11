@@ -391,7 +391,7 @@ def render_svg(records: List[Record]) -> str:
     out.append(f'<g font-family="{FONT}" fill="{COLOR_TEXT}">')
     out.append(f'<text x="{PAGE_MARGIN_X}" y="50" '
                f'font-size="26" font-weight="700">'
-               f'OTLP Logs on the wire — protobuf bytes, color-coded by section'
+               f'OTLP Logs in protocol buffer bytes'
                f'</text>')
     out.append(f'<text x="{PAGE_MARGIN_X}" y="78" font-size="14" '
                f'fill="{COLOR_SUB}">'

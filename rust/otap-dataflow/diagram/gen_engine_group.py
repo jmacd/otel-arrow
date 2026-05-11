@@ -126,7 +126,8 @@ def _accessory_tile(x: float, y: float, w: float, h: float,
     slides for the same reason.
     """
     if shared:
-        bg_fill = "#fbf3f2"          # warm tint matching the SHARED badge
+        #bg_fill = "#fbf3f2"          # warm tint matching the SHARED badge
+        bg_fill = "#f4f6f8"
         stroke_color = COLOR_OTLP    # red outline -> Send-required
         stroke_width = 1.4
     else:
@@ -300,7 +301,7 @@ def _render_controller(out: List[str]) -> None:
     )
     shared: List[str] = [
         "TopicBroker",
-        "memory_pressure watch",
+        "memory_pressure",
     ]
     sy = shared_y + 14
     for name in shared:
@@ -335,7 +336,7 @@ def _render_instances(out: List[str]) -> List[float]:
     """Draw the three per-core instance tiles. Returns their center y values."""
     centers: List[float] = []
     y = INSTANCE_Y0
-    for label in ("Engine Core 0", "Engine Core 1"):
+    for label in ("Engine Group 0", "Engine Group 1"):
         out.append(_instance_tile(
             INSTANCE_X, y, INSTANCE_W, INSTANCE_H,
             core_label=label,
@@ -349,7 +350,7 @@ def _render_instances(out: List[str]) -> List[float]:
     # Engine Core N.
     out.append(_instance_tile(
         INSTANCE_X, y, INSTANCE_W, INSTANCE_H,
-        core_label="Engine Core N",
+        core_label="Engine Group N",
     ))
     centers.append(y + INSTANCE_H / 2)
     return centers
@@ -377,10 +378,10 @@ def _render_cross_thread_edges(out: List[str], centers: List[float]) -> None:
     edge_step = 26
     edges = [
         ("RuntimeCtrlMsgSender", "right", False),         # ctrl out
-        ("PipelineCompletionMsgSender", "left",  False),  # completion in
-        ("memory_pressure watch", "right", True),         # broadcast
-        ("topics", "both", True),                         # bi-dir
+        ("CompletionMsgSender", "left",  False),  # completion in
+        ("memory_pressure signal", "right", True),         # broadcast
         ("note_instance_exit", "left", True),             # exit signal
+        ("topics", "both", True),                         # bi-dir
     ]
 
     base_y = rep_y - (len(edges) - 1) * edge_step / 2
@@ -438,7 +439,7 @@ def _render_thread_emphasis(out: List[str]) -> None:
         f'<text x="{bx + bw/2}" y="{by + bh/2 + 5}" text-anchor="middle" '
         f'font-size="{FS_LABEL}" font-weight="700" '
         f'fill="{COLOR_OTAP}">'
-        f'one tokio single-threaded runtime per pipeline'
+        f'one single-threaded runtime per pipeline'
         f'</text>'
     )
 
@@ -447,7 +448,7 @@ def _render_subtitle(out: List[str]) -> None:
     out.append(
         f'<text x="{TITLE_X}" y="{SUBTITLE_Y}" font-size="{FS_SUBTITLE}" '
         f'font-style="italic" fill="{COLOR_SUBLABEL}">'
-        f'One controller, one OS thread per assigned core.'
+        f'One controller, one engine group per CPU, one thread per pipeline.'
         f'</text>'
     )
 
@@ -458,7 +459,7 @@ def render() -> str:
     out.append(arrow_marker_defs())
     out.append(title_bar(
         TITLE_X, TITLE_Y, PAGE_W - 2 * SLIDE_MARGIN_X,
-        title="Dataflow Engine",
+        title="OpenTelemetry Arrow Dataflow Engine",
         urn="ControllerRuntime + N \u00d7 RuntimePipeline",
         accent=COLOR_OTAP,
     ))
@@ -473,7 +474,7 @@ def render() -> str:
 
 
 def main(argv: List[str]) -> int:
-    out = argv[1] if len(argv) > 1 else "engine_group.svg"
+    out = argv[1] if len(argv) > 1 else "dataflow_engine.svg"
     svg = render()
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(svg)

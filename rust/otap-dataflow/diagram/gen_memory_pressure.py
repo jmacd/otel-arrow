@@ -215,7 +215,7 @@ def _render_controller_left(out: List[str]) -> Tuple[float, float]:
     out.append(
         f'<text x="{inner_x + inner_w - 12}" y="{state_y}" '
         f'text-anchor="end" font-size="{FS_TINY}" font-style="italic" '
-        f'fill="{COLOR_SUBLABEL}">Arc&lt;…Inner&gt; \u2014 fixed</text>'
+        f'fill="{COLOR_SUBLABEL}">Arc&lt;…Inner&gt;</text>'
     )
     rows: List[Tuple[str, str]] = [
         ("level",                 "AtomicU8"),
@@ -252,7 +252,7 @@ def _render_controller_left(out: List[str]) -> Tuple[float, float]:
     out.append(
         f'<text x="{inner_x + inner_w}" y="{pol_y}" '
         f'text-anchor="end" font-size="{FS_TINY}" font-style="italic" '
-        f'fill="{COLOR_SUBLABEL}">policies.resources.memory_limiter</text>'
+        f'fill="{COLOR_SUBLABEL}"></text>'
     )
     pol_rows: List[Tuple[str, str]] = [
         ("mode",                   "MemoryLimiterMode"),
@@ -275,7 +275,7 @@ def _render_controller_left(out: List[str]) -> Tuple[float, float]:
     bub_x = inner_x
     bub_w = inner_w
     out.append(_shared_bubble(bub_x, bub_y, bub_w, bub_h,
-                              "memory_pressure watch",
+                              "memory_pressure",
                               "tokio::sync::watch"))
     return (bub_x + bub_w, bub_y + bub_h / 2)
 
@@ -288,7 +288,7 @@ def _render_controller_left(out: List[str]) -> Tuple[float, float]:
 # slide intentionally does not draw it any more (it was too busy in
 # the engine-core tiles).
 PIPELINE_NODES: List[Tuple[str, str, str, List[str]]] = [
-    ("receiver", "receiver", "OTAPReceiver",
+    ("otlp", "receiver", "OTAPReceiver",
      ["shared admission state",
       "ack subscription registry",
       "rejection counters"]),
@@ -299,7 +299,7 @@ PIPELINE_NODES: List[Tuple[str, str, str, List[str]]] = [
     ("retry", "processor", "RetryProcessor",
      ["local timer wheel",
       "(engine-held payload)"]),
-    ("exporter", "exporter", "OTLPExporter",
+    ("otap", "exporter", "OTLPExporter",
      ["in-flight queue (max_in_flight)",
       "parked-message slot",
       "proto encoders + buffers"]),
@@ -391,9 +391,9 @@ def _slotmap_rect(x: float, y: float, w: float, h: float,
 # in this mapping gets nothing drawn above it (the retry node holds
 # its parked payload in the engine, not in a node-local slotmap).
 NODE_SLOTMAPS: dict = {
-    "receiver": ["pending"],
+    "otlp": ["pending"],
     "batch":    ["inbound", "outbound"],
-    "exporter": ["inflight"],
+    "otap": ["inflight"],
 }
 
 
@@ -548,11 +548,11 @@ def _render_takeaways(out: List[str]) -> None:
         f'stroke-width="1"/>'
     )
     items: List[Tuple[str, str]] = [
-        ("All buffers are sized at construction.",
+        ("Queues and maps are sized at construction",
          "avoid unbounded growth"),
-        ("Backpressure flows backwards via Ack/Nack.",
-         "drains the in-flight slots"),
-        ("Hard pressure sheds at ingress.",
+        ("Backpressure via Acks/Nacks and calldata",
+         "unwind call stack using subscription state"),
+        ("Hard memory pressure signals ingress to stop",
          "receivers reject with Retry-After"),
     ]
     n = len(items)
@@ -587,8 +587,8 @@ def _subtitle(out: List[str]) -> None:
     out.append(
         f'<text x="{TITLE_X}" y="{SUBTITLE_Y}" font-size="{FS_SUBTITLE}" '
         f'font-style="italic" fill="{COLOR_SUBLABEL}">'
-        f'Every queue and slot is named, sized, and visible to the '
-        f'process-memory-limiter.'
+        f'Queues and maps are fixed size, governed by '
+        f'process memory-limiter.'
         f'</text>'
     )
 

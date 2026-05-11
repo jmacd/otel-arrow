@@ -279,7 +279,7 @@ def render_svg() -> str:
 
     out.append(f'<g font-family="{FONT}" fill="{COLOR_TEXT}">')
     out.append(f'<text x="{PAGE_MARGIN_X}" y="50" font-size="26" '
-               f'font-weight="700">OTAP Logs — four Arrow RecordBatches'
+               f'font-weight="700">OTAP Logs in four Arrow RecordBatches'
                f'</text>')
     out.append('</g>')
 

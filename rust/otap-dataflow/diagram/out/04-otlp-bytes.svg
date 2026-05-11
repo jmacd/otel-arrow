@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="678" viewBox="0 0 1600 678">
 <rect width="100%" height="100%" fill="#ffffff"/>
 <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif" fill="#1f2933">
-<text x="60" y="50" font-size="26" font-weight="700">OTLP Logs on the wire — protobuf bytes, color-coded by section</text>
+<text x="60" y="50" font-size="26" font-weight="700">OTLP Logs in protocol buffer bytes</text>
 <text x="60" y="78" font-size="14" fill="#52606d">LogsData → ResourceLogs → ScopeLogs → LogRecord (with attributes nested at each level). Each box is one wire byte.</text>
 </g>
 <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif" fill="#1f2933">
