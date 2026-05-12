@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OTAP Dataflow Slides</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd;
+               font: 14px/1.3 system-ui, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex;
+           align-items: center; justify-content: center; padding: 2vh 2vw; }
+  #stage img, #stage object { max-width: 100%; max-height: 100%;
+                              width: auto; height: auto;
+                              background: white; box-shadow: 0 0 24px #000; }
+  #hud { position: fixed; right: 8px; bottom: 6px;
+         padding: 2px 8px; background: rgba(0,0,0,.55);
+         border-radius: 4px; opacity: .75;
+         pointer-events: none; user-select: none; }
+  #help { position: fixed; top: 0; left: 0; right: 0;
+          padding: 6px 12px; background: rgba(0,0,0,.55);
+          opacity: 0; transition: opacity .2s; pointer-events: none; }
+  body.show-help #help { opacity: 1; }
+  /* Toggle the HUD with 'h' if you want a clean view. */
+  body.hide-hud #hud { display: none; }
+</style>
+</head>
+<body class="show-help">
+<div id="help">
+  ← / →  PgUp / PgDn  Space  Home / End  &nbsp;|&nbsp;
+  <b>g</b> goto #  &nbsp;<b>h</b> toggle HUD  &nbsp;<b>?</b> help  &nbsp;<b>f</b> fullscreen
+</div>
+<div id="stage"></div>
+<div id="hud"></div>
+
+<script>
+// ---- Slide list -------------------------------------------------------------
+// Edit this array to control order / inclusion / titles.
+// `file` is relative to this HTML file. `title` is optional (defaults to file).
+// Order mirrors regenerate.sh. Filenames keep their numeric prefix so this
+// list and the disk layout stay in sync. Reorder rows to reorder the deck.
+const SLIDES = [
+  "static/00-title.svg",
+  "out/01-dataflow-engine.svg",
+  "out/02-pipeline-engine.svg",
+  "out/03-otap-pdata.svg",
+  "out/04-otlp-bytes.svg",
+  "out/05-otap-tables.svg",
+  "out/06-otap-pdata.svg",
+  "out/07-pipeline-engine.svg",
+  "out/08-zero-copy.svg",
+  "out/09-memory-pressure.svg",
+  "static/09b-roadmap.svg",
+
+  "out/10-node-otlp-receiver.svg",
+  "out/11-node-syslog-cef-receiver.svg",
+  "out/12-node-batch.svg",
+  "out/13-node_durable_buffer.svg",
+  "out/14-node_fanout.svg",
+  "out/15-node-transform.svg",
+  "out/16-node-attributes.svg",
+  "out/17-node-filter.svg",
+  "out/18-node_azure_monitor_exporter.svg",
+  "out/19-node_otap_exporter.svg",
+  "out/20-node_parquet_exporter.svg",
+  "out/21-node_geneva_exporter.svg",
+  "out/22-node_topic_exporter.svg",
+  "out/23-node_topic_receiver.svg",
+  "out/24-node_internal_telemetry_receiver.svg",
+  "out/25-node_host_metrics_receiver.svg",
+  "out/26-node_otap_receiver.svg",
+  "out/27-node_otlp_grpc_exporter.svg",
+  "out/28-node_otlp_http_exporter.svg",
+  "out/29-node_content_router.svg",
+  "out/30-node_log_sampling.svg",
+  "out/31-node_retry.svg",
+  "out/32-node_signal_type_router.svg",
+  "out/33-node_temporal_reaggregation.svg",
+  "out/34-node_condense_attributes.svg",
+  "out/35-node_recordset_kql.svg",
+  "out/36-node_resource_validator.svg",
+];
+
+// ---- Renderer ---------------------------------------------------------------
+const stage = document.getElementById("stage");
+const hud   = document.getElementById("hud");
+
+function clamp(i) { return Math.max(0, Math.min(SLIDES.length - 1, i)); }
+
+function readHash() {
+  const m = /^#(\d+)$/.exec(location.hash);
+  return m ? clamp(parseInt(m[1], 10) - 1) : 0;
+}
+
+let idx = readHash();
+
+// Cache-buster: changes on every page load so re-generated SVGs are picked
+// up by a plain reload (no need for hard-reload / DevTools).
+const CACHE_BUST = Date.now();
+
+function render() {
+  const file = SLIDES[idx];
+  // <img> is simplest and isolates SVG scripts. Swap to <object> if you need
+  // SVG interactivity / hyperlinks inside the diagram.
+  stage.innerHTML = "";
+  const img = document.createElement("img");
+  img.src = `${file}?v=${CACHE_BUST}`;
+  img.alt = file;
+  stage.appendChild(img);
+  hud.textContent = `${idx + 1} / ${SLIDES.length}`;
+  history.replaceState(null, "", `#${idx + 1}`);
+  document.title = `[${idx + 1}/${SLIDES.length}] otap-dataflow`;
+}
+
+function go(delta) { const n = clamp(idx + delta); if (n !== idx) { idx = n; render(); } }
+function goTo(n)   { const c = clamp(n);             if (c !== idx) { idx = c; render(); } }
+
+// ---- Input ------------------------------------------------------------------
+let gotoBuf = "";
+let gotoTimer = null;
+
+addEventListener("keydown", (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+  // numeric goto: type digits then Enter, or 'g' to commit.
+  if (/^[0-9]$/.test(e.key)) { gotoBuf += e.key; armGoto(); return; }
+  if (e.key === "Enter" || e.key === "g") {
+    if (gotoBuf) { goTo(parseInt(gotoBuf, 10) - 1); gotoBuf = ""; }
+    return;
+  }
+  if (e.key === "Escape") { gotoBuf = ""; return; }
+
+  switch (e.key) {
+    case "ArrowRight": case "PageDown": case " ": case "j": case "l":
+      go(+1); e.preventDefault(); break;
+    case "ArrowLeft":  case "PageUp":   case "Backspace": case "k": case "h":
+      // 'h' here would conflict with HUD toggle; handled below.
+      if (e.key === "h") { document.body.classList.toggle("hide-hud"); break; }
+      go(-1); e.preventDefault(); break;
+    case "Home":  goTo(0); break;
+    case "End":   goTo(SLIDES.length - 1); break;
+    case "?":     document.body.classList.toggle("show-help"); break;
+    case "f":
+      if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
+      else document.exitFullscreen?.();
+      break;
+  }
+});
+
+function armGoto() {
+  clearTimeout(gotoTimer);
+  gotoTimer = setTimeout(() => {
+    if (gotoBuf) { goTo(parseInt(gotoBuf, 10) - 1); gotoBuf = ""; }
+  }, 800);
+}
+
+// click right half = next, left half = previous
+addEventListener("click", (e) => {
+  go(e.clientX > innerWidth / 2 ? +1 : -1);
+});
+
+addEventListener("hashchange", () => { idx = readHash(); render(); });
+
+// auto-hide help after a few seconds
+setTimeout(() => document.body.classList.remove("show-help"), 4000);
+
+render();
+</script>
+</body>
+</html>
