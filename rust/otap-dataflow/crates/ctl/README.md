@@ -4,7 +4,7 @@
 
 It is built on top of the public Rust SDK `otap-df-admin-api`, but end users
 should think in terms of the installed `dfctl` command. The Rust package name
-for this crate remains `otap-df-enginectl`.
+for this crate remains `otap-df-ctl`.
 
 ## Design Goals
 
@@ -23,9 +23,9 @@ OTAP Dataflow Engine instances:
   the admin API
 
 For the full design principles, see
-[docs/admin/enginectl.md](../../docs/admin/enginectl.md#design-principles).
+[docs/admin/dfctl.md](../../docs/admin/dfctl.md#design-principles).
 For security and privacy behavior, see
-[docs/admin/enginectl.md](../../docs/admin/enginectl.md#security-and-privacy).
+[docs/admin/dfctl.md](../../docs/admin/dfctl.md#security-and-privacy).
 
 ## Before You Start
 
@@ -34,7 +34,7 @@ For security and privacy behavior, see
 - In this repo, build the CLI with:
 
 ```bash
-cargo build -p otap-df-enginectl --bin dfctl
+cargo build -p otap-df-ctl --bin dfctl
 ```
 
 Common local setup:
@@ -493,6 +493,6 @@ Exit codes:
 ## More Details
 
 - CLI reference and command overview:
-  [docs/admin/enginectl.md](../../docs/admin/enginectl.md)
+  [docs/admin/dfctl.md](../../docs/admin/dfctl.md)
 - Live rollout and shutdown behavior:
   [docs/admin/live-reconfiguration.md](../../docs/admin/live-reconfiguration.md)
