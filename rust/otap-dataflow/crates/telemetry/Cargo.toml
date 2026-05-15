@@ -53,3 +53,8 @@ tower = { workspace = true }
 tempfile = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 otap-df-pdata = { workspace = true, features = ["testing"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "sampling"
+harness = false
