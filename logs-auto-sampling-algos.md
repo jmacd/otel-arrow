@@ -145,28 +145,6 @@ At flush:
 - For each remaining item emit weight `max(1, f_at_admit / τ_final)`.
 - Reset state for the next period.
 
-### Why "frozen" keys matter
-
-An earlier draft used **live** keys: every bulk sample-down
-recomputed `k_i = u_i · freq[c_i]` against the *current* frequency.
-That looked attractive — it lets the per-callsite expected sample
-size be exactly `min(N_c, τ)` — but it is **wrong**: as more events
-arrive, every item's key grows, so `τ` is no longer monotone in
-arrival order. The conservativeness of the skip test breaks: an
-item rejected as `u · f_now ≥ τ_now` might in fact end up below the
-*final* threshold once both sides have moved. Empirically this
-produced a **+10% positive bias** in `Σ weight` on a single-callsite
-stream of 5 000 events.
-
-Freezing each item's key at admission restores a monotone non-
-increasing `τ` and a conservative skip test, at the cost of slightly
-higher per-callsite admit counts: `τ · (1 + ln(N_c / τ))` instead of
-`min(N_c, τ)`. The unbiasedness test now passes.
-
-> Lesson: when `τ` is being learned online, the skip test
-> `condition(item, τ_now) ⇒ skip` is only safe if the predicate
-> `condition(item, τ)` is monotone in `τ` over the period.
-
 ## 5. Algorithm K — lagged frozen weights + Chao1
 
 State: a previous-period frequency table `freq_prev`, a current-
