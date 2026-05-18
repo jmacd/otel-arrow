@@ -33,6 +33,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
 pub mod client_settings;
@@ -71,6 +72,14 @@ pub struct Settings {
     pub admission_state: SharedReceiverAdmissionState,
     /// Shared rejection counters used by both stream-open and per-batch shedding.
     pub receiver_rejection_metrics: Option<Arc<dyn ReceiverRejectionMetrics>>,
+    /// Cancellation token observed by each per-stream task. Cancelling it
+    /// causes every active stream handler to break out of its receive loop,
+    /// drop its outbound response sender, and let tonic complete the bidi
+    /// RPC promptly. Used by the receiver to break out of `DrainIngress`
+    /// without waiting for the client to half-close (the bidi stream would
+    /// otherwise stay open and block tonic's graceful shutdown until the
+    /// drain deadline expires).
+    pub stream_shutdown: CancellationToken,
 }
 
 impl Settings {
@@ -313,6 +322,16 @@ async fn handle_stream<T, F>(
         }
 
         tokio::select! {
+            () = settings.stream_shutdown.cancelled() => {
+                // The receiver has entered drain (DrainIngress) or hard
+                // shutdown. Break out of the stream loop so `tx` is dropped,
+                // which closes the response stream and lets tonic complete
+                // the bidi RPC. Without this, tonic's
+                // `serve_with_incoming_shutdown` would wait for the client to
+                // half-close the stream and the drain would only finish at
+                // the deadline.
+                break;
+            }
             response = pending.next(), if !pending.is_empty() => {
                 if let Some(response) = response
                     && send_pending_response(response, &tx).await.is_err()

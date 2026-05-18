@@ -354,6 +354,13 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
         let listener = effect_handler.tcp_listener(self.config.listening_addr)?;
         let listener_stream = TcpListenerStream::new(listener);
 
+        // Token observed by each per-stream handler. Cancelled when this
+        // receiver enters drain (DrainIngress) or hard shutdown, causing
+        // stream handlers to break out of their input-loop and let tonic
+        // complete the bidi RPC promptly. See `stream_shutdown` on
+        // `otap_df_otap::otap_grpc::Settings`.
+        let stream_shutdown = CancellationToken::new();
+
         let settings = Settings {
             response_stream_channel_size: self.config.response_stream_channel_size,
             max_concurrent_requests: self.config.max_concurrent_requests,
@@ -364,6 +371,7 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
             wait_for_result: self.config.wait_for_result,
             admission_state: self.admission_state.clone(),
             receiver_rejection_metrics: Some(self.memory_pressure_metrics.clone()),
+            stream_shutdown: stream_shutdown.clone(),
         };
 
         //create services for the grpc server and clone the effect handler to pass message
@@ -463,7 +471,18 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
                 // immediately, but keep the event loop alive until the serving task
                 // has exited and all in-flight wait_for_result state has been
                 // resolved or force-failed at the deadline.
+                //
+                // We cancel both `grpc_shutdown` (tells tonic to stop accepting
+                // new connections and start its graceful drain) and
+                // `stream_shutdown` (tells each per-stream handler to break out
+                // of its input loop). Without the second signal, tonic's
+                // graceful drain blocks indefinitely on the still-open
+                // bidirectional Arrow streams: tonic only completes a streaming
+                // RPC when the client half-closes, which a long-lived OTAP
+                // exporter on the other end never does until the drain deadline
+                // fires here and we force-NACK its in-flight slots.
                 grpc_shutdown.cancel();
+                stream_shutdown.cancel();
 
                 if clock::now() >= deadline {
                     if let Some(reason) = draining_reason.as_deref() {
@@ -507,10 +526,12 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
                                 draining_deadline = Some(deadline);
                                 draining_reason = Some(reason);
                                 grpc_shutdown.cancel();
+                                stream_shutdown.cancel();
                             }
                         Ok(NodeControlMsg::Shutdown { deadline, reason }) => {
                             otap_df_telemetry::otel_info!("otap_receiver.shutdown");
                             grpc_shutdown.cancel();
+                            stream_shutdown.cancel();
                             states.force_shutdown(&reason);
                             self.flush_memory_pressure_metrics();
                             terminal_state = TerminalState::new(deadline, [self.metrics.snapshot()]);
@@ -606,7 +627,7 @@ mod tests {
     use otap_df_pdata::TryIntoWithOptions;
     use otap_df_pdata::otap::OtapArrowRecords;
     use otap_df_pdata::proto::opentelemetry::arrow::v1::{
-        ArrowPayloadType, arrow_logs_service_client::ArrowLogsServiceClient,
+        ArrowPayloadType, BatchArrowRecords, arrow_logs_service_client::ArrowLogsServiceClient,
         arrow_metrics_service_client::ArrowMetricsServiceClient,
         arrow_traces_service_client::ArrowTracesServiceClient,
     };
@@ -617,7 +638,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{Duration, sleep, timeout};
 
     /// Test closure that simulates a typical receiver scenario.
     fn scenario(
@@ -1405,6 +1426,147 @@ mod tests {
                     .expect("timed out waiting for OTAP pdata")
                     .expect("no OTAP pdata received");
                 request_started.notify_one();
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation_concurrent(validation);
+    }
+
+    /// Regression test for https://github.com/open-telemetry/otel-arrow/issues/<n>
+    /// (DrainDeadlineReached on OTAP receiver shutdown when a client keeps the
+    /// bidi stream open).
+    ///
+    /// Before the fix, the per-stream `handle_stream` task in
+    /// `otap_df_otap::otap_grpc` blocked on `input_stream.message()` until the
+    /// client half-closed; tonic's `serve_with_incoming_shutdown` waited for
+    /// that completion before reporting the server task done, so the receiver
+    /// hit its drain deadline and the engine logged
+    /// `event_type=DrainDeadlineReached`. With the fix, `DrainIngress` cancels
+    /// the new `stream_shutdown` token, which breaks every active
+    /// `handle_stream` out of its select loop, drops the response sender,
+    /// completes the bidi RPC, and lets the receiver report
+    /// `ReceiverDrained` well before the deadline.
+    ///
+    /// The assertion is wall-clock based: with a 30s drain deadline, the run
+    /// must finish in <5s. Pre-fix this would always take ~30s.
+    #[test]
+    fn test_drain_ingress_completes_promptly_with_open_idle_stream() {
+        let test_runtime = TestRuntime::new();
+
+        let grpc_addr = "127.0.0.1";
+        let grpc_port = portpicker::pick_unused_port().expect("No free ports");
+        let grpc_endpoint = format!("http://{grpc_addr}:{grpc_port}");
+        let addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(OTAP_RECEIVER_URN));
+
+        use otap_df_engine::context::ControllerContext;
+        use otap_df_telemetry::registry::TelemetryRegistryHandle;
+        use serde_json::json;
+
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+
+        let config = json!({
+            "listening_addr": addr.to_string(),
+            "response_stream_channel_size": 100,
+            "wait_for_result": false
+        });
+
+        let receiver = ReceiverWrapper::shared(
+            OTAPReceiver::from_config(pipeline_ctx, &config).unwrap(),
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let stream_open = Arc::new(tokio::sync::Notify::new());
+        let scenario_stream_open = stream_open.clone();
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            let stream_open = scenario_stream_open.clone();
+            Box::pin(async move {
+                // Client side: open an arrow_logs bidi stream and keep it open
+                // indefinitely (the inner stream never yields a batch and never
+                // closes from the client side). Pre-fix this is the exact
+                // condition that prevented the server task from completing.
+                let client_handle = tokio::spawn(async move {
+                    let mut client = ArrowLogsServiceClient::connect(grpc_endpoint.clone())
+                        .await
+                        .expect("connect otap receiver");
+
+                    // A `pending()` stream never produces a message and never
+                    // closes from the client side; the only way this RPC
+                    // completes is if the server tears it down.
+                    let idle_stream = futures::stream::pending::<BatchArrowRecords>();
+                    let response = client
+                        .arrow_logs(idle_stream)
+                        .await
+                        .expect("arrow_logs request should succeed");
+
+                    // Drain the response stream so the RPC truly ends; we
+                    // expect no batch statuses (the client never sent
+                    // anything) and the server-side shutdown should close it.
+                    let mut inbound = response.into_inner();
+                    use futures::StreamExt;
+                    while let Some(item) = inbound.next().await {
+                        // No client batches were sent, so there should be no
+                        // ack/nack responses. If any appear they are not a
+                        // correctness issue for this test, just unexpected.
+                        let _ = item;
+                    }
+                });
+
+                // Give the client a moment to actually open the stream and
+                // for the per-stream handler to be parked on input_stream.message().
+                sleep(Duration::from_millis(200)).await;
+                stream_open.notify_one();
+
+                // Send DrainIngress with a deadline 30s in the future. The
+                // fix should let the receiver drain in <1s; pre-fix it
+                // would take the full 30s.
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let drain_start = Instant::now();
+                ctx.send_control_msg(NodeControlMsg::DrainIngress {
+                    deadline,
+                    reason: "test drain ingress promptness".to_owned(),
+                })
+                .await
+                .expect("send DrainIngress");
+
+                // The client's RPC should be closed by the server's stream
+                // shutdown well before the 30s drain deadline. We allow up
+                // to 5s of slack for CI variability; pre-fix this never
+                // completes in under ~30s.
+                timeout(Duration::from_secs(5), client_handle)
+                    .await
+                    .expect(
+                        "OTAP bidi stream did not complete within 5s of DrainIngress; \
+                         pre-fix this would hang until the 30s drain deadline",
+                    )
+                    .expect("client task panicked");
+
+                let elapsed = drain_start.elapsed();
+                assert!(
+                    elapsed < Duration::from_secs(5),
+                    "DrainIngress took {elapsed:?}, expected <5s (drain deadline was 30s)",
+                );
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        let validation = move |_ctx: NotSendValidateContext<OtapPdata>| {
+            let stream_open = stream_open.clone();
+            Box::pin(async move {
+                // Wait for the scenario to confirm the stream is open before
+                // returning; nothing else needs validating on the data path.
+                timeout(Duration::from_secs(3), stream_open.notified())
+                    .await
+                    .expect("scenario did not signal stream-open in time");
             }) as Pin<Box<dyn Future<Output = ()>>>
         };
 
