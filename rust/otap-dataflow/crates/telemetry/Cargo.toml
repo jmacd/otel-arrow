@@ -27,6 +27,7 @@ axum = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 flume = { workspace = true }
+hashbrown = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde_yaml = { workspace = true }
@@ -54,7 +55,3 @@ tempfile = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 otap-df-pdata = { workspace = true, features = ["testing"] }
 criterion = { workspace = true }
-
-[[bench]]
-name = "sampling"
-harness = false
