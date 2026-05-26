@@ -66,7 +66,7 @@ impl<'buf, B: BoundedBuf> DirectLogRecordEncoder<'buf, B> {
         // Pre-encoded body and attributes.
         let _ = self.buf.extend_from_slice(&record.body_attrs_bytes);
 
-        // Encode the optional adjusted count (`otel.count`) injected by
+        // Encode the optional adjusted count (`otel.sampling.count`) injected by
         // the BKCR sampler. The attribute is *omitted* entirely when the
         // count is `None` (sampler not in use) or exactly `1.0`
         // (deterministic / unweighted record), so the common case carries
@@ -75,7 +75,7 @@ impl<'buf, B: BoundedBuf> DirectLogRecordEncoder<'buf, B> {
         if let Some(c) = record.count {
             if c != 1.0 {
                 let _ = self.buf.encode_len_delimited(LOG_RECORD_ATTRIBUTES, |buf| {
-                    buf.encode_string(KEY_VALUE_KEY, "otel.count")?;
+                    buf.encode_string(KEY_VALUE_KEY, "otel.sampling.count")?;
                     buf.encode_len_delimited(KEY_VALUE_VALUE, |buf| {
                         buf.encode_field_tag(ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64)?;
                         buf.extend_from_slice(&c.to_le_bytes())
@@ -923,12 +923,11 @@ mod tests {
         assert_eq!(buf.len(), 0);
     }
 
-    /// `otel.sampling.weight` is emitted only when `sampling_weight`
-    /// is `Some(w)` && `w != 1.0` — `None` and exactly `1.0` produce
-    /// no attribute so the unsampled / deterministic common case
-    /// carries no extra bytes.
+    /// `otel.sampling.count` is emitted only when `count` is `Some(c)` &&
+    /// `c != 1.0` — `None` and exactly `1.0` produce no attribute so the
+    /// unsampled / deterministic common case carries no extra bytes.
     #[test]
-    fn encode_emits_sampling_weight_attribute_only_when_meaningful() {
+    fn encode_emits_count_attribute_only_when_meaningful() {
         let registry = TelemetryRegistryHandle::new();
         let mut scope_cache = ScopeToBytesMap::new(registry.clone());
         let resource_bytes = encode_resource_to_bytes(&OTelResource::builder_empty().build());
@@ -939,10 +938,10 @@ mod tests {
             (Some(0.0), true, 0.0),
             (Some(4.5), true, 4.5),
         ];
-        for (weight, expect_present, expect_value) in cases {
-            let mut record = __log_record_impl!(Level::INFO, "test.weight.case")
+        for (count, expect_present, expect_value) in cases {
+            let mut record = __log_record_impl!(Level::INFO, "test.count.case")
                 .into_record(LogContext::new());
-            record.sampling_weight = weight;
+            record.count = count;
             let event = LogEvent {
                 time: SystemTime::UNIX_EPOCH + Duration::from_nanos(1),
                 record,
@@ -955,16 +954,16 @@ mod tests {
             let attr = lr
                 .attributes
                 .iter()
-                .find(|kv| kv.key == "otel.sampling.weight");
+                .find(|kv| kv.key == "otel.sampling.count");
             if expect_present {
-                let attr = attr.expect("weight attr present");
+                let attr = attr.expect("count attr present");
                 let v = match attr.value.as_ref().unwrap().value.as_ref().unwrap() {
                     otap_df_pdata::proto::opentelemetry::common::v1::any_value::Value::DoubleValue(d) => *d,
                     other => panic!("expected double, got {other:?}"),
                 };
-                assert!((v - expect_value).abs() < f64::EPSILON, "weight={v}");
+                assert!((v - expect_value).abs() < f64::EPSILON, "count={v}");
             } else {
-                assert!(attr.is_none(), "weight attr should be absent for {weight:?}");
+                assert!(attr.is_none(), "count attr should be absent for {count:?}");
             }
         }
     }

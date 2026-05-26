@@ -193,7 +193,7 @@ impl StackLogRecord {
             dropped_attributes_count: self.dropped_count as u16,
             body_attrs_bytes: self.buf.to_bytes(),
             callsite_id: self.callsite_id,
-            sampling_weight: None,
+            count: None,
             context,
         }
     }
@@ -231,7 +231,7 @@ impl LogRecord {
             callsite_id: metadata.callsite(),
             dropped_attributes_count: dropped_count as u16,
             body_attrs_bytes: buf.into_bytes(),
-            sampling_weight: None,
+            count: None,
             context,
         }
     }
