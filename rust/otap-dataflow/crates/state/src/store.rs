@@ -313,22 +313,35 @@ impl ObservedStateStore {
                 let _ = self.report_engine(engine)?;
             }
             ObservedEvent::Log(log) => {
-                if let Some(log_tap) = &self.log_tap {
-                    log_tap.record(log.clone());
+                self.report_log(log);
+            }
+            ObservedEvent::LogBatch(logs) => {
+                // ConsoleAsync currently never receives batched logs
+                // (the sampler is gated to ITS only by LogsConfig::validate).
+                // If a batch ever arrives here, expand it record-by-record
+                // so existing tap/console semantics are preserved.
+                for log in logs {
+                    self.report_log(log);
                 }
-                let context = &log.record.context;
-
-                self.console
-                    .print_log_record(log.time, &log.record.as_view(), |w| {
-                        if !context.is_empty() {
-                            w.write_styled(AnsiCode::Magenta, |w| {
-                                Self::format_scope_from_registry(w, context, &self.registry);
-                            });
-                        }
-                    });
             }
         }
         Ok(())
+    }
+
+    fn report_log(&self, log: otap_df_telemetry::event::LogEvent) {
+        if let Some(log_tap) = &self.log_tap {
+            log_tap.record(log.clone());
+        }
+        let context = &log.record.context;
+
+        self.console
+            .print_log_record(log.time, &log.record.as_view(), |w| {
+                if !context.is_empty() {
+                    w.write_styled(AnsiCode::Magenta, |w| {
+                        Self::format_scope_from_registry(w, context, &self.registry);
+                    });
+                }
+            });
     }
 
     /// Format scope attributes by looking up entity keys in the registry.

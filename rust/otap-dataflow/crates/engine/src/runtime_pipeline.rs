@@ -234,6 +234,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
         runtime_ctrl_msg_rx: RuntimeCtrlMsgReceiver<PData>,
         pipeline_completion_msg_tx: PipelineCompletionMsgSender<PData>,
         pipeline_completion_msg_rx: PipelineCompletionMsgReceiver<PData>,
+        sampler_flush: Option<crate::pipeline_ctrl::SamplerFlushSchedule>,
     ) -> Result<Vec<()>, Error> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -552,6 +553,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
                 manager_telemetry_policy,
                 channel_metrics,
                 node_metric_handles,
+                sampler_flush,
             );
             manager.run().await
         }));

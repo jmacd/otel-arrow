@@ -33,6 +33,53 @@ pub struct LogsConfig {
     /// Internal log tap configuration.
     #[serde(default)]
     pub tap: InternalLogTapConfig,
+
+    /// Per-thread log sampler configuration.
+    ///
+    /// When `enabled`, each engine pipeline thread installs a
+    /// thread-local BKCR sampler that bounds internal-log output to
+    /// roughly `target` records per period (with up to `reserve_capacity`
+    /// novelty-reserve records). When `enabled` is `false` (the default)
+    /// every log event is forwarded individually, matching pre-existing
+    /// behaviour.
+    #[serde(default)]
+    pub sampler: InternalLogSamplerConfig,
+}
+
+/// Per-thread BKCR log sampler configuration.
+///
+/// See `crates/telemetry/src/sampler/design.md` for the algorithm.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct InternalLogSamplerConfig {
+    /// Enable BKCR sampling for internal logs.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Sample-size cap `T` per period per thread.
+    #[serde(default = "default_sampler_target")]
+    pub target: usize,
+
+    /// Novelty-reserve cap `R` per period per thread.
+    #[serde(default = "default_sampler_reserve_capacity")]
+    pub reserve_capacity: usize,
+}
+
+const fn default_sampler_target() -> usize {
+    128
+}
+
+const fn default_sampler_reserve_capacity() -> usize {
+    128
+}
+
+impl Default for InternalLogSamplerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target: default_sampler_target(),
+            reserve_capacity: default_sampler_reserve_capacity(),
+        }
+    }
 }
 
 /// Configuration for the internal log tap used by admin/MCP-style consumers.
@@ -216,6 +263,7 @@ impl Default for LogsConfig {
             level: LogLevel::default(),
             providers: default_providers(),
             tap: InternalLogTapConfig::default(),
+            sampler: InternalLogSamplerConfig::default(),
         }
     }
 }
@@ -262,6 +310,26 @@ impl LogsConfig {
             return Err(Error::InvalidUserConfig {
                 error: "logs.tap.enabled requires at least one async log provider ('console_async' or 'its')".into(),
             });
+        }
+
+        if self.sampler.enabled {
+            if self.sampler.target == 0 {
+                return Err(Error::InvalidUserConfig {
+                    error: "logs.sampler.target must be greater than zero when sampler is enabled"
+                        .into(),
+                });
+            }
+            // v1 limitation: the sampler only supports the ITS engine
+            // provider. ConsoleAsync's downstream consumer
+            // (ObservedStateStore) does not yet handle batched log events.
+            if self.providers.engine != ProviderMode::ITS {
+                return Err(Error::InvalidUserConfig {
+                    error: format!(
+                        "logs.sampler.enabled requires logs.providers.engine = 'its' (got {:?})",
+                        self.providers.engine
+                    ),
+                });
+            }
         }
 
         Ok(())
@@ -471,5 +539,63 @@ mod tests {
         assert!(providers(Noop, ITS, Noop, Noop).uses_its_provider());
         assert!(providers(Noop, Noop, Noop, ITS).uses_its_provider());
         assert!(!providers(Noop, Noop, ITS, Noop).uses_its_provider());
+    }
+
+    #[test]
+    fn test_sampler_defaults() {
+        let config = LogsConfig::default();
+        assert!(!config.sampler.enabled);
+        assert_eq!(config.sampler.target, 128);
+        assert_eq!(config.sampler.reserve_capacity, 128);
+
+        let parsed = parse("{}");
+        assert_eq!(parsed.sampler, config.sampler);
+    }
+
+    #[test]
+    fn test_sampler_parsing() {
+        let parsed = parse("sampler: { enabled: true, target: 64, reserve_capacity: 32 }");
+        assert!(parsed.sampler.enabled);
+        assert_eq!(parsed.sampler.target, 64);
+        assert_eq!(parsed.sampler.reserve_capacity, 32);
+    }
+
+    #[test]
+    fn test_validate_sampler_disabled_ok_with_any_engine() {
+        use ProviderMode::*;
+        // Default sampler is disabled; any valid engine provider should pass.
+        for engine in [Noop, ITS, ConsoleAsync, ConsoleDirect] {
+            let config = config_with(Noop, engine, Noop, ConsoleDirect);
+            config
+                .validate()
+                .expect("sampler-disabled config should validate");
+        }
+    }
+
+    #[test]
+    fn test_validate_sampler_target_must_be_positive() {
+        use ProviderMode::*;
+        let mut config = config_with(Noop, ITS, Noop, ConsoleDirect);
+        config.sampler.enabled = true;
+        config.sampler.target = 0;
+        assert_invalid(&config, "logs.sampler.target");
+    }
+
+    #[test]
+    fn test_validate_sampler_requires_its_engine_provider() {
+        use ProviderMode::*;
+        // ITS engine: should validate.
+        let mut config = config_with(Noop, ITS, Noop, ConsoleDirect);
+        config.sampler.enabled = true;
+        config
+            .validate()
+            .expect("sampler with ITS engine should validate");
+
+        // Non-ITS engine providers: rejected (v1 limitation).
+        for engine in [Noop, ConsoleAsync, ConsoleDirect] {
+            let mut config = config_with(Noop, engine, Noop, ConsoleDirect);
+            config.sampler.enabled = true;
+            assert_invalid(&config, "logs.sampler.enabled requires");
+        }
     }
 }

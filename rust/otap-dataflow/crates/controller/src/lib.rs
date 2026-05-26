@@ -220,6 +220,15 @@ enum TopicReceiverMode {
     Unknown,
 }
 
+/// Pre-staggered install parameters for a per-thread BKCR log sampler.
+#[derive(Debug, Clone, Copy)]
+struct SamplerInstall {
+    target: usize,
+    reserve_capacity: usize,
+    initial_delay: Duration,
+    period: Duration,
+}
+
 #[derive(Debug, Clone)]
 struct InferredTopicModeReport {
     topic: TopicName,
@@ -1358,6 +1367,11 @@ impl<
             all_cores.clone(),
             telemetry_system.engine_tracing_setup(),
             telemetry_reporting_interval,
+            telemetry_config
+                .logs
+                .sampler
+                .enabled
+                .then(|| telemetry_config.logs.sampler.clone()),
             memory_pressure_tx.clone(),
             engine_config.clone(),
         ));
@@ -1487,6 +1501,16 @@ impl<
             runtime.register_launched_instance(launched);
         }
 
+        // Snapshot the per-thread BKCR log sampler configuration once
+        // (it's validated at config-load time to be ITS-only when
+        // enabled).  `None` here means engine threads emit log events
+        // as singletons via the tracing reporter, exactly as before.
+        let sampler_config = telemetry_config
+            .logs
+            .sampler
+            .enabled
+            .then(|| telemetry_config.logs.sampler.clone());
+
         for (pipeline_entry, requested_cores) in pipelines.iter().zip(planned_core_assignments) {
             runtime.register_committed_pipeline(pipeline_entry.clone(), 0);
             let num_cores = requested_cores.len();
@@ -1533,6 +1557,7 @@ impl<
                     Arc::downgrade(&runtime),
                     runtime.next_thread_id(),
                     None,
+                    sampler_config.clone(),
                 )?;
                 runtime.register_launched_instance(launched);
             }
@@ -1825,7 +1850,25 @@ impl<
             InternalTelemetrySettings,
             std_mpsc::SyncSender<Result<(), EngineError>>,
         )>,
+        sampler_config: Option<otap_df_config::settings::telemetry::logs::InternalLogSamplerConfig>,
     ) -> Result<LaunchedPipelineThread<PData>, Error> {
+        // Pre-compute the per-thread sampler install: each engine
+        // thread starts its first flush at a staggered offset within
+        // the reporting interval so that N parallel threads do not
+        // all flush simultaneously into the ITS receiver.  Stagger by
+        // dense thread ordinal (modulo num_cores) — not the OS core
+        // id, which may be sparse.
+        let sampler_install = sampler_config.map(|cfg| {
+            let stagger_slot = (thread_id as u128) % (num_cores.max(1) as u128);
+            let initial_delay = telemetry_reporting_interval
+                .mul_f64(stagger_slot as f64 / num_cores.max(1) as f64);
+            SamplerInstall {
+                target: cfg.target,
+                reserve_capacity: cfg.reserve_capacity,
+                initial_delay,
+                period: telemetry_reporting_interval,
+            }
+        });
         let mut pipeline_ctx = controller_ctx.pipeline_context_with_generation(
             pipeline_key.pipeline_group_id.clone(),
             pipeline_key.pipeline_id.clone(),
@@ -1881,6 +1924,7 @@ impl<
                         memory_pressure_rx,
                         tracing_setup,
                         internal_telemetry,
+                        sampler_install,
                     )
                 })) {
                     Ok(Ok(_)) => RuntimeInstanceExit::Success,
@@ -1991,6 +2035,7 @@ impl<
             runtime,
             0,
             Some((its_settings, startup_tx)),
+            None,
         )?;
 
         // Wait for the internal pipeline to signal successful startup
@@ -2041,6 +2086,7 @@ impl<
             InternalTelemetrySettings,
             std_mpsc::SyncSender<Result<(), EngineError>>,
         )>,
+        sampler_install: Option<SamplerInstall>,
     ) -> Result<Vec<()>, Error> {
         // Pin thread to specific core. As much as possible, we pin
         // before allocating memory.
@@ -2059,6 +2105,33 @@ impl<
             // so that all logs within this scope include pipeline context.
             let span = otel_info_span!("pipeline_thread", core.id = core_id.id);
             let _guard = span.enter();
+
+            // Install the per-thread BKCR log sampler (if configured)
+            // for the duration of this scope.  The guard's `Drop`
+            // performs a best-effort final flush; the manager also
+            // does an explicit pre-shutdown flush so the final batch
+            // reaches the ITS receiver before it tears down.  When no
+            // sampler is configured, the layer hot path takes the
+            // unsampled path (one TLS probe per event).
+            let _sampler_guard = sampler_install.as_ref().and_then(|cfg| {
+                tracing_setup.async_reporter().map(|reporter| {
+                    otap_df_telemetry::sampler::install(
+                        cfg.target,
+                        cfg.reserve_capacity,
+                        reporter.clone(),
+                    )
+                })
+            });
+            let sampler_schedule = sampler_install.as_ref().and_then(|cfg| {
+                // Only schedule a flush timer when the guard was
+                // actually installed (i.e. an async reporter exists).
+                _sampler_guard.as_ref().map(|_| {
+                    otap_df_engine::pipeline_ctrl::SamplerFlushSchedule::new(
+                        cfg.initial_delay,
+                        cfg.period,
+                    )
+                })
+            });
 
             // The controller creates a pipeline instance into a dedicated thread. The corresponding
             // entity is registered here for proper context tracking and set into thread-local storage
@@ -2124,6 +2197,7 @@ impl<
                     runtime_ctrl_msg_rx,
                     pipeline_completion_msg_tx,
                     pipeline_completion_msg_rx,
+                    sampler_schedule,
                 )
                 .map_err(|e| {
                     otel_error!(

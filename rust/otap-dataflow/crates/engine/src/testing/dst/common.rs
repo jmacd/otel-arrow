@@ -156,6 +156,7 @@ pub(super) fn build_manager<PData>(
         },
         Vec::new(),
         empty_node_metric_handles(),
+        None,
     );
 
     (
