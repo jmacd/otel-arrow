@@ -58,8 +58,8 @@ pub struct LogRecord {
     /// Number of attribute fields dropped due to truncation (if any).
     pub dropped_attributes_count: u16,
 
-    /// Adjusted count assigned by a per-thread BKCR sampler at flush time.
-    /// 
+    /// Adjusted count assigned by a per-thread CCKR sampler at flush time.
+    ///
     /// Represents how many population items this sample stands in for.
     /// Formally: the sampler's final statistical weight divided by the
     /// original item's class weight, yielding the "adjusted count."

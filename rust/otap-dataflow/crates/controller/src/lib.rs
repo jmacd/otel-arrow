@@ -220,7 +220,7 @@ enum TopicReceiverMode {
     Unknown,
 }
 
-/// Pre-staggered install parameters for a per-thread BKCR log sampler.
+/// Pre-staggered install parameters for a per-thread CCKR log sampler.
 #[derive(Debug, Clone, Copy)]
 struct SamplerInstall {
     reservoir_capacity: usize,
@@ -1501,7 +1501,7 @@ impl<
             runtime.register_launched_instance(launched);
         }
 
-        // Snapshot the per-thread BKCR log sampler configuration once
+        // Snapshot the per-thread CCKR log sampler configuration once
         // (it's validated at config-load time to be ITS-only when
         // enabled).  `None` here means engine threads emit log events
         // as singletons via the tracing reporter, exactly as before.
@@ -1860,8 +1860,8 @@ impl<
         // id, which may be sparse.
         let sampler_install = sampler_config.map(|cfg| {
             let stagger_slot = (thread_id as u128) % (num_cores.max(1) as u128);
-            let initial_delay = telemetry_reporting_interval
-                .mul_f64(stagger_slot as f64 / num_cores.max(1) as f64);
+            let initial_delay =
+                telemetry_reporting_interval.mul_f64(stagger_slot as f64 / num_cores.max(1) as f64);
             SamplerInstall {
                 reservoir_capacity: cfg.reservoir_capacity,
                 preserve_capacity: cfg.preserve_capacity,
@@ -2106,7 +2106,7 @@ impl<
             let span = otel_info_span!("pipeline_thread", core.id = core_id.id);
             let _guard = span.enter();
 
-            // Install the per-thread BKCR log sampler (if configured)
+            // Install the per-thread CCKR log sampler (if configured)
             // for the duration of this scope.  The guard's `Drop`
             // performs a best-effort final flush; the manager also
             // does an explicit pre-shutdown flush so the final batch

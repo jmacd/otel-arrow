@@ -37,7 +37,7 @@ pub struct LogsConfig {
     /// Per-thread log sampler configuration.
     ///
     /// When `enabled`, each engine pipeline thread installs a
-    /// thread-local BKCR sampler that bounds internal-log output to
+    /// thread-local CCKR sampler that bounds internal-log output to
     /// roughly `reservoir_capacity` records per period (with up to `preserve_capacity`
     /// novelty-preserve records). When `enabled` is `false` (the default)
     /// every log event is forwarded individually, matching pre-existing
@@ -46,12 +46,12 @@ pub struct LogsConfig {
     pub sampler: InternalLogSamplerConfig,
 }
 
-/// Per-thread BKCR log sampler configuration.
+/// Per-thread CCKR log sampler configuration.
 ///
 /// See `crates/telemetry/src/sampler/design.md` for the algorithm.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct InternalLogSamplerConfig {
-    /// Enable BKCR sampling for internal logs.
+    /// Enable CCKR sampling for internal logs.
     #[serde(default)]
     pub enabled: bool,
 
@@ -71,7 +71,7 @@ pub struct InternalLogSamplerConfig {
 
 /// Minimum reservoir capacity required for Chao1 estimator stability.
 ///
-/// This matches the internal `min_period_count` threshold in the BKCR
+/// This matches the internal `min_period_count` threshold in the CCKR
 /// sampler's flush logic. Below this threshold, frequency estimates
 /// become unreliable and the adaptive weighting degrades.
 pub const MIN_RESERVOIR_CAPACITY: usize = 32;
@@ -568,7 +568,8 @@ mod tests {
 
     #[test]
     fn test_sampler_parsing() {
-        let parsed = parse("sampler: { enabled: true, reservoir_capacity: 64, preserve_capacity: 32 }");
+        let parsed =
+            parse("sampler: { enabled: true, reservoir_capacity: 64, preserve_capacity: 32 }");
         assert!(parsed.sampler.enabled);
         assert_eq!(parsed.sampler.reservoir_capacity, 64);
         assert_eq!(parsed.sampler.preserve_capacity, 32);
@@ -591,19 +592,19 @@ mod tests {
         use ProviderMode::*;
         let mut config = config_with(Noop, ITS, Noop, ConsoleDirect);
         config.sampler.enabled = true;
-        
+
         // reservoir_capacity < MIN_RESERVOIR_CAPACITY should be rejected
         for reservoir_capacity in [0, 1, 16, MIN_RESERVOIR_CAPACITY - 1] {
             config.sampler.reservoir_capacity = reservoir_capacity;
             assert_invalid(&config, "logs.sampler.reservoir_capacity");
         }
-        
+
         // reservoir_capacity >= MIN_RESERVOIR_CAPACITY should validate
         config.sampler.reservoir_capacity = MIN_RESERVOIR_CAPACITY;
         config
             .validate()
             .expect("sampler with reservoir_capacity=MIN_RESERVOIR_CAPACITY should validate");
-        
+
         config.sampler.reservoir_capacity = 128;
         config
             .validate()

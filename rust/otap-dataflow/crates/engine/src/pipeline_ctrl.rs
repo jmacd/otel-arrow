@@ -180,7 +180,7 @@ impl TimerSet {
     }
 }
 
-/// Schedule for the periodic per-thread BKCR log sampler flush.
+/// Schedule for the periodic per-thread CCKR log sampler flush.
 ///
 /// The first flush is performed at `next_fire`; subsequent flushes are
 /// spaced by `period`.  `next_fire` is staggered across pipeline
@@ -277,7 +277,7 @@ pub struct RuntimeCtrlMsgManager<PData> {
     tick_timers: TimerSet,
     /// Repeating timers for telemetry collection (CollectTelemetry).
     telemetry_timers: TimerSet,
-    /// Optional schedule for periodically flushing the per-thread BKCR
+    /// Optional schedule for periodically flushing the per-thread CCKR
     /// log sampler.  `None` when no sampler is enabled on this thread.
     sampler_flush: Option<SamplerFlushSchedule>,
     /// Delayed data in activation order.
@@ -816,7 +816,7 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
             delayed_data_count += 1;
         }
 
-        // Drain the per-thread BKCR log sampler whenever its period has
+        // Drain the per-thread CCKR log sampler whenever its period has
         // elapsed.  `flush_current_thread` is a TLS read + no-op when
         // no sampler is installed on this thread, so taking this path
         // for non-sampler threads is cheap.  Reschedule against the

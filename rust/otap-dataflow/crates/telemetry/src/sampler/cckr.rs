@@ -1,7 +1,11 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! BKCR — Bottom-K Chao-Reserve sampler.
+//! CCKR — Chao-Cohen-Kaplan-Reservoir sketch.
+//!
+//! A diversity sampling algorithm using Chao's sampling coverage estimate
+//! (an estimate of the Good-Turing frequency estimate) and Bottom-K sampling
+//! with exponential function.
 //!
 //! See [`crate::sampler::design`](../design.md) for the algorithm
 //! specification, the three foundational references (Duffield/Lund/
@@ -14,7 +18,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::hash::Hash;
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
 use super::{Admission, LogSampler};
@@ -55,12 +59,12 @@ pub struct AdmitTicket {
     pub key: f64,
 }
 
-/// The BKCR sampler.
+/// The CCKR sampler.
 ///
 /// Single-threaded by design.  All hot-path methods take `&self`
 /// with interior mutability via `RefCell` / `Cell`; the type is
 /// intentionally `!Sync`.
-pub struct Bkcr<C, P> {
+pub struct Cckr<C, P> {
     reservoir_capacity: usize,
     preserve_capacity: usize,
     /// Minimum prior-period arrival count below which we discard
@@ -103,32 +107,32 @@ struct Inner<C, P> {
     rng: SmallRng,
 }
 
-impl<C, P> Bkcr<C, P>
+impl<C, P> Cckr<C, P>
 where
     C: Hash + Eq + Clone,
 {
-    /// Construct a sampler with target sample size `T`.  Uses the
+    /// Construct a sampler with reservoir capacity `T`.  Uses the
     /// default preserve capacity (`R = T`), Chao1 stability threshold
     /// (`min_period_count = 32`), and a fresh OS-derived seed.
     /// Panics if `T == 0`.
     #[must_use]
-    pub fn new(target: usize) -> Self {
-        Self::with_options(target, target, 32, rand::random())
+    pub fn new(reservoir_capacity: usize) -> Self {
+        Self::with_options(reservoir_capacity, reservoir_capacity, 32, rand::random())
     }
 
-    /// Construct a sampler with explicit `target`,
+    /// Construct a sampler with explicit `reservoir_capacity`,
     /// `preserve_capacity`, `min_period_count`, and RNG seed.
-    /// Panics if `target == 0`.
+    /// Panics if `reservoir_capacity == 0`.
     #[must_use]
     pub fn with_options(
-        target: usize,
+        reservoir_capacity: usize,
         preserve_capacity: usize,
         min_period_count: u64,
         seed: u64,
     ) -> Self {
-        assert!(target >= 1, "target must be >= 1");
+        assert!(reservoir_capacity >= 1, "reservoir_capacity must be >= 1");
         Self {
-            target,
+            reservoir_capacity,
             preserve_capacity,
             min_period_count,
             tau: Cell::new(f64::INFINITY),
@@ -180,7 +184,7 @@ where
     }
 }
 
-impl<C, P> LogSampler<C, P> for Bkcr<C, P>
+impl<C, P> LogSampler<C, P> for Cckr<C, P>
 where
     C: Hash + Eq + Clone,
 {
@@ -199,7 +203,7 @@ where
         // EXP rank.  -ln(U[0,1]) / w  ~  Exp(w).  See Cohen & Kaplan
         // §2 for the family-of-rank-functions discussion.
         let k = -u.ln() / w_c;
-        
+
         if k < self.tau.get() {
             return Admission::Admit(AdmitTicket { key: k });
         }
@@ -218,7 +222,7 @@ where
                 // This maintains the invariant that heap and preserve
                 // are disjoint sets.
                 let _ = inner.preserve.remove(&callsite);
-                
+
                 inner.heap.push(HeapEntry {
                     key: ticket.key,
                     callsite,
@@ -379,7 +383,7 @@ mod tests {
     where
         C: Clone,
         P: Clone,
-        S: LogSampler<C, P, Ticket = f64>,
+        S: LogSampler<C, P, Ticket = AdmitTicket>,
     {
         for (c, p) in events {
             let adm = sampler.admit(c);
@@ -417,7 +421,7 @@ mod tests {
 
     #[test]
     fn admit_skip_and_flush_bounds() {
-        let s: Bkcr<u32, u8> = Bkcr::with_options(10, 10, 32, 0xBADC0FFEE0DDF00D);
+        let s: Cckr<u32, u8> = Cckr::with_options(10, 10, 32, 0xBADC0FFEE0DDF00D);
         // Warmup period: all the same callsite; everything is
         // "unseen" until τ tightens via heap pops.
         let evs: Vec<(u32, u8)> = (0..5_000).map(|_| (1u32, 0u8)).collect();
@@ -451,7 +455,7 @@ mod tests {
 
     #[test]
     fn tau_monotone_within_period() {
-        let s: Bkcr<u32, u8> = Bkcr::with_options(10, 0, 32, 7);
+        let s: Cckr<u32, u8> = Cckr::with_options(10, 0, 32, 7);
         // Warm up so unseen_weight becomes Chao1-derived.
         let warmup: Vec<(u32, u8)> = (0..1_000).map(|i| ((i % 5) as u32, 0u8)).collect();
         let _ = run_period(&s, &warmup);
@@ -480,7 +484,7 @@ mod tests {
         let trials = 30;
         let mut total_err = 0.0f64;
         for trial in 0..trials {
-            let s: Bkcr<u32, u8> = Bkcr::with_options(40, 0, 32, trial as u64 + 1);
+            let s: Cckr<u32, u8> = Cckr::with_options(40, 0, 32, trial as u64 + 1);
             let _ = run_period(&s, &zipf_like_stream(k, n, 7777 + trial as u64));
             let mut sum_w = 0.0;
             let mut sum_n = 0.0;
@@ -505,7 +509,7 @@ mod tests {
     fn reserve_zero_means_vanilla_bottom_k() {
         // R=0: no admission should ever produce Admission::Preserve,
         // and every output sampling_count is ≥ 1.
-        let s: Bkcr<u32, u8> = Bkcr::with_options(5, 0, 32, 42);
+        let s: Cckr<u32, u8> = Cckr::with_options(5, 0, 32, 42);
         // Construct a stream guaranteed to overflow the heap.
         let evs: Vec<(u32, u8)> = (0..1000).map(|i| ((i % 100) as u32, 0u8)).collect();
         let mut saw_reserve = false;
@@ -530,7 +534,7 @@ mod tests {
         // singleton can be reserved.  Strategy: warm up with the
         // chatty callsite, then a window with chatty events
         // followed by a single novel singleton.
-        let s: Bkcr<u32, u8> = Bkcr::with_options(1, 2, 32, 0xC0FFEE);
+        let s: Cckr<u32, u8> = Cckr::with_options(1, 2, 32, 0xC0FFEE);
         let warmup: Vec<(u32, u8)> = (0..1_000).map(|_| (1u32, 0u8)).collect();
         let _ = run_period(&s, &warmup);
         // Window 2: many chatty events followed by one singleton.
@@ -548,7 +552,7 @@ mod tests {
         // R=3: flood the stream with novel callsites; the preserve
         // must not exceed 3 entries.
         let r = 3usize;
-        let s: Bkcr<u32, u8> = Bkcr::with_options(2, r, 32, 0xCABBA9E);
+        let s: Cckr<u32, u8> = Cckr::with_options(2, r, 32, 0xCABBA9E);
         // Warm up so the heap τ tightens.
         let warmup: Vec<(u32, u8)> = (0..200).map(|i| ((i % 3) as u32, 0u8)).collect();
         let _ = run_period(&s, &warmup);
@@ -574,7 +578,7 @@ mod tests {
         // events from many callsites; for any callsite that ends
         // up in the heap, ensure it does not also appear as
         // sampling_count=0.
-        let s: Bkcr<u32, u8> = Bkcr::with_options(2, 5, 32, 0xDEADBEEF);
+        let s: Cckr<u32, u8> = Cckr::with_options(2, 5, 32, 0xDEADBEEF);
         let evs: Vec<(u32, u8)> = (0..50).map(|i| (i as u32, 0u8)).collect();
         let out = run_period(&s, &evs);
         for (c, _, w) in &out {
@@ -590,7 +594,7 @@ mod tests {
         // After a flush, reserve_len must be 0 and a fresh
         // appearance of a callsite that was reserved last period
         // can again be reserved.
-        let s: Bkcr<u32, u8> = Bkcr::with_options(1, 5, 32, 0x12345);
+        let s: Cckr<u32, u8> = Cckr::with_options(1, 5, 32, 0x12345);
         let warmup: Vec<(u32, u8)> = (0..100).map(|_| (1u32, 0u8)).collect();
         let _ = run_period(&s, &warmup);
         // Window 2: chatty + a few novel.
@@ -611,7 +615,7 @@ mod tests {
     fn output_size_bounded_by_t_plus_r() {
         let t = 7usize;
         let r = 11usize;
-        let s: Bkcr<u32, u8> = Bkcr::with_options(t, r, 32, 0xAA55);
+        let s: Cckr<u32, u8> = Cckr::with_options(t, r, 32, 0xAA55);
         let evs: Vec<(u32, u8)> = (0..10_000).map(|i| (i as u32, 0u8)).collect();
         let out = run_period(&s, &evs);
         assert!(
@@ -624,7 +628,7 @@ mod tests {
 
     #[test]
     fn preserve_entries_have_sampling_count_zero() {
-        let s: Bkcr<u32, u8> = Bkcr::with_options(1, 50, 32, 0xBEAD);
+        let s: Cckr<u32, u8> = Cckr::with_options(1, 50, 32, 0xBEAD);
         // Fresh sampler, lots of unique callsites: many will land
         // in the preserve.
         let evs: Vec<(u32, u8)> = (0..1000).map(|i| (i as u32, 0u8)).collect();
@@ -639,7 +643,7 @@ mod tests {
 
     #[test]
     fn reserve_unbiasedness_preserved() {
-        // Vanilla BKCR (R=0) vs BKCR with R=T should agree on
+        // Vanilla CCKR (R=0) vs CCKR with R=T should agree on
         // Σ sampling_count (HT estimator), because preserve entries
         // contribute exactly 0.
         let k = 8;
@@ -648,8 +652,8 @@ mod tests {
         let mut sum_diff = 0.0f64;
         let mut sum_n = 0.0f64;
         for trial in 0..trials {
-            let s0: Bkcr<u32, u8> = Bkcr::with_options(20, 0, 32, 9000 + trial as u64);
-            let s_r: Bkcr<u32, u8> = Bkcr::with_options(20, 20, 32, 9000 + trial as u64);
+            let s0: Cckr<u32, u8> = Cckr::with_options(20, 0, 32, 9000 + trial as u64);
+            let s_r: Cckr<u32, u8> = Cckr::with_options(20, 20, 32, 9000 + trial as u64);
             let evs = zipf_like_stream(k, n, 12345 + trial as u64);
             // Warm up both samplers with the same data so freq_prev
             // is identical and the RNG advance is identical.
@@ -728,7 +732,9 @@ mod criterion_bench {
 
     fn gen_uniform(k: usize, n: usize, seed: u64) -> Vec<u32> {
         let mut rng = SmallRng::seed_from_u64(seed);
-        (0..n).map(|_| (rng.random::<u64>() % k as u64) as u32).collect()
+        (0..n)
+            .map(|_| (rng.random::<u64>() % k as u64) as u32)
+            .collect()
     }
 
     fn gen_zipf_like(k: usize, n: usize, seed: u64) -> Vec<u32> {
@@ -763,7 +769,7 @@ mod criterion_bench {
             .collect()
     }
 
-    fn drive(sampler: &Bkcr<u32, u64>, cs: &[u32]) {
+    fn drive(sampler: &Cckr<u32, u64>, cs: &[u32]) {
         for (i, c) in cs.iter().enumerate() {
             let adm = sampler.admit(c);
             match adm {
@@ -792,7 +798,7 @@ mod criterion_bench {
                                 // Warm the sampler so freq_prev is
                                 // populated and we measure
                                 // steady-state cost.
-                                let s = Bkcr::<u32, u64>::with_options(TARGET, TARGET, 32, SEED);
+                                let s = Cckr::<u32, u64>::with_options(TARGET, TARGET, 32, SEED);
                                 drive(&s, cs);
                                 s
                             },

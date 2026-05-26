@@ -1,9 +1,9 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-thread BKCR sampler registration.
+//! Per-thread CCKR sampler registration.
 //!
-//! Each engine pipeline thread installs at most one [`Bkcr`] sampler via
+//! Each engine pipeline thread installs at most one [`Cckr`] sampler via
 //! [`install`], which returns an RAII [`SamplerGuard`]. While the guard is
 //! alive, the [`crate::tracing_init::StructuredLoggingLayer`] hot path
 //! consults the thread-local sampler to decide whether to format and
@@ -24,14 +24,14 @@ use crate::event::{LogEvent, ObservedEventReporter};
 #[cfg(test)]
 use crate::self_tracing::LogRecord;
 
-use super::{Admission, AdmitTicket, Bkcr, LogSampler};
+use super::{Admission, AdmitTicket, Cckr, LogSampler};
 
 thread_local! {
     static THREAD_SAMPLER: RefCell<Option<ThreadSamplerState>> = const { RefCell::new(None) };
 }
 
 struct ThreadSamplerState {
-    sampler: Bkcr<Identifier, LogEvent>,
+    sampler: Cckr<Identifier, LogEvent>,
     reporter: ObservedEventReporter,
 }
 
@@ -64,12 +64,12 @@ impl Drop for SamplerGuard {
     }
 }
 
-/// Install a per-thread BKCR sampler.
+/// Install a per-thread CCKR sampler.
 ///
 /// Panics if a sampler is already installed on the current thread.
 ///
-/// `target` is `T` (statistical sample-size cap) and
-/// `reserve_capacity` is `R` (novelty-reserve cap); see
+/// `reservoir_capacity` is `T` (statistical sample-size cap) and
+/// `preserve_capacity` is `R` (novelty-preserve cap); see
 /// `crates/telemetry/src/sampler/design.md`.
 ///
 /// The `reporter` is the *tracing* reporter (the one held inside
@@ -77,18 +77,18 @@ impl Drop for SamplerGuard {
 /// batches are shipped through it as
 /// [`crate::event::ObservedEvent::LogBatch`].
 pub fn install(
-    target: usize,
-    reserve_capacity: usize,
+    reservoir_capacity: usize,
+    preserve_capacity: usize,
     reporter: ObservedEventReporter,
 ) -> SamplerGuard {
     THREAD_SAMPLER.with(|cell| {
         let mut slot = cell.borrow_mut();
         assert!(
             slot.is_none(),
-            "per-thread BKCR sampler already installed on this thread"
+            "per-thread CCKR sampler already installed on this thread"
         );
         *slot = Some(ThreadSamplerState {
-            sampler: Bkcr::with_options(reservoir_capacity, preserve_capacity, 32, rand::random()),
+            sampler: Cckr::with_options(reservoir_capacity, preserve_capacity, 32, rand::random()),
             reporter,
         });
     });
@@ -104,7 +104,7 @@ pub fn is_installed() -> bool {
 }
 
 /// Outcome of [`admit`] (a thread-local convenience over the underlying
-/// [`Bkcr::admit`]) when a sampler is installed on the current thread.
+/// [`Cckr::admit`]) when a sampler is installed on the current thread.
 pub type ThreadAdmission = Admission<AdmitTicket>;
 
 /// Probe the per-thread sampler with `callsite`.  Returns `Some` when a
@@ -112,6 +112,7 @@ pub type ThreadAdmission = Admission<AdmitTicket>;
 /// sampler is installed on the current thread (caller should use the
 /// non-sampled path).
 #[inline]
+#[must_use]
 pub fn admit(callsite: &Identifier) -> Option<ThreadAdmission> {
     THREAD_SAMPLER.with(|cell| {
         cell.borrow()
@@ -209,12 +210,12 @@ mod tests {
         }
     }
 
-    fn test_reporter() -> (ObservedEventReporter, flume::Receiver<crate::event::ObservedEvent>) {
+    fn test_reporter() -> (
+        ObservedEventReporter,
+        flume::Receiver<crate::event::ObservedEvent>,
+    ) {
         let (tx, rx) = flume::bounded(16);
-        (
-            ObservedEventReporter::new(SendPolicy::default(), tx),
-            rx,
-        )
+        (ObservedEventReporter::new(SendPolicy::default(), tx), rx)
     }
 
     #[test]

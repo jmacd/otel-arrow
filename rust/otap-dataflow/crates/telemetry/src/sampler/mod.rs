@@ -4,26 +4,26 @@
 //! Adaptive per-thread log-event sampler.
 //!
 //! See [`design`](../sampler/design.md) for the full algorithm
-//! specification and references.  In one paragraph: BKCR is a
+//! specification and references.  In one paragraph: CCKR is a
 //! Bottom-K sketch with exponential ranks (a WS-sketch — Cohen &
 //! Kaplan, PODC 2007 — built on the priority-sampling foundation of
 //! Duffield, Lund & Thorup, JACM 2007) using a Chao1 / Good–Turing
 //! estimate (Chao, *Scand. J. Statist.* 1984) for as-yet-unseen
-//! callsites, plus a bounded *novelty reserve* that captures one
+//! callsites, plus a bounded *novelty preserve* that captures one
 //! example per first-rejected callsite as a weight-0 observational
 //! record.
 //!
-//! The crate exposes [`Bkcr`] as the single sampler implementation
+//! The crate exposes [`Cckr`] as the single sampler implementation
 //! behind the [`LogSampler`] trait.  The sampler is `!Sync` by
 //! design: one instance per dataflow-engine thread, accessed via
 //! `&self` with interior mutability through `RefCell`/`Cell`.
 
 #![doc = include_str!("design.md")]
 
-mod bkcr;
+mod cckr;
 pub mod thread_local;
 
-pub use bkcr::{AdmitTicket, Bkcr, chao1_unseen_weight};
+pub use cckr::{AdmitTicket, Cckr, chao1_unseen_weight};
 pub use thread_local::{
     SamplerGuard, ThreadAdmission, admit, flush_current_thread, insert, install, is_installed,
 };

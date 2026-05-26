@@ -101,7 +101,7 @@ impl ObservedEventReporter {
     }
 
     /// Report a pre-grouped batch of log events as a single channel
-    /// send.  Used by the per-thread BKCR sampler to ship one period's
+    /// send.  Used by the per-thread CCKR sampler to ship one period's
     /// records as one `ObservedEvent::LogBatch`.  Empty batches are
     /// suppressed.
     pub fn log_batch(&self, events: Vec<LogEvent>) {

@@ -81,8 +81,7 @@ pub(super) struct ControllerRuntime<PData: 'static + Clone + Send + Sync + std::
     /// Snapshot of the internal-logs sampler configuration; passed to
     /// every launched pipeline thread so re-deployed pipelines reuse
     /// the same sampler policy as the initial deployment.
-    sampler_config:
-        Option<otap_df_config::settings::telemetry::logs::InternalLogSamplerConfig>,
+    sampler_config: Option<otap_df_config::settings::telemetry::logs::InternalLogSamplerConfig>,
     /// Memory-pressure signal fanout shared with pipeline runtimes.
     memory_pressure_tx: tokio::sync::watch::Sender<MemoryPressureChanged>,
     /// All mutable live-control state protected by a single mutex.
@@ -127,9 +126,7 @@ impl<
         available_core_ids: Vec<CoreId>,
         engine_tracing_setup: TracingSetup,
         telemetry_reporting_interval: Duration,
-        sampler_config: Option<
-            otap_df_config::settings::telemetry::logs::InternalLogSamplerConfig,
-        >,
+        sampler_config: Option<otap_df_config::settings::telemetry::logs::InternalLogSamplerConfig>,
         memory_pressure_tx: tokio::sync::watch::Sender<MemoryPressureChanged>,
         live_config: OtelDataflowSpec,
     ) -> Self {

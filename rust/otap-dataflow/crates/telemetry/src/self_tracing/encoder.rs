@@ -67,7 +67,7 @@ impl<'buf, B: BoundedBuf> DirectLogRecordEncoder<'buf, B> {
         let _ = self.buf.extend_from_slice(&record.body_attrs_bytes);
 
         // Encode the optional adjusted count (`otel.sampling.count`) injected by
-        // the BKCR sampler. The attribute is *omitted* entirely when the
+        // the CCKR sampler. The attribute is *omitted* entirely when the
         // count is `None` (sampler not in use) or exactly `1.0`
         // (deterministic / unweighted record), so the common case carries
         // no extra bytes. A count of `0.0` is valid and indicates a
@@ -939,8 +939,8 @@ mod tests {
             (Some(4.5), true, 4.5),
         ];
         for (count, expect_present, expect_value) in cases {
-            let mut record = __log_record_impl!(Level::INFO, "test.count.case")
-                .into_record(LogContext::new());
+            let mut record =
+                __log_record_impl!(Level::INFO, "test.count.case").into_record(LogContext::new());
             record.count = count;
             let event = LogEvent {
                 time: SystemTime::UNIX_EPOCH + Duration::from_nanos(1),

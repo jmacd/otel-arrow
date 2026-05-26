@@ -58,7 +58,7 @@ impl TracingSetup {
     ///
     /// Returns `Some` only for [`ProviderSetup::InternalAsync`] — the
     /// only mode whose log delivery flows through an
-    /// [`ObservedEventReporter`].  Per-thread BKCR samplers use this
+    /// [`ObservedEventReporter`].  Per-thread CCKR samplers use this
     /// reporter to ship flushed batches.
     #[must_use]
     pub fn async_reporter(&self) -> Option<&ObservedEventReporter> {
@@ -197,7 +197,7 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        // Fast path: when a per-thread BKCR sampler is installed, ask
+        // Fast path: when a per-thread CCKR sampler is installed, ask
         // it whether to admit this callsite *before* we pay any
         // formatting cost (no SystemTime::now, no context_fn, no
         // LogRecord::new on Skip).  When no sampler is installed the
