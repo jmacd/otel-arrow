@@ -150,8 +150,8 @@ pub fn flush_current_thread() {
         }
 
         let mut batch: Vec<LogEvent> = Vec::with_capacity(drained.len());
-        for (_callsite, mut event, weight) in drained {
-            event.record.count = Some(weight);
+        for (_callsite, mut event, sampling_count) in drained {
+            event.record.count = Some(sampling_count);
             batch.push(event);
         }
         state.reporter.log_batch(batch);
@@ -240,7 +240,7 @@ mod tests {
                 crate::event::ObservedEvent::LogBatch(batch) => {
                     assert!(!batch.is_empty());
                     for ev in &batch {
-                        // All flushed records must carry a weight.
+                        // All flushed records must carry a sampling count.
                         assert!(ev.record.count.is_some());
                     }
                 }
