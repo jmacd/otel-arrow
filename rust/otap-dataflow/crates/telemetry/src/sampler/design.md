@@ -1,4 +1,4 @@
-# BKCR — Bottom-K Chao-Reserve
+# BKCR — Bottom-K Chao-Preserve
 
 A per-thread log-sampling data structure that produces, every period,
 a small **bounded sample of log events** annotated with
@@ -23,7 +23,7 @@ callsites. We want:
 
 BKCR addresses all three: a Bottom-K sketch with exponential ranks
 (weighted sampling without replacement) for (1) and (2), augmented
-with a bounded *novelty reserve* for (3).
+with a bounded *novelty preserve* for (3).
 
 ## References
 
@@ -68,10 +68,10 @@ if `c` is novel). On every arrival from callsite `c`, BKCR draws
 `u ~ U(0,1)`, computes the EXP rank `k = -ln(u) / w_c`, and keeps
 the event in a bottom-`T` max-heap if `k` is below the heap's root
 `τ`. Heap-rejected events from callsites not yet observed by the
-sketch this period are placed in a bounded *novelty reserve* of
+sketch this period are placed in a bounded *novelty preserve* of
 capacity `R` (FIFO with no eviction). At flush, kept heap items
 are emitted with Horvitz–Thompson weight
-`max(1, 1 / (1 − e^{−τ·w_c}))`, and reserve items absent from the
+`max(1, 1 / (1 − e^{−τ·w_c}))`, and preserve items absent from the
 heap's sample are emitted with **weight 0** as observational
 records that do not influence statistical estimates. The current
 period's tallies are then frozen as `freq_prev` for the next
@@ -81,7 +81,7 @@ period.
 
 ```text
 target           : T (sample-size cap)
-reserve_capacity : R (novelty-reserve cap; R = 0 disables it)
+preserve_capacity : R (novelty-preserve cap; R = 0 disables it)
 min_period_count : Chao1 stability threshold (default 32)
 
 freq_prev        : HashMap<Callsite, u64>   -- last period
@@ -90,8 +90,8 @@ heap             : BinaryHeap<HeapEntry>    -- max-heap of size ≤ T+1
 tau              : f64                      -- current threshold (heap root)
 unseen_weight    : f64                      -- Chao1/Good–Turing imputation
 
-reserve          : Vec<(Callsite, Payload)> -- novelty FIFO, size ≤ R
-reserved_set     : HashSet<Callsite>        -- membership index, size ≤ R
+preserve          : Vec<(Callsite, Payload)> -- novelty FIFO, size ≤ R
+preserved_set     : HashSet<Callsite>        -- membership index, size ≤ R
 
 rng              : SmallRng
 ```
@@ -109,14 +109,14 @@ w_c = freq_prev.get(c).map(|f| 1.0 / f as f64)
 u   = rng.gen::<f64>()
 k   = -u.ln() / w_c               // EXP rank, [2]
 if k < tau:           return Admit(k)
-if reserve.len() < R && !reserved_set.contains(c):
-                       return Reserve
+if preserve.len() < R && !preserved_set.contains(c):
+                       return Preserve
                        return Skip
 ```
 
 `insert(c, payload, admission)` — called only when the caller
 chose to format the payload after `admit` returned `Admit` or
-`Reserve`:
+`Preserve`:
 
 ```text
 match admission:
@@ -125,9 +125,9 @@ match admission:
         if heap.len() > T:
             heap.pop()
             tau = heap.peek().key
-    Reserve =>
-        reserve.push((c.clone(), payload))
-        reserved_set.insert(c)
+    Preserve =>
+        preserve.push((c.clone(), payload))
+        preserved_set.insert(c)
     Skip => unreachable
 ```
 
@@ -148,7 +148,7 @@ flush_into(out):
         kept.insert(entry.callsite.clone())
         out.push((entry.callsite, entry.payload, weight))
 
-    for (c, p) in reserve.drain(..):
+    for (c, p) in preserve.drain(..):
         if !kept.contains(&c):
             out.push((c, p, 0.0))
 
@@ -161,7 +161,7 @@ flush_into(out):
         unseen_weight = chao1_unseen_weight(freq_curr.values())  // [3]
         swap(&mut freq_prev, &mut freq_curr)
     freq_curr.clear()
-    reserved_set.clear()
+    preserved_set.clear()
     tau = +infinity
 ```
 
@@ -170,7 +170,7 @@ flush_into(out):
 1. **Output size is bounded.** `|out| ≤ T + R` always.
 2. **Horvitz–Thompson unbiased ([1, 2]).** For any subset
    `J ⊆ callsites`, `E[Σ_{i kept, i∈J} ŵ_i] = Σ_{i∈J} 1` (total
-   arrivals in `J`). Weight-0 reserve entries contribute nothing
+   arrivals in `J`). Weight-0 preserve entries contribute nothing
    and so cannot bias the estimator.
 3. **Temporally uniform.** Because BKCR's frozen-weight scheme
    uses `freq_prev` (constant within a period), the probability
@@ -181,14 +181,14 @@ flush_into(out):
    `freq_prev` exists, a callsite `c` with `freq_prev[c] = N_c`
    that fires once in the current period is kept by the heap
    with probability `1 − exp(−τ / N_c)`; absent that, it is
-   kept by the reserve with probability 1 provided fewer than
+   kept by the preserve with probability 1 provided fewer than
    `R` novel callsites preceded it that period.
-5. **No conditioning corruption.** The reserve is a downstream
+5. **No conditioning corruption.** The preserve is a downstream
    consumer of `admit`'s reject signal; it does not feed the RNG,
    `τ`, or the heap. K's sampling distribution is identical to
    the `R = 0` baseline whatever `R` is.
 6. **Hash-only state.** No per-callsite metadata is allocated
-   outside the two `HashMap`s and the reserve set. Steady-state
+   outside the two `HashMap`s and the preserve set. Steady-state
    allocation is zero if `freq_curr` capacity has been preheated.
 
 ## Configuration
@@ -196,7 +196,7 @@ flush_into(out):
 | knob               | meaning                                            | default |
 |---|---|---|
 | `target`           | sample size `T` per period                         | (req'd) |
-| `reserve_capacity` | novelty reserve `R`; `R=0` disables               | `T`     |
+| `preserve_capacity` | novelty preserve `R`; `R=0` disables               | `T`     |
 | `min_period_count` | drop `freq_prev` if window arrivals < this        | `32`    |
 | seed / RNG         | injectable for tests                               | OS rand |
 
@@ -215,7 +215,7 @@ Horvitz–Thompson weight:
 
 ## Monitoring
 
-BKCR exposes no new metric. The reserve size is observable as
+BKCR exposes no new metric. The preserve size is observable as
 `count(records where weight == 0)` per flush. Operators
 monitoring "are rare callsites being squeezed out?" should alert
 when that count is consistently trending toward `R`; in that
@@ -237,7 +237,7 @@ long-tailed categorical distributions confirmed:
   within a window are visually uniform for every callsite.
 - **Singleton inclusion.** A callsite with one expected
   occurrence per window of 10 000 events is captured by BKCR
-  (heap + reserve, `T = 100`, `R = 100`) in > 99 % of trials in
+  (heap + preserve, `T = 100`, `R = 100`) in > 99 % of trials in
   steady state.
 - **Chao1 accuracy.** The Chao1 / Good–Turing weight estimate
   matches empirical missing-mass within ≈ 0.3 % on every

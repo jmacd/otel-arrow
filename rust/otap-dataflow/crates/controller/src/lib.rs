@@ -224,7 +224,7 @@ enum TopicReceiverMode {
 #[derive(Debug, Clone, Copy)]
 struct SamplerInstall {
     target: usize,
-    reserve_capacity: usize,
+    preserve_capacity: usize,
     initial_delay: Duration,
     period: Duration,
 }
@@ -1864,7 +1864,7 @@ impl<
                 .mul_f64(stagger_slot as f64 / num_cores.max(1) as f64);
             SamplerInstall {
                 target: cfg.target,
-                reserve_capacity: cfg.reserve_capacity,
+                preserve_capacity: cfg.preserve_capacity,
                 initial_delay,
                 period: telemetry_reporting_interval,
             }
@@ -2117,7 +2117,7 @@ impl<
                 tracing_setup.async_reporter().map(|reporter| {
                     otap_df_telemetry::sampler::install(
                         cfg.target,
-                        cfg.reserve_capacity,
+                        cfg.preserve_capacity,
                         reporter.clone(),
                     )
                 })

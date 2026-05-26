@@ -68,7 +68,7 @@ pub struct AdmitTicket {
 /// intentionally `!Sync`.
 pub struct Bkcr<C, P> {
     target: usize,
-    reserve_capacity: usize,
+    preserve_capacity: usize,
     /// Minimum prior-period arrival count below which we discard
     /// the frozen table and treat the next period as warmup.
     min_period_count: u64,
@@ -84,12 +84,12 @@ struct Inner<C, P> {
     freq_curr: HashMap<C, u64>,
     /// Bottom-`T+1` max-heap on key.
     heap: BinaryHeap<HeapEntry<C, P>>,
-    /// Novelty reserve: first-rejected callsites this period, FIFO.
+    /// Novelty preserve: first-rejected callsites this period, FIFO.
     /// Each entry carries (callsite, payload, seq) where seq is the
     /// chronological sequence number at admission.
-    reserve: Vec<(C, P, u64)>,
-    /// Membership index for the reserve.  Same size as `reserve`.
-    reserved_set: HashSet<C>,
+    preserve: Vec<(C, P, u64)>,
+    /// Membership index for the preserve.  Same size as `preserve`.
+    preserved_set: HashSet<C>,
     /// Monotonic sequence counter for chronological ordering.
     /// Incremented on every Admit or Reserve admission.
     seq_counter: u64,
@@ -101,7 +101,7 @@ where
     C: Hash + Eq + Clone,
 {
     /// Construct a sampler with target sample size `T`.  Uses the
-    /// default reserve capacity (`R = T`), Chao1 stability threshold
+    /// default preserve capacity (`R = T`), Chao1 stability threshold
     /// (`min_period_count = 32`), and a fresh OS-derived seed.
     /// Panics if `T == 0`.
     #[must_use]
@@ -110,19 +110,19 @@ where
     }
 
     /// Construct a sampler with explicit `target`,
-    /// `reserve_capacity`, `min_period_count`, and RNG seed.
+    /// `preserve_capacity`, `min_period_count`, and RNG seed.
     /// Panics if `target == 0`.
     #[must_use]
     pub fn with_options(
         target: usize,
-        reserve_capacity: usize,
+        preserve_capacity: usize,
         min_period_count: u64,
         seed: u64,
     ) -> Self {
         assert!(target >= 1, "target must be >= 1");
         Self {
             target,
-            reserve_capacity,
+            preserve_capacity,
             min_period_count,
             tau: Cell::new(f64::INFINITY),
             // Until the first flush, every callsite is "unseen" with
@@ -132,8 +132,8 @@ where
                 freq_prev: HashMap::with_capacity(target),
                 freq_curr: HashMap::with_capacity(target),
                 heap: BinaryHeap::with_capacity(target + 1),
-                reserve: Vec::with_capacity(reserve_capacity),
-                reserved_set: HashSet::with_capacity(reserve_capacity),
+                preserve: Vec::with_capacity(preserve_capacity),
+                preserved_set: HashSet::with_capacity(preserve_capacity),
                 seq_counter: 0,
                 rng: SmallRng::seed_from_u64(seed),
             }),
@@ -160,10 +160,10 @@ where
         self.inner.borrow().freq_prev.len()
     }
 
-    /// Current reserve occupancy.
+    /// Current preserve occupancy.
     #[must_use]
     pub fn reserve_len(&self) -> usize {
-        self.inner.borrow().reserve.len()
+        self.inner.borrow().preserve.len()
     }
 
     fn weight_for(freq_prev: &HashMap<C, u64>, callsite: &C, unseen_weight: f64) -> f64 {
@@ -201,9 +201,9 @@ where
         if k < self.tau.get() {
             return Admission::Admit(AdmitTicket { key: k, seq });
         }
-        // K rejected — consider the novelty reserve.
-        if inner.reserve.len() < self.reserve_capacity && !inner.reserved_set.contains(callsite) {
-            return Admission::Reserve;
+        // K rejected — consider the novelty preserve.
+        if inner.preserve.len() < self.preserve_capacity && !inner.preserved_set.contains(callsite) {
+            return Admission::Preserve;
         }
         Admission::Skip
     }
@@ -227,11 +227,11 @@ where
                     self.tau.set(new_tau);
                 }
             }
-            Admission::Reserve => {
+            Admission::Preserve => {
                 let seq = inner.seq_counter;
                 inner.seq_counter += 1;
-                let _ = inner.reserved_set.insert(callsite.clone());
-                inner.reserve.push((callsite, payload, seq));
+                let _ = inner.preserved_set.insert(callsite.clone());
+                inner.preserve.push((callsite, payload, seq));
             }
             Admission::Skip => {
                 debug_assert!(false, "insert called for Skip admission");
@@ -243,18 +243,18 @@ where
         let final_tau = self.tau.get();
         let mut inner = self.inner.borrow_mut();
         let unseen = self.unseen_weight.get();
-        out.reserve(inner.heap.len() + inner.reserve.len());
+        out.reserve(inner.heap.len() + inner.preserve.len());
 
         // (1) Drain the bottom-T heap with Horvitz–Thompson weights.
         //     Track the kept callsites and their sequence numbers so
-        //     the reserve can be deduplicated: we prefer the earliest
+        //     the preserve can be deduplicated: we prefer the earliest
         //     observation per callsite.
         let mut kept: HashMap<C, u64> = HashMap::with_capacity(inner.heap.len());
         let Inner {
             freq_prev,
             heap,
-            reserve,
-            reserved_set,
+            preserve,
+            preserved_set,
             freq_curr,
             seq_counter: _,
             rng: _,
@@ -276,16 +276,16 @@ where
             out.push((e.callsite, e.payload, weight));
         }
 
-        // (2) Drain the novelty reserve, suppressing entries whose
+        // (2) Drain the novelty preserve, suppressing entries whose
         //     callsite appears in the heap with an earlier or equal
         //     sequence number.  Surviving entries carry weight 0: they
         //     contribute no statistical mass but provide observational
         //     coverage of callsites that fired and would otherwise be
         //     absent.
-        for (c, p, seq) in reserve.drain(..) {
+        for (c, p, seq) in preserve.drain(..) {
             match kept.get(&c) {
                 Some(heap_seq) if *heap_seq <= seq => {
-                    // Heap has an earlier or equal observation; skip reserve entry.
+                    // Heap has an earlier or equal observation; skip preserve entry.
                 }
                 _ => {
                     // Reserve has earlier observation, or callsite not in heap.
@@ -293,7 +293,7 @@ where
                 }
             }
         }
-        reserved_set.clear();
+        preserved_set.clear();
 
         // (3) Period-boundary bookkeeping.
         let n_curr: u64 = freq_curr.values().sum();
@@ -395,7 +395,7 @@ mod tests {
             let adm = sampler.admit(c);
             match adm {
                 Admission::Skip => {}
-                Admission::Admit(_) | Admission::Reserve => {
+                Admission::Admit(_) | Admission::Preserve => {
                     sampler.insert(c.clone(), adm, p.clone());
                 }
             }
@@ -434,8 +434,8 @@ mod tests {
         let out = run_period(&s, &evs);
         // Single callsite, so heap holds at most T=10 of it; once τ
         // tightens the first rejection of callsite 1 may also land
-        // in the reserve (callsite 1 is "first-rejected this period",
-        // not "novel").  Bound on output is T + 1 distinct reserve
+        // in the preserve (callsite 1 is "first-rejected this period",
+        // not "novel").  Bound on output is T + 1 distinct preserve
         // entry = 11.
         assert!(out.len() <= 11);
         let n_heap = out.iter().filter(|(_, _, w)| *w >= 1.0).count();
@@ -451,7 +451,7 @@ mod tests {
             if matches!(adm, Admission::Admit(_)) {
                 admits += 1;
                 s.insert(1u32, adm, 0u8);
-            } else if matches!(adm, Admission::Reserve) {
+            } else if matches!(adm, Admission::Preserve) {
                 s.insert(1u32, adm, 0u8);
             }
         }
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn reserve_zero_means_vanilla_bottom_k() {
-        // R=0: no admission should ever produce Admission::Reserve,
+        // R=0: no admission should ever produce Admission::Preserve,
         // and every output weight is ≥ 1.
         let s: Bkcr<u32, u8> = Bkcr::with_options(5, 0, 32, 42);
         // Construct a stream guaranteed to overflow the heap.
@@ -521,7 +521,7 @@ mod tests {
         let mut saw_reserve = false;
         for (c, p) in &evs {
             let adm = s.admit(c);
-            if matches!(adm, Admission::Reserve) {
+            if matches!(adm, Admission::Preserve) {
                 saw_reserve = true;
             }
             if matches!(adm, Admission::Admit(_)) {
@@ -547,7 +547,7 @@ mod tests {
         let mut evs: Vec<(u32, u8)> = (0..1_000).map(|_| (1u32, 0u8)).collect();
         evs.push((42u32, 0u8));
         let out = run_period(&s, &evs);
-        // At most 1 heap + 2 reserve = 3, deduped.
+        // At most 1 heap + 2 preserve = 3, deduped.
         assert!(out.len() <= 3);
         let has_singleton = out.iter().any(|(c, _, _)| *c == 42);
         assert!(has_singleton, "novel singleton lost: out={out:?}");
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn reserve_cap_is_respected() {
-        // R=3: flood the stream with novel callsites; the reserve
+        // R=3: flood the stream with novel callsites; the preserve
         // must not exceed 3 entries.
         let r = 3usize;
         let s: Bkcr<u32, u8> = Bkcr::with_options(2, r, 32, 0xCABBA9E);
@@ -569,7 +569,7 @@ mod tests {
         let reserve_emitted = out.iter().filter(|(_, _, w)| *w == 0.0).count();
         assert!(
             reserve_emitted <= r,
-            "reserve emitted {reserve_emitted} > R={r}; out={out:?}"
+            "preserve emitted {reserve_emitted} > R={r}; out={out:?}"
         );
     }
 
@@ -590,7 +590,7 @@ mod tests {
         for (c, _, w) in &out {
             if *w == 0.0 {
                 let in_heap = out.iter().any(|(c2, _, w2)| c == c2 && *w2 != 0.0);
-                assert!(!in_heap, "callsite {c} duplicated: heap+reserve");
+                assert!(!in_heap, "callsite {c} duplicated: heap+preserve");
             }
         }
     }
@@ -608,9 +608,9 @@ mod tests {
         evs.push((42u32, 0u8));
         evs.push((43u32, 0u8));
         let _ = run_period(&s, &evs);
-        assert_eq!(s.reserve_len(), 0, "reserve not cleared after flush");
+        assert_eq!(s.reserve_len(), 0, "preserve not cleared after flush");
         // Window 3: same novel callsite — should be eligible for
-        // reserve again (since reserved_set was cleared).
+        // preserve again (since preserved_set was cleared).
         let mut evs: Vec<(u32, u8)> = (0..500).map(|_| (1u32, 0u8)).collect();
         evs.push((42u32, 0u8));
         let out = run_period(&s, &evs);
@@ -636,11 +636,11 @@ mod tests {
     fn reserve_entries_have_weight_zero() {
         let s: Bkcr<u32, u8> = Bkcr::with_options(1, 50, 32, 0xBEAD);
         // Fresh sampler, lots of unique callsites: many will land
-        // in the reserve.
+        // in the preserve.
         let evs: Vec<(u32, u8)> = (0..1000).map(|i| (i as u32, 0u8)).collect();
         let out = run_period(&s, &evs);
         let n_reserve = out.iter().filter(|(_, _, w)| *w == 0.0).count();
-        assert!(n_reserve > 0, "no reserve entries emitted; out={out:?}");
+        assert!(n_reserve > 0, "no preserve entries emitted; out={out:?}");
         // Every weight is either 0 or ≥ 1; no weights in (0, 1).
         for (_, _, w) in &out {
             assert!(*w == 0.0 || *w >= 1.0, "anomalous weight {w}");
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn reserve_unbiasedness_preserved() {
         // Vanilla BKCR (R=0) vs BKCR with R=T should agree on
-        // Σ weight (HT estimator), because reserve entries
+        // Σ weight (HT estimator), because preserve entries
         // contribute exactly 0.
         let k = 8;
         let n = 5_000;
@@ -778,7 +778,7 @@ mod criterion_bench {
             let adm = sampler.admit(c);
             match adm {
                 Admission::Skip => {}
-                Admission::Admit(_) | Admission::Reserve => {
+                Admission::Admit(_) | Admission::Preserve => {
                     sampler.insert(*c, adm, i as u64);
                 }
             }

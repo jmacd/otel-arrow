@@ -219,7 +219,7 @@ where
         let log_event = LogEvent { time, record };
         match admission {
             // Sampler installed and approved this event for the
-            // statistical sample or the novelty reserve: route through
+            // statistical sample or the novelty preserve: route through
             // the sampler so it joins the next flushed batch instead
             // of being shipped as a singleton.
             Some(adm) => {

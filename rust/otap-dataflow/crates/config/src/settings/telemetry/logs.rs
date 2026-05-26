@@ -38,8 +38,8 @@ pub struct LogsConfig {
     ///
     /// When `enabled`, each engine pipeline thread installs a
     /// thread-local BKCR sampler that bounds internal-log output to
-    /// roughly `target` records per period (with up to `reserve_capacity`
-    /// novelty-reserve records). When `enabled` is `false` (the default)
+    /// roughly `target` records per period (with up to `preserve_capacity`
+    /// novelty-preserve records). When `enabled` is `false` (the default)
     /// every log event is forwarded individually, matching pre-existing
     /// behaviour.
     #[serde(default)]
@@ -64,16 +64,16 @@ pub struct InternalLogSamplerConfig {
     #[serde(default = "default_sampler_target")]
     pub target: usize,
 
-    /// Novelty-reserve cap `R` per period per thread.
-    #[serde(default = "default_sampler_reserve_capacity")]
-    pub reserve_capacity: usize,
+    /// Novelty-preserve cap `R` per period per thread.
+    #[serde(default = "default_sampler_preserve_capacity")]
+    pub preserve_capacity: usize,
 }
 
 const fn default_sampler_target() -> usize {
     128
 }
 
-const fn default_sampler_reserve_capacity() -> usize {
+const fn default_sampler_preserve_capacity() -> usize {
     128
 }
 
@@ -82,7 +82,7 @@ impl Default for InternalLogSamplerConfig {
         Self {
             enabled: false,
             target: default_sampler_target(),
-            reserve_capacity: default_sampler_reserve_capacity(),
+            preserve_capacity: default_sampler_preserve_capacity(),
         }
     }
 }
@@ -551,7 +551,7 @@ mod tests {
         let config = LogsConfig::default();
         assert!(!config.sampler.enabled);
         assert_eq!(config.sampler.target, 128);
-        assert_eq!(config.sampler.reserve_capacity, 128);
+        assert_eq!(config.sampler.preserve_capacity, 128);
 
         let parsed = parse("{}");
         assert_eq!(parsed.sampler, config.sampler);
@@ -559,10 +559,10 @@ mod tests {
 
     #[test]
     fn test_sampler_parsing() {
-        let parsed = parse("sampler: { enabled: true, target: 64, reserve_capacity: 32 }");
+        let parsed = parse("sampler: { enabled: true, target: 64, preserve_capacity: 32 }");
         assert!(parsed.sampler.enabled);
         assert_eq!(parsed.sampler.target, 64);
-        assert_eq!(parsed.sampler.reserve_capacity, 32);
+        assert_eq!(parsed.sampler.preserve_capacity, 32);
     }
 
     #[test]

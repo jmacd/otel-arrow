@@ -42,10 +42,10 @@ pub enum Admission<Ticket> {
     /// this ticket.
     Admit(Ticket),
     /// The event was rejected by the statistical sample but accepted
-    /// by the novelty reserve as a weight-0 observational record.
+    /// by the novelty preserve as a weight-0 observational record.
     /// The caller must format the payload and call
-    /// [`LogSampler::insert`] with [`Admission::Reserve`] verbatim.
-    Reserve,
+    /// [`LogSampler::insert`] with [`Admission::Preserve`] verbatim.
+    Preserve,
 }
 
 /// Common API for the per-thread sampler.
