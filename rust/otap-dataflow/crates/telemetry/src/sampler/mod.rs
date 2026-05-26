@@ -71,12 +71,12 @@ pub trait LogSampler<C, P> {
     /// [`Self::admit`].
     fn insert(&self, callsite: C, admission: Admission<Self::Ticket>, payload: P);
 
-    /// Drain the current period's sample.  Returns `(callsite,
-    /// payload, weight)` triples; `Σ weight` is an unbiased
+    /// Drain the current period's sample. Returns `(callsite,
+    /// payload, sampling_count)` triples; `Σ sampling_count` is an unbiased
     /// Horvitz–Thompson estimator of the period's total arrival
-    /// count.  Reserve entries appear with `weight == 0`.
+    /// count. Preserve entries appear with `sampling_count == 0`.
     ///
-    /// Allocates a fresh `Vec` each call.  Use [`Self::flush_into`]
+    /// Allocates a fresh `Vec` each call. Use [`Self::flush_into`]
     /// to recycle a caller-owned buffer.
     fn flush(&self) -> Vec<(C, P, f64)> {
         let mut out = Vec::new();

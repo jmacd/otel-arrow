@@ -265,20 +265,20 @@ where
             // EXP-rank inclusion probability: π = 1 - exp(-τ·w_c).
             // In the τ·w_c → 0 limit this agrees with the PRI
             // estimator τ·w_c; for larger products it gives a
-            // larger π (smaller weight), which is the source of
+            // larger π (smaller sampling_count), which is the source of
             // EXP's variance advantage on subpopulation queries.
-            let weight = if final_tau.is_finite() {
+            let sampling_count = if final_tau.is_finite() {
                 let pi = -(-final_tau * w_c).exp_m1();
                 (1.0 / pi).max(1.0)
             } else {
                 1.0
             };
-            out.push((e.callsite, e.payload, weight));
+            out.push((e.callsite, e.payload, sampling_count));
         }
 
         // (2) Drain the novelty preserve. Since heap and preserve are
         //     disjoint (enforced by insert()), we emit all preserve
-        //     entries with weight 0. They contribute no statistical mass
+        //     entries with sampling_count 0. They contribute no statistical mass
         //     but provide observational coverage of callsites that fired
         //     and would otherwise be absent.
         for (c, (p, _seq)) in preserve.drain() {
@@ -374,7 +374,7 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
     /// Drive one period of events end-to-end and return the flushed
-    /// `(callsite, payload, weight)` records.
+    /// `(callsite, payload, sampling_count)` records.
     fn run_period<C, P, S>(sampler: &S, events: &[(C, P)]) -> Vec<(C, P, f64)>
     where
         C: Clone,
@@ -472,8 +472,8 @@ mod tests {
 
     #[test]
     fn ht_unbiasedness_stationary() {
-        // Stationary Zipf-like workload.  After one warmup period,
-        // Σ weight should track total event count.
+        // Stationary Zipf-like workload. After one warmup period,
+        // Σ sampling_count should track total event count.
         let k = 6;
         let n = 10_000;
         let periods = 4;
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn reserve_zero_means_vanilla_bottom_k() {
         // R=0: no admission should ever produce Admission::Preserve,
-        // and every output weight is ≥ 1.
+        // and every output sampling_count is ≥ 1.
         let s: Bkcr<u32, u8> = Bkcr::with_options(5, 0, 32, 42);
         // Construct a stream guaranteed to overflow the heap.
         let evs: Vec<(u32, u8)> = (0..1000).map(|i| ((i % 100) as u32, 0u8)).collect();
@@ -567,13 +567,13 @@ mod tests {
     fn reserve_dedups_against_sample() {
         // If a callsite is both reserved AND later admitted to the
         // heap, the flushed output must contain only the heap copy
-        // (no weight-0 duplicate).
+        // (no sampling_count=0 duplicate).
         //
         // Strategy: tiny T=2 with R=5, fresh sampler so every
-        // callsite is "unseen" with the same weight.  Fire many
+        // callsite is "unseen" with the same weight. Fire many
         // events from many callsites; for any callsite that ends
         // up in the heap, ensure it does not also appear as
-        // weight=0.
+        // sampling_count=0.
         let s: Bkcr<u32, u8> = Bkcr::with_options(2, 5, 32, 0xDEADBEEF);
         let evs: Vec<(u32, u8)> = (0..50).map(|i| (i as u32, 0u8)).collect();
         let out = run_period(&s, &evs);
@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_entries_have_weight_zero() {
+    fn preserve_entries_have_sampling_count_zero() {
         let s: Bkcr<u32, u8> = Bkcr::with_options(1, 50, 32, 0xBEAD);
         // Fresh sampler, lots of unique callsites: many will land
         // in the preserve.
@@ -631,16 +631,16 @@ mod tests {
         let out = run_period(&s, &evs);
         let n_reserve = out.iter().filter(|(_, _, w)| *w == 0.0).count();
         assert!(n_reserve > 0, "no preserve entries emitted; out={out:?}");
-        // Every weight is either 0 or ≥ 1; no weights in (0, 1).
+        // Every sampling_count is either 0 or ≥ 1; no counts in (0, 1).
         for (_, _, w) in &out {
-            assert!(*w == 0.0 || *w >= 1.0, "anomalous weight {w}");
+            assert!(*w == 0.0 || *w >= 1.0, "anomalous sampling_count {w}");
         }
     }
 
     #[test]
     fn reserve_unbiasedness_preserved() {
         // Vanilla BKCR (R=0) vs BKCR with R=T should agree on
-        // Σ weight (HT estimator), because preserve entries
+        // Σ sampling_count (HT estimator), because preserve entries
         // contribute exactly 0.
         let k = 8;
         let n = 5_000;
@@ -662,12 +662,12 @@ mod tests {
             sum_diff += (wr - w0).abs();
             sum_n += w0;
         }
-        // Reserve adds only weight-0 entries → ΣwR == Σw0 exactly.
+        // Preserve adds only sampling_count=0 entries → Σ(sampling_count) for R=0 and R=T is the same.
         // Allow a tiny floating tolerance because the two samplers
         // share a seed and so produce identical RNG sequences.
         assert!(
             sum_diff / sum_n < 1e-9,
-            "Σ weight diverged between R=0 and R=T: diff/sum = {}",
+            "Σ sampling_count diverged between R=0 and R=T: diff/sum = {}",
             sum_diff / sum_n
         );
     }
