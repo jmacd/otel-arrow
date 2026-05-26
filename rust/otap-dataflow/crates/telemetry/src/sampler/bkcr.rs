@@ -84,6 +84,18 @@ struct Inner<C, P> {
     /// This is a best-effort mechanism to capture the earliest
     /// observation, but we don't fight to keep it if the heap later
     /// admits the same callsite.
+    ///
+    /// TODO(museum mode): For high-value debugging scenarios, we could
+    /// add a "museum mode" that uses extra memory to preserve the first
+    /// example of every callsite regardless of reservoir state. This
+    /// could be implemented with the same single-map structure by
+    /// storing mutable state per callsite: the map would track that a
+    /// callsite has >= 0 entries in the reservoir and <= 1 entry in
+    /// the preserve, allowing the preserve entry to survive even when
+    /// the callsite is later admitted to the heap. The preserve would
+    /// only be removed when explicitly evicted due to capacity or when
+    /// the period ends. This trades memory (unbounded growth within a
+    /// period) for complete chronological coverage.
     preserve: HashMap<C, (P, u64)>,
     /// Monotonic sequence counter for chronological ordering.
     /// Incremented on every Admit or Preserve admission.
