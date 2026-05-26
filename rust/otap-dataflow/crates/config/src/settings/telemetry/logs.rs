@@ -56,6 +56,11 @@ pub struct InternalLogSamplerConfig {
     pub enabled: bool,
 
     /// Sample-size cap `T` per period per thread.
+    ///
+    /// Must be at least 32 when sampling is enabled. This minimum ensures
+    /// the Chao1 richness estimator has sufficient events for reliable
+    /// frequency estimates, matching the internal `min_period_count`
+    /// threshold used by the sampler's flush logic.
     #[serde(default = "default_sampler_target")]
     pub target: usize,
 
@@ -313,9 +318,9 @@ impl LogsConfig {
         }
 
         if self.sampler.enabled {
-            if self.sampler.target == 0 {
+            if self.sampler.target < 32 {
                 return Err(Error::InvalidUserConfig {
-                    error: "logs.sampler.target must be greater than zero when sampler is enabled"
+                    error: "logs.sampler.target must be at least 32 when sampler is enabled (required for Chao1 estimator stability)"
                         .into(),
                 });
             }
@@ -573,12 +578,27 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_sampler_target_must_be_positive() {
+    fn test_validate_sampler_target_minimum() {
         use ProviderMode::*;
         let mut config = config_with(Noop, ITS, Noop, ConsoleDirect);
         config.sampler.enabled = true;
-        config.sampler.target = 0;
-        assert_invalid(&config, "logs.sampler.target");
+        
+        // target < 32 should be rejected
+        for target in [0, 1, 16, 31] {
+            config.sampler.target = target;
+            assert_invalid(&config, "logs.sampler.target");
+        }
+        
+        // target >= 32 should validate
+        config.sampler.target = 32;
+        config
+            .validate()
+            .expect("sampler with target=32 should validate");
+        
+        config.sampler.target = 128;
+        config
+            .validate()
+            .expect("sampler with target=128 should validate");
     }
 
     #[test]
