@@ -223,7 +223,7 @@ enum TopicReceiverMode {
 /// Pre-staggered install parameters for a per-thread BKCR log sampler.
 #[derive(Debug, Clone, Copy)]
 struct SamplerInstall {
-    target: usize,
+    reservoir_capacity: usize,
     preserve_capacity: usize,
     initial_delay: Duration,
     period: Duration,
@@ -1863,7 +1863,7 @@ impl<
             let initial_delay = telemetry_reporting_interval
                 .mul_f64(stagger_slot as f64 / num_cores.max(1) as f64);
             SamplerInstall {
-                target: cfg.target,
+                reservoir_capacity: cfg.reservoir_capacity,
                 preserve_capacity: cfg.preserve_capacity,
                 initial_delay,
                 period: telemetry_reporting_interval,
@@ -2116,7 +2116,7 @@ impl<
             let _sampler_guard = sampler_install.as_ref().and_then(|cfg| {
                 tracing_setup.async_reporter().map(|reporter| {
                     otap_df_telemetry::sampler::install(
-                        cfg.target,
+                        cfg.reservoir_capacity,
                         cfg.preserve_capacity,
                         reporter.clone(),
                     )

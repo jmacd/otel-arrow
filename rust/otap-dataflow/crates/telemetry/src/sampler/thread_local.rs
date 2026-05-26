@@ -88,7 +88,7 @@ pub fn install(
             "per-thread BKCR sampler already installed on this thread"
         );
         *slot = Some(ThreadSamplerState {
-            sampler: Bkcr::with_options(target, reserve_capacity, 32, rand::random()),
+            sampler: Bkcr::with_options(reservoir_capacity, preserve_capacity, 32, rand::random()),
             reporter,
         });
     });

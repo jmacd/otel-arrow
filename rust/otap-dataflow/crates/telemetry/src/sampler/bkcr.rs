@@ -61,7 +61,7 @@ pub struct AdmitTicket {
 /// with interior mutability via `RefCell` / `Cell`; the type is
 /// intentionally `!Sync`.
 pub struct Bkcr<C, P> {
-    target: usize,
+    reservoir_capacity: usize,
     preserve_capacity: usize,
     /// Minimum prior-period arrival count below which we discard
     /// the frozen table and treat the next period as warmup.
@@ -136,9 +136,9 @@ where
             // weight 1.0 — i.e., we behave as a uniform reservoir.
             unseen_weight: Cell::new(1.0),
             inner: RefCell::new(Inner {
-                freq_prev: HashMap::with_capacity(target),
-                freq_curr: HashMap::with_capacity(target),
-                heap: BinaryHeap::with_capacity(target + 1),
+                freq_prev: HashMap::with_capacity(reservoir_capacity),
+                freq_curr: HashMap::with_capacity(reservoir_capacity),
+                heap: BinaryHeap::with_capacity(reservoir_capacity + 1),
                 preserve: HashMap::with_capacity(preserve_capacity),
                 seq_counter: 0,
                 rng: SmallRng::seed_from_u64(seed),
@@ -224,7 +224,7 @@ where
                     callsite,
                     payload,
                 });
-                if inner.heap.len() > self.target {
+                if inner.heap.len() > self.reservoir_capacity {
                     let _ = inner.heap.pop();
                     // The (T+1)-th smallest is gone; the new root is
                     // the largest of the remaining T smallest, which

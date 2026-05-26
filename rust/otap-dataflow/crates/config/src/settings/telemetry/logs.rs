@@ -38,7 +38,7 @@ pub struct LogsConfig {
     ///
     /// When `enabled`, each engine pipeline thread installs a
     /// thread-local BKCR sampler that bounds internal-log output to
-    /// roughly `target` records per period (with up to `preserve_capacity`
+    /// roughly `reservoir_capacity` records per period (with up to `preserve_capacity`
     /// novelty-preserve records). When `enabled` is `false` (the default)
     /// every log event is forwarded individually, matching pre-existing
     /// behaviour.
@@ -55,21 +55,28 @@ pub struct InternalLogSamplerConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Sample-size cap `T` per period per thread.
+    /// Reservoir capacity `T` per period per thread.
     ///
-    /// Must be at least 32 when sampling is enabled. This minimum ensures
-    /// the Chao1 richness estimator has sufficient events for reliable
-    /// frequency estimates, matching the internal `min_period_count`
+    /// Must be at least `MIN_RESERVOIR_CAPACITY` (32) when sampling is enabled.
+    /// This minimum ensures the Chao1 richness estimator has sufficient events
+    /// for reliable frequency estimates, matching the internal `min_period_count`
     /// threshold used by the sampler's flush logic.
-    #[serde(default = "default_sampler_target")]
-    pub target: usize,
+    #[serde(default = "default_reservoir_capacity")]
+    pub reservoir_capacity: usize,
 
     /// Novelty-preserve cap `R` per period per thread.
     #[serde(default = "default_sampler_preserve_capacity")]
     pub preserve_capacity: usize,
 }
 
-const fn default_sampler_target() -> usize {
+/// Minimum reservoir capacity required for Chao1 estimator stability.
+///
+/// This matches the internal `min_period_count` threshold in the BKCR
+/// sampler's flush logic. Below this threshold, frequency estimates
+/// become unreliable and the adaptive weighting degrades.
+pub const MIN_RESERVOIR_CAPACITY: usize = 32;
+
+const fn default_reservoir_capacity() -> usize {
     128
 }
 
@@ -81,7 +88,7 @@ impl Default for InternalLogSamplerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            target: default_sampler_target(),
+            reservoir_capacity: default_reservoir_capacity(),
             preserve_capacity: default_sampler_preserve_capacity(),
         }
     }
@@ -318,10 +325,12 @@ impl LogsConfig {
         }
 
         if self.sampler.enabled {
-            if self.sampler.target < 32 {
+            if self.sampler.reservoir_capacity < MIN_RESERVOIR_CAPACITY {
                 return Err(Error::InvalidUserConfig {
-                    error: "logs.sampler.target must be at least 32 when sampler is enabled (required for Chao1 estimator stability)"
-                        .into(),
+                    error: format!(
+                        "logs.sampler.reservoir_capacity must be at least {} when sampler is enabled (required for Chao1 estimator stability)",
+                        MIN_RESERVOIR_CAPACITY
+                    ),
                 });
             }
             // v1 limitation: the sampler only supports the ITS engine
@@ -550,7 +559,7 @@ mod tests {
     fn test_sampler_defaults() {
         let config = LogsConfig::default();
         assert!(!config.sampler.enabled);
-        assert_eq!(config.sampler.target, 128);
+        assert_eq!(config.sampler.reservoir_capacity, 128);
         assert_eq!(config.sampler.preserve_capacity, 128);
 
         let parsed = parse("{}");
@@ -559,9 +568,9 @@ mod tests {
 
     #[test]
     fn test_sampler_parsing() {
-        let parsed = parse("sampler: { enabled: true, target: 64, preserve_capacity: 32 }");
+        let parsed = parse("sampler: { enabled: true, reservoir_capacity: 64, preserve_capacity: 32 }");
         assert!(parsed.sampler.enabled);
-        assert_eq!(parsed.sampler.target, 64);
+        assert_eq!(parsed.sampler.reservoir_capacity, 64);
         assert_eq!(parsed.sampler.preserve_capacity, 32);
     }
 
@@ -583,22 +592,22 @@ mod tests {
         let mut config = config_with(Noop, ITS, Noop, ConsoleDirect);
         config.sampler.enabled = true;
         
-        // target < 32 should be rejected
-        for target in [0, 1, 16, 31] {
-            config.sampler.target = target;
-            assert_invalid(&config, "logs.sampler.target");
+        // reservoir_capacity < MIN_RESERVOIR_CAPACITY should be rejected
+        for reservoir_capacity in [0, 1, 16, MIN_RESERVOIR_CAPACITY - 1] {
+            config.sampler.reservoir_capacity = reservoir_capacity;
+            assert_invalid(&config, "logs.sampler.reservoir_capacity");
         }
         
-        // target >= 32 should validate
-        config.sampler.target = 32;
+        // reservoir_capacity >= MIN_RESERVOIR_CAPACITY should validate
+        config.sampler.reservoir_capacity = MIN_RESERVOIR_CAPACITY;
         config
             .validate()
-            .expect("sampler with target=32 should validate");
+            .expect("sampler with reservoir_capacity=MIN_RESERVOIR_CAPACITY should validate");
         
-        config.sampler.target = 128;
+        config.sampler.reservoir_capacity = 128;
         config
             .validate()
-            .expect("sampler with target=128 should validate");
+            .expect("sampler with reservoir_capacity=128 should validate");
     }
 
     #[test]
