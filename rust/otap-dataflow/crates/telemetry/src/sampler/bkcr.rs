@@ -21,9 +21,12 @@ use super::{Admission, LogSampler};
 
 /// One heap entry.  `key` is the EXP rank `-ln(u) / w_c`.  A
 /// `BinaryHeap` of these is a max-heap, so its root is the current
-/// threshold τ.
+/// threshold τ.  `seq` is a monotonic sequence number for chronological
+/// ordering (used during flush deduplication to prefer the earliest
+/// observation per callsite).
 struct HeapEntry<C, P> {
     key: f64,
+    seq: u64,
     callsite: C,
     payload: P,
 }
@@ -45,6 +48,17 @@ impl<C, P> Ord for HeapEntry<C, P> {
             .partial_cmp(&other.key)
             .expect("finite EXP-rank keys")
     }
+}
+
+/// Admission ticket for heap-bound events.  Carries both the EXP rank
+/// (for sampling correctness) and a chronological sequence number (for
+/// flush deduplication).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct AdmitTicket {
+    /// EXP rank `-ln(u) / w_c` for bottom-k heap ordering.
+    pub key: f64,
+    /// Chronological sequence number for flush deduplication.
+    pub seq: u64,
 }
 
 /// The BKCR sampler.
@@ -71,9 +85,14 @@ struct Inner<C, P> {
     /// Bottom-`T+1` max-heap on key.
     heap: BinaryHeap<HeapEntry<C, P>>,
     /// Novelty reserve: first-rejected callsites this period, FIFO.
-    reserve: Vec<(C, P)>,
+    /// Each entry carries (callsite, payload, seq) where seq is the
+    /// chronological sequence number at admission.
+    reserve: Vec<(C, P, u64)>,
     /// Membership index for the reserve.  Same size as `reserve`.
     reserved_set: HashSet<C>,
+    /// Monotonic sequence counter for chronological ordering.
+    /// Incremented on every Admit or Reserve admission.
+    seq_counter: u64,
     rng: SmallRng,
 }
 
@@ -115,6 +134,7 @@ where
                 heap: BinaryHeap::with_capacity(target + 1),
                 reserve: Vec::with_capacity(reserve_capacity),
                 reserved_set: HashSet::with_capacity(reserve_capacity),
+                seq_counter: 0,
                 rng: SmallRng::seed_from_u64(seed),
             }),
         }
@@ -158,8 +178,11 @@ impl<C, P> LogSampler<C, P> for Bkcr<C, P>
 where
     C: Hash + Eq + Clone,
 {
-    /// The EXP rank `k = -ln(u) / w_c` derived at admit time.
-    type Ticket = f64;
+    /// Admission ticket: carries the EXP rank `k = -ln(u) / w_c` for
+    /// heap ordering, plus a chronological sequence number `seq` for
+    /// flush deduplication (to prefer the earliest observation per
+    /// callsite).
+    type Ticket = AdmitTicket;
 
     fn admit(&self, callsite: &C) -> Admission<Self::Ticket> {
         let mut inner = self.inner.borrow_mut();
@@ -172,8 +195,11 @@ where
         // EXP rank.  -ln(U[0,1]) / w  ~  Exp(w).  See Cohen & Kaplan
         // §2 for the family-of-rank-functions discussion.
         let k = -u.ln() / w_c;
+        let seq = inner.seq_counter;
+        inner.seq_counter += 1;
+        
         if k < self.tau.get() {
-            return Admission::Admit(k);
+            return Admission::Admit(AdmitTicket { key: k, seq });
         }
         // K rejected — consider the novelty reserve.
         if inner.reserve.len() < self.reserve_capacity && !inner.reserved_set.contains(callsite) {
@@ -185,9 +211,10 @@ where
     fn insert(&self, callsite: C, admission: Admission<Self::Ticket>, payload: P) {
         let mut inner = self.inner.borrow_mut();
         match admission {
-            Admission::Admit(key) => {
+            Admission::Admit(ticket) => {
                 inner.heap.push(HeapEntry {
-                    key,
+                    key: ticket.key,
+                    seq: ticket.seq,
                     callsite,
                     payload,
                 });
@@ -201,8 +228,10 @@ where
                 }
             }
             Admission::Reserve => {
+                let seq = inner.seq_counter;
+                inner.seq_counter += 1;
                 let _ = inner.reserved_set.insert(callsite.clone());
-                inner.reserve.push((callsite, payload));
+                inner.reserve.push((callsite, payload, seq));
             }
             Admission::Skip => {
                 debug_assert!(false, "insert called for Skip admission");
@@ -217,15 +246,17 @@ where
         out.reserve(inner.heap.len() + inner.reserve.len());
 
         // (1) Drain the bottom-T heap with Horvitz–Thompson weights.
-        //     Track the set of kept callsites so the reserve can be
-        //     deduplicated against the statistical sample.
-        let mut kept: HashSet<C> = HashSet::with_capacity(inner.heap.len());
+        //     Track the kept callsites and their sequence numbers so
+        //     the reserve can be deduplicated: we prefer the earliest
+        //     observation per callsite.
+        let mut kept: HashMap<C, u64> = HashMap::with_capacity(inner.heap.len());
         let Inner {
             freq_prev,
             heap,
             reserve,
             reserved_set,
             freq_curr,
+            seq_counter: _,
             rng: _,
         } = &mut *inner;
         for e in heap.drain() {
@@ -241,18 +272,25 @@ where
             } else {
                 1.0
             };
-            let _ = kept.insert(e.callsite.clone());
+            let _ = kept.insert(e.callsite.clone(), e.seq);
             out.push((e.callsite, e.payload, weight));
         }
 
-        // (2) Drain the novelty reserve, suppressing entries that
-        //     are already represented in the statistical sample.
-        //     Surviving entries carry weight 0: they contribute no
-        //     statistical mass but provide observational coverage
-        //     of callsites that fired and would otherwise be absent.
-        for (c, p) in reserve.drain(..) {
-            if !kept.contains(&c) {
-                out.push((c, p, 0.0));
+        // (2) Drain the novelty reserve, suppressing entries whose
+        //     callsite appears in the heap with an earlier or equal
+        //     sequence number.  Surviving entries carry weight 0: they
+        //     contribute no statistical mass but provide observational
+        //     coverage of callsites that fired and would otherwise be
+        //     absent.
+        for (c, p, seq) in reserve.drain(..) {
+            match kept.get(&c) {
+                Some(heap_seq) if *heap_seq <= seq => {
+                    // Heap has an earlier or equal observation; skip reserve entry.
+                }
+                _ => {
+                    // Reserve has earlier observation, or callsite not in heap.
+                    out.push((c, p, 0.0));
+                }
             }
         }
         reserved_set.clear();

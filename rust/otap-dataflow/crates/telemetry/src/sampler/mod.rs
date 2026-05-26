@@ -23,7 +23,7 @@
 mod bkcr;
 pub mod thread_local;
 
-pub use bkcr::{Bkcr, chao1_unseen_weight};
+pub use bkcr::{AdmitTicket, Bkcr, chao1_unseen_weight};
 pub use thread_local::{
     SamplerGuard, ThreadAdmission, admit, flush_current_thread, insert, install, is_installed,
 };

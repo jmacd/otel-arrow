@@ -24,7 +24,7 @@ use crate::event::{LogEvent, ObservedEventReporter};
 #[cfg(test)]
 use crate::self_tracing::LogRecord;
 
-use super::{Admission, Bkcr, LogSampler};
+use super::{Admission, AdmitTicket, Bkcr, LogSampler};
 
 thread_local! {
     static THREAD_SAMPLER: RefCell<Option<ThreadSamplerState>> = const { RefCell::new(None) };
@@ -105,7 +105,7 @@ pub fn is_installed() -> bool {
 
 /// Outcome of [`admit`] (a thread-local convenience over the underlying
 /// [`Bkcr::admit`]) when a sampler is installed on the current thread.
-pub type ThreadAdmission = Admission<f64>;
+pub type ThreadAdmission = Admission<AdmitTicket>;
 
 /// Probe the per-thread sampler with `callsite`.  Returns `Some` when a
 /// sampler is installed (with the admission outcome), `None` when no
