@@ -21,12 +21,9 @@ use super::{Admission, LogSampler};
 
 /// One heap entry.  `key` is the EXP rank `-ln(u) / w_c`.  A
 /// `BinaryHeap` of these is a max-heap, so its root is the current
-/// threshold τ.  `seq` is a monotonic sequence number for chronological
-/// ordering (used during flush deduplication to prefer the earliest
-/// observation per callsite).
+/// threshold τ.
 struct HeapEntry<C, P> {
     key: f64,
-    seq: u64,
     callsite: C,
     payload: P,
 }
@@ -50,15 +47,12 @@ impl<C, P> Ord for HeapEntry<C, P> {
     }
 }
 
-/// Admission ticket for heap-bound events.  Carries both the EXP rank
-/// (for sampling correctness) and a chronological sequence number (for
-/// flush deduplication).
+/// Admission ticket for heap-bound events. Carries the EXP rank for
+/// bottom-k heap ordering.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct AdmitTicket {
     /// EXP rank `-ln(u) / w_c` for bottom-k heap ordering.
     pub key: f64,
-    /// Chronological sequence number for flush deduplication.
-    pub seq: u64,
 }
 
 /// The BKCR sampler.
@@ -84,14 +78,15 @@ struct Inner<C, P> {
     freq_curr: HashMap<C, u64>,
     /// Bottom-`T+1` max-heap on key.
     heap: BinaryHeap<HeapEntry<C, P>>,
-    /// Novelty preserve: first-rejected callsites this period, FIFO.
-    /// Each entry carries (callsite, payload, seq) where seq is the
-    /// chronological sequence number at admission.
-    preserve: Vec<(C, P, u64)>,
-    /// Membership index for the preserve.  Same size as `preserve`.
-    preserved_set: HashSet<C>,
+    /// Novelty preserve: first-rejected callsites this period.
+    /// Maps callsite to (payload, seq). Exclusive with heap: when a
+    /// callsite is admitted to the heap, it's removed from preserve.
+    /// This is a best-effort mechanism to capture the earliest
+    /// observation, but we don't fight to keep it if the heap later
+    /// admits the same callsite.
+    preserve: HashMap<C, (P, u64)>,
     /// Monotonic sequence counter for chronological ordering.
-    /// Incremented on every Admit or Reserve admission.
+    /// Incremented on every Admit or Preserve admission.
     seq_counter: u64,
     rng: SmallRng,
 }
@@ -132,8 +127,7 @@ where
                 freq_prev: HashMap::with_capacity(target),
                 freq_curr: HashMap::with_capacity(target),
                 heap: BinaryHeap::with_capacity(target + 1),
-                preserve: Vec::with_capacity(preserve_capacity),
-                preserved_set: HashSet::with_capacity(preserve_capacity),
+                preserve: HashMap::with_capacity(preserve_capacity),
                 seq_counter: 0,
                 rng: SmallRng::seed_from_u64(seed),
             }),
@@ -179,9 +173,7 @@ where
     C: Hash + Eq + Clone,
 {
     /// Admission ticket: carries the EXP rank `k = -ln(u) / w_c` for
-    /// heap ordering, plus a chronological sequence number `seq` for
-    /// flush deduplication (to prefer the earliest observation per
-    /// callsite).
+    /// heap ordering.
     type Ticket = AdmitTicket;
 
     fn admit(&self, callsite: &C) -> Admission<Self::Ticket> {
@@ -195,14 +187,12 @@ where
         // EXP rank.  -ln(U[0,1]) / w  ~  Exp(w).  See Cohen & Kaplan
         // §2 for the family-of-rank-functions discussion.
         let k = -u.ln() / w_c;
-        let seq = inner.seq_counter;
-        inner.seq_counter += 1;
         
         if k < self.tau.get() {
-            return Admission::Admit(AdmitTicket { key: k, seq });
+            return Admission::Admit(AdmitTicket { key: k });
         }
         // K rejected — consider the novelty preserve.
-        if inner.preserve.len() < self.preserve_capacity && !inner.preserved_set.contains(callsite) {
+        if inner.preserve.len() < self.preserve_capacity && !inner.preserve.contains_key(callsite) {
             return Admission::Preserve;
         }
         Admission::Skip
@@ -212,9 +202,13 @@ where
         let mut inner = self.inner.borrow_mut();
         match admission {
             Admission::Admit(ticket) => {
+                // Enforce exclusivity: remove from preserve if present.
+                // This maintains the invariant that heap and preserve
+                // are disjoint sets.
+                let _ = inner.preserve.remove(&callsite);
+                
                 inner.heap.push(HeapEntry {
                     key: ticket.key,
-                    seq: ticket.seq,
                     callsite,
                     payload,
                 });
@@ -230,8 +224,8 @@ where
             Admission::Preserve => {
                 let seq = inner.seq_counter;
                 inner.seq_counter += 1;
-                let _ = inner.preserved_set.insert(callsite.clone());
-                inner.preserve.push((callsite, payload, seq));
+                // Insert only if not already present (first rejection wins).
+                let _ = inner.preserve.entry(callsite).or_insert((payload, seq));
             }
             Admission::Skip => {
                 debug_assert!(false, "insert called for Skip admission");
@@ -246,15 +240,10 @@ where
         out.reserve(inner.heap.len() + inner.preserve.len());
 
         // (1) Drain the bottom-T heap with Horvitz–Thompson weights.
-        //     Track the kept callsites and their sequence numbers so
-        //     the preserve can be deduplicated: we prefer the earliest
-        //     observation per callsite.
-        let mut kept: HashMap<C, u64> = HashMap::with_capacity(inner.heap.len());
         let Inner {
             freq_prev,
             heap,
             preserve,
-            preserved_set,
             freq_curr,
             seq_counter: _,
             rng: _,
@@ -272,28 +261,17 @@ where
             } else {
                 1.0
             };
-            let _ = kept.insert(e.callsite.clone(), e.seq);
             out.push((e.callsite, e.payload, weight));
         }
 
-        // (2) Drain the novelty preserve, suppressing entries whose
-        //     callsite appears in the heap with an earlier or equal
-        //     sequence number.  Surviving entries carry weight 0: they
-        //     contribute no statistical mass but provide observational
-        //     coverage of callsites that fired and would otherwise be
-        //     absent.
-        for (c, p, seq) in preserve.drain(..) {
-            match kept.get(&c) {
-                Some(heap_seq) if *heap_seq <= seq => {
-                    // Heap has an earlier or equal observation; skip preserve entry.
-                }
-                _ => {
-                    // Reserve has earlier observation, or callsite not in heap.
-                    out.push((c, p, 0.0));
-                }
-            }
+        // (2) Drain the novelty preserve. Since heap and preserve are
+        //     disjoint (enforced by insert()), we emit all preserve
+        //     entries with weight 0. They contribute no statistical mass
+        //     but provide observational coverage of callsites that fired
+        //     and would otherwise be absent.
+        for (c, (p, _seq)) in preserve.drain() {
+            out.push((c, p, 0.0));
         }
-        preserved_set.clear();
 
         // (3) Period-boundary bookkeeping.
         let n_curr: u64 = freq_curr.values().sum();
