@@ -58,15 +58,19 @@ pub struct LogRecord {
     /// Number of attribute fields dropped due to truncation (if any).
     pub dropped_attributes_count: u16,
 
-    /// Horvitz–Thompson sampling weight assigned by a per-thread BKCR
-    /// sampler at flush time.  `None` indicates no sampling was
-    /// applied (treat as weight `1` downstream).  `Some(w)` with
-    /// `w == 1.0` is equivalent to `None` and is omitted from the
-    /// OTLP encoding.  `Some(0.0)` is a novelty-reserve record
+    /// Adjusted count assigned by a per-thread BKCR sampler at flush time.
+    /// 
+    /// Represents how many population items this sample stands in for.
+    /// Formally: the sampler's final statistical weight divided by the
+    /// original item's class weight, yielding the "adjusted count."
+    ///
+    /// `None` indicates no sampling was applied (treat as count `1` downstream).
+    /// `Some(c)` with `c == 1.0` is equivalent to `None` and is omitted from
+    /// the OTLP encoding. `Some(0.0)` is a novelty-preserve record
     /// (observational only, contributes nothing to weighted estimates).
-    /// `Some(w > 1.0)` is a statistical sample standing in for `w`
+    /// `Some(c > 1.0)` is a statistical sample standing in for `c`
     /// real events from the same callsite.
-    pub sampling_weight: Option<f64>,
+    pub count: Option<f64>,
 
     /// The context of this log record, typically pipeline and node context keys.
     pub context: LogContext,

@@ -66,19 +66,19 @@ impl<'buf, B: BoundedBuf> DirectLogRecordEncoder<'buf, B> {
         // Pre-encoded body and attributes.
         let _ = self.buf.extend_from_slice(&record.body_attrs_bytes);
 
-        // Encode the optional sampling weight (`otel.sampling.weight`)
-        // injected by the BKCR sampler.  The attribute is *omitted*
-        // entirely when the weight is `None` (sampler not in use) or
-        // exactly `1.0` (deterministic / unweighted record), so the
-        // common case carries no extra bytes.  A weight of `0.0` is
-        // valid and indicates a novelty-reserve record.
-        if let Some(w) = record.sampling_weight {
-            if w != 1.0 {
+        // Encode the optional adjusted count (`otel.count`) injected by
+        // the BKCR sampler. The attribute is *omitted* entirely when the
+        // count is `None` (sampler not in use) or exactly `1.0`
+        // (deterministic / unweighted record), so the common case carries
+        // no extra bytes. A count of `0.0` is valid and indicates a
+        // novelty-preserve record.
+        if let Some(c) = record.count {
+            if c != 1.0 {
                 let _ = self.buf.encode_len_delimited(LOG_RECORD_ATTRIBUTES, |buf| {
-                    buf.encode_string(KEY_VALUE_KEY, "otel.sampling.weight")?;
+                    buf.encode_string(KEY_VALUE_KEY, "otel.count")?;
                     buf.encode_len_delimited(KEY_VALUE_VALUE, |buf| {
                         buf.encode_field_tag(ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64)?;
-                        buf.extend_from_slice(&w.to_le_bytes())
+                        buf.extend_from_slice(&c.to_le_bytes())
                     })
                 });
             }

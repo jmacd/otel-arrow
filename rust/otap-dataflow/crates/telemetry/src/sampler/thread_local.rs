@@ -151,7 +151,7 @@ pub fn flush_current_thread() {
 
         let mut batch: Vec<LogEvent> = Vec::with_capacity(drained.len());
         for (_callsite, mut event, weight) in drained {
-            event.record.sampling_weight = Some(weight);
+            event.record.count = Some(weight);
             batch.push(event);
         }
         state.reporter.log_batch(batch);
@@ -203,7 +203,7 @@ mod tests {
                 callsite_id: Identifier(&TEST_CALLSITE),
                 body_attrs_bytes: Bytes::new(),
                 dropped_attributes_count: 0,
-                sampling_weight: None,
+                count: None,
                 context: LogContext::new(),
             },
         }
@@ -241,7 +241,7 @@ mod tests {
                     assert!(!batch.is_empty());
                     for ev in &batch {
                         // All flushed records must carry a weight.
-                        assert!(ev.record.sampling_weight.is_some());
+                        assert!(ev.record.count.is_some());
                     }
                 }
                 other => panic!("expected LogBatch, got {other:?}"),
