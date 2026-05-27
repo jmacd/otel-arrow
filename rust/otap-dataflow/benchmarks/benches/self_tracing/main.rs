@@ -492,6 +492,126 @@ fn bench_cckr_sampling(c: &mut Criterion) {
         });
     });
     
+    // Scenario 4: Sample exceeds reservoir by 10x (1280 events, reservoir=128)
+    // Tests sampling with 10x volume - only 10% of events kept
+    let _ = group.bench_function("exceeds_10x_1280", |b| {
+        b.iter(|| {
+            let sampler = Cckr::<usize, MockPayload>::new(RESERVOIR);
+            let mut total_size = 0usize;
+            
+            // Generate 1280 log records (10x reservoir)
+            for i in 0..RESERVOIR * 10 {
+                let payload = MockPayload {
+                    data: Bytes::from(format!(
+                        "Event #{} with some realistic content for testing sampling performance", i
+                    )),
+                    context: context.clone(),
+                };
+                
+                let admission = sampler.admit(&i);
+                if !matches!(admission, otap_df_telemetry::sampler::Admission::Skip) {
+                    sampler.insert(i, admission, payload);
+                }
+            }
+            
+            // Flush and accumulate sizes
+            let flushed = sampler.flush();
+            for (_, payload, count) in flushed {
+                total_size += payload.data.len();
+                let _ = std::hint::black_box(count);
+            }
+            
+            let _ = std::hint::black_box(total_size);
+        });
+    });
+    
+    // Scenario 5: No sampling baseline (1280 events, no sampler)
+    let _ = group.bench_function("no_sampling_1280", |b| {
+        b.iter(|| {
+            let mut events = Vec::with_capacity(RESERVOIR * 10);
+            let mut total_size = 0usize;
+            
+            // Generate 1280 log records without sampling
+            for i in 0..RESERVOIR * 10 {
+                let payload = MockPayload {
+                    data: Bytes::from(format!(
+                        "Event #{} with some realistic content for testing sampling performance", i
+                    )),
+                    context: context.clone(),
+                };
+                
+                events.push(payload);
+            }
+            
+            // Process all events
+            for payload in events {
+                total_size += payload.data.len();
+            }
+            
+            let _ = std::hint::black_box(total_size);
+        });
+    });
+    
+    // Scenario 6: Sample exceeds reservoir by 100x (12800 events, reservoir=128)
+    // Extreme case - only 1% of events kept, demonstrates maximum savings
+    let _ = group.bench_function("exceeds_100x_12800", |b| {
+        b.iter(|| {
+            let sampler = Cckr::<usize, MockPayload>::new(RESERVOIR);
+            let mut total_size = 0usize;
+            
+            // Generate 12800 log records (100x reservoir)
+            for i in 0..RESERVOIR * 100 {
+                let payload = MockPayload {
+                    data: Bytes::from(format!(
+                        "Event #{} with some realistic content for testing sampling performance", i
+                    )),
+                    context: context.clone(),
+                };
+                
+                let admission = sampler.admit(&i);
+                if !matches!(admission, otap_df_telemetry::sampler::Admission::Skip) {
+                    sampler.insert(i, admission, payload);
+                }
+            }
+            
+            // Flush and accumulate sizes
+            let flushed = sampler.flush();
+            for (_, payload, count) in flushed {
+                total_size += payload.data.len();
+                let _ = std::hint::black_box(count);
+            }
+            
+            let _ = std::hint::black_box(total_size);
+        });
+    });
+    
+    // Scenario 7: No sampling baseline (12800 events, no sampler)
+    let _ = group.bench_function("no_sampling_12800", |b| {
+        b.iter(|| {
+            let mut events = Vec::with_capacity(RESERVOIR * 100);
+            let mut total_size = 0usize;
+            
+            // Generate 12800 log records without sampling
+            for i in 0..RESERVOIR * 100 {
+                let payload = MockPayload {
+                    data: Bytes::from(format!(
+                        "Event #{} with some realistic content for testing sampling performance", i
+                    )),
+                    context: context.clone(),
+                };
+                
+                events.push(payload);
+            }
+            
+            // Process all events
+            for payload in events {
+                total_size += payload.data.len();
+            }
+            
+            let _ = std::hint::black_box(total_size);
+        });
+    });
+    
     group.finish();
 }
 
