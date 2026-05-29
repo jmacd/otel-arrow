@@ -376,49 +376,52 @@ fn bench_realistic(c: &mut Criterion) {
 /// fits reservoir vs. when it exceeds by 2x compared to logging 2x events
 /// without sampling.
 fn bench_cckr_sampling(c: &mut Criterion) {
-    use otap_df_telemetry::sampler::{Cckr, LogSampler};
-    use otap_df_telemetry::self_tracing::{LogContext, encode_export_logs_request_batch, ScopeToBytesMap};
-    use otap_df_telemetry::event::LogEvent;
     use bytes::Bytes;
+    use otap_df_telemetry::event::LogEvent;
+    use otap_df_telemetry::sampler::{Cckr, LogSampler};
+    use otap_df_telemetry::self_tracing::{
+        LogContext, ScopeToBytesMap, encode_export_logs_request_batch,
+    };
 
     let mut group = c.benchmark_group("cckr_sampling");
-    
+
     // Reservoir capacity
     const RESERVOIR: usize = 128;
-    
+
     // Create a registry and entity context for realistic benchmarks
     let registry = TelemetryRegistryHandle::new();
     let entity_key = registry.register_entity(BenchScopeAttributes::new("bench-pipeline", 42));
     let context = LogContext::from_buf([entity_key]);
     let resource_bytes = Bytes::new();
-    
+
     // Mock payload type for benchmarking - just store bytes
     #[derive(Clone)]
     struct MockPayload {
         data: Bytes,
         context: LogContext,
     }
-    
+
     // Scenario 1: Sample fits in reservoir (128 events, reservoir=128)
     // This is the "happy path" - all events fit, no sampling needed
     let _ = group.bench_function("fits_reservoir_128", |b| {
         b.iter(|| {
             let sampler = Cckr::<usize, MockPayload>::new(RESERVOIR);
             let mut total_size = 0usize;
-            
+
             // Generate 128 log records (fits exactly)
             for i in 0..RESERVOIR {
                 let payload = MockPayload {
                     data: Bytes::from(format!(
-                        "Event #{} with some realistic content for testing sampling performance", i
+                        "Event #{} with some realistic content for testing sampling performance",
+                        i
                     )),
                     context: context.clone(),
                 };
-                
+
                 let admission = sampler.admit(&i);
                 sampler.insert(i, admission, payload);
             }
-            
+
             // Flush and accumulate sizes (simulating encoding)
             let flushed = sampler.flush();
             for (_, payload, count) in flushed {
@@ -426,192 +429,198 @@ fn bench_cckr_sampling(c: &mut Criterion) {
                 // In real code, count would be used for weighting
                 let _ = std::hint::black_box(count);
             }
-            
+
             let _ = std::hint::black_box(total_size);
         });
     });
-    
+
     // Scenario 2: Sample exceeds reservoir by 2x (256 events, reservoir=128)
     // This tests sampling overhead when half the events are dropped
     let _ = group.bench_function("exceeds_2x_256", |b| {
         b.iter(|| {
             let sampler = Cckr::<usize, MockPayload>::new(RESERVOIR);
             let mut total_size = 0usize;
-            
+
             // Generate 256 log records (2x reservoir)
             for i in 0..RESERVOIR * 2 {
                 let payload = MockPayload {
                     data: Bytes::from(format!(
-                        "Event #{} with some realistic content for testing sampling performance", i
+                        "Event #{} with some realistic content for testing sampling performance",
+                        i
                     )),
                     context: context.clone(),
                 };
-                
+
                 let admission = sampler.admit(&i);
                 if !matches!(admission, otap_df_telemetry::sampler::Admission::Skip) {
                     sampler.insert(i, admission, payload);
                 }
             }
-            
+
             // Flush and accumulate sizes
             let flushed = sampler.flush();
             for (_, payload, count) in flushed {
                 total_size += payload.data.len();
                 let _ = std::hint::black_box(count);
             }
-            
+
             let _ = std::hint::black_box(total_size);
         });
     });
-    
+
     // Scenario 3: No sampling baseline (256 events, no sampler)
     // This is the cost without sampling - all 256 events stored and processed
     let _ = group.bench_function("no_sampling_256", |b| {
         b.iter(|| {
             let mut events = Vec::with_capacity(RESERVOIR * 2);
             let mut total_size = 0usize;
-            
+
             // Generate 256 log records without sampling
             for i in 0..RESERVOIR * 2 {
                 let payload = MockPayload {
                     data: Bytes::from(format!(
-                        "Event #{} with some realistic content for testing sampling performance", i
+                        "Event #{} with some realistic content for testing sampling performance",
+                        i
                     )),
                     context: context.clone(),
                 };
-                
+
                 events.push(payload);
             }
-            
+
             // Process all events (simulating encoding)
             for payload in events {
                 total_size += payload.data.len();
             }
-            
+
             let _ = std::hint::black_box(total_size);
         });
     });
-    
+
     // Scenario 4: Sample exceeds reservoir by 10x (1280 events, reservoir=128)
     // Tests sampling with 10x volume - only 10% of events kept
     let _ = group.bench_function("exceeds_10x_1280", |b| {
         b.iter(|| {
             let sampler = Cckr::<usize, MockPayload>::new(RESERVOIR);
             let mut total_size = 0usize;
-            
+
             // Generate 1280 log records (10x reservoir)
             for i in 0..RESERVOIR * 10 {
                 let payload = MockPayload {
                     data: Bytes::from(format!(
-                        "Event #{} with some realistic content for testing sampling performance", i
+                        "Event #{} with some realistic content for testing sampling performance",
+                        i
                     )),
                     context: context.clone(),
                 };
-                
+
                 let admission = sampler.admit(&i);
                 if !matches!(admission, otap_df_telemetry::sampler::Admission::Skip) {
                     sampler.insert(i, admission, payload);
                 }
             }
-            
+
             // Flush and accumulate sizes
             let flushed = sampler.flush();
             for (_, payload, count) in flushed {
                 total_size += payload.data.len();
                 let _ = std::hint::black_box(count);
             }
-            
+
             let _ = std::hint::black_box(total_size);
         });
     });
-    
+
     // Scenario 5: No sampling baseline (1280 events, no sampler)
     let _ = group.bench_function("no_sampling_1280", |b| {
         b.iter(|| {
             let mut events = Vec::with_capacity(RESERVOIR * 10);
             let mut total_size = 0usize;
-            
+
             // Generate 1280 log records without sampling
             for i in 0..RESERVOIR * 10 {
                 let payload = MockPayload {
                     data: Bytes::from(format!(
-                        "Event #{} with some realistic content for testing sampling performance", i
+                        "Event #{} with some realistic content for testing sampling performance",
+                        i
                     )),
                     context: context.clone(),
                 };
-                
+
                 events.push(payload);
             }
-            
+
             // Process all events
             for payload in events {
                 total_size += payload.data.len();
             }
-            
+
             let _ = std::hint::black_box(total_size);
         });
     });
-    
+
     // Scenario 6: Sample exceeds reservoir by 100x (12800 events, reservoir=128)
     // Extreme case - only 1% of events kept, demonstrates maximum savings
     let _ = group.bench_function("exceeds_100x_12800", |b| {
         b.iter(|| {
             let sampler = Cckr::<usize, MockPayload>::new(RESERVOIR);
             let mut total_size = 0usize;
-            
+
             // Generate 12800 log records (100x reservoir)
             for i in 0..RESERVOIR * 100 {
                 let payload = MockPayload {
                     data: Bytes::from(format!(
-                        "Event #{} with some realistic content for testing sampling performance", i
+                        "Event #{} with some realistic content for testing sampling performance",
+                        i
                     )),
                     context: context.clone(),
                 };
-                
+
                 let admission = sampler.admit(&i);
                 if !matches!(admission, otap_df_telemetry::sampler::Admission::Skip) {
                     sampler.insert(i, admission, payload);
                 }
             }
-            
+
             // Flush and accumulate sizes
             let flushed = sampler.flush();
             for (_, payload, count) in flushed {
                 total_size += payload.data.len();
                 let _ = std::hint::black_box(count);
             }
-            
+
             let _ = std::hint::black_box(total_size);
         });
     });
-    
+
     // Scenario 7: No sampling baseline (12800 events, no sampler)
     let _ = group.bench_function("no_sampling_12800", |b| {
         b.iter(|| {
             let mut events = Vec::with_capacity(RESERVOIR * 100);
             let mut total_size = 0usize;
-            
+
             // Generate 12800 log records without sampling
             for i in 0..RESERVOIR * 100 {
                 let payload = MockPayload {
                     data: Bytes::from(format!(
-                        "Event #{} with some realistic content for testing sampling performance", i
+                        "Event #{} with some realistic content for testing sampling performance",
+                        i
                     )),
                     context: context.clone(),
                 };
-                
+
                 events.push(payload);
             }
-            
+
             // Process all events
             for payload in events {
                 total_size += payload.data.len();
             }
-            
+
             let _ = std::hint::black_box(total_size);
         });
     });
-    
+
     group.finish();
 }
 

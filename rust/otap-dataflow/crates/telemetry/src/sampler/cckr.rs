@@ -75,6 +75,34 @@ pub struct Cckr<C, P> {
     unseen_weight: Cell<f64>,
 }
 
+/// Per-callsite state in the unified `states` map.
+///
+/// Combines reservoir membership (a multiset count of heap entries)
+/// with the novelty-preserve slot (at most one). The two are
+/// mutually exclusive: an admission to the heap clears any preserve
+/// slot; a preserve slot is only created when no heap entry exists.
+/// An entry with `heap_count == 0` *and* `preserve.is_none()` is
+/// removed from the map so that map cardinality reflects live state.
+struct CallsiteState<P> {
+    heap_count: u32,
+    preserve: Option<(P, u64)>,
+}
+
+impl<P> Default for CallsiteState<P> {
+    fn default() -> Self {
+        Self {
+            heap_count: 0,
+            preserve: None,
+        }
+    }
+}
+
+impl<P> CallsiteState<P> {
+    fn is_empty(&self) -> bool {
+        self.heap_count == 0 && self.preserve.is_none()
+    }
+}
+
 struct Inner<C, P> {
     /// Frozen table from the previous period.
     freq_prev: HashMap<C, u64>,
@@ -82,25 +110,27 @@ struct Inner<C, P> {
     freq_curr: HashMap<C, u64>,
     /// Bottom-`T+1` max-heap on key.
     heap: BinaryHeap<HeapEntry<C, P>>,
-    /// Novelty preserve: first-rejected callsites this period.
-    /// Maps callsite to (payload, seq). Exclusive with heap: when a
-    /// callsite is admitted to the heap, it's removed from preserve.
-    /// This is a best-effort mechanism to capture the earliest
-    /// observation, but we don't fight to keep it if the heap later
-    /// admits the same callsite.
+    /// Unified per-callsite state: reservoir multiplicity plus an
+    /// optional novelty-preserve slot. See [`CallsiteState`].
+    ///
+    /// Entries are removed when they become empty, so this map's
+    /// size is bounded by `T + R` (heap entries plus distinct
+    /// preserve callsites).
     ///
     /// TODO(museum mode): For high-value debugging scenarios, we could
     /// add a "museum mode" that uses extra memory to preserve the first
-    /// example of every callsite regardless of reservoir state. This
-    /// could be implemented with the same single-map structure by
-    /// storing mutable state per callsite: the map would track that a
-    /// callsite has >= 0 entries in the reservoir and <= 1 entry in
-    /// the preserve, allowing the preserve entry to survive even when
-    /// the callsite is later admitted to the heap. The preserve would
-    /// only be removed when explicitly evicted due to capacity or when
-    /// the period ends. This trades memory (unbounded growth within a
-    /// period) for complete chronological coverage.
-    preserve: HashMap<C, (P, u64)>,
+    /// example of every callsite regardless of reservoir state. The
+    /// preserve slot would survive even when the callsite is later
+    /// admitted to the heap, only being removed when explicitly
+    /// evicted due to capacity or when the period ends. This trades
+    /// memory (unbounded growth within a period) for complete
+    /// chronological coverage.
+    states: HashMap<C, CallsiteState<P>>,
+    /// Number of `states` entries with `preserve.is_some()`.
+    /// Maintained at the same call sites that mutate the preserve
+    /// slot, giving O(1) `reserve_len` and `preserve_capacity`
+    /// bounds checks.
+    preserve_count: usize,
     /// Monotonic sequence counter for chronological ordering.
     /// Incremented on every Admit or Preserve admission.
     seq_counter: u64,
@@ -143,7 +173,8 @@ where
                 freq_prev: HashMap::with_capacity(reservoir_capacity),
                 freq_curr: HashMap::with_capacity(reservoir_capacity),
                 heap: BinaryHeap::with_capacity(reservoir_capacity + 1),
-                preserve: HashMap::with_capacity(preserve_capacity),
+                states: HashMap::with_capacity(reservoir_capacity + preserve_capacity),
+                preserve_count: 0,
                 seq_counter: 0,
                 rng: SmallRng::seed_from_u64(seed),
             }),
@@ -173,7 +204,7 @@ where
     /// Current preserve occupancy.
     #[must_use]
     pub fn reserve_len(&self) -> usize {
-        self.inner.borrow().preserve.len()
+        self.inner.borrow().preserve_count
     }
 
     fn weight_for(freq_prev: &HashMap<C, u64>, callsite: &C, unseen_weight: f64) -> f64 {
@@ -207,8 +238,12 @@ where
         if k < self.tau.get() {
             return Admission::Admit(AdmitTicket { key: k });
         }
-        // K rejected — consider the novelty preserve.
-        if inner.preserve.len() < self.preserve_capacity && !inner.preserve.contains_key(callsite) {
+        // K rejected — consider the novelty preserve.  Skip when the
+        // callsite is already represented anywhere in `states` (heap
+        // or preserve): heap presence would violate disjointness, and
+        // preserve presence is the documented first-rejection-wins
+        // rule.
+        if inner.preserve_count < self.preserve_capacity && !inner.states.contains_key(callsite) {
             return Admission::Preserve;
         }
         Admission::Skip
@@ -216,32 +251,74 @@ where
 
     fn insert(&self, callsite: C, admission: Admission<Self::Ticket>, payload: P) {
         let mut inner = self.inner.borrow_mut();
+        let Inner {
+            heap,
+            states,
+            preserve_count,
+            seq_counter,
+            ..
+        } = &mut *inner;
         match admission {
             Admission::Admit(ticket) => {
-                // Enforce exclusivity: remove from preserve if present.
-                // This maintains the invariant that heap and preserve
-                // are disjoint sets.
-                let _ = inner.preserve.remove(&callsite);
+                let state = states.entry(callsite.clone()).or_default();
+                // Heap supplants any pre-existing preserve slot for
+                // this callsite.
+                if state.preserve.take().is_some() {
+                    *preserve_count -= 1;
+                }
+                state.heap_count += 1;
 
-                inner.heap.push(HeapEntry {
+                heap.push(HeapEntry {
                     key: ticket.key,
                     callsite,
                     payload,
                 });
-                if inner.heap.len() > self.reservoir_capacity {
-                    let _ = inner.heap.pop();
+                if heap.len() > self.reservoir_capacity {
+                    let evicted = heap.pop().expect("heap non-empty");
+                    // Decrement the evicted callsite's heap_count and
+                    // drop the entry entirely if it becomes empty.
+                    // The evicted entry may be the one we just pushed
+                    // (when its key is the new max), in which case
+                    // ++/-- cancels.
+                    if let hashbrown::hash_map::Entry::Occupied(mut e) =
+                        states.entry(evicted.callsite)
+                    {
+                        let st = e.get_mut();
+                        st.heap_count -= 1;
+                        if st.is_empty() {
+                            let _ = e.remove();
+                        }
+                    }
                     // The (T+1)-th smallest is gone; the new root is
                     // the largest of the remaining T smallest, which
                     // equals the new threshold.
-                    let new_tau = inner.heap.peek().expect("heap has >= T items").key;
+                    let new_tau = heap.peek().expect("heap has >= T items").key;
                     self.tau.set(new_tau);
                 }
             }
             Admission::Preserve => {
-                let seq = inner.seq_counter;
-                inner.seq_counter += 1;
-                // Insert only if not already present (first rejection wins).
-                let _ = inner.preserve.entry(callsite).or_insert((payload, seq));
+                let seq = *seq_counter;
+                *seq_counter += 1;
+                // Belt-and-braces: only create the preserve slot if
+                // the callsite has no current heap or preserve
+                // entry.  In single-threaded use this matches the
+                // admit-time check; the defensive form makes
+                // multi-step usage safe.
+                use hashbrown::hash_map::Entry;
+                match states.entry(callsite) {
+                    Entry::Vacant(v) => {
+                        let _ = v.insert(CallsiteState {
+                            heap_count: 0,
+                            preserve: Some((payload, seq)),
+                        });
+                        *preserve_count += 1;
+                    }
+                    Entry::Occupied(_) => {
+                        // Either already in heap (disjointness wins)
+                        // or already preserved (first-rejection-wins).
+                        // Drop the payload.
+                    }
+                }
             }
             Admission::Skip => {
                 debug_assert!(false, "insert called for Skip admission");
@@ -253,13 +330,14 @@ where
         let final_tau = self.tau.get();
         let mut inner = self.inner.borrow_mut();
         let unseen = self.unseen_weight.get();
-        out.reserve(inner.heap.len() + inner.preserve.len());
+        out.reserve(inner.heap.len() + inner.preserve_count);
 
         // (1) Drain the bottom-T heap with Horvitz–Thompson weights.
         let Inner {
             freq_prev,
             heap,
-            preserve,
+            states,
+            preserve_count,
             freq_curr,
             seq_counter: _,
             rng: _,
@@ -280,14 +358,20 @@ where
             out.push((e.callsite, e.payload, sampling_count));
         }
 
-        // (2) Drain the novelty preserve. Since heap and preserve are
-        //     disjoint (enforced by insert()), we emit all preserve
-        //     entries with sampling_count 0. They contribute no statistical mass
-        //     but provide observational coverage of callsites that fired
-        //     and would otherwise be absent.
-        for (c, (p, _seq)) in preserve.drain() {
-            out.push((c, p, 0.0));
+        // (2) Drain the preserve slots. Heap entries have already been
+        //     removed above, so any remaining `states` entry with a
+        //     `Some(preserve)` is by construction disjoint from the
+        //     heap output (the heap/preserve disjointness invariant is
+        //     enforced at insert() time). Emit as observational
+        //     novelty records with sampling_count 0.
+        for (c, st) in states.drain() {
+            if let Some((p, _seq)) = st.preserve {
+                out.push((c, p, 0.0));
+            }
+            // `heap_count` entries are already drained from `heap`
+            // above; the state is gone with the drain.
         }
+        *preserve_count = 0;
 
         // (3) Period-boundary bookkeeping.
         let n_curr: u64 = freq_curr.values().sum();
@@ -426,16 +510,15 @@ mod tests {
         // "unseen" until τ tightens via heap pops.
         let evs: Vec<(u32, u8)> = (0..5_000).map(|_| (1u32, 0u8)).collect();
         let out = run_period(&s, &evs);
-        // Single callsite, so heap holds at most T=10 of it; once τ
-        // tightens the first rejection of callsite 1 may also land
-        // in the preserve (callsite 1 is "first-rejected this period",
-        // not "novel").  Bound on output is T + 1 distinct preserve
-        // entry = 11.
-        assert!(out.len() <= 11);
+        // Single callsite admitted to the heap on the first event, so
+        // the heap/preserve disjointness invariant guarantees no
+        // preserve entry for callsite 1. Output is therefore at most
+        // T = 10 heap entries.
+        assert!(out.len() <= 10);
         let n_heap = out.iter().filter(|(_, _, w)| *w >= 1.0).count();
         let n_reserve = out.iter().filter(|(_, _, w)| *w == 0.0).count();
         assert!((1..=10).contains(&n_heap));
-        assert!(n_reserve <= 1);
+        assert_eq!(n_reserve, 0);
 
         // Steady state: with one callsite, τ tightens hard and most
         // events are skipped or reserved-once-then-skipped.
@@ -451,6 +534,28 @@ mod tests {
         }
         let _ = s.flush();
         assert!(admits < 500, "admit count {admits} after warmup");
+    }
+
+    #[test]
+    fn heap_and_preserve_are_disjoint_at_flush() {
+        // Regression: a callsite admitted to the heap must never
+        // subsequently re-enter the preserve, even after τ tightens
+        // and later events for that callsite are K-rejected.
+        let s: Cckr<u32, u8> = Cckr::with_options(4, 64, 32, 5);
+        let out = run_period(&s, &zipf_like_stream(80, 2_000, 5));
+        let heap_cs: std::collections::HashSet<u32> = out
+            .iter()
+            .filter_map(|(c, _, w)| if *w > 0.0 { Some(*c) } else { None })
+            .collect();
+        let preserve_cs: std::collections::HashSet<u32> = out
+            .iter()
+            .filter_map(|(c, _, w)| if *w == 0.0 { Some(*c) } else { None })
+            .collect();
+        let overlap: Vec<_> = heap_cs.intersection(&preserve_cs).copied().collect();
+        assert!(
+            overlap.is_empty(),
+            "heap/preserve overlap at flush: {overlap:?}"
+        );
     }
 
     #[test]
