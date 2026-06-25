@@ -606,9 +606,11 @@ Those layers are described in
 this ingest queue as **L1** of a durable, disconnection-tolerant metrics
 appliance and adds: **L2** event-time windowing and watermarks over the
 shuffled streams (extending the `temporal_reaggregation` processor from
-processing-time to event-time), **L3** a second `quiver` stage storing complete
-aggregated batches keyed by `(metric_name, time_bucket)`, **L4** a DataFusion +
-Grafana query interface, and **L5** store-and-forward to a central platform.
+processing-time to event-time), **L3** a stage-2 store of complete aggregated
+batches keyed by `(metric_name, resolution, window_index)` (Vortex columnar
+files behind a store seam, Parquet for archival), **L4** a DataFusion
+`TableProvider` + Grafana query interface, and **L5** store-and-forward to a
+central platform.
 
 Two properties established here are load-bearing for L2: the shuffle by metric
 name co-locates all of a name's points on one core (so windowing is local), and
