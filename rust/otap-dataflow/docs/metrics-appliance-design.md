@@ -2,7 +2,7 @@
 
 This document sketches a durable, disconnection-tolerant metrics appliance built
 on the otap-dataflow engine. It layers event-time aggregation, a queryable
-timeseries store, and a Grafana-facing query interface on top of the
+timeseries store, and a pull-based query interface on top of the
 vertically-integrated ingest queue, so a single node can ingest, aggregate,
 store, serve, and forward metrics -- continuing to operate (and answer local
 queries) while disconnected from a central observability platform.
@@ -47,11 +47,11 @@ DataFusion for query, and the existing exporters for forwarding.
      v                                                               |
  +--------+   +-----------+   +-------------+   +---------+   +-------------+
  |  L1    |   |    L2     |   |     L3      |   |   L4    |   |     L5      |
- | Ingest |-->| Event-    |-->| Aggregated  |-->| Query + |   | Forwarding  |
- | queue  |   | time      |   | TS store    |   | serving |   | (store-and- |
- | (shuf- |   | windowing |   | (stage-2    |   | (Data-  |   |  forward)   |
- |  fle)  |   | + water-  |   |  quiver,    |   | Fusion +|   |             |
- |        |   | marks     |   |  Arrow IPC) |   | Grafana)|   |             |
+ | Ingest |-->| Event-    |-->| Aggregated  |-->| Pull    |   | Forwarding  |
+ | queue  |   | time      |   | TS store    |   | query   |   | (push OTAP, |
+ | (shuf- |   | windowing |   | (stage-2    |   | (OPL -> |   |  store-and- |
+ |  fle)  |   | + water-  |   |  quiver,    |   |  OTAP)  |   |  forward)   |
+ |        |   | marks     |   |  Arrow IPC) |   |         |   |             |
  +--------+   +-----------+   +------+------+   +----+----+   +------+------+
  stage-1                            |                |               |
  quiver                             +----------------+---------------+
@@ -59,13 +59,13 @@ DataFusion for query, and the existing exporters for forwarding.
                                     v   for interop / archival (sibling path)
 ```
 
-| Layer               | Role                                                    | Substrate / status                               |
-| ------------------- | ------------------------------------------------------- | ------------------------------------------------ |
-| L1 Ingest queue     | Admit, shuffle by name, durable raw OTAP buffer         | ingest-queue-design.md; stage-1 `quiver`         |
-| L2 Aggregation      | Event-time windowing + watermarks over shuffled streams | `temporal_reaggregation` (processing-time today) |
-| L3 Aggregated store | Complete windowed batches, keyed (name, bucket)         | stage-2 `quiver` (Arrow IPC); new usage          |
-| L4 Query + serving  | Timeseries query + Grafana                              | DataFusion + serving layer (greenfield)          |
-| L5 Forwarding       | Egress to a central observability platform              | OTAP / OTLP exporters (exist)                    |
+| Layer               | Role                                                        | Substrate / status                               |
+| ------------------- | ----------------------------------------------------------- | ------------------------------------------------ |
+| L1 Ingest queue     | Admit, shuffle by name, durable raw OTAP buffer             | ingest-queue-design.md; stage-1 `quiver`         |
+| L2 Aggregation      | Event-time windowing + watermarks over shuffled streams     | `temporal_reaggregation` (processing-time today) |
+| L3 Aggregated store | Complete windowed batches, keyed (name, bucket)             | stage-2 `quiver` (Arrow IPC); new usage          |
+| L4 Query (pull)     | Pull-based retrieval; metrics + sample queries (spans/logs) | query-engine (OPL/OTTL) -> OTAP; greenfield      |
+| L5 Forwarding       | Push egress to a central observability platform             | OTAP exporters (exist)                           |
 
 The crucial enabler is L1's shuffle by metric name: once all points for a name
 are co-located on one core (the ingest queue's data bucket key), event-time
@@ -249,26 +249,39 @@ form built for query:
 This is why Arrow IPC in `quiver`, not Parquet, is the **live** store -- see
 "Why not Parquet for the live store" below.
 
-## L4: Query and serving
+## L4: Query and serving (pull-based retrieval)
 
-The appliance answers timeseries queries locally, so dashboards keep working
-while disconnected:
+The appliance answers **pull-based queries** locally, so consumers can retrieve
+data while the node is disconnected. OpenTelemetry specifies push protocols
+(OTLP, OTAP) but **no pull-based retrieval protocol**; this layer fills that gap
+using the engine's own query engine rather than adopting a vendor query
+protocol.
 
-- **Query engine**: DataFusion over the stage-2 segments, with the windowing key
-  `(metric_name, time_bucket)` enabling efficient range scans for a name.
-- **Grafana-facing interface**: served through a vendor-neutral protocol. The
-  preferred option (D14) is the Prometheus remote-read / HTTP query API, because
-  Grafana's Prometheus datasource is ubiquitous and the protocol is an open CNCF
-  standard, consistent with the project's vendor-neutral posture. Arrow
-  FlightSQL is a possible Arrow-native alternative, and a native datasource
-  plugin is the most work.
+- **Query interface -- query-engine language in, OTAP out**: queries are
+  expressed in the query engine's language (OPL, the OpenTelemetry Processing
+  Language, or OTTL), compiled to the engine's intermediate representation, and
+  executed as DataFusion / Arrow pipeline stages over the stage-2 segments. The
+  result is returned as OTAP, so the query path needs no representation change
+  and no new wire protocol. The windowing key `(metric_name, time_bucket)`
+  enables efficient range scans for a name.
+- **All three signals**: pull-based retrieval is the interesting case for
+  **metrics** (range/instant queries over the aggregated timeseries). **Spans
+  and logs** are served the same way as **sample queries over their
+  temporally-aggregated data** -- the same query interface, returning OTAP.
+- **Clients**: any OTAP-speaking consumer can pull directly. A dashboard such as
+  Grafana connects through a thin datasource adapter that issues OPL and renders
+  the OTAP/Arrow result; the adapter is a client of this interface, not a
+  separate server protocol.
 - **Disconnected operation**: because L1-L3 have no central dependency, L4
   serves from local storage regardless of upstream connectivity.
 
 ## L5: Forwarding
 
-The appliance forwards data to a central observability platform using the
-engine's existing exporters (OTAP, OTLP), with store-and-forward semantics:
+The appliance forwards data to a central observability platform by **pushing
+OTAP** through the engine's existing exporters, with store-and-forward
+semantics. (Pull-based retrieval is L4's concern; forwarding is push, and OTAP
+is sufficient -- no Prometheus remote-write or other vendor egress protocol is
+needed.)
 
 - **What is forwarded** (D15): the aggregated stream by default (smaller,
   already windowed), with raw passthrough available when the central platform
@@ -276,8 +289,8 @@ engine's existing exporters (OTAP, OTLP), with store-and-forward semantics:
 - **Store-and-forward**: forwarding reads from a durable stage (stage-1 for raw,
   stage-2 for aggregated), so an outage simply delays delivery; at-least-once
   and progress tracking resume on reconnect with no data loss.
-- **No new dependency**: forwarding is an exporter on the balanced topic, the
-  same mechanism the pipeline already uses.
+- **No new dependency**: forwarding is an OTAP exporter on the balanced topic,
+  the same mechanism the pipeline already uses.
 
 ## Why not Parquet for the live store
 
@@ -314,8 +327,8 @@ drafting order; L3-L5 decisions (D13-D16) are placeholders to be expanded.
 | D11 | Watermark policy          | heuristic; bounded by L1 max_lag                     | open   |
 | D12 | Late/early + accumulation | allowed_lateness; restate via correction; modes      | open   |
 | D13 | Stage-2 layout            | Arrow IPC, (name, bucket) key, correction segments   | open   |
-| D14 | Query/serving protocol    | Prometheus remote-read (neutral); FlightSQL alt      | open   |
-| D15 | Forwarding granularity    | forward aggregated; store-and-forward                | open   |
+| D14 | Query/serving protocol    | query-engine language (OPL/OTTL) in, OTAP out        | open   |
+| D15 | Forwarding granularity    | push OTAP; aggregated default; store-and-forward     | open   |
 | D16 | Parquet role              | interop/archival export only                         | open   |
 
 ### D10. Window model
@@ -353,15 +366,20 @@ accumulation policy; retention via the `quiver` disk budget.
 
 ### D14. Query and serving protocol
 
-**Question:** how does Grafana talk to the appliance? **Recommendation
-(placeholder):** a vendor-neutral Prometheus remote-read / HTTP query API over
-DataFusion, with Arrow FlightSQL as an Arrow-native alternative.
+**Question:** how do consumers pull data from the appliance, given OpenTelemetry
+specifies no pull-based retrieval protocol? **Recommendation:** use the query
+engine's language (OPL / OTTL) as the query interface and return OTAP -- a
+pull-based retrieval built on the engine's own primitives, no vendor query
+protocol. Pull-based retrieval is the interesting case for metrics; spans and
+logs are served as sample queries over their aggregated data. Grafana and other
+dashboards connect via a thin adapter that issues OPL and renders OTAP.
 
 ### D15. Forwarding granularity
 
-**Question:** forward raw, aggregated, or both? **Recommendation
-(placeholder):** aggregated by default with optional raw passthrough; reads from
-a durable stage for store-and-forward; at-least-once on reconnect.
+**Question:** forward raw, aggregated, or both, and over what transport?
+**Recommendation:** push **OTAP** (no Prometheus remote-write or other vendor
+egress); forward the aggregated stream by default with optional raw passthrough;
+read from a durable stage for store-and-forward; at-least-once on reconnect.
 
 ### D16. Parquet role
 
@@ -377,8 +395,9 @@ query store, which is Arrow IPC in stage-2 quiver.
   ratified). Nothing in this document is implemented yet.
 - L2's seed exists -- the `temporal_reaggregation` processor -- but is
   processing-time, not event-time; L2 is the extension described here.
-- `quiver` (L1/L3 substrate), the `parquet_exporter` (object-store Parquet), and
-  the OTAP/OTLP exporters (L5) exist; the L4 serving layer is greenfield.
+- `quiver` (L1/L3 substrate), the `parquet_exporter` (object-store Parquet), the
+  OTAP exporters (L5), and the query engine with its OPL/OTTL languages (L4) all
+  exist; the L4 pull-based query interface over stage-2 is the new assembly.
 
 **To resume:**
 
@@ -414,3 +433,9 @@ ARCHITECTURE, and the `temporal_reaggregation` processor README.
   stored as a new stage-2 segment resolved at query time.
 - **Stage-1 / stage-2 quiver**: the raw durable ingest buffer (L1) and the
   aggregated durable timeseries store (L3).
+- **Pull-based retrieval**: querying stored data on demand (as opposed to
+  push/export); OpenTelemetry specifies no pull protocol, so L4 uses the query
+  engine for this.
+- **OPL / OTTL**: the query engine's query languages (OpenTelemetry Processing
+  Language; OpenTelemetry Transformation Language); a query compiles to the
+  engine's intermediate representation and executes over OTAP, returning OTAP.
