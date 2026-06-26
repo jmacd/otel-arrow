@@ -5,6 +5,10 @@
 #[cfg(feature = "condense-attributes-processor")]
 pub mod condense_attributes_processor;
 
+/// Local log sampler processor (two-level log sampling, SDK side)
+#[cfg(feature = "log-sampler-processor")]
+pub mod log_sampler_processor;
+
 /// Recordset KQL OTLP Query Engine processor
 #[cfg(feature = "recordset-kql-processor")]
 pub mod recordset_kql_processor;

@@ -104,10 +104,12 @@ azure-monitor-exporter = [
 
 contrib-processors = [
     "condense-attributes-processor",
+    "log-sampler-processor",
     "recordset-kql-processor",
     "resource-validator-processor",
 ]
 condense-attributes-processor = []
+log-sampler-processor = ["dep:rand", "dep:humantime-serde"]
 recordset-kql-processor = [
     "dep:data_engine_expressions",
     "dep:data_engine_kql_parser",
