@@ -30,6 +30,10 @@ pub struct GlobalReservoirMetrics {
     #[metric(unit = "{error}")]
     pub decode_errors: Counter<u64>,
 
+    /// Rejected or malformed runtime reconfiguration messages.
+    #[metric(unit = "{error}")]
+    pub config_errors: Counter<u64>,
+
     /// Heavy hitters in the last published table.
     #[metric(unit = "{callsite}")]
     pub last_heavy_hitters: Gauge<u64>,

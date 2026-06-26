@@ -26,6 +26,10 @@ pub struct LogSamplerMetrics {
     #[metric(unit = "{error}")]
     pub decode_errors: Counter<u64>,
 
+    /// Rejected or malformed runtime reconfiguration messages.
+    #[metric(unit = "{error}")]
+    pub config_errors: Counter<u64>,
+
     /// Records rejected by the global gate before reaching the reservoir.
     #[metric(unit = "{log}")]
     pub globally_rejected: Counter<u64>,

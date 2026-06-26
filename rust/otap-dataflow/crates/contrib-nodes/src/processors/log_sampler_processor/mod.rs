@@ -36,6 +36,7 @@ use otap_df_engine::MessageSourceLocalEffectHandlerExtension;
 use otap_df_engine::config::ProcessorConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, NodeControlMsg};
+use otap_df_engine::effect_handler::TimerCancelHandle;
 use otap_df_engine::error::Error as EngineError;
 use otap_df_engine::local::processor as local;
 use otap_df_engine::message::Message;
@@ -100,7 +101,9 @@ impl Config {
 struct LogSamplerProcessor {
     sampler: WindowSampler,
     interval: Duration,
-    timer_started: bool,
+    /// Handle to the running window timer; `None` until the first message
+    /// starts it. Retained so a runtime interval change can cancel and restart.
+    timer: Option<TimerCancelHandle<OtapPdata>>,
     /// Shared global heavy-hitter table for the binding gate; `None` means the
     /// global gate is always slack.
     shared: Option<SharedGlobalTable>,
@@ -126,7 +129,7 @@ impl LogSamplerProcessor {
         Ok(Self {
             sampler: WindowSampler::new(config.k),
             interval: config.interval,
-            timer_started: false,
+            timer: None,
             shared: config.feedback_channel.as_deref().map(shared_global_table),
             max_staleness: config.max_table_staleness,
             last_version: 0,
@@ -241,6 +244,41 @@ impl LogSamplerProcessor {
         effect_handler.send_message_with_source_node(pdata).await?;
         Ok(())
     }
+
+    /// Apply a runtime [`NodeControlMsg::Config`] update: reconfigure `k`, the
+    /// window `interval`, the staleness bound, and the feedback channel. A
+    /// malformed or invalid config is ignored (counted under `config_errors`)
+    /// so the node keeps running with its previous settings.
+    async fn apply_config(
+        &mut self,
+        config: serde_json::Value,
+        effect_handler: &mut local::EffectHandler<OtapPdata>,
+    ) -> Result<(), EngineError> {
+        let cfg = match serde_json::from_value::<Config>(config) {
+            Ok(cfg) if cfg.validate().is_ok() => cfg,
+            _ => {
+                self.metrics.config_errors.inc();
+                return Ok(());
+            }
+        };
+
+        self.sampler.set_k(cfg.k);
+        self.max_staleness = cfg.max_table_staleness;
+        // Re-resolve the feedback channel and reset staleness tracking.
+        self.shared = cfg.feedback_channel.as_deref().map(shared_global_table);
+        self.last_version = 0;
+        self.last_update = Instant::now();
+
+        // Restart the window timer only when the interval actually changed.
+        if cfg.interval != self.interval {
+            self.interval = cfg.interval;
+            if let Some(timer) = self.timer.take() {
+                let _ = timer.cancel().await;
+            }
+            self.timer = Some(effect_handler.start_periodic_timer(self.interval).await?);
+        }
+        Ok(())
+    }
 }
 
 #[async_trait(?Send)]
@@ -250,9 +288,8 @@ impl local::Processor<OtapPdata> for LogSamplerProcessor {
         msg: Message<OtapPdata>,
         effect_handler: &mut local::EffectHandler<OtapPdata>,
     ) -> Result<(), EngineError> {
-        if !self.timer_started {
-            let _handle = effect_handler.start_periodic_timer(self.interval).await?;
-            self.timer_started = true;
+        if self.timer.is_none() {
+            self.timer = Some(effect_handler.start_periodic_timer(self.interval).await?);
         }
 
         match msg {
@@ -271,12 +308,14 @@ impl local::Processor<OtapPdata> for LogSamplerProcessor {
                     let _ = metrics_reporter.report(&mut self.metrics);
                     Ok(())
                 }
+                NodeControlMsg::Config { config } => {
+                    self.apply_config(config, effect_handler).await
+                }
                 NodeControlMsg::Shutdown { .. } => {
                     // Flush any buffered representatives before stopping.
                     self.close_window(effect_handler).await
                 }
-                NodeControlMsg::Config { .. }
-                | NodeControlMsg::Ack(_)
+                NodeControlMsg::Ack(_)
                 | NodeControlMsg::Nack(_)
                 | NodeControlMsg::MemoryPressureChanged { .. }
                 | NodeControlMsg::DrainIngress { .. }

@@ -113,6 +113,18 @@ impl GlobalWindow {
             .unwrap_or(self.n_unseen_smoothed)
     }
 
+    /// Update the reservoir size `k`, heavy-hitter budget `k_prime`, and EWMA
+    /// smoothing factor at runtime. Takes effect immediately; if `k` shrank, the
+    /// reservoir is trimmed to the new `k + 1` smallest keys.
+    pub(crate) fn set_params(&mut self, k: usize, k_prime: usize, count_smoothing: f64) {
+        self.k = k;
+        while self.keys.len() > self.k + 1 {
+            let _ = self.keys.pop();
+        }
+        self.k_prime = k_prime;
+        self.count_smoothing = count_smoothing;
+    }
+
     /// Insert a fresh reservoir key for `weight`, keeping only the smallest
     /// `k + 1` keys.
     fn push_key(&mut self, weight: f64) {

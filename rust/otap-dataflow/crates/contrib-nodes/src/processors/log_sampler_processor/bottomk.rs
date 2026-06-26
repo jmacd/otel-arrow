@@ -120,6 +120,16 @@ impl WindowSampler {
         }
     }
 
+    /// Update the per-window representative budget `k` at runtime. Takes effect
+    /// immediately; if `k` shrank, the reservoir is trimmed to the new `k + 1`
+    /// smallest keys.
+    pub(crate) fn set_k(&mut self, k: usize) {
+        self.k = k;
+        while self.heap.len() > self.k + 1 {
+            let _ = self.heap.pop();
+        }
+    }
+
     fn intern_group(&mut self, key: GroupKey) -> u32 {
         if let Some(idx) = self.groups.iter().position(|g| *g == key) {
             return idx as u32;

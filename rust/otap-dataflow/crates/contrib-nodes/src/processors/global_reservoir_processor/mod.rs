@@ -37,6 +37,7 @@ use otap_df_engine::MessageSourceLocalEffectHandlerExtension;
 use otap_df_engine::config::ProcessorConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::NodeControlMsg;
+use otap_df_engine::effect_handler::TimerCancelHandle;
 use otap_df_engine::error::Error as EngineError;
 use otap_df_engine::local::processor as local;
 use otap_df_engine::message::Message;
@@ -117,7 +118,9 @@ impl Config {
 struct GlobalReservoirProcessor {
     window: GlobalWindow,
     interval: Duration,
-    timer_started: bool,
+    /// Handle to the running window timer; `None` until the first message
+    /// starts it. Retained so a runtime interval change can cancel and restart.
+    timer: Option<TimerCancelHandle<OtapPdata>>,
     shared: SharedGlobalTable,
     metrics: MetricSet<GlobalReservoirMetrics>,
 }
@@ -137,7 +140,7 @@ impl GlobalReservoirProcessor {
         Ok(Self {
             window: GlobalWindow::new(config.k, config.k_prime, config.count_smoothing),
             interval: config.interval,
-            timer_started: false,
+            timer: None,
             shared: shared_global_table(&config.channel),
             metrics,
         })
@@ -214,6 +217,37 @@ impl GlobalReservoirProcessor {
 
         self.shared.store(Arc::new(table));
     }
+
+    /// Apply a runtime [`NodeControlMsg::Config`] update: reconfigure `k`,
+    /// `k_prime`, `count_smoothing`, and the window `interval`. A malformed or
+    /// invalid config is ignored (counted under `config_errors`) so the node
+    /// keeps running with its previous settings. The `channel` is fixed for the
+    /// node's lifetime and is not re-resolved here.
+    async fn apply_config(
+        &mut self,
+        config: serde_json::Value,
+        effect_handler: &mut local::EffectHandler<OtapPdata>,
+    ) -> Result<(), EngineError> {
+        let cfg = match serde_json::from_value::<Config>(config) {
+            Ok(cfg) if cfg.validate().is_ok() => cfg,
+            _ => {
+                self.metrics.config_errors.inc();
+                return Ok(());
+            }
+        };
+
+        self.window
+            .set_params(cfg.k, cfg.k_prime, cfg.count_smoothing);
+
+        if cfg.interval != self.interval {
+            self.interval = cfg.interval;
+            if let Some(timer) = self.timer.take() {
+                let _ = timer.cancel().await;
+            }
+            self.timer = Some(effect_handler.start_periodic_timer(self.interval).await?);
+        }
+        Ok(())
+    }
 }
 
 #[async_trait(?Send)]
@@ -223,9 +257,8 @@ impl local::Processor<OtapPdata> for GlobalReservoirProcessor {
         msg: Message<OtapPdata>,
         effect_handler: &mut local::EffectHandler<OtapPdata>,
     ) -> Result<(), EngineError> {
-        if !self.timer_started {
-            let _handle = effect_handler.start_periodic_timer(self.interval).await?;
-            self.timer_started = true;
+        if self.timer.is_none() {
+            self.timer = Some(effect_handler.start_periodic_timer(self.interval).await?);
         }
 
         match msg {
@@ -247,12 +280,14 @@ impl local::Processor<OtapPdata> for GlobalReservoirProcessor {
                     let _ = metrics_reporter.report(&mut self.metrics);
                     Ok(())
                 }
+                NodeControlMsg::Config { config } => {
+                    self.apply_config(config, effect_handler).await
+                }
                 NodeControlMsg::Shutdown { .. } => {
                     self.close_window();
                     Ok(())
                 }
-                NodeControlMsg::Config { .. }
-                | NodeControlMsg::Ack(_)
+                NodeControlMsg::Ack(_)
                 | NodeControlMsg::Nack(_)
                 | NodeControlMsg::MemoryPressureChanged { .. }
                 | NodeControlMsg::DrainIngress { .. }
