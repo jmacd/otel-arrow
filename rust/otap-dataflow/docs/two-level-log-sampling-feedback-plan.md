@@ -4,10 +4,10 @@ Status: draft plan, for prototyping. Owner: @jmacd.
 
 This document is an implementation plan for a working prototype of
 **two-level (local + global) bottom-k log sampling with a feedback loop**,
-built entirely from `otap-dataflow` components. It does not change any
-existing component yet; it specifies the new nodes, the shared-state and
-control plumbing they reuse, and the wire protocol for the feedback
-return path.
+built entirely from `otap-dataflow` components. It specifies the new nodes,
+the shared-state and control plumbing they reuse, and the wire protocol for
+the feedback return path. The return path (M2) also adds an opt-in
+`sampling_feedback_channel` to the existing OTLP/HTTP receiver and exporter.
 
 The statistical design and its evidence live outside this repo, in the
 `cckr-experiment` study (Bottom-Floor sampler and the two-stage feedback
@@ -323,23 +323,30 @@ pointing it at external traffic.
 
 ## 8. Milestones
 
-- **M0 - Local sampler, no feedback.** Implement C1 as a standalone
+Implementation status (prototype): **M0-M3 implemented and unit-tested;
+M4 not started.** The end-to-end loop is functionally complete over the
+OTLP/HTTP return path. The crates are wired behind the
+`log-sampler-processor` and `global-reservoir-processor` features; the C6
+return protocol uses `otel-sample-*` response headers and a process-global
+`Arc<ArcSwap<GlobalTable>>` registry keyed by channel name.
+
+- **M0 - Local sampler, no feedback. [done]** Implement C1 as a standalone
   bottom-`(k+1)` processor (global gate always slack, `tau^G = +inf`).
   Validate unbiased per-callsite counts and bounded state on a synthetic
   log stream. This reproduces today's Bottom-Floor locally.
-- **M1 - Global sampler, no return.** Implement C2 on the agent: pass-
+- **M1 - Global sampler, no return. [done]** Implement C2 on the agent: pass-
   through + weighted bottom-k over SDK representatives; log the computed
   heavy-hitter table, `tau^G`, and `g_unseen`. Validate `N_c` recovers
   global counts.
-- **M2 - Return channel.** Implement C3 + C6: agent attaches the table to
+- **M2 - Return channel. [done]** Implement C3 + C6: agent attaches the table to
   OTLP/HTTP responses; SDK exporter decodes it and publishes to ArcSwap.
   Validate end-to-end header round-trip and HPACK compression (inspect
   on-wire header bytes across repeated responses).
-- **M3 - Close the loop.** Wire C4 into C1's admission (binding gate) and
+- **M3 - Close the loop. [done]** Wire C4 into C1's admission (binding gate) and
   confirm the redundant-head flood drops (fleet spends less on globally
   ubiquitous callsites) while globally-unique callsites are preserved,
   matching the two-stage-feedback predictions.
-- **M4 - Hardening.** EWMA smoothing of `N_c`, staleness tolerance (table
+- **M4 - Hardening. [pending]** EWMA smoothing of `N_c`, staleness tolerance (table
   is >=1 round trip old; degrade gracefully toward local-only),
   runtime-config of `k`/`K'`/interval, and the gRPC/tonic-metadata return
   variant.
