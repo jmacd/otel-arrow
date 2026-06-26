@@ -22,7 +22,7 @@ mod bottomk;
 mod metrics;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
@@ -71,6 +71,13 @@ struct Config {
     /// slack (local-only sampling).
     #[serde(default)]
     feedback_channel: Option<String>,
+    /// Optional maximum age of the global table before the sampler ignores it
+    /// and degrades to local-only sampling. Age is measured locally as the time
+    /// since the table's version last advanced (i.e. since the exporter last
+    /// applied a fresh table from the agent), so no cross-host clocks are
+    /// involved. When unset, the table is trusted indefinitely.
+    #[serde(default, with = "humantime_serde::option")]
+    max_table_staleness: Option<Duration>,
 }
 
 impl Config {
@@ -97,6 +104,13 @@ struct LogSamplerProcessor {
     /// Shared global heavy-hitter table for the binding gate; `None` means the
     /// global gate is always slack.
     shared: Option<SharedGlobalTable>,
+    /// Maximum tolerated table age before degrading to local-only; `None`
+    /// trusts the table indefinitely.
+    max_staleness: Option<Duration>,
+    /// Last global table version observed (for staleness tracking).
+    last_version: u32,
+    /// Local instant at which `last_version` last changed.
+    last_update: Instant,
     metrics: MetricSet<LogSamplerMetrics>,
 }
 
@@ -114,17 +128,35 @@ impl LogSamplerProcessor {
             interval: config.interval,
             timer_started: false,
             shared: config.feedback_channel.as_deref().map(shared_global_table),
+            max_staleness: config.max_table_staleness,
+            last_version: 0,
+            last_update: Instant::now(),
             metrics,
         })
     }
 
     /// Snapshot the current global table (absent when no feedback channel is
-    /// configured), used as the global half of the binding gate.
-    fn current_table(&self) -> Arc<GlobalTable> {
-        match &self.shared {
-            Some(shared) => shared.load_full(),
-            None => Arc::new(GlobalTable::absent()),
+    /// configured), used as the global half of the binding gate. Tracks table
+    /// freshness by version change and, when `max_staleness` is configured,
+    /// degrades to the absent (slack) table once the table stops advancing for
+    /// longer than that bound.
+    fn current_table(&mut self) -> Arc<GlobalTable> {
+        let Some(shared) = &self.shared else {
+            return Arc::new(GlobalTable::absent());
+        };
+        let table = shared.load_full();
+        if table.version != self.last_version {
+            self.last_version = table.version;
+            self.last_update = Instant::now();
+            self.metrics.last_table_version.set(table.version as u64);
         }
+        if let Some(max) = self.max_staleness {
+            if !table.is_absent() && self.last_update.elapsed() > max {
+                self.metrics.table_stale_degradations.inc();
+                return Arc::new(GlobalTable::absent());
+            }
+        }
+        table
     }
 
     /// Decode an incoming log payload, absorb its records into the reservoir,

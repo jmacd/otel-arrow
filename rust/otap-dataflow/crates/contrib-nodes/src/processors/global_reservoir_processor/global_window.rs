@@ -68,11 +68,17 @@ pub(crate) struct GlobalWindow {
     k_prime: usize,
     /// Exact per-callsite global count `N_c` for the current window.
     n_curr: HashMap<u64, f64>,
-    /// Per-callsite count from the previous window, used as reservoir weight.
-    n_prev: HashMap<u64, f64>,
-    /// Weight applied to callsites unseen in the previous window
-    /// (`min_c N_prev_c`, i.e. the rarest-seen weight).
-    n_unseen_prev: f64,
+    /// EWMA-smoothed per-callsite count carried from prior windows. Used as the
+    /// reservoir weight during observation and, after folding in the current
+    /// window on close, as the basis for the published heavy-hitter weights.
+    n_smoothed: HashMap<u64, f64>,
+    /// Smoothed weight applied to callsites absent from `n_smoothed`
+    /// (the rarest-seen smoothed count).
+    n_unseen_smoothed: f64,
+    /// EWMA smoothing factor `alpha` in `(0, 1]`. `1.0` disables smoothing
+    /// (each window replaces the previous counts outright); smaller values
+    /// blend in history so a heavy hitter persists across a quiet window.
+    count_smoothing: f64,
     /// Bottom-`(k+1)` keys for this window.
     keys: BinaryHeap<OrdKey>,
     /// Monotonic table version; `0` is reserved for the absent table.
@@ -81,28 +87,30 @@ pub(crate) struct GlobalWindow {
 }
 
 impl GlobalWindow {
-    /// Create a new global window with reservoir size `k` and heavy-hitter
-    /// budget `k_prime`.
-    pub(crate) fn new(k: usize, k_prime: usize) -> Self {
+    /// Create a new global window with reservoir size `k`, heavy-hitter budget
+    /// `k_prime`, and EWMA count-smoothing factor `count_smoothing` (`1.0`
+    /// disables smoothing).
+    pub(crate) fn new(k: usize, k_prime: usize, count_smoothing: f64) -> Self {
         let seed = rand::rng().random::<u64>();
         Self {
             k,
             k_prime,
             n_curr: HashMap::new(),
-            n_prev: HashMap::new(),
-            n_unseen_prev: 1.0,
+            n_smoothed: HashMap::new(),
+            n_unseen_smoothed: 1.0,
+            count_smoothing,
             keys: BinaryHeap::new(),
             version: 0,
             rng: SmallRng::seed_from_u64(seed),
         }
     }
 
-    /// Previous-window weight for a callsite (rarest-seen if unseen before).
-    fn prev_weight(&self, callsite: u64) -> f64 {
-        self.n_prev
+    /// Smoothed weight for a callsite (rarest-seen smoothed weight if unseen).
+    fn smoothed_weight(&self, callsite: u64) -> f64 {
+        self.n_smoothed
             .get(&callsite)
             .copied()
-            .unwrap_or(self.n_unseen_prev)
+            .unwrap_or(self.n_unseen_smoothed)
     }
 
     /// Insert a fresh reservoir key for `weight`, keeping only the smallest
@@ -130,7 +138,7 @@ impl GlobalWindow {
                     let callsite = callsite_id(scope_name, rec);
                     let nhat = take_nhat(rec);
                     *self.n_curr.entry(callsite).or_insert(0.0) += nhat;
-                    let weight = self.prev_weight(callsite);
+                    let weight = self.smoothed_weight(callsite);
                     self.push_key(weight);
                 }
             }
@@ -160,11 +168,36 @@ impl GlobalWindow {
             .values()
             .copied()
             .fold(f64::INFINITY, f64::min);
-        let g_unseen = 1.0 / min_n;
 
-        // Heavy hitters: top K' callsites by global count N_c.
-        let mut by_count: Vec<(u64, f64)> =
-            self.n_curr.iter().map(|(&c, &n)| (c, n)).collect();
+        // Fold this window's exact counts into the EWMA-smoothed counts. At
+        // alpha = 1.0 this is a plain replacement (smoothed == this window's
+        // exact counts); smaller alpha blends in history so a heavy hitter
+        // persists across a transiently quiet window.
+        let alpha = self.count_smoothing;
+        let n_curr = std::mem::take(&mut self.n_curr);
+        let distinct_callsites = n_curr.len() as u64;
+
+        let mut smoothed: HashMap<u64, f64> = HashMap::with_capacity(n_curr.len());
+        // Decay/blend callsites carried from prior windows.
+        for (&c, &prev) in &self.n_smoothed {
+            let raw = n_curr.get(&c).copied().unwrap_or(0.0);
+            let _ = smoothed.insert(c, alpha * raw + (1.0 - alpha) * prev);
+        }
+        // Introduce callsites seen for the first time (no prior smoothed value).
+        for (&c, &raw) in &n_curr {
+            let _ = smoothed.entry(c).or_insert(alpha * raw);
+        }
+        // Bound memory: drop decayed callsites that fell below the rarest count
+        // actually seen this window (dominated for ranking and the gate), but
+        // always keep callsites observed this window.
+        smoothed.retain(|c, v| n_curr.contains_key(c) || *v >= min_n);
+
+        // Rarest-seen floor over the smoothed counts.
+        let min_smoothed = smoothed.values().copied().fold(f64::INFINITY, f64::min);
+        let g_unseen = 1.0 / min_smoothed;
+
+        // Heavy hitters: top K' callsites by smoothed global count.
+        let mut by_count: Vec<(u64, f64)> = smoothed.iter().map(|(&c, &n)| (c, n)).collect();
         by_count.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         by_count.truncate(self.k_prime);
         let heavy: Vec<HeavyHitter> = by_count
@@ -182,7 +215,7 @@ impl GlobalWindow {
         }
 
         let stats = GlobalStats {
-            distinct_callsites: self.n_curr.len() as u64,
+            distinct_callsites,
             heavy_hitters: heavy.len() as u64,
             tau_g,
             g_unseen,
@@ -194,10 +227,10 @@ impl GlobalWindow {
             heavy,
         };
 
-        // Roll the window forward: this window's counts become next window's
-        // reservoir weights; the rarest becomes the unseen weight.
-        self.n_prev = std::mem::take(&mut self.n_curr);
-        self.n_unseen_prev = min_n;
+        // Roll the window forward: smoothed counts become next window's
+        // reservoir weights; the rarest smoothed count is the unseen weight.
+        self.n_smoothed = smoothed;
+        self.n_unseen_smoothed = min_smoothed;
         self.keys.clear();
 
         Some((table, stats))
@@ -264,7 +297,7 @@ mod tests {
 
     #[test]
     fn accumulates_counts_and_strips_nhat() {
-        let mut w = GlobalWindow::new(8, 4);
+        let mut w = GlobalWindow::new(8, 4, 1.0);
         let mut data = logs(vec![
             rec("a", Some(10.0)),
             rec("a", Some(5.0)),
@@ -295,13 +328,13 @@ mod tests {
 
     #[test]
     fn empty_window_publishes_nothing() {
-        let mut w = GlobalWindow::new(4, 2);
+        let mut w = GlobalWindow::new(4, 2, 1.0);
         assert!(w.close().is_none());
     }
 
     #[test]
     fn heavy_hitter_budget_is_respected() {
-        let mut w = GlobalWindow::new(16, 2);
+        let mut w = GlobalWindow::new(16, 2, 1.0);
         let mut data = logs(vec![
             rec("a", Some(100.0)),
             rec("b", Some(50.0)),
@@ -318,5 +351,33 @@ mod tests {
         let listed: Vec<u64> = table.heavy.iter().map(|h| h.callsite).collect();
         assert!(listed.contains(&a));
         assert!(listed.contains(&b));
+    }
+
+    #[test]
+    fn ewma_persists_a_heavy_hitter_across_a_quiet_window() {
+        // alpha = 0.5: a callsite that goes quiet decays gradually rather than
+        // dropping to zero, so its smoothed count (and heavy-hitter status)
+        // persists for a window.
+        let mut w = GlobalWindow::new(16, 4, 0.5);
+        let a = callsite_id("scope", &rec("a", None));
+
+        // Window 1: 'a' is very heavy.
+        let mut d1 = logs(vec![rec("a", Some(100.0)), rec("b", Some(1.0))]);
+        let _ = w.observe_and_strip(&mut d1);
+        let (t1, _) = w.close().expect("publishes");
+        let g_a_1 = t1.g_for(a);
+
+        // Window 2: 'a' is absent; only 'b' is seen. With smoothing, 'a' should
+        // still be carried (decayed) as a heavy hitter.
+        let mut d2 = logs(vec![rec("b", Some(1.0))]);
+        let _ = w.observe_and_strip(&mut d2);
+        let (t2, _) = w.close().expect("publishes");
+        assert!(
+            t2.heavy.iter().any(|h| h.callsite == a),
+            "smoothed heavy hitter should persist across a quiet window"
+        );
+        // Its weight decayed (count halved -> g_c doubled), but it is still a
+        // smaller g_c than a brand-new rare callsite would receive.
+        assert!(t2.g_for(a) > g_a_1);
     }
 }

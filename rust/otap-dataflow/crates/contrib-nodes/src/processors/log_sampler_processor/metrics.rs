@@ -30,6 +30,11 @@ pub struct LogSamplerMetrics {
     #[metric(unit = "{log}")]
     pub globally_rejected: Counter<u64>,
 
+    /// Times the global table was ignored as stale (sampler degraded to
+    /// local-only sampling for that observation).
+    #[metric(unit = "{event}")]
+    pub table_stale_degradations: Counter<u64>,
+
     /// Distinct callsites among the representatives of the last window.
     #[metric(unit = "{callsite}")]
     pub last_distinct_callsites: Gauge<u64>,
@@ -37,4 +42,8 @@ pub struct LogSamplerMetrics {
     /// The local threshold `tau^L` of the last closed window.
     #[metric(unit = "1")]
     pub last_tau_l: Gauge<f64>,
+
+    /// Version of the global table most recently observed by the sampler.
+    #[metric(unit = "1")]
+    pub last_table_version: Gauge<u64>,
 }

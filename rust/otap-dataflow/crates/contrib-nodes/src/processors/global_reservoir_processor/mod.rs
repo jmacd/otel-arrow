@@ -70,6 +70,16 @@ struct Config {
     /// Shared-table channel name. Nodes naming the same channel (e.g. the OTLP
     /// receiver attaching the table to responses) share the published table.
     channel: String,
+    /// EWMA smoothing factor for per-callsite counts, in `(0, 1]`. `1.0` (the
+    /// default) disables smoothing; smaller values blend in history so a heavy
+    /// hitter persists across a transiently quiet window.
+    #[serde(default = "default_count_smoothing")]
+    count_smoothing: f64,
+}
+
+/// Default EWMA smoothing factor: `1.0` (no smoothing).
+fn default_count_smoothing() -> f64 {
+    1.0
 }
 
 impl Config {
@@ -92,6 +102,11 @@ impl Config {
         if self.channel.is_empty() {
             return Err(ConfigError::InvalidUserConfig {
                 error: "global_reservoir.channel must not be empty".to_string(),
+            });
+        }
+        if !(self.count_smoothing > 0.0 && self.count_smoothing <= 1.0) {
+            return Err(ConfigError::InvalidUserConfig {
+                error: "global_reservoir.count_smoothing must be in (0, 1]".to_string(),
             });
         }
         Ok(())
@@ -120,7 +135,7 @@ impl GlobalReservoirProcessor {
 
         let metrics = pipeline_ctx.register_metrics::<GlobalReservoirMetrics>();
         Ok(Self {
-            window: GlobalWindow::new(config.k, config.k_prime),
+            window: GlobalWindow::new(config.k, config.k_prime, config.count_smoothing),
             interval: config.interval,
             timer_started: false,
             shared: shared_global_table(&config.channel),
