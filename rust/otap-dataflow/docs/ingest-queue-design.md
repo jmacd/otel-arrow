@@ -455,6 +455,19 @@ bucket, D5) and of forwarding. A co-located trace is written and forwarded
 compaction pass. The shuffle moves the sort to cheap ingest-time routing:
 co-location turns sort-on-compact into sort-on-write.
 
+**The shuffle is split-by-sub-tenant (the unifying frame).** The shard key is a
+*sub-tenant identifier*: a descriptor dimension sourced from the data columns
+(metric name; `trace_id`), resolved per row, scoped under the request's tenant
+(D9). The shuffle is therefore one instance of a general **split-by-key**
+operation -- split-by-resource, -scope, -name, -trace_id, -descriptor -- that
+lives in the OTAP **batch processor**, extending the size-based split it already
+performs (`otap::groups` / `transform::split`) with a grouping projection over
+the same columnar, parent-id-cascading machinery the admission filter uses.
+Low-cardinality keys (tenant, resource) value-match to named routes for
+*isolation*; high-cardinality keys (name, `trace_id`) hash or slice into N
+partitions for *co-location*. See the multitenancy design's "Split-by-key and
+sub-tenant identifiers".
+
 ### D4. Storage locality: local disk versus shared object store
 
 **Decided:** the storage backend is a configuration choice -- both are
@@ -676,22 +689,54 @@ which the downstream watermark operates.
 - All decisions D1 through D9 are ratified. The two-plane collapse (metrics
   shuffle by `metric_name`) is adopted.
 
-**To resume in a new session, start at Phase 1:**
+> **Paused (Phase 1 blocked on a foundation gap).** Starting Phase 1 surfaced
+> that the engine has no key-deterministic cross-core dispatch (the topic broker
+> offers only broadcast and round-robin *balanced* delivery), and no durable
+> topic backend (the bespoke `durable_buffer_processor` wraps `quiver` outside
+> the broker). Both the name-keyed **shuffle** and **registry durability** should
+> be built on shared infrastructure, not bespoke parts:
+>
+> - the topic broker's **backend seam** already reserves
+>   `TopicBackendKind::Quiver` ("a future Quiver-backed implementation") -- a
+>   durable, at-least-once topic;
+> - the **multitenancy design** already routes the topic exporter/fanout by
+>   *descriptor condition*; our shard key (`hash(metric_name)`; low-56-bit
+>   `trace_id`) is another routing dimension on that same descriptor substrate.
+>
+> Phase 1 is therefore paused pending a **durable, partition-dispatch topic**.
+> The converged design (this session) factors the shuffle into three reusable
+> components:
+>
+> 1. **Split-by-key** in the OTAP **batch processor** (extending
+>    `otap::groups`/`transform::split` with a grouping projection over the
+>    cascade machinery): rows -> per-partition sub-batches, each tagged with
+>    `partition = hash(sub-tenant key) mod N` (or the `trace_id` low-56-bit
+>    slice). The expensive columnar group-by happens once, here.
+> 2. **Durable partition-dispatch topic** (the reserved `TopicBackendKind::Quiver`
+>    backend + a dispatch-by-partition-tag subscription mode): routes whole
+>    tagged sub-batches to the owning subscriber and persists at-least-once.
+> 3. **Placement** (`partition -> owner`): static first, controller-rebalanced
+>    later (Phase 2/3), with leases/generation fencing in quiver bundle metadata.
+>
+> The shard key is a **sub-tenant identifier** (data-sourced, per-row descriptor
+> under the request tenant; see D3 and the multitenancy design's "Split-by-key
+> and sub-tenant identifiers"). This subsumes `durable_buffer_processor` into the
+> Quiver-backed topic and removes any need for a hand-rolled WAL.
 
-1. Shuffle by the signal key (`metric_name`) so each core owns its names: route
-   admission behind a name-keyed shuffle (a topic/exchange partitioned by
-   `hash(tenant, name)`) so each replica's `TypeRegistry` is the sole authority
-   for its names, with no broadcast. Build the shuffle's key-to-bucket function
-   as a **per-signal partitioner** (D3 refinement): `hash(name)` for metrics,
-   low-56-bit slice of `trace_id` for traces/correlated-logs.
-2. Persist the per-core registry: a compacted snapshot plus an append log (a
-   dedicated `quiver` instance or `quiver`-style WAL), replayed on startup
-   before admission resumes. The `TypeDescriptor`/`observe` registry API is
-   already in `metrics_admission_processor/registry.rs`; it needs a
-   serialization + WAL/snapshot layer. See `durable_buffer_processor` and the
-   `quiver` README/ARCHITECTURE for the WAL + snapshot patterns.
-3. Add restart-replay and conflict-flagging tests.
-4. File tracking issues for the remaining phases and the ratified decisions.
+**To resume in a new session:**
+
+1. Draft/land the durable partition-dispatch topic + split-by-key design (the
+   three components above; open decisions: Quiver backend granularity =
+   per-owner with per-partition Arrow-IPC streams (D5); whether split and
+   dispatch are one node or two; standalone-logs (no `trace_id`) sub-tenant key).
+2. Phase 1 shuffle = `metrics_admission` subscribes to the partition-dispatch
+   topic keyed by the **per-signal partitioner** (D3 refinement): `hash(name)`
+   for metrics, low-56-bit slice of `trace_id` for traces/correlated-logs, so
+   each owner's `TypeRegistry` is the sole authority for its keys.
+3. Phase 1 registry durability = persist the registry through the Quiver topic
+   backend (snapshot + log), replayed on startup. The `TypeDescriptor`/`observe`
+   API is already in `metrics_admission_processor/registry.rs`.
+4. Add restart-replay and conflict-flagging tests; file tracking issues.
 
 **Related engine docs:** `design-principles.md`, `topic-architecture.md`,
 `load-balancing.md`, `memory-limiter-phase1.md`, and the `quiver` crate README.
