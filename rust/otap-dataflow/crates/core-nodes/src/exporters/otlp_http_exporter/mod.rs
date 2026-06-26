@@ -262,6 +262,14 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
         let mut proto_buffer = ProtoBuffer::default();
 
         let compression = self.config.http.compression();
+        // Shared global heavy-hitter table for the configured sampling feedback
+        // channel; the exporter publishes the table decoded from log-export
+        // response headers here for a local `log_sampler` to read back.
+        let sampling_table = self
+            .config
+            .sampling_feedback_channel
+            .as_deref()
+            .map(otap_df_otap::sampling::shared_global_table);
         // Buffer to hold compressed bytes. We re-use this scratch space to place
         // the compressed bytes and then allocate an exact sized Bytes to copy
         // them into for exporting.
@@ -440,6 +448,7 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                     let max_response_body_len = self.config.max_response_body_length;
 
                     let client = client_pool.get_client();
+                    let sampling_table = sampling_table.clone();
                     inflight_exports.push(async move {
                         let mut req = client.post(endpoint.as_str()).body(body);
                         if let Some(method) = compression {
@@ -455,6 +464,7 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                                 &signal_type,
                                 max_response_body_len,
                                 result,
+                                sampling_table.as_ref(),
                             )
                             .await,
                             context,
@@ -611,8 +621,17 @@ async fn query_result_to_service_response(
     signal_type: &SignalType,
     max_response_body_len: usize,
     result: Result<Response, reqwest::Error>,
+    sampling_table: Option<&otap_df_otap::sampling::SharedGlobalTable>,
 ) -> Result<ServiceResponse, ServiceRequestError> {
     let resp = result?.error_for_status()?;
+
+    // Two-level log sampling feedback: decode the global heavy-hitter table
+    // from response headers and publish it for the local sampler. Done before
+    // the body is consumed; absence or malformed headers yield the slack table.
+    if let (SignalType::Logs, Some(table)) = (signal_type, sampling_table) {
+        publish_sampling_feedback(resp.headers(), table);
+    }
+
     let mut body = collect_body(resp, max_response_body_len).await?;
 
     let service_resp = match signal_type {
@@ -622,6 +641,26 @@ async fn query_result_to_service_response(
     };
 
     Ok(service_resp?)
+}
+
+/// Decode the global sampling table from OTLP/HTTP response headers and publish
+/// it to the shared channel. Only stores a present (non-absent) table so a
+/// response that omits the headers leaves the last table in force.
+fn publish_sampling_feedback(
+    headers: &HeaderMap,
+    table: &otap_df_otap::sampling::SharedGlobalTable,
+) {
+    use otap_df_otap::sampling;
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let decoded = sampling::decode_headers(
+        get(sampling::HEADER_VER),
+        get(sampling::HEADER_TAU_G),
+        get(sampling::HEADER_G_UNSEEN),
+        get(sampling::HEADER_HEAVY),
+    );
+    if !decoded.is_absent() {
+        table.store(Arc::new(decoded));
+    }
 }
 
 async fn collect_body(response: Response, max_len: usize) -> Result<Bytes, ServiceRequestError> {
@@ -1346,6 +1385,7 @@ mod test {
             traces_endpoint: None,
             metrics_endpoint: None,
             logs_endpoint: None,
+            sampling_feedback_channel: None,
         }
     }
 

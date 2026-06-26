@@ -1,0 +1,26 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: enhancement
+
+# The name of the component, or a single word describing the area of concern, (e.g. engine, otap).
+# Must be one of the components listed in rust/otap-dataflow/.chloggen/config.yaml.
+component: pipeline
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Add the OTLP/HTTP feedback return path for two-level log sampling (global heavy-hitter table over response headers).
+
+# Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
+issues: []
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries.
+subtext: |
+  Adds a `sampling_feedback_channel` option to the OTLP/HTTP receiver and
+  exporter. When set, the receiver attaches the current global table (published
+  by a `global_reservoir` processor on the same channel) to log responses as
+  `otel-sample-*` headers, and the exporter decodes those headers and publishes
+  the table to its shared channel for a local `log_sampler` to consult. The
+  wire codec lives in `otap_df_otap::sampling` and is fail-safe: missing or
+  malformed headers decode to the absent (slack) table. This is milestone M2.

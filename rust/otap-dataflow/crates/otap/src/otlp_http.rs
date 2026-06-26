@@ -125,6 +125,13 @@ pub struct HttpServerSettings {
     /// Optional TLS configuration.
     #[serde(default)]
     pub tls: Option<TlsServerConfig>,
+
+    /// Optional two-level log-sampling feedback channel name. When set, the
+    /// receiver attaches the current global heavy-hitter table (published by a
+    /// `global_reservoir` processor sharing the same channel) to OTLP/HTTP
+    /// log responses as `otel-sample-*` headers.
+    #[serde(default)]
+    pub sampling_feedback_channel: Option<String>,
 }
 
 impl Default for HttpServerSettings {
@@ -141,6 +148,7 @@ impl Default for HttpServerSettings {
             timeout: default_http_timeout(),
             accept_compressed_requests: default_accept_compressed_requests(),
             tls: None,
+            sampling_feedback_channel: None,
         }
     }
 }
@@ -519,9 +527,29 @@ struct HttpHandler {
     /// to every `OtapPdata` produced from the connection so downstream
     /// processors can read it via `OtapPdata::peer_addr()`.
     peer_addr: SocketAddr,
+    /// Shared global heavy-hitter table for the configured sampling feedback
+    /// channel, attached to OTLP log responses when present.
+    sampling_table: Option<crate::sampling::SharedGlobalTable>,
 }
 
 impl HttpHandler {
+    /// Build the success response, attaching the global sampling-feedback table
+    /// to log responses when a feedback channel is configured.
+    fn ok_response_with_feedback(&self, signal: SignalType) -> Response<Full<Bytes>> {
+        let mut resp = ok_response(signal);
+        if signal == SignalType::Logs {
+            if let Some(table) = &self.sampling_table {
+                let snapshot = table.load();
+                for (name, value) in crate::sampling::encode_headers(&snapshot) {
+                    if let Ok(v) = HeaderValue::from_str(&value) {
+                        _ = resp.headers_mut().append(name, v);
+                    }
+                }
+            }
+        }
+        resp
+    }
+
     async fn handle(self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
         let Some(signal) = map_path_to_signal(req.uri().path()) else {
             return Ok(not_found());
@@ -786,7 +814,7 @@ impl HttpHandler {
             }
 
             self.metrics.lock().requests_completed.inc();
-            Ok(ok_response(signal))
+            Ok(self.ok_response_with_feedback(signal))
         };
 
         let result = if let Some(timeout_duration) = timeout {
@@ -856,6 +884,13 @@ pub async fn serve(
 
     let maybe_tls_acceptor = build_tls_acceptor(settings.tls.as_ref()).await?;
 
+    // Resolve the sampling-feedback table once for this server (cheap clone of
+    // a shared Arc handle per accepted connection).
+    let sampling_table = settings
+        .sampling_feedback_channel
+        .as_deref()
+        .map(crate::sampling::shared_global_table);
+
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -894,6 +929,7 @@ pub async fn serve(
                     global_semaphore: global_semaphore.clone(),
                     local_semaphore: local_semaphore.clone(),
                     peer_addr,
+                    sampling_table: sampling_table.clone(),
                 };
 
                 if let Some(acceptor) = maybe_tls_acceptor.clone() {

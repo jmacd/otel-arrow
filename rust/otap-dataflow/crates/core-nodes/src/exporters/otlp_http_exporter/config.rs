@@ -53,6 +53,13 @@ pub struct Config {
     /// Maximum number of concurrent in-flight export requests.
     #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
+
+    /// Optional two-level log-sampling feedback channel name. When set, the
+    /// exporter decodes the global heavy-hitter table from `otel-sample-*`
+    /// response headers on log exports and publishes it to the shared channel
+    /// for a local `log_sampler` to consult.
+    #[serde(default)]
+    pub sampling_feedback_channel: Option<String>,
 }
 
 fn default_max_response_body_length() -> usize {
