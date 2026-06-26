@@ -69,6 +69,13 @@ pub struct Config {
     /// receiver uses `SO_REUSEPORT` across cores. Defaults to 1.
     #[serde(default = "default_num_connections")]
     pub num_connections: usize,
+
+    /// Optional two-level log-sampling feedback channel name. When set, the
+    /// exporter decodes the global heavy-hitter table from `otel-sample-*`
+    /// response metadata on log exports and publishes it to the shared channel
+    /// for a local `log_sampler` to consult.
+    #[serde(default)]
+    pub sampling_feedback_channel: Option<String>,
 }
 
 pub(crate) const fn default_max_in_flight() -> usize {
@@ -208,6 +215,14 @@ impl Exporter<OtapPdata> for OTLPExporter {
         // the zero-allocation fast path in `build_grpc_metadata`.
         let static_metadata = self.config.grpc.build_static_metadata();
 
+        // Resolve the shared global sampling table once, if configured. Only the
+        // Logs export path reads response metadata and publishes the decoded table.
+        let sampling_table = self
+            .config
+            .sampling_feedback_channel
+            .as_deref()
+            .map(otap_df_otap::sampling::shared_global_table);
+
         // reuse the encoder and the buffer across pdatas
         let mut logs_proto_encoder = LogsProtoBytesEncoder::new();
         let mut metrics_proto_encoder = MetricsProtoBytesEncoder::new();
@@ -337,7 +352,7 @@ impl Exporter<OtapPdata> for OTLPExporter {
                                 &mut logs_proto_encoder,
                                 |encoded| {
                                     let client = SignalClient::Logs(grpc_clients.take_logs());
-                                    make_export_future(encoded, client)
+                                    make_export_future(encoded, client, sampling_table.clone())
                                 },
                                 &mut inflight_exports,
                                 &mut self.pdata_metrics.logs_failed,
@@ -356,7 +371,7 @@ impl Exporter<OtapPdata> for OTLPExporter {
                                 &mut metrics_proto_encoder,
                                 |encoded| {
                                     let client = SignalClient::Metrics(grpc_clients.take_metrics());
-                                    make_export_future(encoded, client)
+                                    make_export_future(encoded, client, None)
                                 },
                                 &mut inflight_exports,
                                 &mut self.pdata_metrics.metrics_failed,
@@ -375,7 +390,7 @@ impl Exporter<OtapPdata> for OTLPExporter {
                                 &mut traces_proto_encoder,
                                 |encoded| {
                                     let client = SignalClient::Traces(grpc_clients.take_traces());
-                                    make_export_future(encoded, client)
+                                    make_export_future(encoded, client, None)
                                 },
                                 &mut inflight_exports,
                                 &mut self.pdata_metrics.traces_failed,
@@ -417,7 +432,11 @@ impl Exporter<OtapPdata> for OTLPExporter {
                                     SignalClient::Traces(grpc_clients.take_traces())
                                 }
                             };
-                            let future = make_export_future(prepared, client);
+                            let sampling_table = match signal_type {
+                                SignalType::Logs => sampling_table.clone(),
+                                _ => None,
+                            };
+                            let future = make_export_future(prepared, client, sampling_table);
                             inflight_exports.push(future);
                         }
                     }
@@ -746,6 +765,7 @@ fn build_grpc_metadata(
 fn make_export_future(
     prepared: EncodedExport,
     client: SignalClient,
+    sampling_table: Option<otap_df_otap::sampling::SharedGlobalTable>,
 ) -> impl Future<Output = CompletedExport> {
     let EncodedExport {
         bytes,
@@ -764,7 +784,17 @@ fn make_export_future(
     async move {
         match client {
             SignalClient::Logs(mut client) => {
-                let result = client.export(request).await.map(|_| ());
+                // Logs is the only signal that consumes the response, decoding the
+                // global sampling table from response metadata when configured.
+                let result = match client.export(request).await {
+                    Ok(response) => {
+                        if let Some(table) = &sampling_table {
+                            publish_grpc_feedback(response.metadata(), table);
+                        }
+                        Ok(())
+                    }
+                    Err(status) => Err(status),
+                };
                 CompletedExport {
                     result,
                     context,
@@ -794,6 +824,27 @@ fn make_export_future(
                 }
             }
         }
+    }
+}
+
+/// Decode the global sampling table from gRPC response metadata and publish it
+/// to the shared channel. Only stores a present (non-absent) table so a response
+/// that omits the metadata leaves the last table in force. Mirrors the OTLP/HTTP
+/// exporter's header-based feedback path.
+fn publish_grpc_feedback(
+    metadata: &MetadataMap,
+    table: &otap_df_otap::sampling::SharedGlobalTable,
+) {
+    use otap_df_otap::sampling;
+    let get = |name: &str| metadata.get(name).and_then(|v| v.to_str().ok());
+    let decoded = sampling::decode_headers(
+        get(sampling::HEADER_VER),
+        get(sampling::HEADER_TAU_G),
+        get(sampling::HEADER_G_UNSEEN),
+        get(sampling::HEADER_HEAVY),
+    );
+    if !decoded.is_absent() {
+        table.store(Arc::new(decoded));
     }
 }
 
@@ -1212,6 +1263,7 @@ mod tests {
                     },
                     max_in_flight: 32,
                     num_connections: default_num_connections(),
+                    sampling_feedback_channel: None,
                 },
                 pdata_metrics: pipeline_ctx.register_metrics::<ExporterPDataMetrics>(),
             },
@@ -1336,6 +1388,7 @@ mod tests {
                     },
                     max_in_flight: 32,
                     num_connections: default_num_connections(),
+                    sampling_feedback_channel: None,
                 },
                 pdata_metrics: pipeline_ctx.register_metrics::<ExporterPDataMetrics>(),
             },
@@ -1406,6 +1459,7 @@ mod tests {
                     },
                     max_in_flight: 32,
                     num_connections: default_num_connections(),
+                    sampling_feedback_channel: None,
                 },
                 pdata_metrics: pipeline_ctx.register_metrics::<ExporterPDataMetrics>(),
             },

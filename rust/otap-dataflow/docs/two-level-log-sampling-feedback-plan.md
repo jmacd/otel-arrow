@@ -323,12 +323,12 @@ pointing it at external traffic.
 
 ## 8. Milestones
 
-Implementation status (prototype): **M0-M3 implemented and unit-tested;
-M4 not started.** The end-to-end loop is functionally complete over the
-OTLP/HTTP return path. The crates are wired behind the
+Implementation status (prototype): **M0-M4 implemented and unit-tested.**
+The end-to-end loop is functionally complete over both the OTLP/HTTP and
+OTLP/gRPC return paths. The crates are wired behind the
 `log-sampler-processor` and `global-reservoir-processor` features; the C6
-return protocol uses `otel-sample-*` response headers and a process-global
-`Arc<ArcSwap<GlobalTable>>` registry keyed by channel name.
+return protocol uses `otel-sample-*` response headers/metadata and a
+process-global `Arc<ArcSwap<GlobalTable>>` registry keyed by channel name.
 
 - **M0 - Local sampler, no feedback. [done]** Implement C1 as a standalone
   bottom-`(k+1)` processor (global gate always slack, `tau^G = +inf`).
@@ -346,10 +346,12 @@ return protocol uses `otel-sample-*` response headers and a process-global
   confirm the redundant-head flood drops (fleet spends less on globally
   ubiquitous callsites) while globally-unique callsites are preserved,
   matching the two-stage-feedback predictions.
-- **M4 - Hardening. [pending]** EWMA smoothing of `N_c`, staleness tolerance (table
+- **M4 - Hardening. [done]** EWMA smoothing of `N_c`, staleness tolerance (table
   is >=1 round trip old; degrade gracefully toward local-only),
-  runtime-config of `k`/`K'`/interval, and the gRPC/tonic-metadata return
-  variant.
+  runtime-config of `k`/`K'`/interval via `NodeControlMsg::Config`, and the
+  gRPC/tonic-metadata return variant (receiver attaches the table to Logs
+  export responses as `otel-sample-*` metadata; exporter decodes it on Logs
+  exports), parallel to the OTLP/HTTP path.
 
 ## 9. Testing and validation
 

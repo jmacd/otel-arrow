@@ -180,6 +180,14 @@ pub struct GrpcServerSettings {
     /// When configured, the server will use TLS/mTLS for secure connections.
     #[serde(default)]
     pub tls: Option<TlsServerConfig>,
+
+    /// Optional name of the shared global sampling table to publish on log responses.
+    ///
+    /// When set, the Logs gRPC export handler attaches the current sampling feedback table
+    /// (encoded as response metadata) to each successful export, enabling two-level log
+    /// sampling feedback over the gRPC return channel.
+    #[serde(default)]
+    pub sampling_feedback_channel: Option<String>,
 }
 
 impl GrpcServerSettings {
@@ -248,6 +256,7 @@ impl GrpcServerSettings {
             max_decoding_message_size: self.max_decoding_message_size.map(|value| value as usize),
             request_compression_encodings,
             response_compression_encodings,
+            sampling_feedback_channel: self.sampling_feedback_channel.clone(),
         }
     }
 }
@@ -334,6 +343,7 @@ impl Default for GrpcServerSettings {
             wait_for_result: default_wait_for_result(),
             timeout: None,
             tls: None,
+            sampling_feedback_channel: None,
         }
     }
 }

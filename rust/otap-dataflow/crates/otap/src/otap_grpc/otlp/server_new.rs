@@ -45,6 +45,8 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EnabledCompressionEncodings, Encod
 use tonic::server::{Grpc, NamedService, UnaryService};
 
 use crate::otap_grpc::common::peer_addr_from_extensions;
+use crate::sampling::{SharedGlobalTable, encode_headers, shared_global_table};
+use tonic::metadata::MetadataValue;
 
 /// Tracks outstanding request subscriptions for a single signal so ACK/NACK responses can be routed
 /// back to the waiting caller. When `wait_for_result` is disabled the receiver skips creating this
@@ -155,6 +157,11 @@ pub struct OtlpServerSettings {
     pub request_compression_encodings: EnabledCompressionEncodings,
     /// Response compression used
     pub response_compression_encodings: EnabledCompressionEncodings,
+    /// Optional two-level log-sampling feedback channel. When set, the logs
+    /// service attaches the current global heavy-hitter table to successful
+    /// log-export responses as gRPC metadata (the gRPC analogue of the
+    /// OTLP/HTTP `otel-sample-*` response headers).
+    pub sampling_feedback_channel: Option<String>,
 }
 
 /// Encodes a default response for repeated use.
@@ -334,18 +341,23 @@ struct OtapBatchService {
     effect_handler: Option<EffectHandler<OtapPdata>>,
     state: Option<AckSlot>,
     metrics: Arc<Mutex<MetricSet<OtlpReceiverMetrics>>>,
+    /// When set (logs service only), the current global sampling table is
+    /// attached to the success response as gRPC metadata.
+    sampling_table: Option<SharedGlobalTable>,
 }
 
 impl OtapBatchService {
-    const fn new(
+    fn new(
         effect_handler: EffectHandler<OtapPdata>,
         state: Option<AckSlot>,
         metrics: Arc<Mutex<MetricSet<OtlpReceiverMetrics>>>,
+        sampling_table: Option<SharedGlobalTable>,
     ) -> Self {
         Self {
             effect_handler: Some(effect_handler),
             state,
             metrics,
+            sampling_table,
         }
     }
 }
@@ -413,6 +425,7 @@ impl UnaryService<OtapPdata> for OtapBatchService {
 
         let state = self.state.clone();
         let metrics = self.metrics.clone();
+        let sampling_table = self.sampling_table.take();
         Box::pin(async move {
             metrics.lock().requests_started.inc();
             let cancel_rx = if let Some(state) = state {
@@ -464,7 +477,18 @@ impl UnaryService<OtapPdata> for OtapBatchService {
 
             metrics.lock().requests_completed.inc();
 
-            Ok(tonic::Response::new(()))
+            // Attach the current global sampling table (logs service only) as
+            // gRPC response metadata, the analogue of the OTLP/HTTP headers.
+            let mut response = tonic::Response::new(());
+            if let Some(table) = &sampling_table {
+                let snapshot = table.load_full();
+                for (name, value) in encode_headers(&snapshot) {
+                    if let Ok(val) = MetadataValue::try_from(value) {
+                        let _ = response.metadata_mut().insert(name, val);
+                    }
+                }
+            }
+            Ok(response)
         })
     }
 }
@@ -491,6 +515,8 @@ pub struct ServerCommon {
     state: Option<AckSlot>,
     settings: OtlpServerSettings,
     metrics: Arc<Mutex<MetricSet<OtlpReceiverMetrics>>>,
+    /// Resolved shared sampling-feedback table (logs service only).
+    sampling_table: Option<SharedGlobalTable>,
 }
 
 impl ServerCommon {
@@ -506,11 +532,16 @@ impl ServerCommon {
         metrics: Arc<Mutex<MetricSet<OtlpReceiverMetrics>>>,
         state: Option<AckSlot>,
     ) -> Self {
+        let sampling_table = settings
+            .sampling_feedback_channel
+            .as_deref()
+            .map(shared_global_table);
         Self {
             effect_handler,
             state,
             settings: settings.clone(),
             metrics,
+            sampling_table,
         }
     }
 }
@@ -559,6 +590,7 @@ impl tower_service::Service<Request<Body>> for LogsServiceServer {
                     common.effect_handler,
                     common.state,
                     common.metrics.clone(),
+                    common.sampling_table,
                 );
                 Box::pin(async move { Ok(grpc.unary(service, req).await) })
             }
@@ -615,6 +647,7 @@ impl tower_service::Service<Request<Body>> for MetricsServiceServer {
                     common.effect_handler,
                     common.state,
                     common.metrics.clone(),
+                    None,
                 );
                 Box::pin(async move { Ok(grpc.unary(service, req).await) })
             }
@@ -671,6 +704,7 @@ impl tower_service::Service<Request<Body>> for TraceServiceServer {
                     common.effect_handler,
                     common.state,
                     common.metrics.clone(),
+                    None,
                 );
                 Box::pin(async move { Ok(grpc.unary(service, req).await) })
             }
