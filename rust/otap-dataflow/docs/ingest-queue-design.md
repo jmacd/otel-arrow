@@ -703,40 +703,48 @@ which the downstream watermark operates.
 >   *descriptor condition*; our shard key (`hash(metric_name)`; low-56-bit
 >   `trace_id`) is another routing dimension on that same descriptor substrate.
 >
-> Phase 1 is therefore paused pending a **durable, partition-dispatch topic**.
-> The converged design (this session) factors the shuffle into three reusable
-> components:
+> Phase 1 is therefore paused pending a **partition-dispatch topic with optional
+> durability**, now designed in
+> [`durable-dispatch-topic-design.md`](./durable-dispatch-topic-design.md)
+> (decisions D18-D27). Durability is an **orthogonal axis** (D27): the
+> shuffle/aggregate/load-balance path runs in memory (a large-scale aggregating
+> SDK) or durable (this appliance) by choosing the topic backend. It factors into:
 >
-> 1. **Split-by-key** in the OTAP **batch processor** (extending
->    `otap::groups`/`transform::split` with a grouping projection over the
->    cascade machinery): rows -> per-partition sub-batches, each tagged with
->    `partition = hash(sub-tenant key) mod N` (or the `trace_id` low-56-bit
->    slice). The expensive columnar group-by happens once, here.
-> 2. **Durable partition-dispatch topic** (the reserved `TopicBackendKind::Quiver`
->    backend + a dispatch-by-partition-tag subscription mode): routes whole
->    tagged sub-batches to the owning subscriber and persists at-least-once.
-> 3. **Placement** (`partition -> owner`): static first, controller-rebalanced
->    later (Phase 2/3), with leases/generation fencing in quiver bundle metadata.
+> 1. **Split-by-key** (Layer A) in the OTAP **batch processor**, built on the
+>    selection-mask cascade (the `filter_otap_batch` family the admission
+>    processor already uses), *not* the size-based `transform::split`: rows ->
+>    per-partition sub-batches tagged `partition = part_fn(key) mod N`
+>    (`hash(metric_name)`, or the `trace_id` low-56-bit slice). Durability-independent.
+> 2. **Partition-dispatch + placement** (Layer C), built **in-memory first**: a
+>    partition-claim subscription giving stable, exclusive `partition -> owner`
+>    ownership, plus the controller placement map (static first,
+>    controller-rebalanced later). A+C in memory is the runnable aggregator.
+> 3. **Quiver topic backend** (Layer B), the **optional** durability plug-in: the
+>    reserved `TopicBackendKind::Quiver`, the *same* dispatch made durable, also
+>    backing registry durability. Replaces `durable_buffer_processor`.
+>    **Deferred this effort (design doc D28)** -- added later as a backend swap.
 >
-> The shard key is a **sub-tenant identifier** (data-sourced, per-row descriptor
-> under the request tenant; see D3 and the multitenancy design's "Split-by-key
-> and sub-tenant identifiers"). This subsumes `durable_buffer_processor` into the
-> Quiver-backed topic and removes any need for a hand-rolled WAL.
+> The shard key is a **sub-tenant identifier** (data-sourced from OTAP columns,
+> per row; see D3 and the multitenancy design's "Split-by-key and sub-tenant
+> identifiers"). No hand-rolled WAL is needed.
 
-**To resume in a new session:**
+**To resume in a new session (in-memory core only, design doc D28):**
 
-1. Draft/land the durable partition-dispatch topic + split-by-key design (the
-   three components above; open decisions: Quiver backend granularity =
-   per-owner with per-partition Arrow-IPC streams (D5); whether split and
-   dispatch are one node or two; standalone-logs (no `trace_id`) sub-tenant key).
+1. Implement **Layer A** (split-by-key) -> **Layer C on the in-memory backend**
+   (the runnable in-memory aggregator). **Layer B (Quiver durability) is
+   deferred.** D25 (packaging) resolves as A/C are built; D26 when logs are
+   addressed.
 2. Phase 1 shuffle = `metrics_admission` subscribes to the partition-dispatch
-   topic keyed by the **per-signal partitioner** (D3 refinement): `hash(name)`
-   for metrics, low-56-bit slice of `trace_id` for traces/correlated-logs, so
-   each owner's `TypeRegistry` is the sole authority for its keys.
-3. Phase 1 registry durability = persist the registry through the Quiver topic
-   backend (snapshot + log), replayed on startup. The `TypeDescriptor`/`observe`
-   API is already in `metrics_admission_processor/registry.rs`.
-4. Add restart-replay and conflict-flagging tests; file tracking issues.
+   topic (in-memory backend) keyed by the **per-signal partitioner** (D3
+   refinement): `hash(name)` for metrics, low-56-bit slice of `trace_id` for
+   traces/correlated-logs, so each owner's `TypeRegistry` is the sole authority
+   for its keys.
+3. Phase 1 registry stays **in-memory** (relearned on restart, safe per D8).
+   Durable registry is deferred with Layer B (then: switch the registry's topic
+   to the Quiver backend, replayed on startup; the `TypeDescriptor`/`observe` API
+   is already in `metrics_admission_processor/registry.rs`).
+4. Add conflict-flagging tests; file tracking issues. (Restart-replay tests
+   arrive with Layer B.)
 
 **Related engine docs:** `design-principles.md`, `topic-architecture.md`,
 `load-balancing.md`, `memory-limiter-phase1.md`, and the `quiver` crate README.

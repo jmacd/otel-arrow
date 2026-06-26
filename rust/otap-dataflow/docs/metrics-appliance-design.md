@@ -43,6 +43,16 @@ for the queryable aggregated store, Parquet for archival interop, and the
 existing exporters for forwarding. The engine *owns* the L1 ingest queue; it
 *rents* the L3 store from neutral file formats (Vortex, Parquet).
 
+**Durability is optional and per-location.** The shuffle/aggregate/load-balance
+path runs with or without durable storage; durability is a backend choice at
+each of two locations -- **stage-1** (L1, via the topic backend: in-memory or
+`quiver`) and **stage-2** (L3, via the store seam: in-memory or Vortex). With
+durability off at both, the appliance is a large-scale aggregating telemetry SDK
+(in-memory shuffle, aggregation, load-balancing, and queries); with it on, the
+disconnection-tolerant appliance described here. This orthogonality is designed
+in [`durable-dispatch-topic-design.md`](./durable-dispatch-topic-design.md)
+(D27); "Durable" above is the durable end of that spectrum.
+
 ## Layered architecture
 
 ```text
