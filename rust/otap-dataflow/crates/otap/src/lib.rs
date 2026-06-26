@@ -68,6 +68,9 @@ pub mod transport_headers;
 /// TLS utilities
 pub mod tls_utils;
 
+/// Shared state for two-level log sampling feedback (heavy-hitter table).
+pub mod sampling;
+
 /// Factory for OTAP-based pipeline
 #[pipeline_factory(OTAP, OtapPdata)]
 pub static OTAP_PIPELINE_FACTORY: PipelineFactory<OtapPdata> = build_factory();

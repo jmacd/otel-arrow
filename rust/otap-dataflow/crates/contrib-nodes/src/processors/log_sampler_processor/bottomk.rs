@@ -29,44 +29,10 @@ use otap_df_pdata::proto::opentelemetry::common::v1::{
 use otap_df_pdata::proto::opentelemetry::logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs};
 use otap_df_pdata::proto::opentelemetry::resource::v1::Resource;
 
+use otap_df_otap::sampling::{OTEL_SAMPLING_NHAT, callsite_id};
+
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
-
-/// Reserved log attribute key carrying the per-callsite Horvitz-Thompson
-/// count of a representative across SDK -> agent transport.
-pub(crate) const OTEL_SAMPLING_NHAT: &str = "otel.sampling.nhat";
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
-    let mut h = seed;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
-}
-
-/// Compute the stable callsite identity of a log record.
-///
-/// Prefers `event_name` (the OTel-model field closest to a statement
-/// identity); falls back to a hash of `scope_name` + the string body when
-/// `event_name` is absent. The result is a 64-bit FNV-1a hash so the same
-/// callsite produces an identical token fleet-wide.
-pub(crate) fn callsite_id(scope_name: &str, rec: &LogRecord) -> u64 {
-    if !rec.event_name.is_empty() {
-        return fnv1a(FNV_OFFSET, rec.event_name.as_bytes());
-    }
-    let mut h = fnv1a(FNV_OFFSET, scope_name.as_bytes());
-    h = fnv1a(h, &[0]);
-    if let Some(body) = &rec.body {
-        if let Some(Value::StringValue(s)) = &body.value {
-            h = fnv1a(h, s.as_bytes());
-        }
-    }
-    h
-}
 
 /// Identity of a `(resource, scope)` grouping, used to faithfully regroup
 /// representatives into `ResourceLogs` / `ScopeLogs` on emission.

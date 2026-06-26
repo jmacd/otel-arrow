@@ -305,6 +305,7 @@ user_events-eventheader = ["otap-df-contrib-nodes/user_events-eventheader"]
 # Contrib processors (opt-in) - now in contrib-nodes
 contrib-processors = ["otap-df-contrib-nodes/contrib-processors"]
 condense-attributes-processor = ["otap-df-contrib-nodes/condense-attributes-processor"]
+global-reservoir-processor = ["otap-df-contrib-nodes/global-reservoir-processor"]
 log-sampler-processor = ["otap-df-contrib-nodes/log-sampler-processor"]
 recordset-kql-processor = ["otap-df-contrib-nodes/recordset-kql-processor"]
 resource-validator-processor = ["otap-df-contrib-nodes/resource-validator-processor"]

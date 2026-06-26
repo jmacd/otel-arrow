@@ -5,6 +5,10 @@
 #[cfg(feature = "condense-attributes-processor")]
 pub mod condense_attributes_processor;
 
+/// Global reservoir processor (two-level log sampling, agent side)
+#[cfg(feature = "global-reservoir-processor")]
+pub mod global_reservoir_processor;
+
 /// Local log sampler processor (two-level log sampling, SDK side)
 #[cfg(feature = "log-sampler-processor")]
 pub mod log_sampler_processor;
