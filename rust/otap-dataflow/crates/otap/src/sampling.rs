@@ -393,4 +393,71 @@ mod tests {
         assert_eq!(decoded.heavy[0].callsite, 10);
         assert!((decoded.heavy[0].g_c - 0.01).abs() < 1e-12);
     }
+
+    /// Round-trip a present table through an actual tonic [`MetadataMap`], exactly
+    /// as the OTLP/gRPC receiver attaches it to a Logs response and the OTLP/gRPC
+    /// exporter decodes it. This guards the gRPC wire path: it proves the
+    /// `otel-sample-*` header names and encoded values are valid ASCII metadata
+    /// keys/values and survive the insert -> read cycle unchanged.
+    #[test]
+    fn grpc_metadata_round_trip_present_table() {
+        use tonic::metadata::{MetadataMap, MetadataValue};
+
+        let table = GlobalTable {
+            version: 42,
+            tau_g: 0.001_234,
+            g_unseen: 0.5,
+            heavy: vec![
+                HeavyHitter {
+                    callsite: 0xdead_beef_0000_0001,
+                    g_c: 0.01,
+                },
+                HeavyHitter {
+                    callsite: 7,
+                    g_c: 0.002_5,
+                },
+            ],
+        };
+
+        // Attach side (receiver): encode and insert into gRPC metadata.
+        let mut md = MetadataMap::new();
+        for (name, value) in encode_headers(&table) {
+            let val = MetadataValue::try_from(value).expect("valid ASCII metadata value");
+            let _ = md.insert(name, val);
+        }
+
+        // Read side (exporter): decode from gRPC metadata.
+        let get = |name: &str| md.get(name).and_then(|v| v.to_str().ok());
+        let decoded = decode_headers(
+            get(HEADER_VER),
+            get(HEADER_TAU_G),
+            get(HEADER_G_UNSEEN),
+            get(HEADER_HEAVY),
+        );
+
+        assert_eq!(decoded, table);
+    }
+
+    /// An absent table encodes to no metadata, so the exporter leaves the last
+    /// table in force (decodes absent and stores nothing).
+    #[test]
+    fn grpc_metadata_absent_table_yields_empty() {
+        use tonic::metadata::{MetadataMap, MetadataValue};
+
+        let mut md = MetadataMap::new();
+        for (name, value) in encode_headers(&GlobalTable::absent()) {
+            let val = MetadataValue::try_from(value).expect("valid ASCII metadata value");
+            let _ = md.insert(name, val);
+        }
+        assert_eq!(md.len(), 0);
+
+        let get = |name: &str| md.get(name).and_then(|v| v.to_str().ok());
+        let decoded = decode_headers(
+            get(HEADER_VER),
+            get(HEADER_TAU_G),
+            get(HEADER_G_UNSEEN),
+            get(HEADER_HEAVY),
+        );
+        assert!(decoded.is_absent());
+    }
 }
