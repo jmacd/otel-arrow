@@ -1013,6 +1013,96 @@ mod tests {
             .expect("temporal reaggregation metrics resource attributes validation failed");
     }
 
+    /// Validates that the metrics admission processor passes log signals through
+    /// unchanged. The processor only gates metrics; logs are forwarded as-is.
+    #[test]
+    fn validation_metrics_admission_passthrough_logs() {
+        Scenario::new()
+            .pipeline(
+                Pipeline::from_file("./validation_pipelines/metrics-admission-processor.yaml")
+                    .expect("failed to read pipeline yaml"),
+            )
+            .add_generator(
+                "traffic_gen",
+                Generator::logs()
+                    .fixed_count(500)
+                    .otlp_grpc("receiver")
+                    .core_range(1, 1)
+                    .static_signals(),
+            )
+            .add_capture(
+                "validate",
+                Capture::default()
+                    .otap_grpc("exporter")
+                    .validate(vec![ValidationInstructions::Equivalence])
+                    .control_streams(["traffic_gen"])
+                    .core_range(2, 2),
+            )
+            .run()
+            .expect("metrics admission passthrough logs validation failed");
+    }
+
+    /// Validates that the metrics admission processor passes trace signals
+    /// through unchanged. The processor only gates metrics; traces are forwarded
+    /// as-is.
+    #[test]
+    fn validation_metrics_admission_passthrough_traces() {
+        Scenario::new()
+            .pipeline(
+                Pipeline::from_file("./validation_pipelines/metrics-admission-processor.yaml")
+                    .expect("failed to read pipeline yaml"),
+            )
+            .add_generator(
+                "traffic_gen",
+                Generator::traces()
+                    .fixed_count(500)
+                    .otlp_grpc("receiver")
+                    .core_range(1, 1)
+                    .static_signals(),
+            )
+            .add_capture(
+                "validate",
+                Capture::default()
+                    .otap_grpc("exporter")
+                    .validate(vec![ValidationInstructions::Equivalence])
+                    .control_streams(["traffic_gen"])
+                    .core_range(2, 2),
+            )
+            .run()
+            .expect("metrics admission passthrough traces validation failed");
+    }
+
+    /// Validates that the metrics admission processor admits metrics whose event
+    /// time is within the configured window. The traffic generator stamps data
+    /// points with wall-clock time, so with the default `max_lag`/`max_skew`
+    /// every point is admitted and the output is equivalent to the input.
+    #[test]
+    fn validation_metrics_admission_metrics() {
+        Scenario::new()
+            .pipeline(
+                Pipeline::from_file("./validation_pipelines/metrics-admission-processor.yaml")
+                    .expect("failed to read pipeline yaml"),
+            )
+            .add_generator(
+                "traffic_gen",
+                Generator::metrics()
+                    .fixed_count(500)
+                    .otlp_grpc("receiver")
+                    .core_range(1, 1)
+                    .static_signals(),
+            )
+            .add_capture(
+                "validate",
+                Capture::default()
+                    .otap_grpc("exporter")
+                    .validate(vec![ValidationInstructions::Equivalence])
+                    .control_streams(["traffic_gen"])
+                    .core_range(2, 2),
+            )
+            .run()
+            .expect("metrics admission metrics validation failed");
+    }
+
     #[test]
     fn validation_multiple_input_output() {
         Scenario::new()

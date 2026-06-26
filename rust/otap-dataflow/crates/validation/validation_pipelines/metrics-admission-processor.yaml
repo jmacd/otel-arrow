@@ -1,0 +1,24 @@
+nodes:
+  receiver:
+    type: "urn:otel:receiver:otlp"
+    config:
+      protocols:
+        grpc:
+          listening_addr: 127.0.0.1:4317
+  admission:
+    type: "urn:otel:processor:metrics_admission"
+    config:
+      max_lag: 1h
+      max_skew: 5m
+  exporter:
+    type: "urn:otel:exporter:otap"
+    config:
+      grpc_endpoint: http://127.0.0.1:4318
+      compression_method: none
+      arrow:
+        payload_compression: none
+connections:
+  - from: receiver
+    to: admission
+  - from: admission
+    to: exporter

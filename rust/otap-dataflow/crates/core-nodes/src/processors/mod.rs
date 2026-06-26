@@ -42,3 +42,6 @@ pub mod log_sampling_processor;
 
 /// Temporal reaggregation processor.
 pub mod temporal_reaggregation_processor;
+
+/// Metrics admission processor (ingest-queue phase 0).
+pub mod metrics_admission_processor;

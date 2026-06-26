@@ -9,9 +9,11 @@ queries) while disconnected from a central observability platform.
 
 > Status: early design, not yet implemented. The ingest queue (L1) is designed
 > separately in [`ingest-queue-design.md`](./ingest-queue-design.md) with
-> ratified decisions D1-D9. This document covers the layers above it (L2-L5).
-> Its decisions (D10-D17) are now **ratified** (see "Decisions"); what remains
-> is implementation, laid out in "Implementation phases". Names are provisional.
+> ratified decisions D1-D9; its **phase 0 (admission + per-core type registry)
+> is now implemented** as the `metrics_admission` processor. This document
+> covers the layers above it (L2-L5). Its decisions (D10-D17) are now
+> **ratified** (see "Decisions"); what remains is implementation, laid out in
+> "Implementation phases". Names are provisional.
 
 ## Motivation
 
@@ -524,8 +526,11 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
 **Where this stands:**
 
 - L1 (the ingest queue) is designed in `ingest-queue-design.md` (D1-D9
-  ratified). Nothing in this document is implemented yet; decisions D10-D17 are
-  ratified.
+  ratified); its **phase 0 is implemented** -- the `metrics_admission` processor
+  (`crates/core-nodes/src/processors/metrics_admission_processor/`) provides the
+  per-core type registry and the `[now - max_lag, now + max_skew]` admission
+  window that bounds L2's watermark (the floor/ceiling in "Watermarks").
+  Nothing in *this* document is implemented yet; decisions D10-D17 are ratified.
 - L2's seed exists -- the `temporal_reaggregation` processor -- but is
   processing-time, not event-time; L2 (phase A0) is the extension described here.
 - `quiver` (L1 substrate), the `parquet_exporter` (object-store Parquet, L5

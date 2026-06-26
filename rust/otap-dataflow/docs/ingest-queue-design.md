@@ -18,10 +18,10 @@ buffering), the topic system (broadcast and balanced delivery), the controller
 (placement and leases), and the query engine (DataFusion over OTAP for
 vectorized validation).
 
-> Status: early design, not yet implemented. Names are provisional. Decisions
-> D1 through D9 (see "Decisions") are ratified and gate most of the detail
-> below. See "Status and next steps" for where this stands and how to resume in
-> a fresh session.
+> Status: phase 0 is implemented; phases 1-4 are early design. Names are
+> provisional. Decisions D1 through D9 (see "Decisions") are ratified and gate
+> most of the detail below. See "Status and next steps" for where this stands
+> (including the phase-0 artifacts) and how to resume in a fresh session.
 
 ## Background and motivation
 
@@ -109,15 +109,18 @@ lossless mode.
 | Capability                      | Engine primitive                                                            | Status                              |
 | ------------------------------- | --------------------------------------------------------------------------- | ----------------------------------- |
 | Durable buffer-queue            | `quiver` (WAL + Arrow IPC segments, multi-subscriber at-least-once, budget) | exists (experimental)               |
-| Per-core type registry          | in-memory Arrow table + `quiver` snapshot                                   | exists                              |
+| Per-core type registry          | in-memory Arrow table + `quiver` snapshot                                   | in-memory done (Phase 0); durability TODO (Phase 1) |
 | Balanced work distribution      | balanced topic + thread-per-core controller                                 | exists                              |
 | Local control plane / placement | controller (core allocation, lifecycle, leases)                             | partial; local-only, no rebalancing |
 | Validation compute              | query engine / DataFusion over OTAP Arrow                                   | exists                              |
-| Manifest, admission, sharder    | (this design)                                                               | to build                            |
+| Admission + manifest (Phase 0)  | `processor:metrics_admission` (time-window gate, per-core type registry)    | exists (Phase 0)                    |
+| Auto-sharder                    | (this design)                                                               | to build                            |
 
-The durable-queue question is largely answered by `quiver` already. The new work
-is the admission front-end (the manifest) and the assignment control plane (the
-auto-sharder).
+The durable-queue question is largely answered by `quiver` already. Phase 0
+landed the admission front-end (the `metrics_admission` processor and its
+per-core `TypeRegistry`). The remaining new work is registry durability in
+Phase 1 and the assignment control plane -- the auto-sharder -- in Phase 2 and
+beyond.
 
 ## Architecture
 
@@ -257,7 +260,8 @@ A two-level mapping (the Slicer and M3 separation of concerns):
 - Hotspots are handled by moving whole buckets rather than resplitting keys.
   For metrics, a hot `metric_name` (many series under one name) can be
   adaptively sub-partitioned by series identity (extra radix bits) into several
-  buckets; `trace_id` is high-entropy and needs none. Size N so the hottest
+  buckets; `trace_id` is high-entropy (its low 56 bits are random by the OTel
+  randomness definition, D3 refinement) and needs none. Size N so the hottest
   bucket is tolerable.
 
 **Leases and fencing (from Centrifuge and Slicer):** each bucket has an owner
@@ -307,12 +311,20 @@ retention window. No transactional broker is required.
 
 ## Phased implementation plan
 
-- **Phase 0 -- identity and registry (single core):** `pdata-views` extracts
-  the identity key and type descriptor from OTAP columns. A new processor
-  performs the time-window check and records observed descriptors in an
-  in-memory registry (Arrow table) using DataFusion, admitting all rows and
-  emitting `name_conflict` warnings. Tests cover conflict warning, window
-  rejection, and the accept path.
+- **Phase 0 -- identity and registry (single core): DONE.** Implemented as the
+  `metrics_admission` processor
+  (`crates/core-nodes/src/processors/metrics_admission_processor/`, URN
+  `urn:otel:processor:metrics_admission`). `OtapMetricsView` extracts the
+  identity key and type descriptor; the per-core in-memory `TypeRegistry`
+  (`registry.rs`) records observed descriptors, admits all rows, and emits
+  one-shot `name_conflict` warnings (optional strict-reject mode). A new `pdata`
+  primitive, `filter_metrics_time_window`
+  (`crates/pdata/src/otap/filter.rs`), applies the
+  `[now - max_lag, now + max_skew]` gate with
+  `points_rejected_{too_old,too_future,malformed}` telemetry, cascading drops to
+  attribute/exemplar children. Tests cover conflict warning, window rejection,
+  the accept path, strict mode, and end-to-end admission. Single-tenant
+  (D9 default); the per-tenant projection arrives with later phases.
 - **Phase 1 -- per-core registry and durability:** shuffle by signal key so
   each core owns its names; maintain the registry locally (no broadcast).
   Persist the registry (snapshot plus WAL, Quiver-backed) with startup replay.
@@ -343,7 +355,7 @@ decision, rationale, and implications.**
 | -- | -------------------------- | ------------------------------------ | ------- |
 | D1 | Type-identity domain       | identity key = name in tenant        | decided |
 | D2 | New name on data path      | admit-and-record (no quarantine)     | decided |
-| D3 | Sharding scheme            | hash by signal key                   | decided |
+| D3 | Sharding scheme            | per-signal: hash name, slice trace_id | decided |
 | D4 | Storage locality           | configurable: local + object-store   | decided |
 | D5 | Sizing M and N             | N ~ 16-64x cores (pow2), streams     | decided |
 | D6 | QoS default                | loss-tolerant default, lossless mode | decided |
@@ -398,11 +410,13 @@ Defines the first-point tail-latency expectation.
 
 ### D3. Sharding scheme: hash versus range
 
-**Decided:** hash the signal key (`metric_name` for metrics, `trace_id` for
-traces) into N fixed buckets -- the morsel-driven radix exchange (D5). Hashing
-gives trivial routing and even load with no split/merge machinery; an ingest
-queue needs no key locality or range scans. Range partitioning was considered
-and rejected as unnecessary machinery for a queue.
+**Decided:** partition the signal key into N fixed buckets via the
+morsel-driven radix exchange (D5). The key-to-bucket function is **per signal**
+(see the refinement below): `metric_name` is *hashed* (it is skewed), while
+`trace_id` is *sliced* on its low bits (it is already uniform). Both give
+trivial routing and even load with no split/merge machinery; an ingest queue
+needs no key locality or range scans. General range partitioning over arbitrary
+keys was considered and rejected as unnecessary machinery for a queue.
 
 **Why it matters:** it determines load evenness, routing complexity, and
 whether a split/merge state machine (Monarch) is needed or fixed buckets (M3)
@@ -412,6 +426,34 @@ suffice.
 and the rebalancing strategy. The shuffle key co-locates a metric's data with
 its type registry (see Architecture). Couples to D5 (the value of N) and the
 hot-`metric_name` sub-partitioning noted under Auto-sharding.
+
+**Refinement (per-signal partitioner, ratified):** the key-to-bucket function
+follows the key's entropy, not one rule.
+
+- *Metrics (`metric_name`):* hash into the bucket space. Names are
+  low-cardinality and skewed, so hashing is what spreads them; a hot name gets
+  series-identity sub-partitioning (see Auto-sharding).
+- *Traces and trace-correlated logs (`trace_id`):* slice the low bits -- no
+  hash. OpenTelemetry defines the right-most 56 bits of `trace-id` as the trace
+  *randomness value* used by consistent probability sampling, and W3C Trace
+  Context Level 2's *random-trace-id* flag propagates that those bits are
+  uniform over `[0, 2^56-1]`. We treat them as random by definition: with
+  power-of-two N the bucket is the low `log2(N)` bits (`trace_id & (N-1)`), the
+  hash-free radix, so sharding reuses the same entropy source as sampling. A
+  defensive `hash(trace_id)` fallback is available by configuration for
+  non-conformant producers, but is not the default. `trace_id` is never
+  sub-partitioned: a whole trace (its spans and correlated logs) stays in one
+  bucket.
+- *Standalone logs (no `trace_id`):* a separate keying decision (resource
+  identity or a sampling key); still open.
+
+**Bucket = the flush/forward unit (write amplification).** Because the bucket is
+the co-located unit -- all of a name's series, or all of a trace's spans and
+logs -- it is also the natural unit of durable flush (one Arrow-IPC stream per
+bucket, D5) and of forwarding. A co-located trace is written and forwarded
+**once**, not scattered across owners and re-sorted by `trace_id` in a backend
+compaction pass. The shuffle moves the sort to cheap ingest-time routing:
+co-location turns sort-on-compact into sort-on-write.
 
 ### D4. Storage locality: local disk versus shared object store
 
@@ -621,21 +663,35 @@ which the downstream watermark operates.
 
 **Where this stands:**
 
-- This document is placed; nothing here is implemented yet.
+- **Phase 0 is implemented**: the `metrics_admission` processor
+  (`crates/core-nodes/src/processors/metrics_admission_processor/`) and the
+  `pdata` primitive `filter_metrics_time_window`
+  (`crates/pdata/src/otap/filter.rs`). See the phased plan above for details.
+  Phases 1-4 are not yet implemented.
 - The durable buffer substrate (`quiver`) exists (experimental). The broadcast
-  and balanced topics, the controller, and DataFusion query support exist.
-- The manifest, the admission processor, and the auto-sharder do not yet exist.
+  and balanced topics, the controller, and DataFusion query support exist. The
+  `durable_buffer_processor` already wraps `quiver` as a pipeline node.
+- Registry durability, the name-keyed shuffle, the auto-sharder, and the
+  placement plane do not yet exist.
 - All decisions D1 through D9 are ratified. The two-plane collapse (metrics
   shuffle by `metric_name`) is adopted.
 
-**To resume in a new session, start here:**
+**To resume in a new session, start at Phase 1:**
 
-1. Confirm the metric identity-extraction columns (the name plus the tenant
-   projection) feeding the registry, via `pdata-views`.
-2. Begin Phase 0: a single-core admission processor (time-window check plus
-   per-core registry) admitting all rows with `name_conflict` warning and
-   window-rejection telemetry.
-3. File tracking issues for the phases and for each ratified decision.
+1. Shuffle by the signal key (`metric_name`) so each core owns its names: route
+   admission behind a name-keyed shuffle (a topic/exchange partitioned by
+   `hash(tenant, name)`) so each replica's `TypeRegistry` is the sole authority
+   for its names, with no broadcast. Build the shuffle's key-to-bucket function
+   as a **per-signal partitioner** (D3 refinement): `hash(name)` for metrics,
+   low-56-bit slice of `trace_id` for traces/correlated-logs.
+2. Persist the per-core registry: a compacted snapshot plus an append log (a
+   dedicated `quiver` instance or `quiver`-style WAL), replayed on startup
+   before admission resumes. The `TypeDescriptor`/`observe` registry API is
+   already in `metrics_admission_processor/registry.rs`; it needs a
+   serialization + WAL/snapshot layer. See `durable_buffer_processor` and the
+   `quiver` README/ARCHITECTURE for the WAL + snapshot patterns.
+3. Add restart-replay and conflict-flagging tests.
+4. File tracking issues for the remaining phases and the ratified decisions.
 
 **Related engine docs:** `design-principles.md`, `topic-architecture.md`,
 `load-balancing.md`, `memory-limiter-phase1.md`, and the `quiver` crate README.

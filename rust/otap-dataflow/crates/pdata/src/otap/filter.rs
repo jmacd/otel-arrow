@@ -3,7 +3,8 @@
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, Float64Array, Int64Array,
-    PrimitiveArray, RecordBatch, StringArray, StructArray, UInt16Array, UInt32Array,
+    PrimitiveArray, RecordBatch, StringArray, StructArray, TimestampNanosecondArray, UInt16Array,
+    UInt32Array,
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, UInt8Type, UInt16Type, UInt32Type};
@@ -1849,6 +1850,228 @@ pub fn filter_otap_batch(
     result
 }
 
+/// Per-reason data-point counts produced by [`filter_metrics_time_window`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimeWindowCounts {
+    /// Data points retained because their event time fell within the window.
+    pub kept: u64,
+    /// Data points dropped because their event time was before the window
+    /// (older than the lower bound).
+    pub too_old: u64,
+    /// Data points dropped because their event time was after the window
+    /// (further future than the upper bound).
+    pub too_future: u64,
+    /// Data points dropped for other reasons (e.g. a null event time).
+    pub malformed: u64,
+}
+
+impl TimeWindowCounts {
+    /// Total number of data points dropped, summed across all reasons.
+    #[must_use]
+    pub fn rejected(&self) -> u64 {
+        self.too_old + self.too_future + self.malformed
+    }
+}
+
+/// Filter one metric data-point family by the event-time window and cascade the
+/// removal to that family's attribute and exemplar child batches.
+///
+/// `direct_children` are batches whose `parent_id` references the data-point
+/// `id` (attributes, exemplars); `grandchildren` reference a direct child's `id`
+/// (exemplar attributes) and must therefore be filtered after their parents are
+/// written into `output`.
+#[allow(clippy::too_many_arguments)]
+fn filter_metric_dp_family(
+    input: &OtapArrowRecords,
+    output: &mut OtapArrowRecords,
+    dp_type: ArrowPayloadType,
+    direct_children: &[ArrowPayloadType],
+    grandchildren: &[ArrowPayloadType],
+    lo: i64,
+    hi: i64,
+    counts: &mut TimeWindowCounts,
+    id_bitmap: &mut IdBitmap,
+) -> Result<()> {
+    let Some(dp_rb) = input.get(dp_type) else {
+        return Ok(());
+    };
+    let total = dp_rb.num_rows();
+
+    // Build the keep mask and per-reason tallies on the event-time column.
+    use arrow::compute::kernels::cmp;
+    let ts = get_required_array(dp_rb, consts::TIME_UNIX_NANO)?;
+    let lo_scalar = TimestampNanosecondArray::new_scalar(lo);
+    let hi_scalar = TimestampNanosecondArray::new_scalar(hi);
+
+    let ge_lo =
+        cmp::gt_eq(&ts, &lo_scalar).map_err(|source| Error::ColumnLengthMismatch { source })?;
+    let le_hi =
+        cmp::lt_eq(&ts, &hi_scalar).map_err(|source| Error::ColumnLengthMismatch { source })?;
+    let keep = nulls_to_false(
+        &arrow::compute::and_kleene(&ge_lo, &le_hi)
+            .map_err(|source| Error::ColumnLengthMismatch { source })?,
+    );
+    let kept = keep.true_count();
+
+    let too_old = nulls_to_false(
+        &cmp::lt(&ts, &lo_scalar).map_err(|source| Error::ColumnLengthMismatch { source })?,
+    )
+    .true_count();
+    let too_future = nulls_to_false(
+        &cmp::gt(&ts, &hi_scalar).map_err(|source| Error::ColumnLengthMismatch { source })?,
+    )
+    .true_count();
+    // Remaining rejects (e.g. null timestamps) are neither too-old nor too-future.
+    let malformed = total - kept - too_old - too_future;
+
+    counts.kept += kept as u64;
+    counts.too_old += too_old as u64;
+    counts.too_future += too_future as u64;
+    counts.malformed += malformed as u64;
+
+    // Fast path: every data point in this family is within the window; copy the
+    // family and its children unchanged.
+    if kept == total {
+        output.set(dp_type, dp_rb.clone())?;
+        for &child in direct_children.iter().chain(grandchildren) {
+            if let Some(child_rb) = input.get(child) {
+                output.set(child, child_rb.clone())?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Some data points dropped: filter the family, then cascade to children.
+    // `filter_child_batch` reads the *filtered* parent back from `output`, so the
+    // data-point batch (and any direct child that parents a grandchild) must be
+    // written before its descendants are filtered.
+    let filtered = filter_record_batch(dp_rb, &keep)
+        .map_err(|source| Error::ColumnLengthMismatch { source })?;
+    output.set(dp_type, filtered)?;
+    for &child in direct_children {
+        filter_child_batch::<UInt32Type>(input, output, child, id_bitmap)?;
+    }
+    for &child in grandchildren {
+        filter_child_batch::<UInt32Type>(input, output, child, id_bitmap)?;
+    }
+    Ok(())
+}
+
+/// Filter the data points of a metrics OTAP batch by an event-time window on the
+/// `time_unix_nano` column, retaining data points whose event time satisfies
+/// `lo <= time_unix_nano <= hi` (nanoseconds since the Unix epoch).
+///
+/// Every data-point family present (number, summary, histogram, exponential
+/// histogram) is filtered, and each removal cascades to that family's attribute
+/// and exemplar child batches so parent/child `id` integrity is preserved.
+/// Metric, scope, and resource rows and their attributes are retained unchanged;
+/// a metric whose data points are all dropped simply carries no data points.
+///
+/// `pool` is borrowed so that paged-bitmap allocations are reused across batches.
+///
+/// Transport-optimized (delta-encoded) ids must be decoded before calling this
+/// function (see [`OtapArrowRecords::decode_transport_optimized_ids`]).
+///
+/// Returns the filtered batch together with per-reason data-point counts.
+pub fn filter_metrics_time_window(
+    otap_batch: &OtapArrowRecords,
+    lo: i64,
+    hi: i64,
+    pool: &mut IdBitmapPool,
+) -> Result<(OtapArrowRecords, TimeWindowCounts)> {
+    if !matches!(otap_batch, OtapArrowRecords::Metrics(_)) {
+        return Err(Error::Format {
+            error: format!(
+                "filter_metrics_time_window requires a metrics batch, got {:?}",
+                otap_batch.root_payload_type()
+            ),
+        });
+    }
+
+    let mut counts = TimeWindowCounts::default();
+
+    // No root metrics batch -> nothing to filter.
+    let Some(root) = otap_batch.get(ArrowPayloadType::UnivariateMetrics) else {
+        return Ok((otap_batch.clone(), counts));
+    };
+
+    // Copy the root and its non-data-point children unchanged: the window gate
+    // drops data points, never metric/scope/resource identities.
+    let mut output = OtapArrowRecords::Metrics(Metrics::default());
+    output.set(ArrowPayloadType::UnivariateMetrics, root.clone())?;
+    for pt in [
+        ArrowPayloadType::ResourceAttrs,
+        ArrowPayloadType::ScopeAttrs,
+        ArrowPayloadType::MetricAttrs,
+    ] {
+        if let Some(rb) = otap_batch.get(pt) {
+            output.set(pt, rb.clone())?;
+        }
+    }
+
+    let mut id_bitmap = pool.acquire();
+    let result = (|| -> Result<()> {
+        filter_metric_dp_family(
+            otap_batch,
+            &mut output,
+            ArrowPayloadType::NumberDataPoints,
+            &[
+                ArrowPayloadType::NumberDpAttrs,
+                ArrowPayloadType::NumberDpExemplars,
+            ],
+            &[ArrowPayloadType::NumberDpExemplarAttrs],
+            lo,
+            hi,
+            &mut counts,
+            &mut id_bitmap,
+        )?;
+        filter_metric_dp_family(
+            otap_batch,
+            &mut output,
+            ArrowPayloadType::SummaryDataPoints,
+            &[ArrowPayloadType::SummaryDpAttrs],
+            &[],
+            lo,
+            hi,
+            &mut counts,
+            &mut id_bitmap,
+        )?;
+        filter_metric_dp_family(
+            otap_batch,
+            &mut output,
+            ArrowPayloadType::HistogramDataPoints,
+            &[
+                ArrowPayloadType::HistogramDpAttrs,
+                ArrowPayloadType::HistogramDpExemplars,
+            ],
+            &[ArrowPayloadType::HistogramDpExemplarAttrs],
+            lo,
+            hi,
+            &mut counts,
+            &mut id_bitmap,
+        )?;
+        filter_metric_dp_family(
+            otap_batch,
+            &mut output,
+            ArrowPayloadType::ExpHistogramDataPoints,
+            &[
+                ArrowPayloadType::ExpHistogramDpAttrs,
+                ArrowPayloadType::ExpHistogramDpExemplars,
+            ],
+            &[ArrowPayloadType::ExpHistogramDpExemplarAttrs],
+            lo,
+            hi,
+            &mut counts,
+            &mut id_bitmap,
+        )?;
+        Ok(())
+    })();
+    pool.release(id_bitmap);
+    result?;
+
+    Ok((output, counts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2511,5 +2734,110 @@ mod tests {
         let mut bitmap = bitmap_from(&[1, 2, 3]);
         bitmap.clear();
         assert_eq!(bitmap.iter().count(), 0);
+    }
+
+    fn metrics_with_number_points(times_ns: &[u64]) -> OtapArrowRecords {
+        use crate::proto::OtlpProtoMessage;
+        use crate::proto::opentelemetry::common::v1::{AnyValue, InstrumentationScope, KeyValue};
+        use crate::proto::opentelemetry::metrics::v1::{
+            AggregationTemporality, Metric, MetricsData, NumberDataPoint, ResourceMetrics,
+            ScopeMetrics, Sum,
+        };
+        use crate::proto::opentelemetry::resource::v1::Resource;
+        use crate::testing::round_trip::otlp_to_otap;
+
+        let points = times_ns
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                NumberDataPoint::build()
+                    .time_unix_nano(t)
+                    .value_int(i as i64)
+                    .attributes(vec![KeyValue::new("k", AnyValue::new_string("v"))])
+                    .finish()
+            })
+            .collect::<Vec<_>>();
+
+        let data = MetricsData::new(vec![ResourceMetrics::new(
+            Resource::default(),
+            vec![ScopeMetrics::new(
+                InstrumentationScope::build()
+                    .name("scope".to_string())
+                    .finish(),
+                vec![
+                    Metric::build()
+                        .name("test.counter")
+                        .data_sum(Sum::new(AggregationTemporality::Cumulative, true, points))
+                        .finish(),
+                ],
+            )],
+        )]);
+
+        let mut otap = otlp_to_otap(&OtlpProtoMessage::Metrics(data));
+        otap.decode_transport_optimized_ids().unwrap();
+        otap
+    }
+
+    fn dp_rows(b: &OtapArrowRecords, t: ArrowPayloadType) -> usize {
+        b.get(t).map(|rb| rb.num_rows()).unwrap_or(0)
+    }
+
+    #[test]
+    fn test_time_window_keeps_in_window_and_cascades() {
+        use arrow::array::TimestampNanosecondArray;
+
+        let input = metrics_with_number_points(&[1000, 2000, 3000]);
+        assert_eq!(dp_rows(&input, ArrowPayloadType::NumberDataPoints), 3);
+        assert_eq!(dp_rows(&input, ArrowPayloadType::NumberDpAttrs), 3);
+
+        let mut pool = IdBitmapPool::new();
+        let (out, counts) = filter_metrics_time_window(&input, 1500, 2500, &mut pool).unwrap();
+
+        assert_eq!(counts.kept, 1);
+        assert_eq!(counts.too_old, 1);
+        assert_eq!(counts.too_future, 1);
+        assert_eq!(counts.malformed, 0);
+        assert_eq!(counts.rejected(), 2);
+
+        // Metric identity retained; data points and their attributes pruned together.
+        assert_eq!(dp_rows(&out, ArrowPayloadType::UnivariateMetrics), 1);
+        assert_eq!(dp_rows(&out, ArrowPayloadType::NumberDataPoints), 1);
+        assert_eq!(dp_rows(&out, ArrowPayloadType::NumberDpAttrs), 1);
+
+        // The surviving data point is the one at t=2000.
+        let ndp = out.get(ArrowPayloadType::NumberDataPoints).unwrap();
+        let ts = ndp
+            .column_by_name(consts::TIME_UNIX_NANO)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), 2000);
+    }
+
+    #[test]
+    fn test_time_window_passthrough_keeps_all() {
+        let input = metrics_with_number_points(&[1000, 2000, 3000]);
+        let mut pool = IdBitmapPool::new();
+        let (out, counts) = filter_metrics_time_window(&input, 0, i64::MAX, &mut pool).unwrap();
+        assert_eq!(counts.kept, 3);
+        assert_eq!(counts.rejected(), 0);
+        assert_eq!(dp_rows(&out, ArrowPayloadType::NumberDataPoints), 3);
+        assert_eq!(dp_rows(&out, ArrowPayloadType::NumberDpAttrs), 3);
+    }
+
+    #[test]
+    fn test_time_window_drops_all_but_keeps_metric_row() {
+        let input = metrics_with_number_points(&[1000, 2000, 3000]);
+        let mut pool = IdBitmapPool::new();
+        // Window entirely after all points: every data point is too old.
+        let (out, counts) = filter_metrics_time_window(&input, 10_000, 20_000, &mut pool).unwrap();
+        assert_eq!(counts.kept, 0);
+        assert_eq!(counts.too_old, 3);
+        assert_eq!(counts.too_future, 0);
+        // The metric row survives even though all of its data points were dropped.
+        assert_eq!(dp_rows(&out, ArrowPayloadType::UnivariateMetrics), 1);
+        assert_eq!(dp_rows(&out, ArrowPayloadType::NumberDataPoints), 0);
+        assert_eq!(dp_rows(&out, ArrowPayloadType::NumberDpAttrs), 0);
     }
 }
