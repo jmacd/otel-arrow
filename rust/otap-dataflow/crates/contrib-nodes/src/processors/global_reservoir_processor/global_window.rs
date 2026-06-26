@@ -288,8 +288,9 @@ mod tests {
         let a = callsite_id("scope", &rec("a", None));
         let b = callsite_id("scope", &rec("b", None));
         assert!(table.g_for(a) < table.g_for(b));
-        // g_unseen is the rarest floor 1/min_N = 1/2 (callsite 'b').
-        assert!((table.g_unseen - 0.5).abs() < 1e-12);
+        // g_unseen is the rarest floor 1/min_N. Callsite 'c' has nhat=None ->
+        // count 1, so min_N = 1 and g_unseen = 1.0.
+        assert!((table.g_unseen - 1.0).abs() < 1e-12);
     }
 
     #[test]
