@@ -29,7 +29,7 @@ use otap_df_pdata::proto::opentelemetry::common::v1::{
 use otap_df_pdata::proto::opentelemetry::logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs};
 use otap_df_pdata::proto::opentelemetry::resource::v1::Resource;
 
-use otap_df_otap::sampling::{OTEL_SAMPLING_NHAT, callsite_id};
+use otap_df_otap::sampling::{GlobalTable, OTEL_SAMPLING_NHAT, callsite_id};
 
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
@@ -80,6 +80,15 @@ pub(crate) struct WindowStats {
     pub distinct_callsites: u64,
     /// The local threshold `tau^L` (`+inf` if the reservoir did not fill).
     pub tau_l: f64,
+}
+
+/// Result of observing a batch under the binding gate.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ObserveStats {
+    /// Records seen.
+    pub observed: usize,
+    /// Records rejected by the global gate before reaching the reservoir.
+    pub globally_rejected: usize,
 }
 
 /// Weighted bottom-`(k+1)` reservoir over a window.
@@ -137,10 +146,17 @@ impl WindowSampler {
         }
     }
 
-    /// Observe a batch of logs, admitting each record into the reservoir.
-    /// Returns the number of records observed.
-    pub(crate) fn observe_logs(&mut self, logs: LogsData) -> usize {
-        let mut observed = 0;
+    /// Observe a batch of logs, applying the binding gate and admitting
+    /// surviving records into the reservoir.
+    ///
+    /// For each record a single `u ~ Uniform(0, 1]` is drawn and shared
+    /// between the global and local tests, so the realized admission rule is
+    /// exactly `-ln(u) < min(tau^L * w_c, tau^G * g_c)`. The global test is a
+    /// pre-admission skip: a record is dropped before entering the reservoir
+    /// when `-ln(u) >= tau^G * g_c`. An absent (slack) table makes `tau^G * g_c`
+    /// infinite, so nothing is rejected and behaviour reduces to local-only.
+    pub(crate) fn observe_logs(&mut self, logs: LogsData, table: &GlobalTable) -> ObserveStats {
+        let mut stats = ObserveStats::default();
         for rl in logs.resource_logs {
             let resource = rl.resource;
             let resource_schema_url = rl.schema_url;
@@ -154,24 +170,39 @@ impl WindowSampler {
                     scope_schema_url: sl.schema_url,
                 });
                 for rec in sl.log_records {
-                    observed += 1;
+                    stats.observed += 1;
                     let callsite = callsite_id(scope_name, &rec);
                     let w = self.weight_for(callsite);
                     // u in (0, 1]: random() is [0, 1), so 1 - random() is (0, 1].
                     let u = 1.0 - self.rng.random::<f64>();
-                    let key = -u.ln() / w;
+                    let neg_ln_u = -u.ln();
+                    // Global gate (shared u). theta_g is +inf for a slack table.
+                    let theta_g = table.tau_g * table.g_for(callsite);
+                    if neg_ln_u >= theta_g {
+                        stats.globally_rejected += 1;
+                        continue;
+                    }
+                    let key = neg_ln_u / w;
                     self.admit(key, callsite, group, rec);
                 }
             }
         }
-        observed
+        stats
     }
 
     /// Close the current window, returning the representatives as `LogsData`
     /// annotated with per-callsite `nhat`, and roll the weights forward.
     ///
+    /// The HT count uses the *binding* inclusion probability
+    /// `1 - exp(-min(tau^L * w_c, tau^G * g_c))`, so the per-callsite estimate
+    /// stays unbiased under the global gate and the agent's sum recovers the
+    /// true counts. `table` is the global table in force at window close.
+    ///
     /// Returns `None` when the window is empty.
-    pub(crate) fn close_window(&mut self) -> Option<(LogsData, WindowStats)> {
+    pub(crate) fn close_window(
+        &mut self,
+        table: &GlobalTable,
+    ) -> Option<(LogsData, WindowStats)> {
         if self.heap.is_empty() {
             self.groups.clear();
             return None;
@@ -202,8 +233,12 @@ impl WindowSampler {
         let mut max_next_w = 0.0_f64;
         for (&c, &m) in &counts {
             let w = self.weight_for(c);
-            let denom = if tau_l.is_finite() {
-                1.0 - (-tau_l * w).exp()
+            // Binding inclusion threshold: min of the local and global scores.
+            let theta_local = tau_l * w;
+            let theta_global = table.tau_g * table.g_for(c);
+            let theta = theta_local.min(theta_global);
+            let denom = if theta.is_finite() {
+                1.0 - (-theta).exp()
             } else {
                 1.0
             };
@@ -316,7 +351,7 @@ mod tests {
         let mut s = WindowSampler::new(8);
         let records: Vec<LogRecord> =
             (0..1000).map(|i| log_with_event(&format!("e{i}"))).collect();
-        let _ = s.observe_logs(logs_data("scope", records));
+        let _ = s.observe_logs(logs_data("scope", records), &GlobalTable::absent());
         assert!(s.heap.len() <= 9);
     }
 
@@ -324,8 +359,8 @@ mod tests {
     fn under_k_keeps_everything_with_exact_counts() {
         let mut s = WindowSampler::new(100);
         let records = vec![log_with_event("a"), log_with_event("a"), log_with_event("b")];
-        let _ = s.observe_logs(logs_data("scope", records));
-        let (out, stats) = s.close_window().expect("non-empty");
+        let _ = s.observe_logs(logs_data("scope", records), &GlobalTable::absent());
+        let (out, stats) = s.close_window(&GlobalTable::absent()).expect("non-empty");
         assert_eq!(count_records(&out), 3);
         assert!(stats.tau_l.is_infinite());
         // With tau^L = +inf, nhat == m_c (exact).
@@ -343,7 +378,45 @@ mod tests {
     #[test]
     fn empty_window_returns_none() {
         let mut s = WindowSampler::new(4);
-        assert!(s.close_window().is_none());
+        assert!(s.close_window(&GlobalTable::absent()).is_none());
+    }
+
+    #[test]
+    fn global_gate_suppresses_a_heavy_callsite() {
+        use otap_df_otap::sampling::HeavyHitter;
+        // A table that makes the "hot" callsite extremely unlikely to pass the
+        // global gate (tiny g_c, finite tau^G), while leaving everything else
+        // at the permissive g_unseen floor.
+        let hot = callsite_id("scope", &log_with_event("hot"));
+        let table = GlobalTable {
+            version: 1,
+            tau_g: 1.0,
+            g_unseen: f64::INFINITY,
+            heavy: vec![HeavyHitter {
+                callsite: hot,
+                g_c: 1e-9,
+            }],
+        };
+        let mut s = WindowSampler::new(1000);
+        let mut records: Vec<LogRecord> = (0..2000).map(|_| log_with_event("hot")).collect();
+        records.push(log_with_event("rare"));
+        let stats = s.observe_logs(logs_data("scope", records), &table);
+        assert_eq!(stats.observed, 2001);
+        // Nearly all "hot" records are dropped by the global gate; the
+        // non-enumerated "rare" callsite (g_unseen = +inf) is never throttled.
+        assert!(
+            stats.globally_rejected > 1900,
+            "expected heavy suppression, got {}",
+            stats.globally_rejected
+        );
+        let (out, _) = s.close_window(&table).expect("rare survives");
+        let survived_rare = out
+            .resource_logs
+            .iter()
+            .flat_map(|rl| &rl.scope_logs)
+            .flat_map(|sl| &sl.log_records)
+            .any(|r| r.event_name == "rare");
+        assert!(survived_rare, "globally-unique callsite must be preserved");
     }
 
     #[test]
@@ -358,8 +431,8 @@ mod tests {
         for _ in 0..windows {
             let records: Vec<LogRecord> =
                 (0..true_count).map(|_| log_with_event("hot")).collect();
-            let _ = s.observe_logs(logs_data("scope", records));
-            if let Some((out, _)) = s.close_window() {
+            let _ = s.observe_logs(logs_data("scope", records), &GlobalTable::absent());
+            if let Some((out, _)) = s.close_window(&GlobalTable::absent()) {
                 let rec = &out.resource_logs[0].scope_logs[0].log_records[0];
                 sum += nhat_of(rec).expect("nhat");
             }

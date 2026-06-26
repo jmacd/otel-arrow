@@ -4,16 +4,19 @@
 //! Local log sampler processor (SDK side of two-level log sampling).
 //!
 //! Maintains a weighted bottom-`(k+1)` reservoir over a fixed time window
-//! (see [`bottomk`]). Incoming log batches are absorbed into the reservoir
-//! and acknowledged; on each window-close [`NodeControlMsg::TimerTick`] the
-//! kept representatives are emitted downstream, each annotated with its
-//! Horvitz-Thompson count under the [`bottomk::OTEL_SAMPLING_NHAT`] attribute.
+//! (see [`bottomk`]). Incoming log batches are filtered by the binding gate
+//! and absorbed into the reservoir, then acknowledged; on each window-close
+//! [`NodeControlMsg::TimerTick`] the kept representatives are emitted
+//! downstream, each annotated with its Horvitz-Thompson count under the
+//! `otel.sampling.nhat` attribute.
+//!
+//! When a `feedback_channel` is configured, the sampler consults the global
+//! heavy-hitter table published on that channel (decoded from the agent's OTLP
+//! responses by the exporter) as the global half of the binding admission rule
+//! `-ln(u) < min(tau^L * w_c, tau^G * g_c)`. Without a channel the global gate
+//! is slack (`tau^G = +inf`) and admission is purely local.
 //!
 //! Non-log signals pass through unchanged.
-//!
-//! This is milestone M0 of the feedback design: the global gate is always
-//! slack (`tau^G = +inf`), so admission is purely local. Later milestones add
-//! the global reservoir and the feedback return path.
 
 mod bottomk;
 mod metrics;
@@ -40,6 +43,7 @@ use otap_df_engine::node::NodeId;
 use otap_df_engine::processor::ProcessorWrapper;
 use otap_df_otap::OTAP_PROCESSOR_FACTORIES;
 use otap_df_otap::pdata::{Context, OtapPdata};
+use otap_df_otap::sampling::{GlobalTable, SharedGlobalTable, shared_global_table};
 use otap_df_pdata::TryIntoWithOptions;
 use otap_df_pdata::OtapPayload;
 use otap_df_pdata::otlp::OtlpProtoBytes;
@@ -60,6 +64,13 @@ struct Config {
     /// Length of the sampling window (e.g. "5s", "1m").
     #[serde(with = "humantime_serde")]
     interval: Duration,
+    /// Optional two-level sampling feedback channel. When set, the sampler
+    /// consults the global heavy-hitter table published on this channel (by
+    /// the OTLP exporter that decoded it from the agent's responses) as the
+    /// global half of the binding gate. When unset, the global gate is always
+    /// slack (local-only sampling).
+    #[serde(default)]
+    feedback_channel: Option<String>,
 }
 
 impl Config {
@@ -83,6 +94,9 @@ struct LogSamplerProcessor {
     sampler: WindowSampler,
     interval: Duration,
     timer_started: bool,
+    /// Shared global heavy-hitter table for the binding gate; `None` means the
+    /// global gate is always slack.
+    shared: Option<SharedGlobalTable>,
     metrics: MetricSet<LogSamplerMetrics>,
 }
 
@@ -99,8 +113,18 @@ impl LogSamplerProcessor {
             sampler: WindowSampler::new(config.k),
             interval: config.interval,
             timer_started: false,
+            shared: config.feedback_channel.as_deref().map(shared_global_table),
             metrics,
         })
+    }
+
+    /// Snapshot the current global table (absent when no feedback channel is
+    /// configured), used as the global half of the binding gate.
+    fn current_table(&self) -> Arc<GlobalTable> {
+        match &self.shared {
+            Some(shared) => shared.load_full(),
+            None => Arc::new(GlobalTable::absent()),
+        }
     }
 
     /// Decode an incoming log payload, absorb its records into the reservoir,
@@ -131,7 +155,11 @@ impl LogSamplerProcessor {
             }
         };
 
-        let _ = self.sampler.observe_logs(logs);
+        let table = self.current_table();
+        let stats = self.sampler.observe_logs(logs, &table);
+        self.metrics
+            .globally_rejected
+            .add(stats.globally_rejected as u64);
 
         // The data now lives in the reservoir; acknowledge the input so the
         // upstream sender's delivery accounting completes.
@@ -149,7 +177,8 @@ impl LogSamplerProcessor {
         &mut self,
         effect_handler: &mut local::EffectHandler<OtapPdata>,
     ) -> Result<(), EngineError> {
-        let Some((logs, stats)) = self.sampler.close_window() else {
+        let table = self.current_table();
+        let Some((logs, stats)) = self.sampler.close_window(&table) else {
             return Ok(());
         };
 
