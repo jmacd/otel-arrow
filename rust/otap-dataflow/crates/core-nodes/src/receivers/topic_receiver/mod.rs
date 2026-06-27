@@ -119,6 +119,14 @@ pub enum TopicSubscriptionConfig {
         /// Balanced consumer-group identifier.
         group: SubscriptionGroupName,
     },
+    /// The subscriber exclusively owns a set of partitions in a
+    /// partition-dispatch topic, receiving only those partitions' messages
+    /// (Layer C of the partition-dispatch design). The owned set comes from the
+    /// placement map.
+    PartitionDispatch {
+        /// The partitions this receiver owns.
+        owned_partitions: Vec<u32>,
+    },
 }
 
 impl Default for TopicSubscriptionConfig {
@@ -178,6 +186,11 @@ pub static TOPIC_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
             TopicSubscriptionConfig::Balanced { group } => SubscriptionMode::Balanced {
                 group: group.clone(),
             },
+            TopicSubscriptionConfig::PartitionDispatch { owned_partitions } => {
+                SubscriptionMode::PartitionDispatch {
+                    owned_partitions: owned_partitions.clone(),
+                }
+            }
         };
         let subscription = topic_binding
             .subscribe(mode, SubscriberOptions::default())
@@ -240,6 +253,9 @@ impl local::Receiver<OtapPdata> for TopicReceiver {
         let subscription_mode = match &config.subscription {
             TopicSubscriptionConfig::Broadcast {} => "broadcast".to_owned(),
             TopicSubscriptionConfig::Balanced { group } => format!("balanced(group={})", group),
+            TopicSubscriptionConfig::PartitionDispatch { owned_partitions } => {
+                format!("partition_dispatch(owns={owned_partitions:?})")
+            }
         };
         let receiver_id = effect_handler.receiver_id();
         otel_info!(

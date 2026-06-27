@@ -86,8 +86,8 @@ use otap_df_engine::memory_limiter::{
 };
 use otap_df_engine::processor::FlowMetricHook;
 use otap_df_engine::topic::{
-    InMemoryBackend, PipelineTopicBinding, TopicBroker, TopicOptions, TopicPublishOutcomeConfig,
-    TopicSet,
+    InMemoryBackend, PartitionDispatchBackend, PipelineTopicBinding, TopicBroker, TopicOptions,
+    TopicPublishOutcomeConfig, TopicSet,
 };
 use otap_df_state::store::{ObservedStateHandle, ObservedStateStore};
 use otap_df_telemetry::event::{EngineEvent, ErrorSummary, ObservedEventReporter};
@@ -445,7 +445,15 @@ fn engine_context() -> LogContext {
 }
 
 impl<
-    PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
+    PData: 'static
+        + Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + ReceivedAtNode
+        + Unwindable
+        + FlowMetricHook
+        + otap_df_engine::topic::Partitioned,
 > Controller<PData>
 {
     /// Creates a new controller with the given pipeline factory.
@@ -1147,6 +1155,33 @@ impl<
         spec: &TopicSpec,
         inferred_mode: InferredTopicMode,
     ) -> Result<(), Error> {
+        // A partition-dispatch topic (Layer C) is selected by `num_partitions`,
+        // orthogonal to the balanced/broadcast delivery the mode inference picks.
+        // It is in-memory only for now (the spec validation rejects other
+        // backends), and the placement-derived owned-partition sets come from
+        // each subscriber, so the inferred mode and options do not apply.
+        if let Some(num_partitions) = spec.num_partitions {
+            if spec.backend != TopicBackendKind::InMemory {
+                return Err(Error::UnsupportedTopicBackend {
+                    topic: name,
+                    backend: spec.backend,
+                });
+            }
+            let capacity = spec.policies.balanced.queue_capacity.max(1);
+            _ = broker
+                .create_topic(
+                    name,
+                    TopicOptions::default(),
+                    PartitionDispatchBackend {
+                        num_partitions: num_partitions.get(),
+                        capacity,
+                    },
+                )
+                .map_err(|e| Error::PipelineRuntimeError {
+                    source: Box::new(e),
+                })?;
+            return Ok(());
+        }
         Self::validate_topic_runtime_support(&name, spec, inferred_mode)?;
         let opts = Self::map_topic_spec_to_options(spec, inferred_mode);
         match spec.backend {
@@ -3261,6 +3296,65 @@ groups:
         let declared = Controller::<()>::declare_topics(&config).expect("topics should declare");
 
         assert_eq!(declared.broker.topic_names().len(), 4);
+    }
+
+    #[test]
+    fn declare_topics_creates_partition_dispatch_topic() {
+        let yaml = r#"
+version: otel_dataflow/v1
+topics:
+  shuffle:
+    backend: in_memory
+    num_partitions: 4
+groups:
+  g1:
+    pipelines:
+      p1:
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          exporter:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: receiver
+            to: exporter
+"#;
+        let config = OtelDataflowSpec::from_yaml(yaml).expect("test config should parse");
+        let declared = Controller::<()>::declare_topics(&config).expect("topics should declare");
+        assert_eq!(declared.broker.topic_names().len(), 1);
+    }
+
+    #[test]
+    fn config_rejects_partition_dispatch_on_quiver_backend() {
+        let yaml = r#"
+version: otel_dataflow/v1
+topics:
+  shuffle:
+    backend: quiver
+    num_partitions: 4
+groups:
+  g1:
+    pipelines:
+      p1:
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          exporter:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: receiver
+            to: exporter
+"#;
+        let err = OtelDataflowSpec::from_yaml(yaml)
+            .expect_err("partition-dispatch on quiver should be rejected");
+        assert!(
+            format!("{err:?}").contains("in_memory backend"),
+            "got {err:?}"
+        );
     }
 
     #[test]

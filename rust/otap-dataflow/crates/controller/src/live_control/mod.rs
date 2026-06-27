@@ -108,7 +108,15 @@ pub(super) struct LaunchedPipelineThread<PData> {
 }
 
 impl<
-    PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
+    PData: 'static
+        + Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + ReceivedAtNode
+        + Unwindable
+        + FlowMetricHook
+        + otap_df_engine::topic::Partitioned,
 > ControllerRuntime<PData>
 {
     #[allow(clippy::too_many_arguments)]
@@ -447,7 +455,15 @@ impl<
 }
 
 impl<
-    PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
+    PData: 'static
+        + Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + ReceivedAtNode
+        + Unwindable
+        + FlowMetricHook
+        + otap_df_engine::topic::Partitioned,
 > ControlPlane for ControllerControlPlane<PData>
 {
     fn shutdown_all(&self, timeout_secs: u64) -> Result<(), ControlPlaneError> {

@@ -96,6 +96,19 @@ pub struct TopicExporter {
     metrics: MetricSet<TopicExporterMetrics>,
 }
 
+/// Clone `data` without its request context for publishing to a topic, while
+/// **preserving** the partition tag a split-by-key node stamped on the context.
+/// The topic's request-scoped ack/nack state is detached (the topic has its own
+/// tracked-publish accounting), but a partition-dispatch topic still needs the
+/// integer partition to route by; balanced and broadcast topics ignore it.
+fn publish_clone(data: &OtapPdata) -> OtapPdata {
+    let mut published = data.clone_without_context();
+    if let Some(partition) = data.partition() {
+        published.set_partition(partition);
+    }
+    published
+}
+
 /// One upstream pdata message currently blocked in the topic runtime under
 /// `queue_on_full: block`.
 struct BlockedPublish {
@@ -223,7 +236,7 @@ impl TopicExporter {
         tracked_publisher: Option<&otap_df_engine::topic::TrackedTopicPublisher<OtapPdata>>,
         topic: &TopicHandle<OtapPdata>,
     ) -> BlockedPublish {
-        let published = Arc::new(data.clone_without_context());
+        let published = Arc::new(publish_clone(&data));
         let future: Pin<Box<dyn Future<Output = Result<BlockedPublishCompletion, Error>>>> =
             if let Some(tracked_publisher) = tracked_publisher.cloned() {
                 Box::pin(async move {
@@ -263,7 +276,7 @@ impl TopicExporter {
 
         match queue_on_full {
             TopicQueueOnFullPolicy::Block => {
-                let published = Arc::new(data.clone_without_context());
+                let published = Arc::new(publish_clone(&data));
                 // Preserve a cheap uncontended fast path: only retain a blocked
                 // publish when the topic runtime reports real backpressure.
                 if should_track_end_to_end {
@@ -299,7 +312,7 @@ impl TopicExporter {
                 }
             }
             TopicQueueOnFullPolicy::DropNewest => {
-                let published = Arc::new(data.clone_without_context());
+                let published = Arc::new(publish_clone(&data));
                 if should_track_end_to_end {
                     let tracked_publisher = tracked_publisher
                         .expect("tracked publisher should exist when ack propagation is auto");
@@ -1285,6 +1298,124 @@ mod tests {
                 .expect("exporter should exit promptly after shutdown")
                 .expect("exporter task should join");
             assert!(exporter_result.is_ok(), "exporter should stop cleanly");
+        }));
+    }
+}
+
+#[cfg(test)]
+mod partition_dispatch_tests {
+    use super::publish_clone;
+    use otap_df_engine::testing::setup_test_runtime;
+    use otap_df_engine::topic::{
+        PartitionDispatchBackend, PartitionPlacement, RecvItem, SubscriberOptions,
+        SubscriptionMode, TopicBroker, TopicOptions,
+    };
+    use otap_df_otap::pdata::OtapPdata;
+    use otap_df_otap::testing::create_test_pdata;
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    #[test]
+    fn publish_clone_preserves_partition_tag() {
+        let mut data = create_test_pdata();
+        data.set_partition(3);
+        let cloned = publish_clone(&data);
+        assert_eq!(
+            cloned.partition(),
+            Some(3),
+            "the split-by-key partition tag must survive the publish clone"
+        );
+        // The request context's ack/nack routing is detached for the topic hop.
+        assert!(!cloned.has_subscribers());
+    }
+
+    #[test]
+    fn publish_clone_without_partition_stays_none() {
+        let data = create_test_pdata();
+        assert_eq!(publish_clone(&data).partition(), None);
+    }
+
+    // End-to-end: OtapPdata tagged by a split-by-key node, published through the
+    // exporter's publish clone, is routed by the in-memory partition-dispatch
+    // topic to the single owner of its partition (placement-derived).
+    #[test]
+    fn partition_dispatch_routes_tagged_pdata_to_its_owner() {
+        let (rt, local_tasks) = setup_test_runtime();
+        rt.block_on(local_tasks.run_until(async move {
+            let broker = TopicBroker::<OtapPdata>::new();
+            let topic = broker
+                .create_topic(
+                    otap_df_config::TopicName::parse("shuffle").unwrap(),
+                    TopicOptions::default(),
+                    PartitionDispatchBackend {
+                        num_partitions: 4,
+                        capacity: 64,
+                    },
+                )
+                .unwrap();
+
+            // 4 partitions, 2 owners: owner0={0,1}, owner1={2,3}.
+            let placement = PartitionPlacement::balanced(
+                NonZeroUsize::new(4).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+            );
+            let owned0: Vec<u32> = placement
+                .partitions_of(0)
+                .iter()
+                .map(|&p| p as u32)
+                .collect();
+            let owned1: Vec<u32> = placement
+                .partitions_of(1)
+                .iter()
+                .map(|&p| p as u32)
+                .collect();
+            let mut sub0 = topic
+                .subscribe(
+                    SubscriptionMode::PartitionDispatch {
+                        owned_partitions: owned0.clone(),
+                    },
+                    SubscriberOptions::default(),
+                )
+                .unwrap();
+            let mut sub1 = topic
+                .subscribe(
+                    SubscriptionMode::PartitionDispatch {
+                        owned_partitions: owned1.clone(),
+                    },
+                    SubscriberOptions::default(),
+                )
+                .unwrap();
+
+            // Publish tagged pdata for partitions 0,1,2,3,0,3 through the
+            // exporter's publish clone (which must preserve the tag).
+            for partition in [0u32, 1, 2, 3, 0, 3] {
+                let mut data = create_test_pdata();
+                data.set_partition(partition);
+                topic.publish(Arc::new(publish_clone(&data))).await.unwrap();
+            }
+            topic.close();
+
+            let mut got0 = Vec::new();
+            while let Ok(RecvItem::Message(env)) = sub0.recv().await {
+                got0.push(env.payload.partition().expect("tag present"));
+            }
+            let mut got1 = Vec::new();
+            while let Ok(RecvItem::Message(env)) = sub1.recv().await {
+                got1.push(env.payload.partition().expect("tag present"));
+            }
+
+            assert!(
+                got0.iter().all(|p| owned0.contains(p)),
+                "owner0 received a foreign partition: {got0:?}"
+            );
+            assert!(
+                got1.iter().all(|p| owned1.contains(p)),
+                "owner1 received a foreign partition: {got1:?}"
+            );
+            // Conservation: every tagged message reached exactly one owner.
+            assert_eq!(got0.len() + got1.len(), 6);
+            assert_eq!(got0.len(), 3, "owner0 (partitions 0,1) got {got0:?}");
+            assert_eq!(got1.len(), 3, "owner1 (partitions 2,3) got {got1:?}");
         }));
     }
 }

@@ -8,6 +8,7 @@ use crate::error::Error;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 /// Name of a topic declaration/reference.
@@ -168,14 +169,32 @@ pub struct TopicSpec {
     /// Topic behavior policies.
     #[serde(default)]
     pub policies: TopicPolicies,
+    /// Number of partitions for a partition-dispatch topic.
+    ///
+    /// When set, the topic uses **partition-dispatch** delivery (Layer C of the
+    /// partition-dispatch design): each message is routed by the partition tag a
+    /// split-by-key node stamped to the single subscriber that owns that
+    /// partition. Subscribers declare their owned partitions in
+    /// `[0, num_partitions)`. Currently supported only with the `in_memory`
+    /// backend. When omitted, the topic uses balanced/broadcast delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_partitions: Option<NonZeroUsize>,
 }
 
 impl TopicSpec {
     /// Returns validation errors for this topic specification.
     #[must_use]
     pub fn validation_errors(&self, path_prefix: &str) -> Vec<String> {
-        self.policies
-            .validation_errors(&format!("{path_prefix}.policies"))
+        let mut errors = self
+            .policies
+            .validation_errors(&format!("{path_prefix}.policies"));
+        if self.num_partitions.is_some() && self.backend != TopicBackendKind::InMemory {
+            errors.push(format!(
+                "{path_prefix}.num_partitions: partition-dispatch is currently supported \
+                 only with the in_memory backend"
+            ));
+        }
+        errors
     }
 }
 

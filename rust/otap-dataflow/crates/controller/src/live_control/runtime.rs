@@ -22,7 +22,15 @@ fn deployed_instance_label(deployed_key: &DeployedPipelineKey) -> String {
 }
 
 impl<
-    PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
+    PData: 'static
+        + Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + ReceivedAtNode
+        + Unwindable
+        + FlowMetricHook
+        + otap_df_engine::topic::Partitioned,
 > ControllerRuntime<PData>
 {
     /// Launches one regular pipeline instance on a specific core and generation.

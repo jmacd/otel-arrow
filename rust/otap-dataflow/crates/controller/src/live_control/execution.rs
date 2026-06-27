@@ -11,7 +11,15 @@
 use super::*;
 
 impl<
-    PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
+    PData: 'static
+        + Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + ReceivedAtNode
+        + Unwindable
+        + FlowMetricHook
+        + otap_df_engine::topic::Partitioned,
 > ControllerRuntime<PData>
 {
     /// Emits the internal telemetry event for a rollout/shutdown worker panic.

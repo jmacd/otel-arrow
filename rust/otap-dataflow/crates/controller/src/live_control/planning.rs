@@ -41,7 +41,15 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug> Drop
 }
 
 impl<
-    PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
+    PData: 'static
+        + Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + ReceivedAtNode
+        + Unwindable
+        + FlowMetricHook
+        + otap_df_engine::topic::Partitioned,
 > ControllerRuntime<PData>
 {
     fn engine_operation_allows(state: &ControllerRuntimeState, operation_id: Option<&str>) -> bool {

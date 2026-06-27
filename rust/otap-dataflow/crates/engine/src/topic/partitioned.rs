@@ -20,3 +20,12 @@ pub trait Partitioned {
     /// and drops it).
     fn partition(&self) -> Option<u32>;
 }
+
+/// The unit payload carries no partition. This lets the controller's
+/// planning-only `Controller::<()>` paths satisfy the `Partitioned` bound that
+/// partition-dispatch topic creation requires, without any real payload.
+impl Partitioned for () {
+    fn partition(&self) -> Option<u32> {
+        None
+    }
+}
