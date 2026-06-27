@@ -286,7 +286,7 @@ mod tests {
 
         match rx.recv().expect("log event should be captured") {
             ObservedEvent::Log(log) => log,
-            ObservedEvent::Engine(_) => unreachable!("expected log event"),
+            other => unreachable!("expected single log event, got {other:?}"),
         }
     }
 

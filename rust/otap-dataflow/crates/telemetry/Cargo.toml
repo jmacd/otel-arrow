@@ -27,6 +27,7 @@ axum = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 flume = { workspace = true }
+hashbrown = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde_yaml = { workspace = true }
@@ -38,6 +39,7 @@ prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
+rand = { workspace = true }
 # TODO: Note we do not have any compression features enabled for the OTel SDK used for OTLP/Prometheus export.
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, default-features = false, features = ["metrics", "internal-logs"] }
@@ -53,3 +55,4 @@ tempfile = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 otap-df-pdata = { workspace = true, features = ["testing"] }
 rustls = { workspace = true, features = ["ring"] }
+criterion = { workspace = true }

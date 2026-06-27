@@ -25,7 +25,9 @@ use otap_df_pdata::OtlpProtoBytes;
 use otap_df_pdata::otlp::ProtoBuffer;
 use otap_df_telemetry::event::{LogEvent, ObservedEvent};
 use otap_df_telemetry::metrics::MetricSetSnapshot;
-use otap_df_telemetry::self_tracing::{ScopeToBytesMap, encode_export_logs_request};
+use otap_df_telemetry::self_tracing::{
+    ScopeToBytesMap, encode_export_logs_request, encode_export_logs_request_batch,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -123,11 +125,17 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                     match ctrl_msg {
                         Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
                             while let Ok(event) = logs_receiver.try_recv() {
-                                if let ObservedEvent::Log(log_event) = event {
-                                    if let Some(log_tap) = log_tap.as_ref() {
-                                        log_tap.record(log_event.clone());
+                                match event {
+                                    ObservedEvent::Log(log_event) => {
+                                        if let Some(log_tap) = log_tap.as_ref() {
+                                            log_tap.record(log_event.clone());
+                                        }
+                                        Self::send_log_event(&effect_handler, log_event, &resource_bytes, &mut scope_cache).await?;
                                     }
-                                    Self::send_log_event(&effect_handler, log_event, &resource_bytes, &mut scope_cache).await?;
+                                    ObservedEvent::LogBatch(events) => {
+                                        Self::send_log_batch(&effect_handler, events, log_tap.as_ref(), &resource_bytes, &mut scope_cache).await?;
+                                    }
+                                    ObservedEvent::Engine(_) => {}
                                 }
                             }
                             effect_handler.notify_receiver_drained().await?;
@@ -136,11 +144,17 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                         Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
                             // Drain any remaining logs from channel before shutdown
                             while let Ok(event) = logs_receiver.try_recv() {
-                                if let ObservedEvent::Log(log_event) = event {
-                                    if let Some(log_tap) = log_tap.as_ref() {
-                                        log_tap.record(log_event.clone());
+                                match event {
+                                    ObservedEvent::Log(log_event) => {
+                                        if let Some(log_tap) = log_tap.as_ref() {
+                                            log_tap.record(log_event.clone());
+                                        }
+                                        Self::send_log_event(&effect_handler, log_event, &resource_bytes, &mut scope_cache).await?;
                                     }
-                                    Self::send_log_event(&effect_handler, log_event, &resource_bytes, &mut scope_cache).await?;
+                                    ObservedEvent::LogBatch(events) => {
+                                        Self::send_log_batch(&effect_handler, events, log_tap.as_ref(), &resource_bytes, &mut scope_cache).await?;
+                                    }
+                                    ObservedEvent::Engine(_) => {}
                                 }
                             }
                             return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
@@ -165,6 +179,9 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                                 log_tap.record(log_event.clone());
                             }
                             Self::send_log_event(&effect_handler, log_event, &resource_bytes, &mut scope_cache).await?;
+                        }
+                        Ok(ObservedEvent::LogBatch(events)) => {
+                            Self::send_log_batch(&effect_handler, events, log_tap.as_ref(), &resource_bytes, &mut scope_cache).await?;
                         }
                         Ok(ObservedEvent::Engine(_)) => {
                             // Engine events are not yet processed
@@ -191,6 +208,50 @@ impl InternalTelemetryReceiver {
         let mut buf = ProtoBuffer::with_capacity(512);
 
         encode_export_logs_request(&mut buf, &log_event, resource_bytes, scope_cache);
+
+        let pdata = OtapPdata::new(
+            Context::default(),
+            OtlpProtoBytes::ExportLogsRequest(buf.into_bytes()).into(),
+        );
+        effect_handler.send_message(pdata).await?;
+        Ok(())
+    }
+
+    /// Send a batch of [`LogEvent`]s as a single OTLP `ExportLogsServiceRequest`,
+    /// grouped into `ScopeLogs` by (target, context).  Each event also
+    /// flows through the log tap individually so subscribers see the same
+    /// per-record stream as the unbatched path.
+    async fn send_log_batch(
+        effect_handler: &local::EffectHandler<OtapPdata>,
+        mut events: Vec<LogEvent>,
+        log_tap: Option<&otap_df_telemetry::log_tap::InternalLogTapHandle>,
+        resource_bytes: &Bytes,
+        scope_cache: &mut ScopeToBytesMap,
+    ) -> Result<(), Error> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // Sort so that `encode_export_logs_request_batch` can collapse
+        // each run of records sharing (target, context) into one
+        // ScopeLogs.  Stable sort preserves intra-group time order.
+        events.sort_by(|a, b| {
+            a.record
+                .callsite()
+                .target()
+                .cmp(b.record.callsite().target())
+                .then_with(|| a.record.context.cmp(&b.record.context))
+        });
+
+        if let Some(tap) = log_tap {
+            for event in &events {
+                tap.record(event.clone());
+            }
+        }
+
+        // Size hint: ~256 bytes per event amortizes for short records.
+        let mut buf = ProtoBuffer::with_capacity(events.len().saturating_mul(256).max(512));
+        encode_export_logs_request_batch(&mut buf, &events, resource_bytes, scope_cache);
 
         let pdata = OtapPdata::new(
             Context::default(),

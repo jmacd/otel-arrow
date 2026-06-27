@@ -91,6 +91,20 @@ impl TracingSetup {
             .try_init_global(&self.log_level, self.context_fn)
     }
 
+    /// Borrow the asynchronous reporter, if this setup uses one.
+    ///
+    /// Returns `Some` only for [`ProviderSetup::InternalAsync`] — the
+    /// only mode whose log delivery flows through an
+    /// [`ObservedEventReporter`].  Per-thread CCKR samplers use this
+    /// reporter to ship flushed batches.
+    #[must_use]
+    pub fn async_reporter(&self) -> Option<&ObservedEventReporter> {
+        match &self.provider {
+            ProviderSetup::InternalAsync { reporter } => Some(reporter),
+            ProviderSetup::Noop | ProviderSetup::ConsoleDirect => None,
+        }
+    }
+
     /// Run a closure with the appropriate tracing subscriber for this setup.
     pub fn with_subscriber<F, R>(&self, f: F) -> R
     where
@@ -214,6 +228,17 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        // Fast path: when a per-thread CCKR sampler is installed, ask
+        // it whether to admit this callsite *before* we pay any
+        // formatting cost (no SystemTime::now, no context_fn, no
+        // LogRecord::new on Skip).  When no sampler is installed the
+        // probe is one TLS lookup and a None return.
+        let callsite_id = event.metadata().callsite();
+        let admission = crate::sampler::admit(&callsite_id);
+        if matches!(admission, Some(crate::sampler::ThreadAdmission::Skip)) {
+            return;
+        }
+
         let time = SystemTime::now();
         let context = (self.context_fn)();
         let record = LogRecord::new(event, context);
@@ -222,8 +247,22 @@ where
                 w.format_entity_suffix_without_registry(&record.context);
             });
         }
-        if let Some(reporter) = &self.reporter {
-            reporter.log(LogEvent { time, record });
+        let log_event = LogEvent { time, record };
+        match admission {
+            // Sampler installed and approved this event for the
+            // statistical sample or the novelty preserve: route through
+            // the sampler so it joins the next flushed batch instead
+            // of being shipped as a singleton.
+            Some(adm) => {
+                crate::sampler::insert(callsite_id, adm, log_event);
+            }
+            // No sampler installed on this thread: behave exactly as
+            // before.
+            None => {
+                if let Some(reporter) = &self.reporter {
+                    reporter.log(log_event);
+                }
+            }
         }
     }
 }

@@ -33,6 +33,65 @@ pub struct LogsConfig {
     /// Internal log tap configuration.
     #[serde(default)]
     pub tap: InternalLogTapConfig,
+
+    /// Per-thread log sampler configuration.
+    ///
+    /// When `enabled`, each engine pipeline thread installs a
+    /// thread-local CCKR sampler that bounds internal-log output to
+    /// roughly `reservoir_capacity` records per period (with up to `preserve_capacity`
+    /// novelty-preserve records). When `enabled` is `false` (the default)
+    /// every log event is forwarded individually, matching pre-existing
+    /// behaviour.
+    #[serde(default)]
+    pub sampler: InternalLogSamplerConfig,
+}
+
+/// Per-thread CCKR log sampler configuration.
+///
+/// See `crates/telemetry/src/sampler/design.md` for the algorithm.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct InternalLogSamplerConfig {
+    /// Enable CCKR sampling for internal logs.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Reservoir capacity `T` per period per thread.
+    ///
+    /// Must be at least `MIN_RESERVOIR_CAPACITY` (32) when sampling is enabled.
+    /// This minimum ensures the Chao1 richness estimator has sufficient events
+    /// for reliable frequency estimates, matching the internal `min_period_count`
+    /// threshold used by the sampler's flush logic.
+    #[serde(default = "default_reservoir_capacity")]
+    pub reservoir_capacity: usize,
+
+    /// Novelty-preserve cap `R` per period per thread.
+    #[serde(default = "default_sampler_preserve_capacity")]
+    pub preserve_capacity: usize,
+}
+
+/// Minimum reservoir capacity required for Chao1 estimator stability.
+///
+/// This matches the internal `min_period_count` threshold in the CCKR
+/// sampler's flush logic. Below this threshold, frequency estimates
+/// become unreliable and the adaptive weighting degrades.
+pub const MIN_RESERVOIR_CAPACITY: usize = 32;
+
+const fn default_reservoir_capacity() -> usize {
+    128
+}
+
+const fn default_sampler_preserve_capacity() -> usize {
+    128
+}
+
+impl Default for InternalLogSamplerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reservoir_capacity: default_reservoir_capacity(),
+            preserve_capacity: default_sampler_preserve_capacity(),
+        }
+    }
 }
 
 /// Configuration for the internal log tap used by admin/MCP-style consumers.
@@ -216,6 +275,7 @@ impl Default for LogsConfig {
             level: LogLevel::default(),
             providers: default_providers(),
             tap: InternalLogTapConfig::default(),
+            sampler: InternalLogSamplerConfig::default(),
         }
     }
 }
@@ -262,6 +322,28 @@ impl LogsConfig {
             return Err(Error::InvalidUserConfig {
                 error: "logs.tap.enabled requires at least one async log provider ('console_async' or 'its')".into(),
             });
+        }
+
+        if self.sampler.enabled {
+            if self.sampler.reservoir_capacity < MIN_RESERVOIR_CAPACITY {
+                return Err(Error::InvalidUserConfig {
+                    error: format!(
+                        "logs.sampler.reservoir_capacity must be at least {} when sampler is enabled (required for Chao1 estimator stability)",
+                        MIN_RESERVOIR_CAPACITY
+                    ),
+                });
+            }
+            // v1 limitation: the sampler only supports the ITS engine
+            // provider. ConsoleAsync's downstream consumer
+            // (ObservedStateStore) does not yet handle batched log events.
+            if self.providers.engine != ProviderMode::ITS {
+                return Err(Error::InvalidUserConfig {
+                    error: format!(
+                        "logs.sampler.enabled requires logs.providers.engine = 'its' (got {:?})",
+                        self.providers.engine
+                    ),
+                });
+            }
         }
 
         Ok(())
@@ -471,5 +553,79 @@ mod tests {
         assert!(providers(Noop, ITS, Noop, Noop).uses_its_provider());
         assert!(providers(Noop, Noop, Noop, ITS).uses_its_provider());
         assert!(!providers(Noop, Noop, ITS, Noop).uses_its_provider());
+    }
+
+    #[test]
+    fn test_sampler_defaults() {
+        let config = LogsConfig::default();
+        assert!(!config.sampler.enabled);
+        assert_eq!(config.sampler.reservoir_capacity, 128);
+        assert_eq!(config.sampler.preserve_capacity, 128);
+
+        let parsed = parse("{}");
+        assert_eq!(parsed.sampler, config.sampler);
+    }
+
+    #[test]
+    fn test_sampler_parsing() {
+        let parsed =
+            parse("sampler: { enabled: true, reservoir_capacity: 64, preserve_capacity: 32 }");
+        assert!(parsed.sampler.enabled);
+        assert_eq!(parsed.sampler.reservoir_capacity, 64);
+        assert_eq!(parsed.sampler.preserve_capacity, 32);
+    }
+
+    #[test]
+    fn test_validate_sampler_disabled_ok_with_any_engine() {
+        use ProviderMode::*;
+        // Default sampler is disabled; any valid engine provider should pass.
+        for engine in [Noop, ITS, ConsoleAsync, ConsoleDirect] {
+            let config = config_with(Noop, engine, Noop, ConsoleDirect);
+            config
+                .validate()
+                .expect("sampler-disabled config should validate");
+        }
+    }
+
+    #[test]
+    fn test_validate_sampler_target_minimum() {
+        use ProviderMode::*;
+        let mut config = config_with(Noop, ITS, Noop, ConsoleDirect);
+        config.sampler.enabled = true;
+
+        // reservoir_capacity < MIN_RESERVOIR_CAPACITY should be rejected
+        for reservoir_capacity in [0, 1, 16, MIN_RESERVOIR_CAPACITY - 1] {
+            config.sampler.reservoir_capacity = reservoir_capacity;
+            assert_invalid(&config, "logs.sampler.reservoir_capacity");
+        }
+
+        // reservoir_capacity >= MIN_RESERVOIR_CAPACITY should validate
+        config.sampler.reservoir_capacity = MIN_RESERVOIR_CAPACITY;
+        config
+            .validate()
+            .expect("sampler with reservoir_capacity=MIN_RESERVOIR_CAPACITY should validate");
+
+        config.sampler.reservoir_capacity = 128;
+        config
+            .validate()
+            .expect("sampler with reservoir_capacity=128 should validate");
+    }
+
+    #[test]
+    fn test_validate_sampler_requires_its_engine_provider() {
+        use ProviderMode::*;
+        // ITS engine: should validate.
+        let mut config = config_with(Noop, ITS, Noop, ConsoleDirect);
+        config.sampler.enabled = true;
+        config
+            .validate()
+            .expect("sampler with ITS engine should validate");
+
+        // Non-ITS engine providers: rejected (v1 limitation).
+        for engine in [Noop, ConsoleAsync, ConsoleDirect] {
+            let mut config = config_with(Noop, engine, Noop, ConsoleDirect);
+            config.sampler.enabled = true;
+            assert_invalid(&config, "logs.sampler.enabled requires");
+        }
     }
 }

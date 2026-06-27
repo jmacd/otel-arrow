@@ -114,6 +114,7 @@ fn test_runtime(config: &OtelDataflowSpec) -> Arc<ControllerRuntime<()>> {
         available_core_ids(),
         TracingSetup::new(ProviderSetup::Noop, LogLevel::default(), engine_context),
         Duration::from_secs(1),
+        None,
         memory_pressure_tx,
         config.clone(),
     ))

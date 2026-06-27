@@ -66,6 +66,24 @@ impl<'buf, B: BoundedBuf> DirectLogRecordEncoder<'buf, B> {
         // Pre-encoded body and attributes.
         let _ = self.buf.extend_from_slice(&record.body_attrs_bytes);
 
+        // Encode the optional adjusted count (`otel.sampling.count`) injected by
+        // the CCKR sampler. The attribute is *omitted* entirely when the
+        // count is `None` (sampler not in use) or exactly `1.0`
+        // (deterministic / unweighted record), so the common case carries
+        // no extra bytes. A count of `0.0` is valid and indicates a
+        // novelty-preserve record.
+        if let Some(c) = record.count {
+            if c != 1.0 {
+                let _ = self.buf.encode_len_delimited(LOG_RECORD_ATTRIBUTES, |buf| {
+                    buf.encode_string(KEY_VALUE_KEY, "otel.sampling.count")?;
+                    buf.encode_len_delimited(KEY_VALUE_VALUE, |buf| {
+                        buf.encode_field_tag(ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64)?;
+                        buf.extend_from_slice(&c.to_le_bytes())
+                    })
+                });
+            }
+        }
+
         // Encode dropped_attributes_count (field 7, varint) if any were dropped.
         if record.dropped_attributes_count > 0 {
             let _ = self
@@ -635,6 +653,72 @@ pub fn encode_export_logs_request(
     });
 }
 
+/// Encode a batch of [`LogEvent`]s as a single ExportLogsServiceRequest.
+///
+/// Events are expected to be grouped into runs by `(callsite.target(),
+/// context)`; each run becomes one `ScopeLogs` so the scope name and
+/// per-context entity attributes are encoded exactly once for every
+/// `N` records that share them.  All groups share the same pre-encoded
+/// `resource_bytes` and live under a single `ResourceLogs`.
+///
+/// The slice may be empty — in that case the buffer is reset to empty
+/// and nothing is written.  Empty batches are filtered upstream by the
+/// sampler flush path so this method is rarely called with no events.
+pub fn encode_export_logs_request_batch(
+    buf: &mut ProtoBuffer,
+    events: &[LogEvent],
+    resource_bytes: &Bytes,
+    scope_cache: &mut ScopeToBytesMap,
+) {
+    buf.clear();
+    if events.is_empty() {
+        return;
+    }
+
+    let _: EncodeResult = buf.encode_len_delimited(EXPORT_LOGS_REQUEST_RESOURCE_LOGS, |buf| {
+        buf.extend_from_slice(resource_bytes)?;
+
+        // Walk the (pre-sorted) events, emitting one ScopeLogs for each
+        // maximal run of consecutive records that share both `target`
+        // (instrumentation-scope name) and `context` (entity keys).
+        let mut i = 0;
+        while i < events.len() {
+            let group_target = events[i].record.callsite().target();
+            let group_ctx = &events[i].record.context;
+            let mut j = i + 1;
+            while j < events.len()
+                && events[j].record.callsite().target() == group_target
+                && &events[j].record.context == group_ctx
+            {
+                j += 1;
+            }
+
+            buf.encode_len_delimited(RESOURCE_LOGS_SCOPE_LOGS, |buf| {
+                buf.encode_len_delimited(SCOPE_LOG_SCOPE, |buf| {
+                    buf.encode_string(INSTRUMENTATION_SCOPE_NAME, group_target)?;
+                    for entity_key in group_ctx.iter() {
+                        let scope_bytes = scope_cache.get_or_encode(*entity_key);
+                        buf.extend_from_slice(&scope_bytes)?;
+                    }
+                    Ok(())
+                })?;
+
+                for event in &events[i..j] {
+                    buf.encode_len_delimited(SCOPE_LOGS_LOG_RECORDS, |buf| {
+                        let mut encoder = DirectLogRecordEncoder::new(buf);
+                        let _ = encoder.encode_log_record(event.time, &event.record);
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            })?;
+
+            i = j;
+        }
+        Ok(())
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +869,103 @@ mod tests {
             ),
         );
         assert_eq!(expected, decoded);
+    }
+
+    /// Two records with the same `(target, context)` must collapse to
+    /// one ScopeLogs in the batched output (scope + resource encoded
+    /// once), while two records with the same target but different
+    /// contexts must split into two ScopeLogs.
+    #[test]
+    fn encode_batch_groups_by_target_and_context() {
+        let registry = TelemetryRegistryHandle::new();
+        let key_a = registry.register_entity(TestScopeAttributes::new("pipeline-a", 1));
+        let key_b = registry.register_entity(TestScopeAttributes::new("pipeline-b", 2));
+        let mut scope_cache = ScopeToBytesMap::new(registry.clone());
+        let resource_bytes = encode_resource_to_bytes(&OTelResource::builder_empty().build());
+
+        let mk = |entity: EntityKey, ts: u64| LogEvent {
+            time: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+            record: __log_record_impl!(Level::INFO, "test.batch.event")
+                .into_record(LogContext::from_buf([entity])),
+        };
+
+        // Pre-sorted by (target, context); two events for `pipeline-a`
+        // share the same context and must dedupe into one ScopeLogs.
+        let events = vec![
+            mk(key_a, 1_000_000_000),
+            mk(key_a, 2_000_000_000),
+            mk(key_b, 3_000_000_000),
+        ];
+        let mut buf = ProtoBuffer::default();
+        encode_export_logs_request_batch(&mut buf, &events, &resource_bytes, &mut scope_cache);
+
+        let decoded = ExportLogsServiceRequest::decode(buf.into_bytes().as_ref()).unwrap();
+        let resource_logs = &decoded.resource_logs;
+        assert_eq!(resource_logs.len(), 1, "single ResourceLogs");
+        let scope_logs = &resource_logs[0].scope_logs;
+        assert_eq!(
+            scope_logs.len(),
+            2,
+            "two ScopeLogs: one per distinct context"
+        );
+        assert_eq!(scope_logs[0].log_records.len(), 2);
+        assert_eq!(scope_logs[1].log_records.len(), 1);
+    }
+
+    /// Empty batch yields an empty buffer (callers may skip the send).
+    #[test]
+    fn encode_batch_empty_is_empty_buffer() {
+        let registry = TelemetryRegistryHandle::new();
+        let mut scope_cache = ScopeToBytesMap::new(registry);
+        let resource_bytes = encode_resource_to_bytes(&OTelResource::builder_empty().build());
+        let mut buf = ProtoBuffer::default();
+        encode_export_logs_request_batch(&mut buf, &[], &resource_bytes, &mut scope_cache);
+        assert_eq!(buf.len(), 0);
+    }
+
+    /// `otel.sampling.count` is emitted only when `count` is `Some(c)` &&
+    /// `c != 1.0` — `None` and exactly `1.0` produce no attribute so the
+    /// unsampled / deterministic common case carries no extra bytes.
+    #[test]
+    fn encode_emits_count_attribute_only_when_meaningful() {
+        let registry = TelemetryRegistryHandle::new();
+        let mut scope_cache = ScopeToBytesMap::new(registry.clone());
+        let resource_bytes = encode_resource_to_bytes(&OTelResource::builder_empty().build());
+
+        let cases = [
+            (None, false, 0.0),
+            (Some(1.0), false, 0.0),
+            (Some(0.0), true, 0.0),
+            (Some(4.5), true, 4.5),
+        ];
+        for (count, expect_present, expect_value) in cases {
+            let mut record =
+                __log_record_impl!(Level::INFO, "test.count.case").into_record(LogContext::new());
+            record.count = count;
+            let event = LogEvent {
+                time: SystemTime::UNIX_EPOCH + Duration::from_nanos(1),
+                record,
+            };
+
+            let mut buf = ProtoBuffer::default();
+            encode_export_logs_request(&mut buf, &event, &resource_bytes, &mut scope_cache);
+            let decoded = ExportLogsServiceRequest::decode(buf.into_bytes().as_ref()).unwrap();
+            let lr = &decoded.resource_logs[0].scope_logs[0].log_records[0];
+            let attr = lr
+                .attributes
+                .iter()
+                .find(|kv| kv.key == "otel.sampling.count");
+            if expect_present {
+                let attr = attr.expect("count attr present");
+                let v = match attr.value.as_ref().unwrap().value.as_ref().unwrap() {
+                    otap_df_pdata::proto::opentelemetry::common::v1::any_value::Value::DoubleValue(d) => *d,
+                    other => panic!("expected double, got {other:?}"),
+                };
+                assert!((v - expect_value).abs() < f64::EPSILON, "count={v}");
+            } else {
+                assert!(attr.is_none(), "count attr should be absent for {count:?}");
+            }
+        }
     }
 
     // --- Test infrastructure for Map (kvlist) scope attributes ---

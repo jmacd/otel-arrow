@@ -189,6 +189,29 @@ fn opt_min<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
     }
 }
 
+/// Schedule for the periodic per-thread CCKR log sampler flush.
+///
+/// The first flush is performed at `next_fire`; subsequent flushes are
+/// spaced by `period`.  `next_fire` is staggered across pipeline
+/// threads at install time to avoid a thundering herd of receivers
+/// all flushing on the same instant.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplerFlushSchedule {
+    next_fire: Instant,
+    period: Duration,
+}
+
+impl SamplerFlushSchedule {
+    /// Build a schedule whose first fire is `initial_delay` from now.
+    #[must_use]
+    pub fn new(initial_delay: Duration, period: Duration) -> Self {
+        Self {
+            next_fire: clock::now() + initial_delay,
+            period,
+        }
+    }
+}
+
 /// Per-node metrics handles for recording consumed/produced outcomes.
 pub(crate) struct NodeMetricHandles {
     /// Registry handle for automatic unregistration on drop.
@@ -254,6 +277,9 @@ pub struct RuntimeCtrlMsgManager<PData> {
     tick_timers: TimerSet,
     /// Repeating timers for telemetry collection (CollectTelemetry).
     telemetry_timers: TimerSet,
+    /// Optional schedule for periodically flushing the per-thread CCKR
+    /// log sampler.  `None` when no sampler is enabled on this thread.
+    sampler_flush: Option<SamplerFlushSchedule>,
     /// Delayed data in activation order.
     delayed_data: BinaryHeap<Delayed<PData>>,
     /// Event reporter used to report major events influencing the pipeline's behavior.
@@ -294,6 +320,7 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
         telemetry_policy: TelemetryPolicy,
         channel_metrics: Vec<crate::channel_metrics::ChannelMetricsHandle>,
         node_metric_handles: Rc<RefCell<Vec<Option<NodeMetricHandles>>>>,
+        sampler_flush: Option<SamplerFlushSchedule>,
     ) -> Self {
         let mut result = Self {
             runtime_control_metrics: RuntimeControlMetricsState::new(
@@ -311,6 +338,7 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
             control_senders,
             tick_timers: TimerSet::new(),
             telemetry_timers: TimerSet::new(),
+            sampler_flush,
             delayed_data: BinaryHeap::new(),
             event_reporter,
             metrics_reporter,
@@ -425,7 +453,11 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
                 let next_expiry = self.tick_timers.next_expiry();
                 let next_tel_expiry = self.telemetry_timers.next_expiry();
                 let next_delay_expiry = self.delayed_data.peek().map(|d| d.when);
-                opt_min(opt_min(next_expiry, next_tel_expiry), next_delay_expiry)
+                let next_sampler_flush = self.sampler_flush.as_ref().map(|s| s.next_fire);
+                opt_min(
+                    opt_min(opt_min(next_expiry, next_tel_expiry), next_delay_expiry),
+                    next_sampler_flush,
+                )
             };
 
             // Runtime-control traffic can burst during shutdown or completion
@@ -467,6 +499,17 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
                             // admitting new work at the pipeline boundary.
                             self.tick_timers.cancel_all();
                             self.telemetry_timers.cancel_all();
+                            // Drain the per-thread sampler one last time
+                            // *before* the ITS receiver tears down, so the
+                            // final period's batch is delivered while the
+                            // tracing reporter's channel is still open.
+                            // (The SamplerGuard's Drop is a best-effort
+                            // backup that runs later, after run_forever
+                            // returns.)
+                            if self.sampler_flush.is_some() {
+                                otap_df_telemetry::sampler::flush_current_thread();
+                                self.sampler_flush = None;
+                            }
                             self.runtime_control_metrics.set_timer_counts(
                                 self.tick_timers.timer_states.len(),
                                 self.telemetry_timers.timer_states.len(),
@@ -771,6 +814,24 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
                 },
             ));
             delayed_data_count += 1;
+        }
+
+        // Drain the per-thread CCKR log sampler whenever its period has
+        // elapsed.  `flush_current_thread` is a TLS read + no-op when
+        // no sampler is installed on this thread, so taking this path
+        // for non-sampler threads is cheap.  Reschedule against the
+        // original `next_fire` (not `now`) so flush cadence stays
+        // drift-free, but skip forward past any missed periods if we
+        // were starved.
+        if let Some(sched) = self.sampler_flush.as_mut() {
+            if sched.next_fire <= now {
+                otap_df_telemetry::sampler::flush_current_thread();
+                let mut next = sched.next_fire + sched.period;
+                while next <= now {
+                    next += sched.period;
+                }
+                sched.next_fire = next;
+            }
         }
 
         self.runtime_control_metrics.set_timer_counts(
@@ -1381,6 +1442,7 @@ mod tests {
             TelemetryPolicy::default(),
             Vec::new(),
             empty_node_metric_handles(),
+            None,
         );
 
         (manager, pipeline_tx, pipeline_entity_guard)
@@ -1859,6 +1921,7 @@ mod tests {
                     TelemetryPolicy::default(),
                     Vec::new(),
                     empty_node_metric_handles(),
+                    None,
                 );
                 let duration = Duration::from_millis(50);
 
@@ -3158,6 +3221,7 @@ mod tests {
             telemetry_policy.clone(),
             Vec::new(),
             node_metric_handles.clone(),
+            None,
         );
 
         MetricsTestHarness {
@@ -3405,6 +3469,7 @@ mod tests {
             },
             Vec::new(),
             empty_node_metric_handles(),
+            None,
         );
         let runtime_metrics_key = manager.runtime_control_metrics.metric_set_key();
 
@@ -3483,6 +3548,7 @@ mod tests {
             },
             Vec::new(),
             empty_node_metric_handles(),
+            None,
         );
 
         MemoryPressureFanoutHarness {

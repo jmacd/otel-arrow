@@ -69,6 +69,7 @@ impl<
             Arc::downgrade(self),
             thread_id,
             None,
+            self.sampler_config.clone(),
         )?;
         self.register_launched_instance(launched);
         Ok(deployed_key)

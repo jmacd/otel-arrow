@@ -1925,6 +1925,7 @@ fn run_pipeline_with_shutdown_after(
         runtime_ctrl_rx,
         pipeline_completion_tx,
         pipeline_completion_rx,
+        None,
     )
 }
 

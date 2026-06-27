@@ -80,6 +80,9 @@ pub(super) struct ControllerRuntime<PData: 'static + Clone + Send + Sync + std::
     engine_tracing_setup: TracingSetup,
     /// Runtime telemetry reporting cadence.
     telemetry_reporting_interval: Duration,
+    /// Optional per-thread CCKR log-sampler configuration applied to
+    /// launched pipeline runtime threads.
+    sampler_config: Option<otap_df_config::settings::telemetry::logs::InternalLogSamplerConfig>,
     /// Memory-pressure signal fanout shared with pipeline runtimes.
     memory_pressure_tx: tokio::sync::watch::Sender<MemoryPressureChanged>,
     /// All mutable live-control state protected by a single mutex.
@@ -124,6 +127,9 @@ impl<
         available_core_ids: Vec<CoreId>,
         engine_tracing_setup: TracingSetup,
         telemetry_reporting_interval: Duration,
+        sampler_config: Option<
+            otap_df_config::settings::telemetry::logs::InternalLogSamplerConfig,
+        >,
         memory_pressure_tx: tokio::sync::watch::Sender<MemoryPressureChanged>,
         live_config: OtelDataflowSpec,
     ) -> Self {
@@ -138,6 +144,7 @@ impl<
             available_core_ids,
             engine_tracing_setup,
             telemetry_reporting_interval,
+            sampler_config,
             memory_pressure_tx,
             state: Mutex::new(ControllerRuntimeState {
                 live_config,

@@ -23,6 +23,7 @@ use tracing::{Event, Level, Metadata};
 pub use encoder::DirectLogRecordEncoder;
 pub use encoder::ScopeToBytesMap;
 pub use encoder::encode_export_logs_request;
+pub use encoder::encode_export_logs_request_batch;
 pub use encoder::encode_resource_to_bytes;
 pub use formatter::{
     AnsiCode, ColorMode, ConsoleWriter, RawLoggingLayer, StyledBufWriter,
@@ -56,6 +57,20 @@ pub struct LogRecord {
 
     /// Number of attribute fields dropped due to truncation (if any).
     pub dropped_attributes_count: u16,
+
+    /// Adjusted count assigned by a per-thread CCKR sampler at flush time.
+    ///
+    /// Represents how many population items this sample stands in for.
+    /// Formally: the sampler's final statistical weight divided by the
+    /// original item's class weight, yielding the "adjusted count."
+    ///
+    /// `None` indicates no sampling was applied (treat as count `1` downstream).
+    /// `Some(c)` with `c == 1.0` is equivalent to `None` and is omitted from
+    /// the OTLP encoding. `Some(0.0)` is a novelty-preserve record
+    /// (observational only, contributes nothing to weighted estimates).
+    /// `Some(c > 1.0)` is a statistical sample standing in for `c`
+    /// real events from the same callsite.
+    pub count: Option<f64>,
 
     /// The context of this log record, typically pipeline and node context keys.
     pub context: LogContext,
@@ -178,6 +193,7 @@ impl StackLogRecord {
             dropped_attributes_count: self.dropped_count as u16,
             body_attrs_bytes: self.buf.to_bytes(),
             callsite_id: self.callsite_id,
+            count: None,
             context,
         }
     }
@@ -215,6 +231,7 @@ impl LogRecord {
             callsite_id: metadata.callsite(),
             dropped_attributes_count: dropped_count as u16,
             body_attrs_bytes: buf.into_bytes(),
+            count: None,
             context,
         }
     }

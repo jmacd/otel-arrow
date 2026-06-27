@@ -825,6 +825,7 @@ mod tests {
             callsite_id: tracing::callsite::Identifier(&TEST_CALLSITE),
             body_attrs_bytes: Bytes::new(),
             dropped_attributes_count: 0,
+            count: None,
             context: LogContext::new(),
         };
 
@@ -882,6 +883,7 @@ mod tests {
             callsite_id: tracing::callsite::Identifier(&TEST_CALLSITE),
             body_attrs_bytes: Bytes::from(encoded),
             dropped_attributes_count: 0,
+            count: None,
             context: LogContext::new(),
         };
 

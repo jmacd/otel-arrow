@@ -100,8 +100,19 @@ impl ObservedEventReporter {
         self.observe(ObservedEvent::Log(event))
     }
 
+    /// Report a pre-grouped batch of log events as a single channel
+    /// send.  Used by the per-thread CCKR sampler to ship one period's
+    /// records as one `ObservedEvent::LogBatch`.  Empty batches are
+    /// suppressed.
+    pub fn log_batch(&self, events: Vec<LogEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        self.observe(ObservedEvent::LogBatch(events))
+    }
+
     fn observe(&self, event: ObservedEvent) {
-        let is_log = matches!(event, ObservedEvent::Log(_));
+        let is_log = matches!(event, ObservedEvent::Log(_) | ObservedEvent::LogBatch(_));
         match self.policy.blocking_timeout {
             None => match self.sender.try_send(event) {
                 Ok(_) => {}
@@ -156,6 +167,9 @@ pub enum ObservedEvent {
     Engine(EngineEvent),
     /// The log event.
     Log(LogEvent),
+    /// A pre-grouped batch of log events emitted by a per-thread
+    /// sampler at the end of a sampling period.
+    LogBatch(Vec<LogEvent>),
 }
 
 /// An observed event emitted by the engine.
@@ -183,6 +197,7 @@ impl fmt::Display for ObservedEvent {
         match self {
             ObservedEvent::Engine(event) => write!(f, "Engine({:?})", event.key),
             ObservedEvent::Log(event) => write!(f, "Log({})", event),
+            ObservedEvent::LogBatch(events) => write!(f, "LogBatch(len={})", events.len()),
         }
     }
 }
