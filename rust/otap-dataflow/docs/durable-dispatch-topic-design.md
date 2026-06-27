@@ -11,10 +11,11 @@ engine has no key-deterministic cross-core dispatch and no durable topic
 backend, and that both should be built on shared infrastructure rather than
 bespoke parts.
 
-> Status: design in progress. The orthogonal-axis model (D27) and the layer
-> decomposition are **ratified** from this session's discussion; most component
-> decisions are **proposed**; a few are **open**. See "Decisions". Names are
-> provisional. Nothing here is implemented yet.
+> Status: design ratified, not yet implemented. The orthogonal-axis model
+> (D27), the layer decomposition, and all component decisions are **ratified**
+> (D18-D20, D22-D23, D25-D28); only the durable backend (D21/D24) is
+> **deferred** to a later effort, behind the same interface. See "Decisions".
+> Names are provisional. Nothing here is implemented yet.
 >
 > **Scope for this effort (D28):** build the **in-memory core only** -- Layer A
 > (split-by-key) + Layer C (partition-dispatch on the in-memory backend) = the
@@ -47,10 +48,10 @@ Two axes, independent (D27):
 
 The cross-product is the agent's operating range:
 
-| delivery \ backend  | in-memory                              | quiver (durable)               |
-| ------------------- | -------------------------------------- | ------------------------------ |
-| partition-dispatch  | large-scale aggregating telemetry SDK  | disconnection-tolerant appliance |
-| balanced            | stateless load-balancer                | durable work queue             |
+| delivery \ backend | in-memory                             | quiver (durable)                 |
+| ------------------ | ------------------------------------- | -------------------------------- |
+| partition-dispatch | large-scale aggregating telemetry SDK | disconnection-tolerant appliance |
+| balanced           | stateless load-balancer               | durable work queue               |
 
 The shuffle/aggregate/load-balance path runs **identically** over both backends;
 durability only changes the guarantee (in-memory: effective-once within a
@@ -100,16 +101,16 @@ is built and tested **in memory first**, with durability added as a backend swap
 
 ## How it maps onto existing primitives
 
-| Capability                         | Engine primitive                                                        | Status                                   |
-| ---------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------- |
-| Size-based batch split/merge       | `otap::groups` + `transform::split` (contiguous range split)            | exists                                   |
-| Selection-mask cascade (root->child)| `otap::filter::filter_otap_batch` (+ `filter_metrics_time_window`)      | exists (used by filter + admission)      |
-| Topic backend seam                 | `TopicBackend` / `TopicState` / `SubscriptionBackend`                   | exists; `InMemoryBackend` only           |
-| Durable buffer                     | `quiver` (WAL + Arrow IPC segments, at-least-once, multi-stream, budget)| exists (experimental)                    |
-| Reserved durable topic kind        | `TopicBackendKind::Quiver`                                              | reserved; currently rejected at startup  |
-| Split-by-key (Layer A)             | (this design)                                                           | to build                                 |
-| Quiver TopicBackend (Layer B)      | (this design)                                                           | to build                                 |
-| Partition-dispatch + placement (C) | (this design) + controller placement map                               | to build                                 |
+| Capability                           | Engine primitive                                                         | Status                                  |
+| ------------------------------------ | ------------------------------------------------------------------------ | --------------------------------------- |
+| Size-based batch split/merge         | `otap::groups` + `transform::split` (contiguous range split)             | exists                                  |
+| Selection-mask cascade (root->child) | `otap::filter::filter_otap_batch` (+ `filter_metrics_time_window`)       | exists (used by filter + admission)     |
+| Topic backend seam                   | `TopicBackend` / `TopicState` / `SubscriptionBackend`                    | exists; `InMemoryBackend` only          |
+| Durable buffer                       | `quiver` (WAL + Arrow IPC segments, at-least-once, multi-stream, budget) | exists (experimental)                   |
+| Reserved durable topic kind          | `TopicBackendKind::Quiver`                                               | reserved; currently rejected at startup |
+| Split-by-key (Layer A)               | (this design)                                                            | to build                                |
+| Quiver TopicBackend (Layer B)        | (this design)                                                            | to build                                |
+| Partition-dispatch + placement (C)   | (this design) + controller placement map                                 | to build                                |
 
 ## Layer A: Split-by-key
 
@@ -177,7 +178,7 @@ partition cannot be pinned to an owner today. Broadcast has a per-subscriber
 cursor and a `BroadcastSubscriberId` type, but it fans out to all subscribers.
 Neither gives "this partition, that owner."
 
-**Mechanism (proposed).** A new subscription mode in which a subscriber *claims*
+**Mechanism (D22).** A new subscription mode in which a subscriber *claims*
 one or more partitions exclusively, giving a stable `partition -> subscriber`
 mapping:
 
@@ -260,24 +261,23 @@ log), replayed on startup -- so no hand-rolled WAL is needed.
 ## Decisions
 
 Continuing the shared decision ledger of the ingest-queue and appliance designs
-(D1-D17). Status is per-decision: **ratified** (follows from facts/user
-direction already established), **proposed** (recommended, awaiting
-confirmation), **open** (needs discussion), or **deferred** (decided to defer
-beyond this effort).
+(D1-D17). Status is per-decision: **ratified**, decided and ready to build, or
+**deferred**, intentionally postponed beyond this effort and addressed later as
+an additive backend swap (D21/D24, the durable backend).
 
-| ID  | Decision                                   | Recommendation                                  | Status   |
-| --- | ------------------------------------------ | ----------------------------------------------- | -------- |
-| D18 | Layer decomposition + build order          | A split-by-key -> C in-memory dispatch -> B durable | ratified |
-| D19 | Split-by-key mechanism                     | selection-mask radix cascade; batch processor   | proposed |
-| D20 | Shard key source                           | data-sourced; descriptor/tenant composes later  | ratified |
-| D21 | Durable backend                            | Quiver `TopicBackend`; durability is additive    | deferred |
-| D22 | Partition ownership                        | new partition-claim mode; in-memory first        | proposed |
-| D23 | Placement seam                             | controller map; static->rebalanced; leases       | proposed |
-| D24 | Quiver backend granularity                 | one quiver/owner, per-partition IPC streams      | deferred |
-| D25 | Split and dispatch packaging               | separate nodes vs fused shuffle                  | open     |
-| D26 | Standalone logs (no `trace_id`) key        | resource identity vs sampling key                | open     |
-| D27 | Optional, per-location durability          | delivery mode x backend are orthogonal axes      | ratified |
-| D28 | Scope for this effort                      | in-memory core (A+C) only; defer Quiver (B)      | ratified |
+| ID  | Decision                            | Recommendation                                      | Status   |
+| --- | ----------------------------------- | --------------------------------------------------- | -------- |
+| D18 | Layer decomposition + build order   | A split-by-key -> C in-memory dispatch -> B durable | ratified |
+| D19 | Split-by-key mechanism              | selection-mask radix cascade; batch processor       | ratified |
+| D20 | Shard key source                    | data-sourced; descriptor/tenant composes later      | ratified |
+| D21 | Durable backend                     | Quiver `TopicBackend`; durability is additive       | deferred |
+| D22 | Partition ownership                 | new partition-claim mode; in-memory first           | ratified |
+| D23 | Placement seam                      | controller map; static->rebalanced; leases          | ratified |
+| D24 | Quiver backend granularity          | one quiver/owner, per-partition IPC streams         | deferred |
+| D25 | Split and dispatch packaging        | separate composable nodes; fused fast-path later    | ratified |
+| D26 | Standalone logs (no `trace_id`) key | configured projection; default even spread          | ratified |
+| D27 | Optional, per-location durability   | delivery mode x backend are orthogonal axes         | ratified |
+| D28 | Scope for this effort               | in-memory core (A+C) only; defer Quiver (B)         | ratified |
 
 ### D18. Layer decomposition and build order
 
@@ -293,15 +293,22 @@ first runnable prototype is in-memory; the ingest-queue Phase 1 begins on A+C
 
 ### D19. Split-by-key mechanism
 
-**Proposed:** implement split-by-key as a **selection-mask radix cascade**
-(reusing the `filter_otap_batch` family), not by extending the contiguous,
-size-based `transform::split`. Compute `partition = part_fn(root key) mod N`,
-then cascade-filter per partition. **Why:** rows sharing a key are non-contiguous,
-so the range-split model does not apply; the mask-cascade already prunes child
-tables by parent id and is proven by the admission processor. **Home:** the OTAP
-batch processor. **Alternatives:** sort-the-root-by-key then range-split (adds a
-full sort and reorders data); rejected for the prototype. **Implication:** N
-cascade passes initially; a single scatter pass is the later optimization.
+**Decided:** implement split-by-key as a **selection-mask radix cascade**
+reusing the `filter_otap_batch` family, not by extending the contiguous,
+size-based `transform::split`. Compute `partition = part_fn(root key) mod N`
+per root row, then cascade-filter per partition so child tables -- attributes,
+data points, exemplars, events and links -- are pruned by parent-id integrity.
+**Why:** rows sharing a key are non-contiguous, so the range-split model does
+not apply, whereas the mask-cascade already prunes child tables by parent id
+and is proven by the admission processor's `filter_metrics_time_window`.
+**Home:** the OTAP batch processor, which already emits each output as its own
+`OtapPdata` in its flush loop. The partition function and `N` live on the split
+side; each sub-batch carries its integer partition index on the request
+`Context`, alongside `peer_addr`, so Layer C routes without re-deriving the key
+(couples to D25). **Alternative:** sorting the root by key then range-splitting
+adds a full sort and reorders data; rejected. **Implication:** `N` independent
+cascade passes initially; a single scatter pass into `N` builders is the later
+optimization.
 
 ### D20. Shard key source
 
@@ -330,31 +337,35 @@ quiver" and can then be deprecated. Couples to ingest-queue D4/D6.
 
 ### D22. Partition ownership
 
-**Proposed:** add a **partition-claim subscription mode** giving a stable,
-*exclusive* `partition -> subscriber` mapping, because the current balanced
-subscription is a single shared queue with no stable subscriber identity. A
-subscriber declares its owned partitions (from the placement map) at subscribe
-time; publish routes by the item's partition tag to the owning subscriber.
-Built on the **in-memory backend first** (per D18/D27); the quiver backend
-implements the same ownership durably. **Why:** stable *exclusive* ownership is
-the property that makes a per-core registry/aggregator the single writer for its
-keys -- the opposite of balanced's sharing; round-robin cannot provide it.
-**Implication:** new subscription mode and per-partition (or per-owner) queues;
-the partition tag travels with the item; ack/nack fan-in across a split batch
-reuses the batch processor's existing outbound-slot tracking.
+**Decided:** add a **partition-claim subscription mode** giving a stable,
+*exclusive* `partition -> subscriber` mapping. The broker today offers only
+`SubscriptionMode::Balanced { group }`, a single shared group queue that
+consumers race on with no stable "subscriber N of M" identity, and
+`SubscriptionMode::Broadcast`, which has a per-subscriber cursor
+(`BroadcastSubscriberId`) but fans out to every subscriber; neither pins a
+partition to one owner. A subscriber declares its owned partitions, sourced
+from the placement map (D23), at subscribe time, and publish routes by the
+item's partition tag to the owning subscriber. Built on the **in-memory backend
+first** per D18/D27; the quiver backend (D21, deferred) implements the same
+ownership durably. **Why:** stable *exclusive* ownership is what makes a
+per-core registry or aggregator the single writer for its keys, the opposite of
+balanced's sharing, and round-robin cannot provide it. **Implication:** a new
+subscription mode and per-partition (or per-owner) queues; the partition tag
+travels with the item; ack/nack fan-in across a split batch reuses the batch
+processor's existing outbound-slot tracking.
 
 ### D23. Placement seam
 
-**Proposed:** `partition -> owner` lives in the controller as a placement map --
-static `partition -> core` first; load-aware churn-minimizing rebalancing and
+**Decided:** `partition -> owner` lives in the controller as a placement map --
+static `partition -> core` first; load-aware, churn-minimizing rebalancing and
 `partition -> node` later (ingest-queue Phases 2-4). For this effort only the
-**static in-memory map** is needed; leases/generation-fencing and the M3
-`Initializing`/`Leaving` durable handoff are deferred with Layer B (they stamp
-quiver bundle metadata and replay durable streams). **Why:** the two-level
+**static in-memory map** is needed; leases with generation fencing and the M3
+`Initializing`/`Leaving` durable handoff are deferred with Layer B, where they
+stamp quiver bundle metadata and replay durable streams. **Why:** the two-level
 `key -> partition -> owner` indirection bounds churn and makes rebalancing
-possible without rehashing keys (ingest-queue D3/Auto-sharding). **Implication:**
-this effort adds a minimal static placement map; the controller's
-lease/key-ownership primitive arrives with durability.
+possible without rehashing keys (ingest-queue D3 / Auto-sharding).
+**Implication:** this effort adds a minimal static placement map; the
+controller's lease and key-ownership primitive arrives with durability.
 
 ### D24. Quiver backend granularity -- deferred this effort
 
@@ -367,20 +378,45 @@ Alternative: one quiver per partition (simpler isolation and handoff, more WALs)
 The choice hinges on whether quiver can hand off a *single stream* out of a
 multi-stream instance on reassignment (to verify when Layer B is built).
 
-### D25. Split and dispatch packaging (open)
+### D25. Split and dispatch packaging
 
-**Open:** are split-by-key and partition-dispatch **separate** nodes (a batch
-processor that splits + a partition-dispatch topic) or a **fused** "shuffle"
-node? Leaning separate, because each is independently useful (split for tenant
-batching; the topic for any in-memory or durable delivery) and the engine
-already models routing/batching as configured nodes. Needs discussion.
+**Decided: separate composable nodes, not a fused shuffle node.** Split-by-key
+is an OTAP-aware pdata operation in the batch processor that tags each sub-batch
+with an integer partition index; partition-dispatch is a backend-agnostic topic
+delivery mode that routes by that integer tag through the placement map.
+**Why:** the topic broker is generic over its payload type (`TopicBackend<T>`,
+`Envelope<T>`), so teaching it to extract an OTAP key would specialize the
+backend-agnostic seam and couple the broker to pdata; keeping the key logic in
+the pdata layer preserves that seam. Each half is independently useful -- split
+for tenant or descriptor batching, the partition-dispatch topic for any keyed
+in-memory or durable delivery -- and two configured nodes match the engine's
+routing/batching idiom and D18's independently-testable build order. The
+partition function and `N` are configured on the split side; the topic and the
+placement map need only `N`. **Implication:** the integer partition tag is the
+contract between the two nodes, carried on the request `Context`; a fused
+single-scatter fast-path (D19's optimization) stays available internally
+without changing the configured topology.
 
-### D26. Standalone logs key (open)
+### D26. Standalone logs key
 
-**Open:** how are logs with no `trace_id` partitioned? Options: a resource/scope
-identity key (co-locate a producer's logs) or a sampling key. Trace-correlated
-logs ride the trace's `trace_id` partition; standalone logs need their own
-sub-tenant key. Off the metrics-appliance critical path; deferrable.
+**Decided: a configured projection over log columns, defaulting to even
+spread.** Trace-correlated logs continue to ride their trace's `trace_id`
+partition (D3); standalone logs, those with no `trace_id`, take a configured
+sub-tenant projection whose default spreads rows evenly -- round-robin, or a
+hash over a resource-and-scope identity combined with a per-record discriminator
+so a single-resource stream still distributes. **Why:** unlike metrics, which
+need single-writer delta-to-cumulative, and traces, which need whole-trace
+assembly, standalone logs have no co-location *correctness* requirement, so the
+queue's even-load goal dominates; resource cardinality is also often low enough
+that hashing resource identity alone would concentrate one service's logs on a
+single owner. A **resource-identity co-location** mode remains available for
+deployments that do per-resource downstream work such as dedup or per-resource
+rate-limit and forward, with hot-resource sub-partitioning reusing the
+metric-name mechanism. This completes the per-signal partitioner (D3): metrics
+hash `metric_name`, traces slice `trace_id`, standalone logs default to even
+spread with optional resource co-location. **Implication:** off the
+metrics-appliance critical path, so implementation waits until logs are
+addressed, but the keying is now decided rather than open.
 
 ### D27. Optional, per-location durability
 
@@ -439,17 +475,18 @@ Deferred (added later as an additive backend swap, D28/D21):
 
 ## Status and next steps
 
-- Nothing here is implemented. D18/D20/D27/D28 are ratified this session;
-  D19/D22/D23 are proposed; D25/D26 are open; D21/D24 are deferred (Layer B).
-  None of the open/deferred items block Layer A or the in-memory core.
+- Nothing here is implemented. All component decisions are now ratified
+  (D18-D20, D22-D23, D25-D28); only the durable backend (D21/D24) is deferred to
+  Layer B. None of the deferred items block Layer A or the in-memory core.
 - The substrate exists: the topic backend seam, `quiver`, the cascade filter
   (`filter_otap_batch` / `filter_metrics_time_window`), and the size-based batch
   split. The reserved `TopicBackendKind::Quiver` is the (deferred) durable-backend
   wiring point.
 - **To proceed:** implement Layer A (split-by-key, the durability-independent
-  foundation), then Layer C on the in-memory backend (the runnable aggregator).
-  Layer B (durability) is deferred. Resolve D25 (packaging) as Layer A/C are
-  built; D26 when logs are addressed.
+  foundation) as separate composable nodes (D25), then Layer C on the in-memory
+  backend (the runnable aggregator). Layer B (durability) is deferred. The
+  standalone-logs key (D26) is decided but its implementation waits until logs
+  are addressed.
 
 **Related docs:** [`ingest-queue-design.md`](./ingest-queue-design.md) (D3
 per-signal partitioner; the consumer of this infrastructure),

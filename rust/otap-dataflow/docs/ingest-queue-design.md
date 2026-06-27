@@ -106,15 +106,15 @@ lossless mode.
 
 ## How it maps onto existing primitives
 
-| Capability                      | Engine primitive                                                            | Status                              |
-| ------------------------------- | --------------------------------------------------------------------------- | ----------------------------------- |
-| Durable buffer-queue            | `quiver` (WAL + Arrow IPC segments, multi-subscriber at-least-once, budget) | exists (experimental)               |
+| Capability                      | Engine primitive                                                            | Status                                              |
+| ------------------------------- | --------------------------------------------------------------------------- | --------------------------------------------------- |
+| Durable buffer-queue            | `quiver` (WAL + Arrow IPC segments, multi-subscriber at-least-once, budget) | exists (experimental)                               |
 | Per-core type registry          | in-memory Arrow table + `quiver` snapshot                                   | in-memory done (Phase 0); durability TODO (Phase 1) |
-| Balanced work distribution      | balanced topic + thread-per-core controller                                 | exists                              |
-| Local control plane / placement | controller (core allocation, lifecycle, leases)                             | partial; local-only, no rebalancing |
-| Validation compute              | query engine / DataFusion over OTAP Arrow                                   | exists                              |
-| Admission + manifest (Phase 0)  | `processor:metrics_admission` (time-window gate, per-core type registry)    | exists (Phase 0)                    |
-| Auto-sharder                    | (this design)                                                               | to build                            |
+| Balanced work distribution      | balanced topic + thread-per-core controller                                 | exists                                              |
+| Local control plane / placement | controller (core allocation, lifecycle, leases)                             | partial; local-only, no rebalancing                 |
+| Validation compute              | query engine / DataFusion over OTAP Arrow                                   | exists                                              |
+| Admission + manifest (Phase 0)  | `processor:metrics_admission` (time-window gate, per-core type registry)    | exists (Phase 0)                                    |
+| Auto-sharder                    | (this design)                                                               | to build                                            |
 
 The durable-queue question is largely answered by `quiver` already. Phase 0
 landed the admission front-end (the `metrics_admission` processor and its
@@ -351,17 +351,17 @@ stake, the options and their trade-offs, and the implications of the choice.
 **Status: all decisions (D1 through D9) are ratified. See each section for the
 decision, rationale, and implications.**
 
-| ID | Decision                   | Recommendation                       | Status  |
-| -- | -------------------------- | ------------------------------------ | ------- |
-| D1 | Type-identity domain       | identity key = name in tenant        | decided |
-| D2 | New name on data path      | admit-and-record (no quarantine)     | decided |
-| D3 | Sharding scheme            | per-signal: hash name, slice trace_id | decided |
-| D4 | Storage locality           | configurable: local + object-store   | decided |
-| D5 | Sizing M and N             | N ~ 16-64x cores (pow2), streams     | decided |
-| D6 | QoS default                | loss-tolerant default, lossless mode | decided |
-| D7 | Type evolution / overrides | admit-all; override sets primary     | decided |
-| D8 | Manifest eviction / GC     | never evict in v1                    | decided |
-| D9 | Tenancy                    | tenant descriptor projection         | decided |
+| ID  | Decision                   | Recommendation                        | Status  |
+| --- | -------------------------- | ------------------------------------- | ------- |
+| D1  | Type-identity domain       | identity key = name in tenant         | decided |
+| D2  | New name on data path      | admit-and-record (no quarantine)      | decided |
+| D3  | Sharding scheme            | per-signal: hash name, slice trace_id | decided |
+| D4  | Storage locality           | configurable: local + object-store    | decided |
+| D5  | Sizing M and N             | N ~ 16-64x cores (pow2), streams      | decided |
+| D6  | QoS default                | loss-tolerant default, lossless mode  | decided |
+| D7  | Type evolution / overrides | admit-all; override sets primary      | decided |
+| D8  | Manifest eviction / GC     | never evict in v1                     | decided |
+| D9  | Tenancy                    | tenant descriptor projection          | decided |
 
 ### D1. Type-identity domain
 
@@ -444,8 +444,10 @@ follows the key's entropy, not one rule.
   non-conformant producers, but is not the default. `trace_id` is never
   sub-partitioned: a whole trace (its spans and correlated logs) stays in one
   bucket.
-- *Standalone logs (no `trace_id`):* a separate keying decision (resource
-  identity or a sampling key); still open.
+- *Standalone logs (no `trace_id`):* a configured sub-tenant projection that
+  defaults to even spread, with optional resource-identity co-location for
+  per-resource downstream work; decided in the dispatch design (D26). Standalone
+  logs have no co-location correctness need, so even load dominates.
 
 **Bucket = the flush/forward unit (write amplification).** Because the bucket is
 the co-located unit -- all of a name's series, or all of a trace's spans and
@@ -706,7 +708,7 @@ which the downstream watermark operates.
 > Phase 1 is therefore paused pending a **partition-dispatch topic with optional
 > durability**, now designed in
 > [`durable-dispatch-topic-design.md`](./durable-dispatch-topic-design.md)
-> (decisions D18-D27). Durability is an **orthogonal axis** (D27): the
+> (decisions D18-D28). Durability is an **orthogonal axis** (D27): the
 > shuffle/aggregate/load-balance path runs in memory (a large-scale aggregating
 > SDK) or durable (this appliance) by choosing the topic backend. It factors into:
 >
@@ -730,10 +732,10 @@ which the downstream watermark operates.
 
 **To resume in a new session (in-memory core only, design doc D28):**
 
-1. Implement **Layer A** (split-by-key) -> **Layer C on the in-memory backend**
-   (the runnable in-memory aggregator). **Layer B (Quiver durability) is
-   deferred.** D25 (packaging) resolves as A/C are built; D26 when logs are
-   addressed.
+1. Implement **Layer A** (split-by-key, as separate composable nodes per D25) ->
+   **Layer C on the in-memory backend** (the runnable in-memory aggregator).
+   **Layer B (Quiver durability) is deferred.** Dispatch decisions D19/D22/D23
+   are ratified and D25/D26 decided, so none remain open to block this.
 2. Phase 1 shuffle = `metrics_admission` subscribes to the partition-dispatch
    topic (in-memory backend) keyed by the **per-signal partitioner** (D3
    refinement): `hash(name)` for metrics, low-56-bit slice of `trace_id` for
