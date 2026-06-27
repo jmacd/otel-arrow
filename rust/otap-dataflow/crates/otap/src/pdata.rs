@@ -63,6 +63,14 @@ pub struct Context {
     /// 1ns sentinel is acceptable drift. At most one flow_metric can be
     /// active at a time (non-overlapping ranges).
     flow_compute_ns: Option<NonZeroU64>,
+    /// Partition index assigned by a split-by-key (partition-dispatch) node.
+    ///
+    /// Set by a split-by-key node so the immediately-following
+    /// partition-dispatch hop can route each sub-batch to its owner without
+    /// re-deriving the key (the A→C contract, durable-dispatch design D25).
+    /// Ephemeral routing state: `None` until a split node assigns it, and reset
+    /// across transport-boundary clones.
+    partition: Option<u32>,
 }
 
 impl Context {
@@ -75,6 +83,7 @@ impl Context {
             transport_headers: None,
             peer_addr: None,
             flow_compute_ns: None,
+            partition: None,
         }
     }
 
@@ -332,6 +341,17 @@ impl Context {
         self.peer_addr = Some(addr);
     }
 
+    /// Returns the partition index assigned by a split-by-key node, if any.
+    #[must_use]
+    pub fn partition(&self) -> Option<u32> {
+        self.partition
+    }
+
+    /// Set the partition index assigned by a split-by-key node.
+    pub fn set_partition(&mut self, partition: u32) {
+        self.partition = Some(partition);
+    }
+
     /// Merge peer addresses from a set of contributing inputs.
     ///
     /// Returns `Some(addr)` only when every contributing input observed the
@@ -583,6 +603,7 @@ impl OtapPdata {
                 transport_headers: self.context.transport_headers.clone(),
                 peer_addr: self.context.peer_addr,
                 flow_compute_ns: None,
+                partition: None,
             },
             payload: self.payload.clone(),
         }
@@ -737,6 +758,20 @@ impl OtapPdata {
     pub fn with_peer_addr(mut self, addr: SocketAddr) -> Self {
         self.context.set_peer_addr(addr);
         self
+    }
+
+    /// Returns the partition index assigned by a split-by-key node, if any.
+    ///
+    /// Set by a split-by-key (partition-dispatch) node and consumed by the
+    /// immediately-following partition-dispatch hop (durable-dispatch D25).
+    #[must_use]
+    pub fn partition(&self) -> Option<u32> {
+        self.context.partition()
+    }
+
+    /// Set the partition index on this pdata's context.
+    pub fn set_partition(&mut self, partition: u32) {
+        self.context.set_partition(partition);
     }
 }
 

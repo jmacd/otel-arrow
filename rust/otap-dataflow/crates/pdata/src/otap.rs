@@ -26,6 +26,8 @@ pub mod batching_tests;
 /// filter support for the filter processor
 pub mod filter;
 pub mod groups;
+/// split-by-key partitioning (Layer A of the partition-dispatch design)
+pub mod partition;
 pub mod raw_batch_store;
 pub mod schema;
 #[allow(missing_docs)]

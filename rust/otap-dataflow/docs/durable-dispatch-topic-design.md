@@ -11,11 +11,13 @@ engine has no key-deterministic cross-core dispatch and no durable topic
 backend, and that both should be built on shared infrastructure rather than
 bespoke parts.
 
-> Status: design ratified, not yet implemented. The orthogonal-axis model
-> (D27), the layer decomposition, and all component decisions are **ratified**
-> (D18-D20, D22-D23, D25-D28); only the durable backend (D21/D24) is
-> **deferred** to a later effort, behind the same interface. See "Decisions".
-> Names are provisional. Nothing here is implemented yet.
+> Status: design ratified; the in-memory core is partially implemented. The
+> orthogonal-axis model (D27), the layer decomposition, and all component
+> decisions are **ratified** (D18-D20, D22-D23, D25-D28); only the durable backend
+> (D21/D24) is **deferred** to a later effort, behind the same interface. See
+> "Decisions". Names are provisional. **Layer A (split-by-key) is now
+> implemented** as the `partition` processor node; **Layer C (partition-dispatch)
+> is next.**
 >
 > **Scope for this effort (D28):** build the **in-memory core only** -- Layer A
 > (split-by-key) + Layer C (partition-dispatch on the in-memory backend) = the
@@ -148,18 +150,18 @@ for, not required by the ingest queue.)
   condition to a *named* partition (low cardinality, for isolation) rather than
   a hash bucket.
 
-**Home: the OTAP batch processor.** "Group-by-key then batch" belongs with the
-batch processor, which already merges and splits by size via `otap::groups`. The
-operation is columnar over OTAP (a group-by over a root column with child rows
-pruned by parent id); it is possible but less direct over row-oriented OTLP.
-Transport-optimized ids must be decoded first (as the admission processor and
-filter processor already do).
+**Home: a dedicated `partition` processor node.** Split-by-key is exposed as its
+own composable OTAP processor node rather than folded into the size-based batch
+processor, which keeps that node's intricate slot, timer, and ack/nack batching
+logic separate from the stateless key split (D25). The operation is columnar
+over OTAP, a group-by over a root column with child rows pruned by parent id, so
+it reuses the `filter_otap_batch` cascade. Transport-optimized ids must be
+decoded first, as the admission processor and filter processor already do.
 
-**Output.** Each sub-batch is emitted carrying its partition index, so Layer C
-can route it without re-deriving the key. The batch processor already emits each
-output batch as its own `OtapPdata` in its flush loop; split-by-key adds the
-per-partition fan-out and the tag. The tag travels on the request `Context`
-(alongside `peer_addr`/source-node tagging) so it survives to the dispatch hop.
+**Output.** Each sub-batch is emitted as its own `OtapPdata` carrying its
+partition index, so Layer C can route it without re-deriving the key. The tag
+travels on the request `Context` via `Context::partition`, alongside `peer_addr`
+and source-node tagging, so it survives to the dispatch hop.
 
 **Optimization (later).** N independent cascade passes are simple and correct
 for a prototype; a single scatter pass that distributes rows into N builders in
@@ -301,14 +303,14 @@ data points, exemplars, events and links -- are pruned by parent-id integrity.
 **Why:** rows sharing a key are non-contiguous, so the range-split model does
 not apply, whereas the mask-cascade already prunes child tables by parent id
 and is proven by the admission processor's `filter_metrics_time_window`.
-**Home:** the OTAP batch processor, which already emits each output as its own
-`OtapPdata` in its flush loop. The partition function and `N` live on the split
-side; each sub-batch carries its integer partition index on the request
-`Context`, alongside `peer_addr`, so Layer C routes without re-deriving the key
-(couples to D25). **Alternative:** sorting the root by key then range-splitting
-adds a full sort and reorders data; rejected. **Implication:** `N` independent
-cascade passes initially; a single scatter pass into `N` builders is the later
-optimization.
+**Home:** a dedicated `partition` processor node that emits each sub-batch as
+its own `OtapPdata`. The partition function and `N` live on the split side; each
+sub-batch carries its integer partition index on the request `Context` via
+`Context::partition`, alongside `peer_addr`, so Layer C routes without
+re-deriving the key (couples to D25). **Alternative:** sorting the root by key
+then range-splitting adds a full sort and reorders data; rejected.
+**Implication:** `N` independent cascade passes initially; a single scatter pass
+into `N` builders is the later optimization.
 
 ### D20. Shard key source
 
@@ -381,21 +383,30 @@ multi-stream instance on reassignment (to verify when Layer B is built).
 ### D25. Split and dispatch packaging
 
 **Decided: separate composable nodes, not a fused shuffle node.** Split-by-key
-is an OTAP-aware pdata operation in the batch processor that tags each sub-batch
-with an integer partition index; partition-dispatch is a backend-agnostic topic
-delivery mode that routes by that integer tag through the placement map.
+is an OTAP-aware pdata operation exposed as a dedicated `partition` processor
+node that tags each sub-batch with an integer partition index; partition-dispatch
+is a backend-agnostic topic delivery mode that routes by that integer tag through
+the placement map.
 **Why:** the topic broker is generic over its payload type (`TopicBackend<T>`,
 `Envelope<T>`), so teaching it to extract an OTAP key would specialize the
 backend-agnostic seam and couple the broker to pdata; keeping the key logic in
 the pdata layer preserves that seam. Each half is independently useful -- split
 for tenant or descriptor batching, the partition-dispatch topic for any keyed
 in-memory or durable delivery -- and two configured nodes match the engine's
-routing/batching idiom and D18's independently-testable build order. The
-partition function and `N` are configured on the split side; the topic and the
-placement map need only `N`. **Implication:** the integer partition tag is the
-contract between the two nodes, carried on the request `Context`; a fused
-single-scatter fast-path (D19's optimization) stays available internally
-without changing the configured topology.
+routing/batching idiom and D18's independently-testable build order. A dedicated
+node rather than a mode of the size-based batch processor keeps the stateless key
+split out of that node's slot/timer/ack machinery. The partition function and `N`
+are configured on the split side; the topic and the placement map need only `N`.
+**Implication:** the integer partition tag is the contract between the two nodes,
+carried on the request `Context`; a fused single-scatter fast-path (D19's
+optimization) stays available internally without changing the configured
+topology.
+**Implemented:** the split half is the `partition` processor node
+(`urn:otel:processor:partition`,
+`crates/core-nodes/src/processors/partition_processor/`) over the
+`partition_otap_batch` primitive
+(`crates/pdata/src/otap/partition.rs`); the integer tag rides `Context::partition`.
+The partition-dispatch delivery mode (Layer C) is the remaining half.
 
 ### D26. Standalone logs key
 
@@ -456,14 +467,20 @@ registry stays in-memory and is relearned on restart (safe per ingest-queue D8).
 
 In scope for this effort (the in-memory core, D28):
 
-1. **Layer A -- split-by-key** in the batch processor / pdata, on the cascade
-   machinery. Independently testable (split a multi-key OTAP batch into N
-   partition-tagged sub-batches; verify cascade integrity). Durability-independent.
+1. **Layer A -- split-by-key (DONE).** Implemented as the `partition` processor
+   node (`urn:otel:processor:partition`,
+   `crates/core-nodes/src/processors/partition_processor/`) over the
+   `partition_otap_batch` pdata primitive
+   (`crates/pdata/src/otap/partition.rs`), on the cascade machinery. It splits a
+   multi-key OTAP batch into N partition-tagged sub-batches, carrying the integer
+   tag on `Context::partition`; cascade integrity, determinism, conservation, and
+   the per-signal keys (hash `metric_name`, slice the low 56 bits of `trace_id`)
+   are covered by tests. Durability-independent.
 2. **Layer C -- partition-dispatch subscription + static placement on the
    in-memory backend.** With A, this is the complete, runnable in-memory
    aggregating load-balancer (the "large-scale SDK") -- end-to-end, no durability.
    Delivers the in-memory form of ingest-queue Phase 1 (shuffle + per-owner
-   authority).
+   authority). It consumes the `Context::partition` tag the `partition` node sets.
 
 Deferred (added later as an additive backend swap, D28/D21):
 
@@ -475,18 +492,25 @@ Deferred (added later as an additive backend swap, D28/D21):
 
 ## Status and next steps
 
-- Nothing here is implemented. All component decisions are now ratified
-  (D18-D20, D22-D23, D25-D28); only the durable backend (D21/D24) is deferred to
-  Layer B. None of the deferred items block Layer A or the in-memory core.
+- **Layer A is implemented; Layer C and the durable backend are not.** All
+  component decisions are now ratified (D18-D20, D22-D23, D25-D28); only the
+  durable backend (D21/D24) is deferred to Layer B. None of the deferred items
+  block the in-memory core.
+- **Layer A delivered:** the `partition_otap_batch` primitive
+  (`crates/pdata/src/otap/partition.rs`), the `partition` processor node
+  (`crates/core-nodes/src/processors/partition_processor/`,
+  `urn:otel:processor:partition`), and the `Context::partition` tag the A->C
+  contract rides on. Acknowledgement fan-in is the documented, deferred part
+  (D22): the request context rides the first partition only.
 - The substrate exists: the topic backend seam, `quiver`, the cascade filter
   (`filter_otap_batch` / `filter_metrics_time_window`), and the size-based batch
   split. The reserved `TopicBackendKind::Quiver` is the (deferred) durable-backend
   wiring point.
-- **To proceed:** implement Layer A (split-by-key, the durability-independent
-  foundation) as separate composable nodes (D25), then Layer C on the in-memory
-  backend (the runnable aggregator). Layer B (durability) is deferred. The
-  standalone-logs key (D26) is decided but its implementation waits until logs
-  are addressed.
+- **To proceed:** implement Layer C on the in-memory backend (the
+  partition-dispatch subscription + static placement map), consuming the
+  `Context::partition` tag, to complete the runnable in-memory aggregator.
+  Layer B (durability) is deferred. The standalone-logs key (D26) is decided but
+  its implementation waits until logs are addressed.
 
 **Related docs:** [`ingest-queue-design.md`](./ingest-queue-design.md) (D3
 per-signal partitioner; the consumer of this infrastructure),
