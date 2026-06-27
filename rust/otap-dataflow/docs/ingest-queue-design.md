@@ -732,19 +732,20 @@ which the downstream watermark operates.
 
 **To resume in a new session (in-memory core only, design doc D28):**
 
-1. **Layer A (split-by-key) is implemented** as the `partition` processor node
-   (`urn:otel:processor:partition`) over the `partition_otap_batch` primitive
-   (`crates/pdata/src/otap/partition.rs`); it tags each sub-batch on
-   `Context::partition`. The remaining step is **Layer C on the in-memory
-   backend** (the partition-dispatch subscription + static placement) to make the
-   runnable in-memory aggregator. **Layer B (Quiver durability) is deferred.**
-   Dispatch decisions D19/D22/D23 are ratified and D25/D26 decided, so none
-   remain open to block this.
+1. **Layers A and C are implemented** -- the in-memory shuffle is runnable. Layer
+   A is the `partition` processor node (`urn:otel:processor:partition`) over the
+   `partition_otap_batch` primitive (`crates/pdata/src/otap/partition.rs`),
+   tagging each sub-batch on `Context::partition`; Layer C is the in-memory
+   partition-dispatch topic (`SubscriptionMode::PartitionDispatch`, the
+   `PartitionDispatchBackend`, and the `PartitionPlacement` map in
+   `crates/engine/src/topic/`), wired through the topic exporter, receiver,
+   config (`TopicSpec.num_partitions`), and controller. **Layer B (Quiver
+   durability) is deferred.** See `durable-dispatch-topic-design.md`.
 2. Phase 1 shuffle = the `partition` node splits by the **per-signal
    partitioner** (D3 refinement) -- `hash(name)` for metrics, low-56-bit slice of
-   `trace_id` for traces/correlated-logs -- and (with Layer C) `metrics_admission`
-   subscribes to the partition-dispatch topic so each owner's `TypeRegistry` is
-   the sole authority for its keys.
+   `trace_id` for traces/correlated-logs -- and `metrics_admission` subscribes to
+   the partition-dispatch topic (`partition_dispatch` mode, owned partitions) so
+   each owner's `TypeRegistry` is the sole authority for its keys.
 3. Phase 1 registry stays **in-memory** (relearned on restart, safe per D8).
    Durable registry is deferred with Layer B (then: switch the registry's topic
    to the Quiver backend, replayed on startup; the `TypeDescriptor`/`observe` API

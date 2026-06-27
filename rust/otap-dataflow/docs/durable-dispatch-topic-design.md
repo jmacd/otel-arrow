@@ -11,14 +11,14 @@ engine has no key-deterministic cross-core dispatch and no durable topic
 backend, and that both should be built on shared infrastructure rather than
 bespoke parts.
 
-> Status: design ratified; the in-memory core is largely implemented. The
+> Status: design ratified; the **in-memory core is implemented end-to-end**. The
 > orthogonal-axis model (D27), the layer decomposition, and all component
 > decisions are **ratified** (D18-D20, D22-D23, D25-D28); only the durable backend
 > (D21/D24) is **deferred** to a later effort, behind the same interface. See
-> "Decisions". Names are provisional. **Layer A (split-by-key) and the Layer C
-> core (placement map, the `Partitioned` seam, and the in-memory
-> partition-dispatch topic mode) are implemented**; the remaining step is wiring
-> the topic exporter/receiver, config, and controller placement.
+> "Decisions". Names are provisional. **Layer A (split-by-key) and Layer C
+> (placement map, the `Partitioned` seam, the in-memory partition-dispatch topic,
+> and the exporter/receiver/config/controller wiring) are implemented and
+> tested**; the durable backend (Layer B) is the remaining work.
 >
 > **Scope for this effort (D28):** build the **in-memory core only** -- Layer A
 > (split-by-key) + Layer C (partition-dispatch on the in-memory backend) = the
@@ -170,13 +170,17 @@ one traversal is the obvious optimization once the path is proven.
 
 ## Layer C: Partition-dispatch and placement (in-memory first)
 
-> **Implemented (in-memory core).** The static `PartitionPlacement` map
-> (`crates/engine/src/topic/placement.rs`), the `Partitioned` routing seam
+> **Implemented (in-memory core, end-to-end).** The static `PartitionPlacement`
+> map (`crates/engine/src/topic/placement.rs`), the `Partitioned` routing seam
 > (`crates/engine/src/topic/partitioned.rs`, implemented for `OtapPdata` in
 > `crates/otap`), and the in-memory `PartitionDispatchTopic` /
 > `PartitionDispatchBackend` with `SubscriptionMode::PartitionDispatch`
-> (`crates/engine/src/topic/`) are built and broker-tested. The pipeline wiring
-> (topic exporter/receiver, config, controller placement) is the remaining step.
+> (`crates/engine/src/topic/`) are built and broker-tested. The pipeline is wired
+> end-to-end: the topic exporter preserves the partition tag on publish, the
+> topic receiver subscribes with its owned partitions
+> (`TopicSubscriptionConfig::PartitionDispatch`), and the controller creates a
+> partition-dispatch topic from `TopicSpec.num_partitions`. The durable backend
+> (Layer B) is the remaining work.
 
 **Goal.** Deliver each partition deterministically to a stable, *exclusive*
 owner, so the owner's per-core state is the single writer for that partition's
@@ -501,33 +505,32 @@ Deferred (added later as an additive backend swap, D28/D21):
 
 ## Status and next steps
 
-- **Layer A and the Layer C core are implemented; pipeline wiring and the
-  durable backend are not.** All component decisions are now ratified
-  (D18-D20, D22-D23, D25-D28); only the durable backend (D21/D24) is deferred to
-  Layer B. None of the deferred items block the in-memory core.
+- **The in-memory core is implemented end-to-end; the durable backend is not.**
+  All component decisions are now ratified (D18-D20, D22-D23, D25-D28); only the
+  durable backend (D21/D24) is deferred to Layer B.
 - **Layer A delivered:** the `partition_otap_batch` primitive
   (`crates/pdata/src/otap/partition.rs`), the `partition` processor node
   (`crates/core-nodes/src/processors/partition_processor/`,
   `urn:otel:processor:partition`), and the `Context::partition` tag the A->C
   contract rides on. Acknowledgement fan-in is the documented, deferred part
   (D22): the request context rides the first partition only.
-- **Layer C core delivered:** the static `PartitionPlacement` map
-  (`crates/engine/src/topic/placement.rs`, D23); the `Partitioned` routing seam
-  (`crates/engine/src/topic/partitioned.rs`, implemented for `OtapPdata` in
-  `crates/otap`, D25); and the in-memory `PartitionDispatchTopic` /
-  `PartitionDispatchBackend` with `SubscriptionMode::PartitionDispatch`
-  (`crates/engine/src/topic/`, D22) -- exclusive per-partition ownership, routed
-  by `Partitioned::partition`, with broker-level tests.
+- **Layer C delivered:** the static `PartitionPlacement` map (D23); the
+  `Partitioned` routing seam (implemented for `OtapPdata` in `crates/otap`, D25);
+  the in-memory `PartitionDispatchTopic` / `PartitionDispatchBackend` with
+  `SubscriptionMode::PartitionDispatch` (D22); and the pipeline wiring -- the
+  topic exporter preserves the partition on publish, the topic receiver
+  subscribes with its owned partitions, and the controller creates a
+  partition-dispatch topic from `TopicSpec.num_partitions`. Broker-level and
+  end-to-end tests cover routing, exclusivity, placement, and the full
+  tagged-`OtapPdata` path.
 - The substrate exists: the topic backend seam, `quiver`, the cascade filter
   (`filter_otap_batch` / `filter_metrics_time_window`), and the size-based batch
   split. The reserved `TopicBackendKind::Quiver` is the (deferred) durable-backend
   wiring point.
-- **To proceed:** wire the in-memory partition-dispatch into a pipeline -- the
-  topic exporter must preserve `Context::partition` on publish (it currently
-  strips context via `clone_without_context`), the topic receiver subscribes with
-  its owned partitions from the placement map, and the controller assigns
-  placement. Then Layer B (durability) as an additive backend swap. The
-  standalone-logs key (D26) is decided but waits until logs are addressed.
+- **To proceed:** Layer B (durability) as an additive backend swap behind the
+  same dispatch interface, plus the controller computing placement and assigning
+  owned partitions to receiver replicas (now hand-specified in receiver config).
+  The standalone-logs key (D26) is decided but waits until logs are addressed.
 
 **Related docs:** [`ingest-queue-design.md`](./ingest-queue-design.md) (D3
 per-signal partitioner; the consumer of this infrastructure),
