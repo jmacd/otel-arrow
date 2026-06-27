@@ -551,6 +551,27 @@ pub enum Error {
     #[error("broadcast subscriptions are not supported on this topic")]
     SubscribeBroadcastNotSupported,
 
+    /// Partition-dispatch subscriptions are not supported on this topic.
+    #[error("partition-dispatch subscriptions are not supported on this topic")]
+    SubscribePartitionDispatchNotSupported,
+
+    /// A partition-dispatch subscriber claimed a partition already owned by
+    /// another subscriber (partition ownership is exclusive).
+    #[error("partition {partition} is already claimed by another subscriber")]
+    PartitionAlreadyClaimed {
+        /// The conflicting partition index.
+        partition: u32,
+    },
+
+    /// A partition index is outside the topic's configured partition count.
+    #[error("partition {partition} is out of range for {num_partitions} partitions")]
+    PartitionOutOfRange {
+        /// The offending partition index.
+        partition: u32,
+        /// The topic's configured partition count.
+        num_partitions: usize,
+    },
+
     /// This topic only supports a single consumer group, but a subscription request would violate that constraint.
     #[error("this topic only supports a single consumer group")]
     SubscribeSingleGroupViolation,
@@ -645,6 +666,11 @@ impl Error {
             Error::TopicClosed => "TopicClosed",
             Error::SubscribeBalancedNotSupported => "SubscribeBalancedNotSupported",
             Error::SubscribeBroadcastNotSupported => "SubscribeBroadcastNotSupported",
+            Error::SubscribePartitionDispatchNotSupported => {
+                "SubscribePartitionDispatchNotSupported"
+            }
+            Error::PartitionAlreadyClaimed { .. } => "PartitionAlreadyClaimed",
+            Error::PartitionOutOfRange { .. } => "PartitionOutOfRange",
             Error::SubscribeSingleGroupViolation => "SubscribeSingleGroupViolation",
             Error::SubscriptionClosed => "SubscriptionClosed",
             Error::CapabilityAlreadyConsumed { .. } => "CapabilityAlreadyConsumed",

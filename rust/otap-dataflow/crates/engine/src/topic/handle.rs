@@ -109,6 +109,9 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
         let backend = match mode {
             SubscriptionMode::Balanced { group } => self.inner.subscribe_balanced(group, opts)?,
             SubscriptionMode::Broadcast => self.inner.subscribe_broadcast(opts)?,
+            SubscriptionMode::PartitionDispatch { owned_partitions } => self
+                .inner
+                .subscribe_partition_dispatch(owned_partitions, opts)?,
         };
         Ok(Subscription::new(backend))
     }

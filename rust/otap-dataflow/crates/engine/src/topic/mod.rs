@@ -7,6 +7,7 @@ mod backend;
 mod binding;
 mod broker;
 mod handle;
+mod partitioned;
 mod placement;
 mod subscription;
 #[allow(clippy::module_inception)] // topic/topic.rs holds the core topic-state internals.
@@ -17,7 +18,9 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub use backend::{InMemoryBackend, SubscriptionBackend, TopicBackend, TopicState};
+pub use backend::{
+    InMemoryBackend, PartitionDispatchBackend, SubscriptionBackend, TopicBackend, TopicState,
+};
 pub use binding::PipelineTopicBinding;
 pub use broker::TopicBroker;
 pub use handle::{TopicHandle, TrackedTopicPublisher};
@@ -26,6 +29,7 @@ pub use otap_df_config::topic::{
     TopicQueueOnFullPolicy,
 };
 pub use otap_df_config::{SubscriptionGroupName, TopicName};
+pub use partitioned::Partitioned;
 pub use placement::{OwnerId, PartitionPlacement};
 pub use subscription::{Delivery, RecvDelivery, Subscription};
 pub use topic_set::TopicSet;

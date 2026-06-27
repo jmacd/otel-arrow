@@ -775,6 +775,15 @@ impl OtapPdata {
     }
 }
 
+/// Routing seam for partition-dispatch topics (durable-dispatch D25): `crates/otap`
+/// is the single place that picks apart the `Context`, so the generic engine
+/// broker routes by an integer without knowing about `OtapPdata`.
+impl otap_df_engine::topic::Partitioned for OtapPdata {
+    fn partition(&self) -> Option<u32> {
+        self.context.partition()
+    }
+}
+
 /* -------- Producer effect handler extensions (shared, local) -------- */
 
 /// Implements `ProducerEffectHandlerExtension<OtapPdata>` for an EffectHandler type.

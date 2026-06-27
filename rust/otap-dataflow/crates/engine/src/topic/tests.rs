@@ -2647,3 +2647,228 @@ async fn topic_set_len_and_is_empty() {
     assert!(!set.is_empty());
     assert_eq!(set.len(), 1);
 }
+
+// =========================================================================
+// Partition-dispatch mode
+// =========================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartedMsg {
+    partition: u32,
+    value: u64,
+}
+
+impl crate::topic::Partitioned for PartedMsg {
+    fn partition(&self) -> Option<u32> {
+        Some(self.partition)
+    }
+}
+
+fn pd_backend(num_partitions: usize) -> crate::topic::PartitionDispatchBackend {
+    crate::topic::PartitionDispatchBackend {
+        num_partitions,
+        capacity: 64,
+    }
+}
+
+// Each published message is delivered only to the subscriber owning its
+// partition; ownership comes from the placement map.
+#[tokio::test]
+async fn partition_dispatch_routes_each_partition_to_its_owner() {
+    use crate::topic::PartitionPlacement;
+    use std::num::NonZeroUsize;
+
+    let broker = TopicBroker::<PartedMsg>::new();
+    let topic = broker
+        .create_topic("pd", TopicOptions::default(), pd_backend(4))
+        .unwrap();
+
+    // 4 partitions across 2 owners: owner0={0,1}, owner1={2,3}.
+    let placement =
+        PartitionPlacement::balanced(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(2).unwrap());
+    let owned0: Vec<u32> = placement
+        .partitions_of(0)
+        .iter()
+        .map(|&p| p as u32)
+        .collect();
+    let owned1: Vec<u32> = placement
+        .partitions_of(1)
+        .iter()
+        .map(|&p| p as u32)
+        .collect();
+
+    let mut sub0 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: owned0.clone(),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+    let mut sub1 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: owned1.clone(),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    // Publish to partitions 0,1,2,3,0,2 (so owner0 expects 3, owner1 expects 3).
+    for (i, partition) in [0u32, 1, 2, 3, 0, 2].into_iter().enumerate() {
+        topic
+            .publish(Arc::new(PartedMsg {
+                partition,
+                value: i as u64,
+            }))
+            .await
+            .unwrap();
+    }
+    topic.close();
+
+    let mut got0 = Vec::new();
+    while let Ok(RecvItem::Message(env)) = sub0.recv().await {
+        got0.push(env.payload.partition);
+    }
+    let mut got1 = Vec::new();
+    while let Ok(RecvItem::Message(env)) = sub1.recv().await {
+        got1.push(env.payload.partition);
+    }
+
+    assert!(
+        got0.iter().all(|p| owned0.contains(p)),
+        "owner0 saw a foreign partition: {got0:?}"
+    );
+    assert!(
+        got1.iter().all(|p| owned1.contains(p)),
+        "owner1 saw a foreign partition: {got1:?}"
+    );
+    // Conservation: every message reached exactly one owner.
+    assert_eq!(got0.len() + got1.len(), 6);
+    assert_eq!(got0.len(), 3, "owner0 (partitions 0,1) got {got0:?}");
+    assert_eq!(got1.len(), 3, "owner1 (partitions 2,3) got {got1:?}");
+}
+
+// A partition can be owned by at most one subscriber.
+#[tokio::test]
+async fn partition_dispatch_exclusive_claim_rejected() {
+    let broker = TopicBroker::<PartedMsg>::new();
+    let topic = broker
+        .create_topic("pd", TopicOptions::default(), pd_backend(4))
+        .unwrap();
+
+    let _sub0 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![0, 1],
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+    let err = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![1, 2],
+            },
+            SubscriberOptions::default(),
+        )
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, Error::PartitionAlreadyClaimed { partition: 1 }),
+        "got {err:?}"
+    );
+}
+
+// Claiming a partition outside the configured count is rejected.
+#[tokio::test]
+async fn partition_dispatch_out_of_range_rejected() {
+    let broker = TopicBroker::<PartedMsg>::new();
+    let topic = broker
+        .create_topic("pd", TopicOptions::default(), pd_backend(4))
+        .unwrap();
+    let err = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![4],
+            },
+            SubscriberOptions::default(),
+        )
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            err,
+            Error::PartitionOutOfRange {
+                partition: 4,
+                num_partitions: 4
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+// A partition-dispatch topic rejects balanced and broadcast subscriptions.
+#[tokio::test]
+async fn partition_dispatch_rejects_other_modes() {
+    let broker = TopicBroker::<PartedMsg>::new();
+    let topic = broker
+        .create_topic("pd", TopicOptions::default(), pd_backend(4))
+        .unwrap();
+    let balanced = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .err()
+        .unwrap();
+    assert!(matches!(balanced, Error::SubscribeBalancedNotSupported));
+    let broadcast = topic
+        .subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default())
+        .err()
+        .unwrap();
+    assert!(matches!(broadcast, Error::SubscribeBroadcastNotSupported));
+}
+
+// A message whose partition no subscriber owns is dropped (it never reaches the
+// other owners), matching a balanced topic with no subscriber.
+#[tokio::test]
+async fn partition_dispatch_drops_unclaimed_partition() {
+    let broker = TopicBroker::<PartedMsg>::new();
+    let topic = broker
+        .create_topic("pd", TopicOptions::default(), pd_backend(4))
+        .unwrap();
+    let mut sub = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![0, 1],
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    // Partition 2 is owned by nobody; partition 0 is owned by `sub`.
+    topic
+        .publish(Arc::new(PartedMsg {
+            partition: 2,
+            value: 1,
+        }))
+        .await
+        .unwrap();
+    topic
+        .publish(Arc::new(PartedMsg {
+            partition: 0,
+            value: 2,
+        }))
+        .await
+        .unwrap();
+    topic.close();
+
+    let mut got = Vec::new();
+    while let Ok(RecvItem::Message(env)) = sub.recv().await {
+        got.push(env.payload.value);
+    }
+    assert_eq!(got, vec![2], "only the owned-partition message survives");
+}

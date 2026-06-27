@@ -11,10 +11,11 @@ use std::time::Duration;
 
 use crate::error::Error;
 use crate::error::Error::{
-    MessageNotTracked, SubscribeBalancedNotSupported, SubscribeBroadcastNotSupported,
-    SubscribeSingleGroupViolation, SubscriptionClosed, TopicClosed,
+    MessageNotTracked, PartitionAlreadyClaimed, PartitionOutOfRange, SubscribeBalancedNotSupported,
+    SubscribeBroadcastNotSupported, SubscribeSingleGroupViolation, SubscriptionClosed, TopicClosed,
 };
 use crate::topic::backend::{PublishFuture, PublishTrackedFuture, SubscriptionBackend, TopicState};
+use crate::topic::partitioned::Partitioned;
 use crate::topic::subscription::{Delivery, RecvDelivery};
 use crate::topic::types::{
     Envelope, PublishOutcome, SubscriberOptions, TopicOptions, TrackedPublishOutcome,
@@ -583,6 +584,253 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
             group.admission.close();
             let _ = group.tx.close();
         }
+    }
+}
+
+/// One owner's queue in a partition-dispatch topic. Each owner drains its own
+/// queue exclusively (the opposite of a balanced group's shared race-queue).
+struct PartitionOwnerQueue<T> {
+    tx: async_channel::Sender<QueuedEnvelope<T>>,
+    rx: async_channel::Receiver<QueuedEnvelope<T>>,
+    admission: Arc<Semaphore>,
+}
+
+/// Mutable routing state of a [`PartitionDispatchTopic`]: the per-owner queues
+/// and the `partition -> owner` index built as subscribers claim partitions.
+struct PartitionRouting<T> {
+    owners: Vec<PartitionOwnerQueue<T>>,
+    /// `owner_of[p]` is the index into `owners` for partition `p`, or `None`
+    /// while no subscriber owns it. Length is `num_partitions`.
+    owner_of: Vec<Option<usize>>,
+}
+
+/// A topic that routes each published message to the single subscriber owning
+/// the message's partition (Layer C). Ownership is exclusive: a partition is
+/// claimed by at most one subscriber, so that subscriber's per-core state is the
+/// single writer for every key that hashes into the partition.
+pub(crate) struct PartitionDispatchTopic<T: Send + Sync + 'static> {
+    name: TopicName,
+    num_partitions: usize,
+    capacity: usize,
+    next_id: AtomicU64,
+    outcomes: TrackedPublishTracker,
+    closed: AtomicBool,
+    routing: Mutex<PartitionRouting<T>>,
+}
+
+impl<T: Send + Sync + 'static> PartitionDispatchTopic<T> {
+    pub(crate) fn new(name: TopicName, num_partitions: usize, capacity: usize) -> Self {
+        Self {
+            name,
+            num_partitions,
+            capacity: capacity.max(1),
+            next_id: AtomicU64::new(1),
+            outcomes: TrackedPublishTracker::new(),
+            closed: AtomicBool::new(false),
+            routing: Mutex::new(PartitionRouting {
+                owners: Vec::new(),
+                owner_of: vec![None; num_partitions],
+            }),
+        }
+    }
+
+    #[inline]
+    fn next_message_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl<T: Partitioned + Send + Sync + 'static> PartitionDispatchTopic<T> {
+    /// The destination queue (sender + admission semaphore) for a message, or
+    /// `None` when the message is untagged, out of range, or its partition is
+    /// owned by no subscriber. The lock is released before the returned handles
+    /// are awaited.
+    fn route(&self, msg: &T) -> Option<(async_channel::Sender<QueuedEnvelope<T>>, Arc<Semaphore>)> {
+        let partition = msg.partition()?;
+        if partition as usize >= self.num_partitions {
+            return None;
+        }
+        let routing = self.routing.lock();
+        let owner = routing.owner_of[partition as usize]?;
+        let queue = &routing.owners[owner];
+        Some((queue.tx.clone(), queue.admission.clone()))
+    }
+}
+
+impl<T: Partitioned + Send + Sync + 'static> TopicState<T> for PartitionDispatchTopic<T> {
+    fn name(&self) -> &TopicName {
+        &self.name
+    }
+
+    fn publish(&self, msg: Arc<T>) -> PublishFuture<'_> {
+        Box::pin(async move {
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(TopicClosed);
+            }
+            if let Some((tx, admission)) = self.route(&msg) {
+                let permit = acquire_balanced_permit(&admission).await?;
+                let envelope = Envelope {
+                    id: self.next_message_id(),
+                    tracked: false,
+                    payload: msg,
+                };
+                send_queued_envelope(&tx, envelope, permit)?;
+            }
+            // An untagged, out-of-range, or unclaimed partition has no owner;
+            // the message is dropped, matching a balanced topic with no
+            // subscriber.
+            Ok(())
+        })
+    }
+
+    fn publish_tracked(
+        &self,
+        msg: Arc<T>,
+        timeout: Duration,
+        permit: TrackedPublishPermit,
+    ) -> PublishTrackedFuture<'_> {
+        Box::pin(async move {
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(TopicClosed);
+            }
+            let id = self.next_message_id();
+            let receipt = self.outcomes.register(id, timeout, permit);
+            if let Some((tx, admission)) = self.route(&msg) {
+                let admission_permit = acquire_balanced_permit(&admission).await?;
+                let envelope = Envelope {
+                    id,
+                    tracked: true,
+                    payload: msg,
+                };
+                send_queued_envelope(&tx, envelope, admission_permit)?;
+            }
+            Ok(receipt)
+        })
+    }
+
+    fn try_publish(&self, msg: Arc<T>) -> Result<PublishOutcome, Error> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TopicClosed);
+        }
+        if let Some((tx, admission)) = self.route(&msg) {
+            let Some(permit) = try_acquire_balanced_permit(&admission)? else {
+                return Ok(PublishOutcome::DroppedOnFull);
+            };
+            let envelope = Envelope {
+                id: self.next_message_id(),
+                tracked: false,
+                payload: msg,
+            };
+            send_queued_envelope(&tx, envelope, permit)?;
+        }
+        Ok(PublishOutcome::Published)
+    }
+
+    fn try_publish_tracked(
+        &self,
+        msg: Arc<T>,
+        timeout: Duration,
+        permit: TrackedPublishPermit,
+    ) -> Result<TrackedTryPublishOutcome, Error> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TopicClosed);
+        }
+        let id = self.next_message_id();
+        if let Some((tx, admission)) = self.route(&msg) {
+            let Some(admission_permit) = try_acquire_balanced_permit(&admission)? else {
+                return Ok(TrackedTryPublishOutcome::DroppedOnFull);
+            };
+            let receipt = self.outcomes.register(id, timeout, permit);
+            let envelope = Envelope {
+                id,
+                tracked: true,
+                payload: msg,
+            };
+            send_queued_envelope(&tx, envelope, admission_permit)?;
+            Ok(TrackedTryPublishOutcome::Published(receipt))
+        } else {
+            Ok(TrackedTryPublishOutcome::Published(
+                self.outcomes.register(id, timeout, permit),
+            ))
+        }
+    }
+
+    fn subscribe_balanced(
+        &self,
+        _group: SubscriptionGroupName,
+        _opts: SubscriberOptions,
+    ) -> Result<Box<dyn SubscriptionBackend<T>>, Error> {
+        Err(SubscribeBalancedNotSupported)
+    }
+
+    fn subscribe_broadcast(
+        &self,
+        _opts: SubscriberOptions,
+    ) -> Result<Box<dyn SubscriptionBackend<T>>, Error> {
+        Err(SubscribeBroadcastNotSupported)
+    }
+
+    fn subscribe_partition_dispatch(
+        &self,
+        owned_partitions: Vec<u32>,
+        _opts: SubscriberOptions,
+    ) -> Result<Box<dyn SubscriptionBackend<T>>, Error> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TopicClosed);
+        }
+        let mut routing = self.routing.lock();
+        // Validate the whole claim before mutating, so a rejected subscription
+        // leaves no partial ownership.
+        for &partition in &owned_partitions {
+            if partition as usize >= self.num_partitions {
+                return Err(PartitionOutOfRange {
+                    partition,
+                    num_partitions: self.num_partitions,
+                });
+            }
+            if routing.owner_of[partition as usize].is_some() {
+                return Err(PartitionAlreadyClaimed { partition });
+            }
+        }
+
+        let (tx, rx) = async_channel::bounded(self.capacity);
+        let admission = Arc::new(Semaphore::new(self.capacity));
+        let owner_idx = routing.owners.len();
+        routing
+            .owners
+            .push(PartitionOwnerQueue { tx, rx, admission });
+        for &partition in &owned_partitions {
+            routing.owner_of[partition as usize] = Some(owner_idx);
+        }
+
+        // The owner queue retains the receiver so the channel stays open for the
+        // topic's lifetime; the subscriber drains a clone of it.
+        let sub_rx = routing.owners[owner_idx].rx.clone();
+        Ok(Box::new(BalancedSub {
+            rx: Box::pin(sub_rx),
+            ack_state: AckState {
+                outcomes: self.outcomes.clone(),
+            },
+        }))
+    }
+
+    fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy {
+        TopicBroadcastOnLagPolicy::DropOldest
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.outcomes.close_all();
+        let routing = self.routing.lock();
+        for owner in &routing.owners {
+            owner.admission.close();
+            let _ = owner.tx.close();
+        }
+    }
+
+    #[cfg(test)]
+    fn debug_balanced_available_permits(&self) -> Vec<(SubscriptionGroupName, usize)> {
+        Vec::new()
     }
 }
 

@@ -113,6 +113,17 @@ pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
         &self,
         opts: SubscriberOptions,
     ) -> Result<Box<dyn SubscriptionBackend<T>>, Error>;
+    /// Create a partition-dispatch subscription backend that exclusively owns
+    /// `owned_partitions`.
+    ///
+    /// Defaults to unsupported; only a partition-dispatch topic overrides it.
+    fn subscribe_partition_dispatch(
+        &self,
+        _owned_partitions: Vec<u32>,
+        _opts: SubscriberOptions,
+    ) -> Result<Box<dyn SubscriptionBackend<T>>, Error> {
+        Err(Error::SubscribePartitionDispatchNotSupported)
+    }
     /// Effective broadcast lag policy for this topic.
     fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy;
     /// Close the topic. Existing subscriptions eventually observe closure.
@@ -145,5 +156,31 @@ pub struct InMemoryBackend;
 impl<T: Send + Sync + 'static> TopicBackend<T> for InMemoryBackend {
     fn create_topic(&self, name: TopicName, opts: TopicOptions) -> Arc<dyn TopicState<T>> {
         Arc::new(TopicInner::new(name, opts))
+    }
+}
+
+/// In-memory backend that creates **partition-dispatch** topics: each published
+/// message is routed by its [`Partitioned::partition`] tag to the single
+/// subscriber that owns that partition (Layer C of the partition-dispatch
+/// design). The payload type must be [`Partitioned`].
+///
+/// `num_partitions` is the partition space `N` (matching the split-by-key
+/// node's `N`); `capacity` is the per-owner queue capacity.
+pub struct PartitionDispatchBackend {
+    /// The number of partitions `N`.
+    pub num_partitions: usize,
+    /// Per-owner queue capacity.
+    pub capacity: usize,
+}
+
+impl<T: crate::topic::Partitioned + Send + Sync + 'static> TopicBackend<T>
+    for PartitionDispatchBackend
+{
+    fn create_topic(&self, name: TopicName, _opts: TopicOptions) -> Arc<dyn TopicState<T>> {
+        Arc::new(crate::topic::topic::PartitionDispatchTopic::new(
+            name,
+            self.num_partitions,
+            self.capacity,
+        ))
     }
 }

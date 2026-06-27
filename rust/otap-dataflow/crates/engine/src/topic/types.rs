@@ -671,6 +671,13 @@ pub enum SubscriptionMode {
     },
     /// Broadcast mode: each subscriber gets every message with configurable lag behavior.
     Broadcast,
+    /// Partition-dispatch mode: the subscriber exclusively owns a set of
+    /// partitions and receives only the messages routed to those partitions.
+    /// The owned set comes from the placement map (Layer C, decision D22/D23).
+    PartitionDispatch {
+        /// The partitions this subscriber owns.
+        owned_partitions: Vec<u32>,
+    },
 }
 
 /// Options provided at subscription time.
