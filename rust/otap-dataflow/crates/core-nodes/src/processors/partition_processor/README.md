@@ -20,7 +20,7 @@ the batch by key into `num_partitions` sub-batches such that **all rows sharing 
 key value land in the same partition**, and emits each sub-batch tagged with its
 integer partition index (carried on the request context). A downstream
 partition-dispatch hop (Layer C) routes each sub-batch to its owner by that tag
-without re-deriving the key — the A→C contract (decision D25).
+without re-deriving the key -- the A->C contract (decision D25).
 
 Splitting reuses the OTAP selection-mask cascade (`partition_otap_batch`), the
 same machinery the admission processor's time-window filter uses: a partition
@@ -92,8 +92,8 @@ Metric set `processor.partition`:
 - **Acknowledgement semantics.** The request context (its ack/nack subscribers)
   rides the **first** emitted partition only; the remaining partitions carry a
   detached context that still propagates transport metadata (tenant headers,
-  peer address) but no ack subscription. Full per-partition ack/nack fan-in —
-  acking the input once *all* partitions resolve — is deferred to the
+  peer address) but no ack subscription. Full per-partition ack/nack fan-in --
+  acking the input once *all* partitions resolve -- is deferred to the
   dispatch/slot integration (decision D22), matching the loss-tolerant default
   of the in-memory profile (ingest-queue D6).
 - **Routing is not yet performed here.** This node only splits and tags; the

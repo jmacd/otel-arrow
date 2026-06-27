@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Partition (split-by-key) processor — Layer A of the partition-dispatch
+//! Partition (split-by-key) processor -- Layer A of the partition-dispatch
 //! design (`docs/durable-dispatch-topic-design.md`).
 //!
 //! For every incoming OTAP batch of the configured key's target signal, this
@@ -10,7 +10,7 @@
 //! sub-batch tagged with its integer partition index (carried on the request
 //! [`Context`](otap_df_otap::pdata::Context)). A downstream partition-dispatch
 //! hop (Layer C) routes each sub-batch to its owner by that tag without
-//! re-deriving the key (the A→C contract, D25).
+//! re-deriving the key (the A->C contract, D25).
 //!
 //! Splitting reuses the OTAP selection-mask cascade
 //! ([`partition_otap_batch`]); the per-signal key follows ingest-queue D3:
@@ -24,8 +24,8 @@
 //! ack/nack subscribers) is carried on the **first** emitted partition only;
 //! the remaining partitions carry a detached context that still propagates
 //! transport metadata (tenant headers, peer address) but no ack subscription.
-//! Full per-partition ack/nack fan-in — acking the input once *all* partitions
-//! resolve — is deferred to the dispatch/slot integration (D22), matching the
+//! Full per-partition ack/nack fan-in -- acking the input once *all* partitions
+//! resolve -- is deferred to the dispatch/slot integration (D22), matching the
 //! loss-tolerant default of the in-memory profile (ingest-queue D6).
 
 use std::num::NonZeroUsize;
