@@ -217,6 +217,60 @@ Durable reassignment uses the M3 `Initializing`/`Leaving` handoff, replaying the
 partition's durable streams; the in-memory case simply reassigns (unflushed data
 is best-effort, per D27).
 
+**Load balancing across CPUs (the metrics-gateway case).** When the engine runs
+as a metrics gateway aggregating on behalf of a large SDK fleet, the placement
+map is the load balancer for the stateful path, and balancing partition *count*
+is not enough. Metric load is heavily skewed: a few names carry most of the
+series and points, so an even count of partitions per core still leaves some
+cores hot and others idle. Four refinements make placement load-aware, all
+implemented on `PartitionPlacement` (`crates/engine/src/topic/placement.rs`):
+
+- **Load signal.** The dominant cost is per-series aggregation state, one
+  aggregator per `(series, window)`. The owner already holds that state, so it
+  reports a cheap per-partition weight, principally `active_series` plus a
+  points-per-second term, with a heavier multiplier for exponential histograms.
+  Owners report weights to the controller, which rebalances on them.
+
+- **Weighted placement (LPT).** Assigning N weighted partitions to M cores to
+  minimize the busiest core is minimum-makespan scheduling, which is NP-hard, so
+  placement uses greedy longest-processing-time-first: place partitions
+  heaviest-first, each onto the currently-lightest core. This is a
+  4/3-approximation in `O(n log n)`, the `weighted` constructor.
+
+- **Churn-minimizing rebalance.** On load drift or a core-count change the map is
+  not recomputed from scratch, which would dump every core's aggregation state.
+  Instead the busiest core sheds the fewest partitions to the coldest core until
+  the maximum is within a configured fraction of the mean, and every move
+  strictly lowers the maximum so the loop converges. Keys never change partition,
+  so only the `partition -> owner` map moves: `rebalance_weighted`.
+
+- **Hot-key sub-partitioning.** A partition is indivisible, so if one metric name
+  alone exceeds a core's budget no placement helps. Those partitions are reported
+  by `hot_partitions`, and the fix is to sub-partition that name by series
+  identity, hashing the name together with the series attributes over extra radix
+  bits so the name's series spread across cores. This stays correct because
+  single-writer is **per series**, not per name, so each series still has one
+  writer. The cost is that the name's series are no longer co-located, so its type
+  authority and any cross-series attribute reduction move to a later merge stage.
+  The common case of cold names stays whole, and N is sized (ingest-queue D5) so
+  the hottest unsplit partition is tolerable.
+
+Two structural points make this work in memory:
+
+- **Pinned aggregation, stolen stateless work.** The engine is thread-per-core
+  with work-stealing, but a series' aggregator is pinned to its owner core: two
+  cores writing one series would corrupt the cumulative conversion. So the
+  stateless stages -- decode, the admission filter, split-by-key -- work-steal
+  freely for transient balance, while the stateful aggregation balances only
+  through placement, deliberately and at coarse grain.
+
+- **Rebalance at window boundaries.** Moving a partition mid-window would migrate
+  live aggregator state. A reassignment instead takes effect at a window close:
+  the old owner flushes the closed window and the new owner opens the next one,
+  so the handoff carries no state. Aggregation windows are natural, state-free
+  rebalance points; the durable backend later upgrades this to the lease and
+  generation handoff above.
+
 **Relationship to tenancy.** When the multitenancy descriptor system lands,
 condition-routing (named partitions for tenant/resource isolation) and
 hash-partitioning (N buckets for co-location) are the same dispatch mode with

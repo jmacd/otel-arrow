@@ -256,7 +256,11 @@ A two-level mapping (the Slicer and M3 separation of concerns):
   `bucket -> owner` mapping moves, which bounds churn.
 - The placement map lives in the controller. v1: `bucket -> core`. Later:
   `bucket -> node`. It is rebalanced on observed load (Quiver depth, ingest
-  rate) and on failure, minimizing the number of buckets moved.
+  rate) and on failure, minimizing the number of buckets moved. The load-aware
+  algorithm -- greedy LPT placement, churn-minimizing rebalance, and
+  hot-partition detection -- is implemented as `PartitionPlacement`
+  (`crates/engine/src/topic/placement.rs`) and detailed under "Load balancing
+  across CPUs" in [`durable-dispatch-topic-design.md`](./durable-dispatch-topic-design.md).
 - Hotspots are handled by moving whole buckets rather than resplitting keys.
   For metrics, a hot `metric_name` (many series under one name) can be
   adaptively sub-partitioned by series identity (extra radix bits) into several
