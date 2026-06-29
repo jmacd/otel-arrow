@@ -517,16 +517,17 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
   floor, single on-time firing, mixed-temporality intake, cumulative store form
   with OTel reset/gap/overlap handling (D10-D12, D17). Emits complete windowed
   batches. Depends on L1 admission/identity (ingest Phase 0) and benefits from
-  the shuffle-by-name (ingest Phase 1). **The pure windowing core is
-  implemented** -- `TumblingWindows`, `Watermark`, and `WatermarkPolicy` in
+  the shuffle-by-name (ingest Phase 1). **The windowing core and the
+  `(stream, window)` aggregation state machine are implemented** --
+  `TumblingWindows`, `Watermark`, `WatermarkPolicy`, and `WindowedAggregators` in
   `crates/pdata/src/otap/windowing.rs` provide epoch-aligned window assignment
   (D10), the per-stream `max(event) - allowed_lateness` watermark with the
-  `processing_time - max_lag` idle floor (D11), and the on-time completion and
-  drop-and-count lateness triggers (D12). What remains for A0 is the
-  per-`(stream, window)` aggregation state, OTAP event-time extraction, the
-  reset/gap/overlap and cumulative-conversion rules (D17), and the processor that
-  emits complete windowed batches and reports per-partition load as a
-  shuffle owner.
+  `processing_time - max_lag` idle floor (D11), the on-time completion and
+  drop-and-count lateness triggers (D12), and a generic per-`(stream, window)`
+  windower that admits points and drains complete windows. What remains for A0 is
+  OTAP event-time extraction and stream-identity keying, the reset/gap/overlap
+  and cumulative-conversion rules (D17), and the processor that emits complete
+  windowed batches and reports per-partition load as a shuffle owner.
 - **A1 -- stage-2 store (L3 core).** The store seam (writer + `TableProvider`)
   with the Vortex backend, keyed `(metric_name, resolution, window_index)`;
   fixed-window drop-oldest retention (D13, D15, D16). Can be prototyped in
@@ -553,8 +554,9 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
   per-core type registry and the `[now - max_lag, now + max_skew]` admission
   window that bounds L2's watermark (the floor/ceiling in "Watermarks"). In
   *this* document, the **L2 windowing core is implemented** -- `TumblingWindows`,
-  `Watermark`, and `WatermarkPolicy` (`crates/pdata/src/otap/windowing.rs`); the
-  remaining L2/L3/L4/L5 assembly is not. Decisions D10-D17 are ratified.
+  `Watermark`, `WatermarkPolicy`, and the `WindowedAggregators` state machine
+  (`crates/pdata/src/otap/windowing.rs`); the remaining L2/L3/L4/L5 assembly is
+  not. Decisions D10-D17 are ratified.
 - L2's seed exists -- the `temporal_reaggregation` processor -- but is
   processing-time, not event-time; L2 (phase A0) is the extension described here.
 - `quiver` (L1 substrate), the `parquet_exporter` (object-store Parquet, L5
