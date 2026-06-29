@@ -15,8 +15,9 @@ queries) while disconnected from a central observability platform.
 > (see "Decisions"). Implementation has started: the **L2 event-time windowing
 > core (phase A0)** -- epoch-aligned tumbling windows and per-stream watermarks
 > with the on-time and lateness triggers -- is implemented in
-> `crates/pdata/src/otap/windowing.rs`. The rest is laid out in "Implementation
-> phases". Names are provisional.
+> `crates/pdata/src/otap/windowing.rs`, and a **proof-of-concept
+> `event_time_window` processor** drives it end to end over OTAP metrics
+> batches. The rest is laid out in "Implementation phases". Names are provisional.
 
 ## Motivation
 
@@ -524,10 +525,17 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
   (D10), the per-stream `max(event) - allowed_lateness` watermark with the
   `processing_time - max_lag` idle floor (D11), the on-time completion and
   drop-and-count lateness triggers (D12), and a generic per-`(stream, window)`
-  windower that admits points and drains complete windows. What remains for A0 is
-  OTAP event-time extraction and stream-identity keying, the reset/gap/overlap
-  and cumulative-conversion rules (D17), and the processor that emits complete
-  windowed batches and reports per-partition load as a shuffle owner.
+  windower that admits points and drains complete windows. A
+  **proof-of-concept `event_time_window` processor**
+  (`crates/core-nodes/src/processors/event_time_window_processor/`) drives this
+  core end to end: it extracts series identity and event time from OTAP metrics
+  views, folds NUMBER points into windows (delta-sum and gauge last-value), and
+  emits complete windows. It deliberately duplicates identity/aggregation code
+  rather than reuse `temporal_reaggregation`'s private modules, and is scoped to
+  number points with OTLP output. What remains for A0 is OTAP columnar output,
+  the reset/gap/overlap and cumulative-conversion rules (D17), histograms, a
+  timer-driven drain, and reporting per-partition load as a shuffle owner --
+  then folding the PoC into `temporal_reaggregation`.
 - **A1 -- stage-2 store (L3 core).** The store seam (writer + `TableProvider`)
   with the Vortex backend, keyed `(metric_name, resolution, window_index)`;
   fixed-window drop-oldest retention (D13, D15, D16). Can be prototyped in
@@ -555,8 +563,9 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
   window that bounds L2's watermark (the floor/ceiling in "Watermarks"). In
   *this* document, the **L2 windowing core is implemented** -- `TumblingWindows`,
   `Watermark`, `WatermarkPolicy`, and the `WindowedAggregators` state machine
-  (`crates/pdata/src/otap/windowing.rs`); the remaining L2/L3/L4/L5 assembly is
-  not. Decisions D10-D17 are ratified.
+  (`crates/pdata/src/otap/windowing.rs`), driven end to end by the
+  proof-of-concept `event_time_window` processor; the remaining L2/L3/L4/L5
+  assembly is not. Decisions D10-D17 are ratified.
 - L2's seed exists -- the `temporal_reaggregation` processor -- but is
   processing-time, not event-time; L2 (phase A0) is the extension described here.
 - `quiver` (L1 substrate), the `parquet_exporter` (object-store Parquet, L5
@@ -566,11 +575,14 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
 
 **To resume, start at phase A0:**
 
-1. Confirm the OTAP columns and view accessors for event time
-   (`time_unix_nano`, `start_time_unix_nano`) and instrument type feeding the
-   windowing, via `pdata-views` (`OtapMetricsView`).
-2. Extend `temporal_reaggregation` with the event-time, watermark-driven
-   windowing mode emitting complete cumulative windows.
+1. The OTAP columns and view accessors for event time (`time_unix_nano`,
+   `start_time_unix_nano`) and instrument type feeding the windowing are
+   confirmed and exercised by the proof-of-concept `event_time_window` processor
+   via `pdata-views` (`OtapMetricsView`).
+2. Promote the proof-of-concept windower to production: OTAP columnar output,
+   the reset/gap/overlap and cumulative-conversion rules (D17), histograms, and
+   a timer-driven drain -- folding it into `temporal_reaggregation` rather than
+   keeping a duplicate processor.
 3. In parallel, prototype the A1 store seam + Vortex writer against the windowed
    batch schema.
 4. File tracking issues per phase.

@@ -48,3 +48,6 @@ pub mod metrics_admission_processor;
 
 /// Partition (split-by-key) processor (partition-dispatch Layer A).
 pub mod partition_processor;
+
+/// Event-time window processor (metrics-appliance Layer 2, proof of concept).
+pub mod event_time_window_processor;
