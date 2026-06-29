@@ -32,6 +32,8 @@ pub mod raw_batch_store;
 pub mod schema;
 #[allow(missing_docs)]
 pub mod transform;
+/// event-time tumbling windows and watermarks (metrics-appliance L2 foundation)
+pub mod windowing;
 
 /// Testing utilities for constructing OTAP batches in tests.
 #[cfg(any(test, feature = "testing"))]
