@@ -18,7 +18,10 @@
 //! fencing to the handoff.
 
 use std::num::NonZeroUsize;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
+use crate::error::Error;
+use crate::topic::handle::TopicHandle;
 use crate::topic::placement::{OwnerId, PartitionPlacement};
 
 /// The owner-measured load of one partition over a report interval.
@@ -264,6 +267,101 @@ impl PlacementCoordinator {
                 })
             })
             .collect()
+    }
+}
+
+/// A cloneable handle owners use to send their [`PartitionLoadTracker`]
+/// snapshots to a [`PlacementScheduler`]. Sends are lock-free and non-blocking;
+/// a send after the scheduler is gone is silently dropped.
+#[derive(Debug, Clone)]
+pub struct LoadReportSender {
+    tx: Sender<Vec<(usize, PartitionLoad)>>,
+}
+
+impl LoadReportSender {
+    /// Send one owner's per-partition load snapshot to the scheduler.
+    pub fn send(&self, snapshot: Vec<(usize, PartitionLoad)>) {
+        let _ = self.tx.send(snapshot);
+    }
+}
+
+/// Ties the load feedback loop to a live partition-dispatch topic: it collects
+/// owner load reports, drives the [`PlacementCoordinator`], and applies the
+/// resulting [`PartitionMove`]s to the topic.
+///
+/// Owners send snapshots through a [`LoadReportSender`]; a scheduling thread
+/// calls [`tick`](PlacementScheduler::tick) on a cadence aligned with the
+/// aggregation window so a move's handoff carries no live state. The coordinator
+/// owner ids must match the topic's owner indices, which hold when owners
+/// subscribe in owner order.
+pub struct PlacementScheduler<T: Send + Sync + 'static> {
+    coordinator: PlacementCoordinator,
+    topic: TopicHandle<T>,
+    tx: Sender<Vec<(usize, PartitionLoad)>>,
+    rx: Receiver<Vec<(usize, PartitionLoad)>>,
+}
+
+impl<T: Send + Sync + 'static> PlacementScheduler<T> {
+    /// Create a scheduler for `topic`, starting from a count-balanced placement
+    /// of `num_partitions` partitions across `num_owners` owners.
+    #[must_use]
+    pub fn new(
+        topic: TopicHandle<T>,
+        num_partitions: NonZeroUsize,
+        num_owners: NonZeroUsize,
+        weights: LoadWeights,
+        max_imbalance: f64,
+    ) -> Self {
+        let (tx, rx) = channel();
+        Self {
+            coordinator: PlacementCoordinator::new(
+                num_partitions,
+                num_owners,
+                weights,
+                max_imbalance,
+            ),
+            topic,
+            tx,
+            rx,
+        }
+    }
+
+    /// A sender owners use to report their load snapshots.
+    #[must_use]
+    pub fn report_sender(&self) -> LoadReportSender {
+        LoadReportSender {
+            tx: self.tx.clone(),
+        }
+    }
+
+    /// Merge a load snapshot directly (without the channel), for manual driving.
+    pub fn report(&mut self, reports: &[(usize, PartitionLoad)]) {
+        self.coordinator.report(reports);
+    }
+
+    /// Run one scheduling cycle: drain pending owner reports, rebalance from the
+    /// latest loads, and apply each resulting move to the live topic. Returns the
+    /// moves applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error from applying a move (for example if the
+    /// coordinator and topic disagree on the owner set).
+    pub fn tick(&mut self) -> Result<Vec<PartitionMove>, Error> {
+        while let Ok(snapshot) = self.rx.try_recv() {
+            self.coordinator.report(&snapshot);
+        }
+        let moves = self.coordinator.rebalance();
+        for mv in &moves {
+            self.topic.apply_move(*mv)?;
+        }
+        Ok(moves)
+    }
+
+    /// The coordinator, for inspecting placement and owner loads.
+    #[must_use]
+    pub fn coordinator(&self) -> &PlacementCoordinator {
+        &self.coordinator
     }
 }
 

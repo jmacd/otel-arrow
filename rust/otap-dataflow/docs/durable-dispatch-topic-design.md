@@ -296,11 +296,14 @@ Two structural points make this work in memory:
    owner stay in its queue, so applying a move at an aggregation window boundary
    hands off no overlapping per-series state.
 
-The coordinator is the in-memory feedback brain, and `apply_move` is the runtime
-primitive that applies its decisions to a live topic. Wiring an owner's
-aggregator to emit reports, and a scheduler to call `apply_move` at the right
-window boundary, are the surrounding steps; the durable backend adds leases and
-generation fencing to the apply step so a deposed owner's late writes are fenced.
+The coordinator is the feedback brain and `PlacementScheduler` is its driver:
+owners send `PartitionLoadTracker` snapshots through a `LoadReportSender`, and the
+scheduler's `tick` drains them, runs the coordinator's rebalance, and applies each
+move to the live topic via `apply_move`. A scheduling thread calls `tick` on a
+cadence aligned with the aggregation window so a move's handoff carries no live
+state. Wiring an owner's aggregator to emit reports is the remaining step; the
+durable backend adds leases and generation fencing to the apply step so a deposed
+owner's late writes are fenced.
 
 **Relationship to tenancy.** When the multitenancy descriptor system lands,
 condition-routing (named partitions for tenant/resource isolation) and

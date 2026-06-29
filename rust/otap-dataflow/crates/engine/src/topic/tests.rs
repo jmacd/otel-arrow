@@ -3039,3 +3039,104 @@ fn reassign_on_non_partition_dispatch_topic_errors() {
         Error::PartitionReassignNotSupported
     ));
 }
+
+// End-to-end load feedback: owners report skewed load, the scheduler rebalances
+// and applies the moves to the live topic, and a rebalanced partition then
+// routes to its new owner.
+#[tokio::test]
+async fn scheduler_rebalances_a_live_partition_dispatch_topic() {
+    use crate::topic::{LoadWeights, PartitionLoad, PlacementScheduler};
+    use std::num::NonZeroUsize;
+
+    let broker = TopicBroker::<PartedMsg>::new();
+    let topic = broker
+        .create_topic("shuffle", TopicOptions::default(), pd_backend(4))
+        .unwrap();
+    // Owners subscribe in owner order: owner0 -> {0,1}, owner1 -> {2,3}.
+    let _sub0 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![0, 1],
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+    let mut sub1 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![2, 3],
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    let mut scheduler = PlacementScheduler::new(
+        topic.clone(),
+        NonZeroUsize::new(4).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        LoadWeights::default(),
+        1.2,
+    );
+
+    // Owners measure and report: partitions 0,1 (owner0) are hot, 2,3 cold.
+    let sender = scheduler.report_sender();
+    sender.send(vec![
+        (
+            0,
+            PartitionLoad {
+                active_series: 100,
+                points: 0,
+            },
+        ),
+        (
+            1,
+            PartitionLoad {
+                active_series: 100,
+                points: 0,
+            },
+        ),
+    ]);
+    sender.send(vec![
+        (
+            2,
+            PartitionLoad {
+                active_series: 1,
+                points: 0,
+            },
+        ),
+        (
+            3,
+            PartitionLoad {
+                active_series: 1,
+                points: 0,
+            },
+        ),
+    ]);
+
+    let moves = scheduler.tick().unwrap();
+    assert!(
+        !moves.is_empty(),
+        "skew triggers a rebalance applied to the topic"
+    );
+    let m = moves[0];
+    assert_eq!(m.from, 0, "the hot owner sheds a partition");
+    assert_eq!(m.to, 1, "to the cold owner");
+
+    // The rebalanced partition now routes to owner 1 (sub1).
+    topic
+        .publish(Arc::new(PartedMsg {
+            partition: m.partition as u32,
+            value: 42,
+        }))
+        .await
+        .unwrap();
+    topic.close();
+    let mut got1 = Vec::new();
+    while let Ok(RecvItem::Message(env)) = sub1.recv().await {
+        got1.push(env.payload.value);
+    }
+    assert!(
+        got1.contains(&42),
+        "the rebalanced partition routes to its new owner"
+    );
+}
