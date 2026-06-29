@@ -9,8 +9,32 @@
 
 pub mod encoder;
 pub mod formatter;
+pub mod propagation;
+pub mod sampler;
+pub mod span;
 
 use crate::registry::EntityKey;
+pub use span::{
+    OtelTraceState, Randomness, SpanContext, SpanId, StackStr, Threshold, TraceFlags, TraceId,
+};
+
+/// Provisional attribute key distinguishing a span START event from an END
+/// event. Subject to change as the span semantic conventions are finalized.
+pub const ATTR_SPAN_PHASE: &str = "otel.span.phase";
+
+/// Provisional attribute key carrying the parent span identifier on a START
+/// event, expressing the parent relationship as a link.
+pub const ATTR_SPAN_PARENT_SPAN_ID: &str = "otel.span.parent_span_id";
+
+/// Provisional attribute key carrying the elapsed time of a span on its END
+/// event, in nanoseconds.
+pub const ATTR_SPAN_DURATION_NANO: &str = "otel.span.duration_nano";
+
+/// Value of [`ATTR_SPAN_PHASE`] on a span START event.
+pub const SPAN_PHASE_START: &str = "start";
+
+/// Value of [`ATTR_SPAN_PHASE`] on a span END event.
+pub const SPAN_PHASE_END: &str = "end";
 use encoder::DirectFieldVisitor;
 use otap_df_pdata::otlp::common::{ProtoBuffer, StackProtoBuffer};
 use serde::Serialize;
@@ -59,6 +83,11 @@ pub struct LogRecord {
 
     /// The context of this log record, typically pipeline and node context keys.
     pub context: LogContext,
+
+    /// Trace context present when the record was produced inside an active span,
+    /// or when the record is itself a span START or END event. `None` for plain
+    /// log events emitted outside any span.
+    pub trace: Option<SpanContext>,
 }
 
 /// Borrowed view of a log record for zero-copy formatting.
@@ -74,6 +103,8 @@ pub struct BorrowedLogRecord<'a> {
     pub callsite: SavedCallsite,
     /// Number of attribute fields dropped due to truncation.
     pub dropped_attributes_count: u32,
+    /// Trace context, when the record carries one.
+    pub trace: Option<SpanContext>,
 }
 
 /// Context for log records: entity keys that identify scope attribute
@@ -168,6 +199,7 @@ impl StackLogRecord {
             body_attrs_bytes: self.buf.as_ref(),
             callsite: SavedCallsite::new(self.callsite_id.0.metadata()),
             dropped_attributes_count: self.dropped_count,
+            trace: None,
         }
     }
 
@@ -179,6 +211,7 @@ impl StackLogRecord {
             body_attrs_bytes: self.buf.to_bytes(),
             callsite_id: self.callsite_id,
             context,
+            trace: None,
         }
     }
 }
@@ -216,7 +249,18 @@ impl LogRecord {
             dropped_attributes_count: dropped_count as u16,
             body_attrs_bytes: buf.into_bytes(),
             context,
+            trace: None,
         }
+    }
+
+    /// Attach trace context to this record, returning the updated record.
+    ///
+    /// Used by the tracing layer to stamp a log event with the active span's
+    /// identifiers, and to build span START and END events.
+    #[must_use]
+    pub fn with_trace(mut self, trace: Option<SpanContext>) -> Self {
+        self.trace = trace;
+        self
     }
 
     /// The callsite.
@@ -232,6 +276,7 @@ impl LogRecord {
             body_attrs_bytes: self.body_attrs_bytes.as_ref(),
             callsite: self.callsite(),
             dropped_attributes_count: self.dropped_attributes_count as u32,
+            trace: self.trace,
         }
     }
 }

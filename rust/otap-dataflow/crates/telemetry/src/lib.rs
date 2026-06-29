@@ -136,6 +136,12 @@ pub use tracing::warn_span as otel_warn_span;
 /// LogContext is a collection of entity keys.
 pub use self_tracing::LogContext;
 
+// Re-export span and trace-context types for components that need spans.
+pub use self_tracing::propagation::{Injector, inject};
+pub use self_tracing::sampler::{ComposableSampler, Sampler, SpanKind};
+pub use self_tracing::{SpanContext, SpanId, TraceFlags, TraceId};
+pub use tracing_init::current_span_context;
+
 /// The URN for the internal telemetry receiver.
 /// Defined here so it can be used by controller, engine, otap, and other crates.
 pub const INTERNAL_TELEMETRY_RECEIVER_URN: &str = "urn:otel:receiver:internal_telemetry";

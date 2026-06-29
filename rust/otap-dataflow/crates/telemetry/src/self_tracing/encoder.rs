@@ -58,6 +58,23 @@ impl<'buf, B: BoundedBuf> DirectLogRecordEncoder<'buf, B> {
             .encode_field_tag(LOG_RECORD_SEVERITY_NUMBER, wire_types::VARINT);
         let _ = self.buf.encode_varint(severity as u64);
 
+        // Encode trace context (flags field 8, trace_id field 9, span_id field
+        // 10) when the record carries one. Plain log events leave these unset.
+        if let Some(trace) = record.trace {
+            let _ = self
+                .buf
+                .encode_field_tag(LOG_RECORD_FLAGS, wire_types::FIXED32);
+            let _ = self
+                .buf
+                .extend_from_slice(&u32::from(trace.flags.bits()).to_le_bytes());
+            let _ = self.buf.encode_len_delimited(LOG_RECORD_TRACE_ID, |buf| {
+                buf.try_extend(&trace.trace_id.to_bytes())
+            });
+            let _ = self.buf.encode_len_delimited(LOG_RECORD_SPAN_ID, |buf| {
+                buf.try_extend(&trace.span_id.to_bytes())
+            });
+        }
+
         // Note we skip encoding severity_text (field 3, string)
 
         // Encode event_name (field 12, string) - format: "target::name (file:line)"
@@ -255,6 +272,32 @@ fn encode_debug_string<B: BoundedBuf>(buf: &mut B, value: &dyn std::fmt::Debug) 
         use std::fmt::Write as _;
         let mut adapter = BoundedBufFmt(buf);
         write!(adapter, "{:?}", value).map_err(|_| Dropped)
+    })
+}
+
+/// Append a string-valued attribute as a `LogRecord.attributes` entry.
+///
+/// Used by the span layer to add span semantic-convention attributes such as
+/// the phase and parent span id. The value is encoded in full, so callers keep
+/// these values small. On overflow the entry is rolled back by the surrounding
+/// length-delimited encoder and an `Err(Dropped)` is returned.
+pub fn append_string_attribute<B: BoundedBuf>(buf: &mut B, key: &str, value: &str) -> EncodeResult {
+    buf.encode_len_delimited(LOG_RECORD_ATTRIBUTES, |buf| {
+        buf.encode_string(KEY_VALUE_KEY, key)?;
+        buf.encode_len_delimited(KEY_VALUE_VALUE, |buf| {
+            buf.encode_string(ANY_VALUE_STRING_VALUE, value)
+        })
+    })
+}
+
+/// Append an integer-valued attribute as a `LogRecord.attributes` entry.
+pub fn append_int_attribute<B: BoundedBuf>(buf: &mut B, key: &str, value: i64) -> EncodeResult {
+    buf.encode_len_delimited(LOG_RECORD_ATTRIBUTES, |buf| {
+        buf.encode_string(KEY_VALUE_KEY, key)?;
+        buf.encode_len_delimited(KEY_VALUE_VALUE, |buf| {
+            buf.encode_field_tag(ANY_VALUE_INT_VALUE, wire_types::VARINT)?;
+            buf.encode_varint(value as u64)
+        })
     })
 }
 
@@ -1165,4 +1208,43 @@ mod tests {
         ),
         tracing::metadata::Kind::EVENT,
     );
+
+    #[test]
+    fn encode_log_record_writes_trace_fields() {
+        use crate::self_tracing::span::{OtelTraceState, SpanContext, SpanId, TraceFlags, TraceId};
+
+        let ctx = SpanContext {
+            trace_id: TraceId(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210),
+            span_id: SpanId(0x0102_0304_0506_0708),
+            flags: TraceFlags::new(true, true),
+            ot: OtelTraceState::default(),
+        };
+        let record = __log_record_impl!(Level::INFO, "trace.test")
+            .into_record(LogContext::new())
+            .with_trace(Some(ctx));
+
+        let mut buf = ProtoBuffer::default();
+        let mut encoder = DirectLogRecordEncoder::new(&mut buf);
+        let time = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000);
+        let _ = encoder.encode_log_record(time, &record);
+        let decoded = LogRecord::decode(buf.into_bytes().as_ref()).expect("decode failed");
+
+        assert_eq!(decoded.trace_id, ctx.trace_id.to_bytes().to_vec());
+        assert_eq!(decoded.span_id, ctx.span_id.to_bytes().to_vec());
+        assert_eq!(decoded.flags, u32::from(ctx.flags.bits()));
+    }
+
+    #[test]
+    fn encode_log_record_omits_trace_fields_when_absent() {
+        let record = __log_record_impl!(Level::INFO, "no.trace").into_record(LogContext::new());
+
+        let mut buf = ProtoBuffer::default();
+        let mut encoder = DirectLogRecordEncoder::new(&mut buf);
+        let _ = encoder.encode_log_record(SystemTime::UNIX_EPOCH, &record);
+        let decoded = LogRecord::decode(buf.into_bytes().as_ref()).expect("decode failed");
+
+        assert!(decoded.trace_id.is_empty());
+        assert!(decoded.span_id.is_empty());
+        assert_eq!(decoded.flags, 0);
+    }
 }

@@ -8,9 +8,24 @@
 //! trace events are captured and routed.
 
 use crate::event::{LogEvent, ObservedEventReporter};
-use crate::self_tracing::{ConsoleWriter, LogContextFn, LogRecord};
+use crate::self_tracing::encoder::{
+    DirectFieldVisitor, append_int_attribute, append_string_attribute,
+};
+use crate::self_tracing::sampler::{self, ComposableSampler, Sampler, SpanKind};
+use crate::self_tracing::span::{SpanContext, SpanId, TraceId};
+use crate::self_tracing::{
+    ATTR_SPAN_DURATION_NANO, ATTR_SPAN_PARENT_SPAN_ID, ATTR_SPAN_PHASE, ConsoleWriter,
+    LOG_ARGUMENTS_ENCODE_INLINE, LogContext, LogContextFn, LogRecord, SPAN_PHASE_END,
+    SPAN_PHASE_START,
+};
 use otap_df_config::settings::telemetry::logs::LogLevel;
-use std::time::SystemTime;
+use otap_df_pdata::otlp::common::ProtoBuffer;
+use smallvec::SmallVec;
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
+use tracing::callsite::Identifier;
+use tracing::span::{Attributes, Id};
 use tracing::{Dispatch, Event, Subscriber};
 use tracing_subscriber::layer::{Context, Layer as TracingLayer};
 use tracing_subscriber::registry::LookupSpan;
@@ -186,15 +201,107 @@ impl ProviderSetup {
     }
 }
 
+/// Per-span state stored in the tracing registry's span extensions.
+///
+/// This is the only data we retain for a live span. It holds the immutable
+/// [`SpanContext`] used for propagation and stamping, the sampling decision, and
+/// the start instant used to compute the END event duration. Span attributes
+/// and nested events are emitted immediately as independent log records and are
+/// never accumulated here.
+struct SpanState {
+    context: SpanContext,
+    sampled: bool,
+    start: Instant,
+}
+
+thread_local! {
+    /// Stack of trace contexts for the spans currently entered on this thread.
+    /// Updated by `on_enter` and `on_exit`, read by [`current_span_context`].
+    static CURRENT_SPAN_CONTEXT: RefCell<SmallVec<[SpanContext; 8]>> =
+        RefCell::new(SmallVec::new());
+}
+
+/// Returns the trace context of the span currently entered on this thread, if
+/// any.
+///
+/// This is the value to pass to [`crate::self_tracing::propagation::inject`]
+/// when propagating context to an outgoing carrier.
+#[must_use]
+pub fn current_span_context() -> Option<SpanContext> {
+    CURRENT_SPAN_CONTEXT.with(|stack| stack.borrow().last().copied())
+}
+
+/// Build a span START log record from the span attributes and trace context.
+fn build_start_record(
+    callsite: Identifier,
+    context: SpanContext,
+    attrs: &Attributes<'_>,
+    parent: Option<SpanContext>,
+    log_context: LogContext,
+) -> LogRecord {
+    let mut buf = ProtoBuffer::with_capacity_and_limit(
+        LOG_ARGUMENTS_ENCODE_INLINE,
+        LOG_ARGUMENTS_ENCODE_INLINE,
+    );
+    let dropped = {
+        let mut visitor = DirectFieldVisitor::new(&mut buf);
+        attrs.record(&mut visitor);
+        visitor.dropped_count()
+    };
+    let _ = append_string_attribute(&mut buf, ATTR_SPAN_PHASE, SPAN_PHASE_START);
+    if let Some(parent) = parent {
+        let _ = append_string_attribute(
+            &mut buf,
+            ATTR_SPAN_PARENT_SPAN_ID,
+            parent.span_id.to_hex().as_str(),
+        );
+    }
+    LogRecord {
+        callsite_id: callsite,
+        body_attrs_bytes: buf.into_bytes(),
+        dropped_attributes_count: dropped as u16,
+        context: log_context,
+        trace: Some(context),
+    }
+}
+
+/// Build a span END log record carrying the phase and elapsed duration.
+fn build_end_record(
+    callsite: Identifier,
+    context: SpanContext,
+    duration_nanos: i64,
+    log_context: LogContext,
+) -> LogRecord {
+    let mut buf = ProtoBuffer::with_capacity_and_limit(
+        LOG_ARGUMENTS_ENCODE_INLINE,
+        LOG_ARGUMENTS_ENCODE_INLINE,
+    );
+    let _ = append_string_attribute(&mut buf, ATTR_SPAN_PHASE, SPAN_PHASE_END);
+    let _ = append_int_attribute(&mut buf, ATTR_SPAN_DURATION_NANO, duration_nanos);
+    LogRecord {
+        callsite_id: callsite,
+        body_attrs_bytes: buf.into_bytes(),
+        dropped_attributes_count: 0,
+        context: log_context,
+        trace: Some(context),
+    }
+}
+
 /// A tracing layer that emits a structured log record to either console or an async sink.
+///
+/// Spans surface as two independent log records: a START record when the span
+/// opens and an END record when it closes, both gated by the configured
+/// [`Sampler`]. Log events emitted inside a span are stamped with the active
+/// span's trace context.
 pub struct StructuredLoggingLayer {
     writer: Option<ConsoleWriter>,
     reporter: Option<ObservedEventReporter>,
     context_fn: LogContextFn,
+    sampler: Arc<dyn Sampler>,
 }
 
 impl StructuredLoggingLayer {
-    /// Create a new structured logging layer.
+    /// Create a new structured logging layer with the default sampler.
     #[must_use]
     fn new(
         writer: Option<ConsoleWriter>,
@@ -205,18 +312,20 @@ impl StructuredLoggingLayer {
             writer,
             reporter,
             context_fn,
+            sampler: default_sampler(),
         }
     }
-}
 
-impl<S> TracingLayer<S> for StructuredLoggingLayer
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-{
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let time = SystemTime::now();
-        let context = (self.context_fn)();
-        let record = LogRecord::new(event, context);
+    /// Replace the sampler used to decide whether spans emit START and END
+    /// events.
+    #[must_use]
+    pub fn with_sampler(mut self, sampler: Arc<dyn Sampler>) -> Self {
+        self.sampler = sampler;
+        self
+    }
+
+    /// Print to console and forward to the async sink, as configured.
+    fn emit(&self, time: SystemTime, record: LogRecord) {
         if let Some(writer) = self.writer {
             writer.print_log_record(time, &record.as_view(), |w| {
                 w.format_entity_suffix_without_registry(&record.context);
@@ -225,6 +334,107 @@ where
         if let Some(reporter) = &self.reporter {
             reporter.log(LogEvent { time, record });
         }
+    }
+}
+
+/// The default sampler: a root sampler that always records, with children
+/// honoring the propagated threshold.
+fn default_sampler() -> Arc<dyn Sampler> {
+    Arc::new(ComposableSampler::ParentThreshold(Box::new(
+        ComposableSampler::AlwaysOn,
+    )))
+}
+
+impl<S> TracingLayer<S> for StructuredLoggingLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        let metadata = attrs.metadata();
+
+        // Resolve the parent trace context from the tokio span parent chain.
+        let parent = ctx
+            .span(id)
+            .and_then(|span| span.parent())
+            .and_then(|parent| parent.extensions().get::<SpanState>().map(|st| st.context));
+
+        let trace_id = parent.map_or_else(TraceId::generate, |p| p.trace_id);
+        let span_id = SpanId::generate();
+
+        let decision = sampler::evaluate(
+            self.sampler.as_ref(),
+            parent,
+            trace_id,
+            span_id,
+            metadata.name(),
+            SpanKind::Internal,
+        );
+
+        // Retain state for propagation regardless of the sampling decision so
+        // descendants inherit a correct context.
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(SpanState {
+                context: decision.context,
+                sampled: decision.sampled,
+                start: Instant::now(),
+            });
+        }
+
+        if decision.sampled {
+            let record = build_start_record(
+                metadata.callsite(),
+                decision.context,
+                attrs,
+                parent,
+                (self.context_fn)(),
+            );
+            self.emit(SystemTime::now(), record);
+        }
+    }
+
+    fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            if let Some(context) = span.extensions().get::<SpanState>().map(|st| st.context) {
+                CURRENT_SPAN_CONTEXT.with(|stack| stack.borrow_mut().push(context));
+            }
+        }
+    }
+
+    fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            if span.extensions().get::<SpanState>().is_some() {
+                CURRENT_SPAN_CONTEXT.with(|stack| {
+                    let _ = stack.borrow_mut().pop();
+                });
+            }
+        }
+    }
+
+    fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(&id) {
+            let callsite = span.metadata().callsite();
+            let state = match span.extensions().get::<SpanState>() {
+                Some(st) => (st.sampled, st.context, st.start),
+                None => return,
+            };
+            let (sampled, context, start) = state;
+            if !sampled {
+                return;
+            }
+            let duration_nanos = start.elapsed().as_nanos() as i64;
+            let record = build_end_record(callsite, context, duration_nanos, (self.context_fn)());
+            self.emit(SystemTime::now(), record);
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let time = SystemTime::now();
+        let context = (self.context_fn)();
+        let trace = ctx
+            .event_span(event)
+            .and_then(|span| span.extensions().get::<SpanState>().map(|st| st.context));
+        let record = LogRecord::new(event, context).with_trace(trace);
+        self.emit(time, record);
     }
 }
 
@@ -699,6 +909,120 @@ mod tests {
 
             assert!(receiver1.try_recv().is_err());
             assert!(receiver2.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn sampled_span_emits_start_and_end_with_shared_ids() {
+        crate::with_cleared_rust_log(|| {
+            let (reporter, receiver) = test_reporter();
+            let setup = test_setup(internal_async_provider(reporter), level("info"));
+
+            setup.with_subscriber_ignoring_env(|| {
+                let span = crate::otel_info_span!("test.span", key = "value");
+                let entered = span.enter();
+                otel_info!("inside.span");
+                drop(entered);
+                drop(span);
+            });
+
+            let mut logs = Vec::new();
+            while let Ok(ObservedEvent::Log(le)) = receiver.try_recv() {
+                logs.push(le);
+            }
+            assert_eq!(logs.len(), 3, "expected START, in-span event, END");
+
+            let start = logs[0].record.trace.expect("START carries trace");
+            let inside = logs[1].record.trace.expect("event carries trace");
+            let end = logs[2].record.trace.expect("END carries trace");
+
+            assert!(start.is_valid() && start.flags.is_sampled());
+            // All three share the trace id; START, the event, and END share the
+            // span id.
+            assert_eq!(start.trace_id, inside.trace_id);
+            assert_eq!(start.trace_id, end.trace_id);
+            assert_eq!(start.span_id, inside.span_id);
+            assert_eq!(start.span_id, end.span_id);
+
+            let start_text = logs[0].to_string();
+            assert!(start_text.contains("test.span"), "{start_text}");
+            assert!(start_text.contains("key=value"), "{start_text}");
+            assert!(start_text.contains("otel.span.phase=start"), "{start_text}");
+            assert!(start_text.contains("trace="), "{start_text}");
+
+            let end_text = logs[2].to_string();
+            assert!(end_text.contains("otel.span.phase=end"), "{end_text}");
+            assert!(end_text.contains("otel.span.duration_nano"), "{end_text}");
+        });
+    }
+
+    #[test]
+    fn unsampled_span_suppresses_start_and_end_but_keeps_events() {
+        crate::with_cleared_rust_log(|| {
+            let (reporter, receiver) = test_reporter();
+            let layer = StructuredLoggingLayer::new(None, Some(reporter), LogContext::new)
+                .with_sampler(Arc::new(ComposableSampler::AlwaysOff));
+            let subscriber = Registry::default()
+                .with(create_env_filter(&level("info")))
+                .with(layer);
+
+            tracing::subscriber::with_default(subscriber, || {
+                let span = crate::otel_info_span!("unsampled");
+                let entered = span.enter();
+                otel_info!("inside.unsampled");
+                drop(entered);
+                drop(span);
+            });
+
+            let mut logs = Vec::new();
+            while let Ok(ObservedEvent::Log(le)) = receiver.try_recv() {
+                logs.push(le);
+            }
+            // No START or END events, only the in-span event, which still carries
+            // the unsampled span context for correlation.
+            assert_eq!(logs.len(), 1, "only the in-span event should be emitted");
+            let ctx = logs[0].record.trace.expect("event carries trace");
+            assert!(ctx.is_valid());
+            assert!(!ctx.flags.is_sampled());
+        });
+    }
+
+    #[test]
+    fn nested_spans_inherit_trace_id_and_link_parent() {
+        crate::with_cleared_rust_log(|| {
+            let (reporter, receiver) = test_reporter();
+            let setup = test_setup(internal_async_provider(reporter), level("info"));
+
+            setup.with_subscriber_ignoring_env(|| {
+                let parent = crate::otel_info_span!("parent.span");
+                let parent_entered = parent.enter();
+                let child = crate::otel_info_span!("child.span");
+                let child_entered = child.enter();
+                drop(child_entered);
+                drop(child);
+                drop(parent_entered);
+                drop(parent);
+            });
+
+            let mut starts = Vec::new();
+            while let Ok(ObservedEvent::Log(le)) = receiver.try_recv() {
+                if le.to_string().contains("otel.span.phase=start") {
+                    starts.push(le);
+                }
+            }
+            assert_eq!(starts.len(), 2, "expected a START for parent and child");
+            let parent_ctx = starts[0].record.trace.expect("parent trace");
+            let child_ctx = starts[1].record.trace.expect("child trace");
+            // The child shares the trace id but has its own span id.
+            assert_eq!(parent_ctx.trace_id, child_ctx.trace_id);
+            assert_ne!(parent_ctx.span_id, child_ctx.span_id);
+            // The child START links to the parent via parent_span_id.
+            let child_text = starts[1].to_string();
+            let parent_hex = parent_ctx.span_id.to_hex();
+            assert!(
+                child_text.contains(&format!("otel.span.parent_span_id={parent_hex}")),
+                "{child_text}"
+            );
         });
     }
 }

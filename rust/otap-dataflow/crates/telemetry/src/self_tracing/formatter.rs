@@ -6,6 +6,7 @@
 use super::encoder::level_to_severity_number;
 use super::{
     BorrowedLogRecord, LOG_BUFFER_SIZE, LogContext, LogContextFn, LogRecord, SavedCallsite,
+    SpanContext,
 };
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use otap_df_pdata::views::otlp::bytes::logs::RawLogRecord;
@@ -264,6 +265,7 @@ impl StyledBufWriter<'_> {
     {
         let raw_view = RawLogRecord::new(view.body_attrs_bytes);
         let level = *view.callsite.level();
+        let trace = view.trace;
 
         self.format_log_line(
             time,
@@ -272,8 +274,24 @@ impl StyledBufWriter<'_> {
             |w| {
                 w.write_styled(AnsiCode::Bold, |w| write_event_name_to(w, &view.callsite));
             },
-            write_suffix,
+            |w| {
+                if let Some(ctx) = trace {
+                    w.write_trace_suffix(&ctx);
+                }
+                write_suffix(w);
+            },
         );
+    }
+
+    /// Write a compact trace context suffix in the form
+    /// ` trace=<32 hex> span=<16 hex>`.
+    pub fn write_trace_suffix(&mut self, context: &SpanContext) {
+        self.write_styled(AnsiCode::Cyan, |w| {
+            let _ = w.write_all(b" trace=");
+            let _ = w.write_all(context.trace_id.to_hex().as_str().as_bytes());
+            let _ = w.write_all(b" span=");
+            let _ = w.write_all(context.span_id.to_hex().as_str().as_bytes());
+        });
     }
     /// Write a SystemTime timestamp as ISO 8601 (UTC) to buffer.
     #[inline]
@@ -826,6 +844,7 @@ mod tests {
             body_attrs_bytes: Bytes::new(),
             dropped_attributes_count: 0,
             context: LogContext::new(),
+            trace: None,
         };
 
         let output = format_log_record_to_string(Some(time), &record);
@@ -883,6 +902,7 @@ mod tests {
             body_attrs_bytes: Bytes::from(encoded),
             dropped_attributes_count: 0,
             context: LogContext::new(),
+            trace: None,
         };
 
         let mut buf = [0u8; LOG_BUFFER_SIZE];
