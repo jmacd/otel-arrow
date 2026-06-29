@@ -24,7 +24,15 @@
 //! and counted (D12). After ingesting the batch it drains every window the
 //! watermark has closed and emits the completed aggregates as a new metrics
 //! batch. Non-metric signals pass through unchanged.
+//!
+//! As a shuffle owner it keeps an independent windower per partition tag, so a
+//! partition's active-series count is exactly its aggregator's stream count. When
+//! a [`LoadReportSender`] is wired in via
+//! [`set_load_report_sender`](EventTimeWindowProcessor::set_load_report_sender),
+//! each telemetry collection reports per-partition load so a placement scheduler
+//! can rebalance partitions across owners, closing the load feedback loop.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,6 +52,7 @@ use otap_df_engine::message::Message;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::process_duration::ComputeDuration;
 use otap_df_engine::processor::{ProcessorRuntimeRequirements, ProcessorWrapper};
+use otap_df_engine::topic::{LoadReportSender, PartitionLoadTracker};
 use otap_df_otap::{OTAP_PROCESSOR_FACTORIES, pdata::OtapPdata};
 use otap_df_pdata::OtlpProtoBytes;
 use otap_df_pdata::TryIntoWithOptions;
@@ -120,8 +129,20 @@ pub struct EventTimeWindowProcessor {
     metrics: MetricSet<EventTimeWindowMetrics>,
     /// Accumulated compute-time telemetry.
     compute_duration: ComputeDuration,
-    /// Per-stream event-time window aggregation state.
-    aggregators: WindowedAggregators<SeriesKey, WindowAgg>,
+    /// Window geometry, used to lazily construct a per-partition aggregator.
+    windows: TumblingWindows,
+    /// Watermark policy, used to lazily construct a per-partition aggregator.
+    policy: WatermarkPolicy,
+    /// Per-partition event-time window aggregation state, keyed by the partition
+    /// tag the shuffle assigned. As a shuffle owner the windower runs an
+    /// independent windower per partition it holds, so a partition's
+    /// `active_series` is exactly its aggregator's stream count.
+    aggregators: BTreeMap<u32, WindowedAggregators<SeriesKey, WindowAgg>>,
+    /// Owner-side per-partition load accounting (the producer end of the load
+    /// feedback loop, `docs/durable-dispatch-topic-design.md`).
+    load: PartitionLoadTracker,
+    /// Where to send load snapshots, if load reporting is wired to a scheduler.
+    load_sender: Option<LoadReportSender>,
 }
 
 impl EventTimeWindowProcessor {
@@ -146,8 +167,34 @@ impl EventTimeWindowProcessor {
         Ok(Self {
             metrics,
             compute_duration,
-            aggregators: WindowedAggregators::new(windows, policy),
+            windows,
+            policy,
+            aggregators: BTreeMap::new(),
+            load: PartitionLoadTracker::new(),
+            load_sender: None,
         })
+    }
+
+    /// Wire this owner's load reports to a placement scheduler. Once set, each
+    /// telemetry collection reports per-partition load (active series plus the
+    /// interval ingest count) so the scheduler can rebalance partitions across
+    /// owners. Closing the load feedback loop with a real aggregating owner.
+    pub fn set_load_report_sender(&mut self, sender: LoadReportSender) {
+        self.load_sender = Some(sender);
+    }
+
+    /// Report per-partition load to the scheduler, if wired. The `active_series`
+    /// gauge is read from each partition's live stream count; the interval
+    /// `points` were accumulated as batches arrived.
+    fn report_load(&mut self) {
+        let Some(sender) = self.load_sender.as_ref() else {
+            return;
+        };
+        for (&partition, aggregator) in &self.aggregators {
+            self.load
+                .set_active_series(partition as usize, aggregator.stream_count() as u64);
+        }
+        sender.send(self.load.snapshot());
     }
 }
 
@@ -166,6 +213,7 @@ impl local::Processor<OtapPdata> for EventTimeWindowProcessor {
                 {
                     _ = metrics_reporter.report(&mut self.metrics);
                     self.compute_duration.report(&mut metrics_reporter);
+                    self.report_load();
                 }
                 Ok(())
             }
@@ -179,26 +227,35 @@ impl local::Processor<OtapPdata> for EventTimeWindowProcessor {
                 }
 
                 let processor_id = effect_handler.processor_id();
+                // The shuffle tags each batch with the partition it dispatched to;
+                // untagged input (e.g. an un-shuffled pipeline) folds into a single
+                // default partition.
+                let partition = pdata.partition().unwrap_or(0);
                 let (context, payload) = pdata.into_parts();
                 let mut records: OtapArrowRecords = payload.try_into_with_default()?;
                 records.decode_transport_optimized_ids()?;
 
                 let now = unix_now_nanos();
+                let windows = self.windows;
+                let policy = self.policy;
 
-                // Ingest the batch's number data points into the windower. The
-                // view borrow is confined to this match so `records` is free to
-                // move afterward.
-                let ingested = match OtapMetricsView::try_from(&records) {
-                    Ok(view) => {
-                        effect_handler.timed(&self.compute_duration, || -> Result<_, Error> {
-                            ingest_view(&mut self.aggregators, &mut self.metrics, &view, now);
-                            Ok(())
-                        })?;
-                        true
-                    }
+                // Ingest the batch's number data points into the partition's
+                // windower. The view borrow is confined to this match so `records`
+                // is free to move afterward.
+                let admitted = match OtapMetricsView::try_from(&records) {
+                    Ok(view) => Some(effect_handler.timed(
+                        &self.compute_duration,
+                        || -> Result<u64, Error> {
+                            let aggregator = self
+                                .aggregators
+                                .entry(partition)
+                                .or_insert_with(|| WindowedAggregators::new(windows, policy));
+                            Ok(ingest_view(aggregator, &mut self.metrics, &view, now))
+                        },
+                    )?),
                     Err(e) => {
                         otel_warn!(VIEW_CREATION_FAILED_EVENT, error = %e);
-                        false
+                        None
                     }
                 };
 
@@ -206,15 +263,25 @@ impl local::Processor<OtapPdata> for EventTimeWindowProcessor {
 
                 // A batch we could not read is forwarded unchanged rather than
                 // dropped, so no data is silently lost in the PoC.
-                if !ingested {
+                let Some(admitted) = admitted else {
                     return effect_handler
                         .send_message_with_source_node(OtapPdata::new(context, records.into()))
                         .await
                         .map_err(Into::into);
-                }
+                };
 
-                // Drain and emit every window the watermark has now closed.
-                let fired = self.aggregators.drain_complete(now);
+                // Drain the partition's completed windows and record this owner's
+                // per-partition load (ingest rate plus live series count).
+                let aggregator = self
+                    .aggregators
+                    .get_mut(&partition)
+                    .expect("partition aggregator created during ingest");
+                let fired = aggregator.drain_complete(now);
+                let active_series = aggregator.stream_count() as u64;
+                self.load.add_points(partition as usize, admitted);
+                self.load
+                    .set_active_series(partition as usize, active_series);
+
                 if fired.is_empty() {
                     return Ok(());
                 }
@@ -246,13 +313,15 @@ impl local::Processor<OtapPdata> for EventTimeWindowProcessor {
 }
 
 /// Ingest every NUMBER data point in a metrics view into the windower, skipping
-/// (and counting) histogram, exponential-histogram, and summary points.
+/// (and counting) histogram, exponential-histogram, and summary points. Returns
+/// the number of points admitted (folded into a window, not dropped as late).
 fn ingest_view<V: MetricsView>(
     aggregators: &mut WindowedAggregators<SeriesKey, WindowAgg>,
     metrics: &mut MetricSet<EventTimeWindowMetrics>,
     view: &V,
     now: i64,
-) {
+) -> u64 {
+    let mut admitted = 0u64;
     for resource_metrics in view.resources() {
         let resource = resource_metrics
             .resource()
@@ -276,7 +345,7 @@ fn ingest_view<V: MetricsView>(
                                 monotonic: sum.is_monotonic(),
                             };
                             for dp in sum.data_points() {
-                                fold_point(
+                                admitted += u64::from(fold_point(
                                     aggregators,
                                     metrics,
                                     &resource,
@@ -286,14 +355,14 @@ fn ingest_view<V: MetricsView>(
                                     kind,
                                     &dp,
                                     now,
-                                );
+                                ));
                             }
                         }
                     }
                     DataType::Gauge => {
                         if let Some(gauge) = data.as_gauge() {
                             for dp in gauge.data_points() {
-                                fold_point(
+                                admitted += u64::from(fold_point(
                                     aggregators,
                                     metrics,
                                     &resource,
@@ -303,7 +372,7 @@ fn ingest_view<V: MetricsView>(
                                     SeriesKind::Gauge,
                                     &dp,
                                     now,
-                                );
+                                ));
                             }
                         }
                     }
@@ -326,10 +395,12 @@ fn ingest_view<V: MetricsView>(
             }
         }
     }
+    admitted
 }
 
-/// Route one number data point to its window and fold its value in, or count it
-/// as late if its window already fired.
+/// Route one number data point to its window and fold its value in. Returns
+/// `true` if the point was admitted, or `false` if it was counted as late
+/// because its window had already fired.
 #[allow(clippy::too_many_arguments)]
 fn fold_point<DP: NumberDataPointView>(
     aggregators: &mut WindowedAggregators<SeriesKey, WindowAgg>,
@@ -341,9 +412,9 @@ fn fold_point<DP: NumberDataPointView>(
     kind: SeriesKind,
     dp: &DP,
     now: i64,
-) {
+) -> bool {
     let Some(value) = dp.value() else {
-        return;
+        return false;
     };
     let value = match value {
         Value::Double(d) => d,
@@ -362,8 +433,12 @@ fn fold_point<DP: NumberDataPointView>(
         Some(agg) => {
             fold(agg, kind, event_time, value);
             metrics.points_aggregated.inc();
+            true
         }
-        None => metrics.points_late.inc(),
+        None => {
+            metrics.points_late.inc();
+            false
+        }
     }
 }
 
@@ -606,6 +681,27 @@ mod tests {
         (registry, reporter, rt.set_processor(proc))
     }
 
+    /// Build the windower as a load-reporting shuffle owner wired to `sender`.
+    fn setup_owner(
+        cfg: JsonValue,
+        sender: LoadReportSender,
+    ) -> (MetricsReporter, TestPhase<OtapPdata>) {
+        let rt = TestRuntime::new();
+        let registry = rt.metrics_registry();
+        let reporter = rt.metrics_reporter();
+        let controller = ControllerContext::new(registry);
+        let pipeline_ctx = controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+        let node = test_node("event-time-window-owner");
+        let mut node_config = NodeUserConfig::new_processor_config(EVENT_TIME_WINDOW_PROCESSOR_URN);
+        node_config.config = cfg;
+        let proc_config = ProcessorConfig::new("event-time-window-owner");
+        let mut proc = EventTimeWindowProcessor::from_config(pipeline_ctx, &node_config.config)
+            .expect("config");
+        proc.set_load_report_sender(sender);
+        let wrapper = ProcessorWrapper::local(proc, node, Arc::new(node_config), &proc_config);
+        (reporter, rt.set_processor(wrapper))
+    }
+
     fn sum_metric(name: &str, monotonic: bool, points: &[(u64, i64)]) -> Metric {
         Metric::build()
             .name(name)
@@ -656,6 +752,21 @@ mod tests {
         let mut bytes = vec![];
         data.encode(&mut bytes).expect("encode metrics");
         OtapPdata::new_default(OtlpProtoBytes::ExportMetricsRequest(bytes.into()).into())
+    }
+
+    /// Build a metrics input batch carrying the shuffle partition tag `partition`.
+    fn as_input_on(data: MetricsData, partition: u32) -> OtapPdata {
+        let mut pdata = as_input(data);
+        pdata.set_partition(partition);
+        pdata
+    }
+
+    /// A batch of `count` distinct single-point sum series sharing a name prefix.
+    fn distinct_sums(prefix: &str, count: usize, t: u64) -> MetricsData {
+        let metrics = (0..count)
+            .map(|i| sum_metric(&format!("{prefix}_{i}"), true, &[(t, 1)]))
+            .collect::<Vec<_>>();
+        metrics_data(metrics)
     }
 
     /// Decode an output batch into the sum of every number data point value and
@@ -864,5 +975,103 @@ mod tests {
                 assert_eq!(out[0].signal_type(), SignalType::Logs);
             })
             .validate(|_| async {});
+    }
+
+    /// Closes the load feedback loop with a real aggregating owner: the windower
+    /// measures each partition's live series count, reports it through a
+    /// `LoadReportSender`, and the `PlacementScheduler` rebalances the live
+    /// partition-dispatch topic. Owner 0's partitions carry far more series, so
+    /// the scheduler sheds one of them to the idle owner 1.
+    #[test]
+    fn reports_per_partition_load_that_drives_a_rebalance() {
+        use otap_df_engine::topic::{
+            LoadWeights, PartitionDispatchBackend, PlacementScheduler, SubscriberOptions,
+            SubscriptionMode, TopicBroker, TopicOptions,
+        };
+        use std::num::NonZeroUsize;
+
+        // A live 4-partition shuffle topic, two owners: owner0 -> {0,1},
+        // owner1 -> {2,3}.
+        let broker = TopicBroker::<OtapPdata>::new();
+        let topic = broker
+            .create_topic(
+                "shuffle",
+                TopicOptions::default(),
+                PartitionDispatchBackend {
+                    num_partitions: 4,
+                    capacity: 64,
+                },
+            )
+            .expect("create topic");
+        let _sub0 = topic
+            .subscribe(
+                SubscriptionMode::PartitionDispatch {
+                    owned_partitions: vec![0, 1],
+                },
+                SubscriberOptions::default(),
+            )
+            .expect("owner0 subscribes");
+        let _sub1 = topic
+            .subscribe(
+                SubscriptionMode::PartitionDispatch {
+                    owned_partitions: vec![2, 3],
+                },
+                SubscriberOptions::default(),
+            )
+            .expect("owner1 subscribes");
+
+        let mut scheduler = PlacementScheduler::new(
+            topic,
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            LoadWeights::default(),
+            1.2,
+        );
+
+        let (reporter, phase) = setup_owner(
+            json!({ "window_size": "60s", "allowed_lateness": "2s", "max_lag": "1h" }),
+            scheduler.report_sender(),
+        );
+        let now = unix_now_nanos() as u64;
+
+        phase
+            .run_test(move |mut ctx| async move {
+                // Hot owner 0: 50 distinct series each on partitions 0 and 1.
+                ctx.process(Message::PData(as_input_on(distinct_sums("p0", 50, now), 0)))
+                    .await
+                    .expect("p0");
+                ctx.process(Message::PData(as_input_on(distinct_sums("p1", 50, now), 1)))
+                    .await
+                    .expect("p1");
+                // Cold owner 1: one series each on partitions 2 and 3.
+                ctx.process(Message::PData(as_input_on(distinct_sums("p2", 1, now), 2)))
+                    .await
+                    .expect("p2");
+                ctx.process(Message::PData(as_input_on(distinct_sums("p3", 1, now), 3)))
+                    .await
+                    .expect("p3");
+                // Report the measured per-partition load to the scheduler.
+                ctx.process(Message::Control(NodeControlMsg::CollectTelemetry {
+                    metrics_reporter: reporter.clone(),
+                }))
+                .await
+                .expect("collect telemetry");
+            })
+            .validate(|_| async {});
+
+        // The scheduler consumes the owner's report and rebalances the topic.
+        let moves = scheduler.tick().expect("scheduler tick");
+        assert!(
+            !moves.is_empty(),
+            "skewed per-partition series counts must trigger a rebalance"
+        );
+        assert!(
+            moves.iter().any(|m| m.from == 0),
+            "the hot owner sheds a partition"
+        );
+        assert!(
+            moves.iter().all(|m| m.to == 1),
+            "shed load lands on the idle owner"
+        );
     }
 }

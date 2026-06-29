@@ -19,7 +19,7 @@
 ## What it does
 
 Implements the metrics-appliance Layer 2 (event-time windowing) described in
-[`docs/metrics-appliance-design.md`](../../../../docs/metrics-appliance-design.md)
+[`docs/metrics-appliance-design.md`](../../../../../docs/metrics-appliance-design.md)
 (decisions D10-D12). For every incoming OTAP metrics batch it:
 
 1. Reads each NUMBER data point (sum and gauge only) through the metrics view.
@@ -35,6 +35,20 @@ Implements the metrics-appliance Layer 2 (event-time windowing) described in
 The watermark policy is `max(max_event - allowed_lateness, processing_time -
 max_lag)` (D11); a window fires once the watermark reaches `window_end +
 allowed_lateness`.
+
+## Load reporting (shuffle owner)
+
+The shuffle tags each batch with the partition it was dispatched to, so the
+windower keeps an independent aggregator per partition tag and a partition's
+**active series count is exactly that aggregator's stream count**. When a
+`LoadReportSender` is wired in (via `set_load_report_sender`), each telemetry
+collection reports per-partition load -- active series plus the interval ingest
+count -- through the load feedback loop in
+[`durable-dispatch-topic-design.md`](../../../../../docs/durable-dispatch-topic-design.md).
+A `PlacementScheduler` merges those reports and rebalances partitions across
+owners, so the windower acts as a real aggregating owner closing the loop. As a
+PoC the active-series gauge counts every series seen (streams are not aged out
+once their windows drain), and inbound reassignments are not yet handled.
 
 ## PoC limitations (not production behavior)
 
