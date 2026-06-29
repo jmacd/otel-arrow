@@ -17,8 +17,10 @@ bespoke parts.
 > (D21/D24) is **deferred** to a later effort, behind the same interface. See
 > "Decisions". Names are provisional. **Layer A (split-by-key) and Layer C
 > (placement map, the `Partitioned` seam, the in-memory partition-dispatch topic,
-> and the exporter/receiver/config/controller wiring) are implemented and
-> tested**; the durable backend (Layer B) is the remaining work.
+> the load feedback loop, and the exporter/receiver/config/controller wiring) are
+> implemented and tested**, with the load feedback loop now driven end-to-end by
+> a real aggregating owner (the L2 event-time windower); the durable backend
+> (Layer B) is the remaining work.
 >
 > **Scope for this effort (D28):** build the **in-memory core only** -- Layer A
 > (split-by-key) + Layer C (partition-dispatch on the in-memory backend) = the
@@ -111,9 +113,9 @@ is built and tested **in memory first**, with durability added as a backend swap
 | Topic backend seam                   | `TopicBackend` / `TopicState` / `SubscriptionBackend`                    | exists; `InMemoryBackend` only          |
 | Durable buffer                       | `quiver` (WAL + Arrow IPC segments, at-least-once, multi-stream, budget) | exists (experimental)                   |
 | Reserved durable topic kind          | `TopicBackendKind::Quiver`                                               | reserved; currently rejected at startup |
-| Split-by-key (Layer A)               | (this design)                                                            | to build                                |
-| Quiver TopicBackend (Layer B)        | (this design)                                                            | to build                                |
-| Partition-dispatch + placement (C)   | (this design) + controller placement map                                 | to build                                |
+| Split-by-key (Layer A)               | `otap::partition` + `partition` processor                                | implemented + tested                    |
+| Quiver TopicBackend (Layer B)        | (this design)                                                            | deferred (durable backend)              |
+| Partition-dispatch + placement (C)   | `PartitionDispatchBackend` + placement map + load feedback loop          | implemented + tested                    |
 
 ## Layer A: Split-by-key
 
@@ -301,9 +303,14 @@ owners send `PartitionLoadTracker` snapshots through a `LoadReportSender`, and t
 scheduler's `tick` drains them, runs the coordinator's rebalance, and applies each
 move to the live topic via `apply_move`. A scheduling thread calls `tick` on a
 cadence aligned with the aggregation window so a move's handoff carries no live
-state. Wiring an owner's aggregator to emit reports is the remaining step; the
-durable backend adds leases and generation fencing to the apply step so a deposed
-owner's late writes are fenced.
+state. The **event-time window processor**
+(`crates/core-nodes/src/processors/event_time_window_processor/`, the L2 windower)
+is the first real owner to drive this loop: it keeps an independent windower per
+partition tag, so a partition's `active_series` is exactly its aggregator's stream
+count, reports that plus the interval `points` through a `LoadReportSender` on each
+telemetry collection, and a test shows skewed series counts rebalancing a live
+partition-dispatch topic. The durable backend later adds leases and generation
+fencing to the apply step so a deposed owner's late writes are fenced.
 
 **Relationship to tenancy.** When the multitenancy descriptor system lands,
 condition-routing (named partitions for tenant/resource isolation) and

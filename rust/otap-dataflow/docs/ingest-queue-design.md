@@ -111,15 +111,17 @@ lossless mode.
 | Durable buffer-queue            | `quiver` (WAL + Arrow IPC segments, multi-subscriber at-least-once, budget) | exists (experimental)                               |
 | Per-core type registry          | in-memory Arrow table + `quiver` snapshot                                   | in-memory done (Phase 0); durability TODO (Phase 1) |
 | Balanced work distribution      | balanced topic + thread-per-core controller                                 | exists                                              |
-| Local control plane / placement | controller (core allocation, lifecycle, leases)                             | partial; local-only, no rebalancing                 |
+| Local control plane / placement | controller (core allocation, lifecycle, leases)                             | in-memory placement + rebalancing (Layer C) done    |
 | Validation compute              | query engine / DataFusion over OTAP Arrow                                   | exists                                              |
 | Admission + manifest (Phase 0)  | `processor:metrics_admission` (time-window gate, per-core type registry)    | exists (Phase 0)                                    |
-| Auto-sharder                    | (this design)                                                               | to build                                            |
+| Auto-sharder                    | placement map + partition-dispatch (Layer C)                                | in-memory done; durable sharding TODO               |
 
 The durable-queue question is largely answered by `quiver` already. Phase 0
 landed the admission front-end (the `metrics_admission` processor and its
-per-core `TypeRegistry`). The remaining new work is registry durability in
-Phase 1 and the assignment control plane -- the auto-sharder -- in Phase 2 and
+per-core `TypeRegistry`). The in-memory name-keyed shuffle, placement map, and
+load-aware rebalancing already exist (durable-dispatch Layer C); the remaining
+new work is registry durability (Phase 1) and the durable assignment control
+plane -- per-bucket Quiver, leases, and streaming handoff -- in Phase 2 and
 beyond.
 
 ## Architecture
@@ -686,12 +688,18 @@ which the downstream watermark operates.
   (`crates/core-nodes/src/processors/metrics_admission_processor/`) and the
   `pdata` primitive `filter_metrics_time_window`
   (`crates/pdata/src/otap/filter.rs`). See the phased plan above for details.
-  Phases 1-4 are not yet implemented.
+  The **in-memory mechanisms of Phases 1-3** -- the name-keyed shuffle
+  (split-by-key), the `bucket -> owner` placement map, and load-aware
+  churn-minimizing rebalancing with its owner-to-controller feedback loop -- are
+  implemented in the partition-dispatch effort (see
+  [`durable-dispatch-topic-design.md`](./durable-dispatch-topic-design.md)),
+  driven end to end by the L2 event-time windower as a real owner. Their durable
+  aspects and Phase 4 are not yet implemented.
 - The durable buffer substrate (`quiver`) exists (experimental). The broadcast
   and balanced topics, the controller, and DataFusion query support exist. The
   `durable_buffer_processor` already wraps `quiver` as a pipeline node.
-- Registry durability, the name-keyed shuffle, the auto-sharder, and the
-  placement plane do not yet exist.
+- Registry durability, per-bucket Quiver durability, M3-style streaming handoff,
+  replication, and distributed `bucket -> node` placement do not yet exist.
 - All decisions D1 through D9 are ratified. The two-plane collapse (metrics
   shuffle by `metric_name`) is adopted.
 

@@ -532,10 +532,14 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
   views, folds NUMBER points into windows (delta-sum and gauge last-value), and
   emits complete windows. It deliberately duplicates identity/aggregation code
   rather than reuse `temporal_reaggregation`'s private modules, and is scoped to
-  number points with OTLP output. What remains for A0 is OTAP columnar output,
-  the reset/gap/overlap and cumulative-conversion rules (D17), histograms, a
-  timer-driven drain, and reporting per-partition load as a shuffle owner --
-  then folding the PoC into `temporal_reaggregation`.
+  number points with OTLP output. It is also the **first real shuffle owner to
+  close the load feedback loop** (durable-dispatch Layer C): it keeps an
+  independent windower per partition tag, so a partition's `active_series` is
+  exactly its aggregator's stream count, and reports per-partition load through
+  a `LoadReportSender` to the `PlacementScheduler` on each telemetry collection.
+  What remains for A0 is OTAP columnar output, the reset/gap/overlap and
+  cumulative-conversion rules (D17), histograms, a timer-driven drain, and
+  idle-stream aging -- then folding the PoC into `temporal_reaggregation`.
 - **A1 -- stage-2 store (L3 core).** The store seam (writer + `TableProvider`)
   with the Vortex backend, keyed `(metric_name, resolution, window_index)`;
   fixed-window drop-oldest retention (D13, D15, D16). Can be prototyped in
@@ -564,8 +568,10 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
   *this* document, the **L2 windowing core is implemented** -- `TumblingWindows`,
   `Watermark`, `WatermarkPolicy`, and the `WindowedAggregators` state machine
   (`crates/pdata/src/otap/windowing.rs`), driven end to end by the
-  proof-of-concept `event_time_window` processor; the remaining L2/L3/L4/L5
-  assembly is not. Decisions D10-D17 are ratified.
+  proof-of-concept `event_time_window` processor, which also reports
+  per-partition load as a real shuffle owner and so closes the durable-dispatch
+  Layer C load feedback loop; the remaining L2/L3/L4/L5 assembly is not.
+  Decisions D10-D17 are ratified.
 - L2's seed exists -- the `temporal_reaggregation` processor -- but is
   processing-time, not event-time; L2 (phase A0) is the extension described here.
 - `quiver` (L1 substrate), the `parquet_exporter` (object-store Parquet, L5
