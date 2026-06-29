@@ -2872,3 +2872,170 @@ async fn partition_dispatch_drops_unclaimed_partition() {
     }
     assert_eq!(got, vec![2], "only the owned-partition message survives");
 }
+
+// A reassignment repoints future publishes to the new owner; messages already
+// enqueued for the old owner stay with it (a window-boundary handoff).
+#[tokio::test]
+async fn partition_dispatch_reassign_reroutes_future_publishes() {
+    let broker = TopicBroker::<PartedMsg>::new();
+    let topic = broker
+        .create_topic("pd", TopicOptions::default(), pd_backend(4))
+        .unwrap();
+    let mut sub0 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![0, 1],
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+    let mut sub1 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![2, 3],
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    // Partition 0 belongs to owner 0 (sub0) initially.
+    topic
+        .publish(Arc::new(PartedMsg {
+            partition: 0,
+            value: 1,
+        }))
+        .await
+        .unwrap();
+    // Move partition 0 to owner 1 (sub1).
+    topic.reassign_partition(0, 1).unwrap();
+    topic
+        .publish(Arc::new(PartedMsg {
+            partition: 0,
+            value: 2,
+        }))
+        .await
+        .unwrap();
+    topic.close();
+
+    let mut got0 = Vec::new();
+    while let Ok(RecvItem::Message(env)) = sub0.recv().await {
+        got0.push(env.payload.value);
+    }
+    let mut got1 = Vec::new();
+    while let Ok(RecvItem::Message(env)) = sub1.recv().await {
+        got1.push(env.payload.value);
+    }
+    assert_eq!(
+        got0,
+        vec![1],
+        "the pre-reassign message stays with the old owner"
+    );
+    assert_eq!(
+        got1,
+        vec![2],
+        "the post-reassign message goes to the new owner"
+    );
+}
+
+// apply_move(PartitionMove) is the convenience the runtime calls per
+// coordinator-emitted move; it routes like reassign_partition.
+#[tokio::test]
+async fn partition_dispatch_apply_move_reroutes() {
+    use crate::topic::PartitionMove;
+
+    let broker = TopicBroker::<PartedMsg>::new();
+    let topic = broker
+        .create_topic("pd", TopicOptions::default(), pd_backend(4))
+        .unwrap();
+    let _sub0 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![0, 1],
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+    let mut sub1 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![2, 3],
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    topic
+        .apply_move(PartitionMove {
+            partition: 1,
+            from: 0,
+            to: 1,
+        })
+        .unwrap();
+    topic
+        .publish(Arc::new(PartedMsg {
+            partition: 1,
+            value: 7,
+        }))
+        .await
+        .unwrap();
+    topic.close();
+
+    let mut got1 = Vec::new();
+    while let Ok(RecvItem::Message(env)) = sub1.recv().await {
+        got1.push(env.payload.value);
+    }
+    assert_eq!(got1, vec![7], "apply_move repointed partition 1 to owner 1");
+}
+
+#[test]
+fn partition_dispatch_reassign_validates_ranges() {
+    let broker = TopicBroker::<PartedMsg>::new();
+    let topic = broker
+        .create_topic("pd", TopicOptions::default(), pd_backend(4))
+        .unwrap();
+    let _s0 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![0, 1],
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+    let _s1 = topic
+        .subscribe(
+            SubscriptionMode::PartitionDispatch {
+                owned_partitions: vec![2, 3],
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    let out_of_range = topic.reassign_partition(4, 1).err().unwrap();
+    assert!(matches!(
+        out_of_range,
+        Error::PartitionOutOfRange {
+            partition: 4,
+            num_partitions: 4
+        }
+    ));
+    let bad_owner = topic.reassign_partition(0, 5).err().unwrap();
+    assert!(matches!(
+        bad_owner,
+        Error::OwnerOutOfRange {
+            owner: 5,
+            num_owners: 2
+        }
+    ));
+}
+
+#[test]
+fn reassign_on_non_partition_dispatch_topic_errors() {
+    let broker = TopicBroker::<PartedMsg>::new();
+    let topic = broker
+        .create_in_memory_topic("mixed", TopicOptions::default())
+        .unwrap();
+    assert!(matches!(
+        topic.reassign_partition(0, 0).err().unwrap(),
+        Error::PartitionReassignNotSupported
+    ));
+}

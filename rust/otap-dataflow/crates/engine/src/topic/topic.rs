@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use crate::error::Error;
 use crate::error::Error::{
-    MessageNotTracked, PartitionAlreadyClaimed, PartitionOutOfRange, SubscribeBalancedNotSupported,
-    SubscribeBroadcastNotSupported, SubscribeSingleGroupViolation, SubscriptionClosed, TopicClosed,
+    MessageNotTracked, OwnerOutOfRange, PartitionAlreadyClaimed, PartitionOutOfRange,
+    SubscribeBalancedNotSupported, SubscribeBroadcastNotSupported, SubscribeSingleGroupViolation,
+    SubscriptionClosed, TopicClosed,
 };
 use crate::topic::backend::{PublishFuture, PublishTrackedFuture, SubscriptionBackend, TopicState};
 use crate::topic::partitioned::Partitioned;
@@ -812,6 +813,31 @@ impl<T: Partitioned + Send + Sync + 'static> TopicState<T> for PartitionDispatch
                 outcomes: self.outcomes.clone(),
             },
         }))
+    }
+
+    fn reassign_partition(&self, partition: usize, to_owner: usize) -> Result<(), Error> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TopicClosed);
+        }
+        if partition >= self.num_partitions {
+            return Err(PartitionOutOfRange {
+                partition: partition as u32,
+                num_partitions: self.num_partitions,
+            });
+        }
+        let mut routing = self.routing.lock();
+        if to_owner >= routing.owners.len() {
+            return Err(OwnerOutOfRange {
+                owner: to_owner,
+                num_owners: routing.owners.len(),
+            });
+        }
+        // Repoint future publishes to the new owner. Messages already enqueued
+        // for the previous owner remain in its queue and are drained there, so a
+        // reassignment applied at a window boundary hands off no overlapping
+        // state.
+        routing.owner_of[partition] = Some(to_owner);
+        Ok(())
     }
 
     fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy {

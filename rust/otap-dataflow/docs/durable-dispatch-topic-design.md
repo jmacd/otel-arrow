@@ -286,14 +286,18 @@ Two structural points make this work in memory:
    owner-count change), and surfaces indivisible hot partitions for key
    sub-partitioning.
 4. **Apply.** The coordinator emits the minimal set of `PartitionMove`s -- a
-   `partition` changing `from` one owner `to` another -- which the dispatch layer
-   applies at a window boundary. Keys never move; only the `partition -> owner`
-   map changes.
+   `partition` changing `from` one owner `to` another -- which the runtime applies
+   to the live topic via `TopicHandle::apply_move` (or `reassign_partition`),
+   repointing the topic's `partition -> owner` routing. Keys never move; only the
+   `partition -> owner` map changes. Messages already enqueued for the previous
+   owner stay in its queue, so applying a move at an aggregation window boundary
+   hands off no overlapping per-series state.
 
-The coordinator is the in-memory feedback brain. Wiring an owner's aggregator to
-emit reports and a runtime to apply the moves to a live partition-dispatch topic
-are the surrounding steps; the durable backend adds leases and generation fencing
-to the apply step.
+The coordinator is the in-memory feedback brain, and `apply_move` is the runtime
+primitive that applies its decisions to a live topic. Wiring an owner's
+aggregator to emit reports, and a scheduler to call `apply_move` at the right
+window boundary, are the surrounding steps; the durable backend adds leases and
+generation fencing to the apply step so a deposed owner's late writes are fenced.
 
 **Relationship to tenancy.** When the multitenancy descriptor system lands,
 condition-routing (named partitions for tenant/resource isolation) and

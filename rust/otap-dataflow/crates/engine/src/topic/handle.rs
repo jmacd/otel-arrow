@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::topic::backend::TopicState;
+use crate::topic::load_feedback::PartitionMove;
 use crate::topic::subscription::Subscription;
 use crate::topic::types::{
     PublishOutcome, SubscriberOptions, SubscriptionMode, TopicPublishOutcomeConfig,
@@ -119,6 +120,22 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
     /// Close the topic. After closing, further publishes return `Error::TopicClosed`.
     pub fn close(&self) {
         self.inner.close();
+    }
+
+    /// Reassign `partition` to the subscribed owner `to_owner`, repointing future
+    /// publishes for that partition (partition-dispatch topics only; other topics
+    /// return `Error::PartitionReassignNotSupported`). Messages already enqueued
+    /// for the previous owner stay with it; apply this at an aggregation window
+    /// boundary so the single-writer handoff carries no overlapping state.
+    pub fn reassign_partition(&self, partition: usize, to_owner: usize) -> Result<(), Error> {
+        self.inner.reassign_partition(partition, to_owner)
+    }
+
+    /// Apply a [`PartitionMove`] emitted by a
+    /// [`PlacementCoordinator`](crate::topic::PlacementCoordinator), reassigning
+    /// the partition to the move's target owner.
+    pub fn apply_move(&self, mv: PartitionMove) -> Result<(), Error> {
+        self.inner.reassign_partition(mv.partition, mv.to)
     }
 
     /// Get the topic name.

@@ -124,6 +124,16 @@ pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
     ) -> Result<Box<dyn SubscriptionBackend<T>>, Error> {
         Err(Error::SubscribePartitionDispatchNotSupported)
     }
+    /// Reassign `partition` to the subscribed owner `to_owner`, repointing the
+    /// `partition -> owner` routing so future publishes for the partition go to
+    /// that owner. Messages already enqueued for the previous owner stay with it.
+    ///
+    /// Defaults to unsupported; only a partition-dispatch topic overrides it. The
+    /// caller applies a reassignment at an aggregation window boundary so the
+    /// single-writer-per-series handoff carries no overlapping state.
+    fn reassign_partition(&self, _partition: usize, _to_owner: usize) -> Result<(), Error> {
+        Err(Error::PartitionReassignNotSupported)
+    }
     /// Effective broadcast lag policy for this topic.
     fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy;
     /// Close the topic. Existing subscriptions eventually observe closure.

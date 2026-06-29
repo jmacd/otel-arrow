@@ -572,6 +572,20 @@ pub enum Error {
         num_partitions: usize,
     },
 
+    /// Partition reassignment is not supported on this topic (only a
+    /// partition-dispatch topic supports it).
+    #[error("partition reassignment is not supported on this topic")]
+    PartitionReassignNotSupported,
+
+    /// A partition reassignment targeted an owner that has not subscribed.
+    #[error("owner {owner} is out of range for {num_owners} subscribed owners")]
+    OwnerOutOfRange {
+        /// The offending owner index.
+        owner: usize,
+        /// The number of owners currently subscribed to the topic.
+        num_owners: usize,
+    },
+
     /// This topic only supports a single consumer group, but a subscription request would violate that constraint.
     #[error("this topic only supports a single consumer group")]
     SubscribeSingleGroupViolation,
@@ -671,6 +685,8 @@ impl Error {
             }
             Error::PartitionAlreadyClaimed { .. } => "PartitionAlreadyClaimed",
             Error::PartitionOutOfRange { .. } => "PartitionOutOfRange",
+            Error::PartitionReassignNotSupported => "PartitionReassignNotSupported",
+            Error::OwnerOutOfRange { .. } => "OwnerOutOfRange",
             Error::SubscribeSingleGroupViolation => "SubscribeSingleGroupViolation",
             Error::SubscriptionClosed => "SubscriptionClosed",
             Error::CapabilityAlreadyConsumed { .. } => "CapabilityAlreadyConsumed",
