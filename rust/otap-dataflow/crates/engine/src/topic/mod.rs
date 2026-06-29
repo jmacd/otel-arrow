@@ -25,7 +25,9 @@ pub use backend::{
 pub use binding::PipelineTopicBinding;
 pub use broker::TopicBroker;
 pub use handle::{TopicHandle, TrackedTopicPublisher};
-pub use load_feedback::{LoadWeights, PartitionLoad, PartitionMove, PlacementCoordinator};
+pub use load_feedback::{
+    LoadWeights, PartitionLoad, PartitionLoadTracker, PartitionMove, PlacementCoordinator,
+};
 pub use otap_df_config::topic::{
     TopicAckPropagationMode, TopicBroadcastAckMode, TopicBroadcastOnLagPolicy,
     TopicQueueOnFullPolicy,

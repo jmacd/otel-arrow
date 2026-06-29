@@ -80,6 +80,74 @@ pub struct PartitionMove {
     pub to: OwnerId,
 }
 
+/// Owner-side per-partition load accounting: the producer end of the load
+/// feedback loop, the counterpart to [`PlacementCoordinator`].
+///
+/// An owner updates it as it processes the partition-tagged batches the dispatch
+/// delivered -- accumulating `points` per interval and setting the current
+/// `active_series` gauge from the aggregator's per-partition series state -- then
+/// [`snapshot`](PartitionLoadTracker::snapshot)s it for reporting. Tracking only
+/// the partitions an owner holds keeps it sparse.
+#[derive(Debug, Clone, Default)]
+pub struct PartitionLoadTracker {
+    loads: std::collections::BTreeMap<usize, PartitionLoad>,
+}
+
+impl PartitionLoadTracker {
+    /// Create an empty tracker.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add `points` ingested for `partition` during the current interval.
+    pub fn add_points(&mut self, partition: usize, points: u64) {
+        let entry = self.loads.entry(partition).or_default();
+        entry.points = entry.points.saturating_add(points);
+    }
+
+    /// Set the current active-series count for `partition` (a gauge read from the
+    /// aggregator's per-partition state).
+    pub fn set_active_series(&mut self, partition: usize, active_series: u64) {
+        self.loads.entry(partition).or_default().active_series = active_series;
+    }
+
+    /// Stop tracking `partition` -- called when the owner loses ownership of it
+    /// to a reassignment, so its stale load is no longer reported.
+    pub fn forget(&mut self, partition: usize) {
+        let _ = self.loads.remove(&partition);
+    }
+
+    /// Snapshot the per-partition loads for reporting, ascending by partition,
+    /// resetting the interval `points` counters while keeping the `active_series`
+    /// gauges so the next interval measures a fresh rate.
+    pub fn snapshot(&mut self) -> Vec<(usize, PartitionLoad)> {
+        let out: Vec<(usize, PartitionLoad)> = self.loads.iter().map(|(&p, &l)| (p, l)).collect();
+        for load in self.loads.values_mut() {
+            load.points = 0;
+        }
+        out
+    }
+
+    /// The current per-partition loads without resetting, ascending by partition.
+    #[must_use]
+    pub fn peek(&self) -> Vec<(usize, PartitionLoad)> {
+        self.loads.iter().map(|(&p, &l)| (p, l)).collect()
+    }
+
+    /// The number of partitions currently tracked.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.loads.len()
+    }
+
+    /// Whether no partition is currently tracked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.loads.is_empty()
+    }
+}
+
 /// Drives load-aware placement for one partition-dispatch topic from
 /// owner-reported per-partition load.
 ///
@@ -345,5 +413,112 @@ mod tests {
         let mut coord = PlacementCoordinator::new(nz(2), nz(2), LoadWeights::default(), 1.1);
         coord.report(&[(0, series(3)), (99, series(1000))]);
         assert_eq!(coord.owner_loads().iter().sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn tracker_accumulates_points_and_sets_active_series() {
+        let mut tracker = PartitionLoadTracker::new();
+        assert!(tracker.is_empty());
+        tracker.add_points(2, 10);
+        tracker.add_points(2, 5);
+        tracker.set_active_series(2, 100);
+        tracker.add_points(7, 3);
+
+        assert_eq!(tracker.len(), 2);
+        assert_eq!(
+            tracker.peek(),
+            vec![
+                (
+                    2,
+                    PartitionLoad {
+                        active_series: 100,
+                        points: 15
+                    }
+                ),
+                (
+                    7,
+                    PartitionLoad {
+                        active_series: 0,
+                        points: 3
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_resets_points_but_keeps_active_series() {
+        let mut tracker = PartitionLoadTracker::new();
+        tracker.set_active_series(1, 50);
+        tracker.add_points(1, 20);
+
+        let first = tracker.snapshot();
+        assert_eq!(
+            first,
+            vec![(
+                1,
+                PartitionLoad {
+                    active_series: 50,
+                    points: 20
+                }
+            )]
+        );
+
+        // Next interval: points reset to 0, the active-series gauge persists.
+        let second = tracker.snapshot();
+        assert_eq!(
+            second,
+            vec![(
+                1,
+                PartitionLoad {
+                    active_series: 50,
+                    points: 0
+                }
+            )]
+        );
+
+        // New points accumulate from zero.
+        tracker.add_points(1, 7);
+        assert_eq!(
+            tracker.peek(),
+            vec![(
+                1,
+                PartitionLoad {
+                    active_series: 50,
+                    points: 7
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn forget_drops_a_partition_on_loss_of_ownership() {
+        let mut tracker = PartitionLoadTracker::new();
+        tracker.set_active_series(3, 9);
+        tracker.set_active_series(4, 9);
+        tracker.forget(3);
+        assert_eq!(
+            tracker.peek().iter().map(|&(p, _)| p).collect::<Vec<_>>(),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn tracker_feeds_the_coordinator() {
+        // An owner measures, snapshots, and the coordinator rebalances on it.
+        let mut tracker = PartitionLoadTracker::new();
+        tracker.set_active_series(0, 50);
+        tracker.set_active_series(1, 50);
+        for p in 2..8 {
+            tracker.set_active_series(p, 2);
+        }
+
+        let mut coord = PlacementCoordinator::new(nz(8), nz(4), LoadWeights::default(), 1.2);
+        coord.report(&tracker.snapshot());
+        let max_before = *coord.owner_loads().iter().max().unwrap();
+        let moves = coord.rebalance();
+        let max_after = *coord.owner_loads().iter().max().unwrap();
+        assert!(!moves.is_empty());
+        assert!(max_after < max_before);
     }
 }

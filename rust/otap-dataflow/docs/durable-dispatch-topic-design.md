@@ -275,9 +275,12 @@ Two structural points make this work in memory:
 `PlacementCoordinator` (`crates/engine/src/topic/load_feedback.rs`):
 
 1. **Measure (owner).** Each owner buckets the load of the keys it aggregates by
-   the partition tag the dispatch delivered, producing a `PartitionLoad`
-   (`active_series` plus `points`) per owned partition. Because the owner already
-   holds the per-series aggregation state, this is a cheap read, not a scan.
+   the partition tag the dispatch delivered, accumulating a `PartitionLoad`
+   (`active_series` plus `points`) per owned partition in a
+   `PartitionLoadTracker`. `active_series` is read from the aggregator's
+   per-partition series state and `points` from the data-point rows of the
+   batches received, so it is a cheap update, not a scan; `snapshot` resets the
+   interval `points` while keeping the `active_series` gauge.
 2. **Report.** Owners send their per-partition `PartitionLoad`s to the
    coordinator, which merges them (latest wins per partition) into a global
    weight vector via the configured `LoadWeights`.
