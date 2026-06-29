@@ -271,6 +271,30 @@ Two structural points make this work in memory:
   rebalance points; the durable backend later upgrades this to the lease and
   generation handoff above.
 
+**The load feedback loop.** The signal above is closed into a loop by
+`PlacementCoordinator` (`crates/engine/src/topic/load_feedback.rs`):
+
+1. **Measure (owner).** Each owner buckets the load of the keys it aggregates by
+   the partition tag the dispatch delivered, producing a `PartitionLoad`
+   (`active_series` plus `points`) per owned partition. Because the owner already
+   holds the per-series aggregation state, this is a cheap read, not a scan.
+2. **Report.** Owners send their per-partition `PartitionLoad`s to the
+   coordinator, which merges them (latest wins per partition) into a global
+   weight vector via the configured `LoadWeights`.
+3. **Decide.** On a tick or a threshold breach the coordinator runs the
+   churn-minimizing `rebalance` (steady state) or a full LPT `replan` (a large
+   owner-count change), and surfaces indivisible hot partitions for key
+   sub-partitioning.
+4. **Apply.** The coordinator emits the minimal set of `PartitionMove`s -- a
+   `partition` changing `from` one owner `to` another -- which the dispatch layer
+   applies at a window boundary. Keys never move; only the `partition -> owner`
+   map changes.
+
+The coordinator is the in-memory feedback brain. Wiring an owner's aggregator to
+emit reports and a runtime to apply the moves to a live partition-dispatch topic
+are the surrounding steps; the durable backend adds leases and generation fencing
+to the apply step.
+
 **Relationship to tenancy.** When the multitenancy descriptor system lands,
 condition-routing (named partitions for tenant/resource isolation) and
 hash-partitioning (N buckets for co-location) are the same dispatch mode with

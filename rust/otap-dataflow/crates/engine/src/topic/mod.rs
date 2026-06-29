@@ -7,6 +7,7 @@ mod backend;
 mod binding;
 mod broker;
 mod handle;
+mod load_feedback;
 mod partitioned;
 mod placement;
 mod subscription;
@@ -24,6 +25,7 @@ pub use backend::{
 pub use binding::PipelineTopicBinding;
 pub use broker::TopicBroker;
 pub use handle::{TopicHandle, TrackedTopicPublisher};
+pub use load_feedback::{LoadWeights, PartitionLoad, PartitionMove, PlacementCoordinator};
 pub use otap_df_config::topic::{
     TopicAckPropagationMode, TopicBroadcastAckMode, TopicBroadcastOnLagPolicy,
     TopicQueueOnFullPolicy,
