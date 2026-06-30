@@ -26,13 +26,14 @@ bespoke parts.
 > `backend: quiver` and `num_partitions` persists each partition's stream to a
 > per-partition Quiver store (`crates/otap/src/quiver_topic.rs`,
 > `QuiverPartitionDispatchTopic`), survives restart, and resumes subscribers from
-> durable progress. The PoC takes two deliberate simplifications, both swappable
-> later without an interface change: it uses **one Quiver engine per partition**
-> (D24's simpler option) and **flushes per publish** so a published bundle is
-> durable and immediately pollable. The controller arms that previously rejected
-> `TopicBackendKind::Quiver` are now filled, and the durable backend is reached
-> through the `DurableDispatchPayload` trait so the generic engine and controller
-> stay free of quiver and OTAP specifics.
+> durable progress. The PoC's one deliberate simplification, swappable later
+> without an interface change, is that it uses **one Quiver engine per partition**
+> (D24's simpler option). Publishes are durable on return via the WAL, and a
+> partition's segment flush is **batched**: at most once per a short interval so
+> rapid publishes do not each finalize a segment. The controller arms that
+> previously rejected `TopicBackendKind::Quiver` are now filled, and the durable
+> backend is reached through the `DurableDispatchPayload` trait so the generic
+> engine and controller stay free of quiver and OTAP specifics.
 
 ## Motivation
 
@@ -365,8 +366,8 @@ designed to accept either; the ingest queue uses the hash-partition form.
 > (`QuiverPartitionDispatchTopic`) implements `TopicState<OtapPdata>` durably; the
 > controller constructs it through the `DurableDispatchPayload` trait when a topic
 > sets `backend: quiver` and `num_partitions`. The PoC uses one Quiver engine per
-> partition and flushes per publish; both are swappable later without an interface
-> change.
+> partition; segment flushes are batched per partition. The granularity is
+> swappable later without an interface change.
 
 **Goal.** Make the *same* partition-dispatch topic durable: published items are
 persisted before acknowledgement and survive restart; subscribers resume from
@@ -376,10 +377,12 @@ not a separate mechanism.
 **Mechanism (implemented).** The durable topic implements the same `TopicState`
 and `SubscriptionBackend` surface against `quiver`:
 
-- `TopicState::publish*` -> quiver `ingest(bundle)` then `flush`, so the bundle
-  is durable and immediately pollable before the publish resolves. The
-  OTAP->bundle adapter is shared from `otap_df_otap::quiver_bundle`, moved out of
-  the durable buffer processor so both use one implementation.
+- `TopicState::publish*` -> quiver `ingest(bundle)`, durable on return via the
+  WAL. The segment flush that makes data pollable is batched per partition (at
+  most once per a short interval, plus a final flush on close), so rapid
+  publishes accumulate into one segment instead of finalizing one per publish.
+  The OTAP->bundle adapter is shared from `otap_df_otap::quiver_bundle`, moved out
+  of the durable buffer processor so both use one implementation.
 - the partition subscription -> the owner drains the partitions it currently
   owns; each partition is a distinct quiver engine with a single fixed subscriber
   id, so ownership can change without disturbing durable progress.
@@ -499,8 +502,8 @@ controller's `declare_topic` constructs it through the `DurableDispatchPayload`
 trait, and config validation requires a quiver topic to be partition-dispatch.
 The existing `durable_buffer_processor` can now be reduced to "set the topic
 backend to quiver" and deprecated once the durable backend reaches parity. Couples
-to ingest-queue D4/D6. **Open follow-ups beyond the PoC:** batched rather than
-per-publish flush, leases and generation fencing on reassignment, and the durable
+to ingest-queue D4/D6. **Open follow-ups beyond the PoC:** leases and generation
+fencing on reassignment, one-quiver-per-owner granularity (D24), and the durable
 registry half of ingest-queue Phase 1.
 
 ### D22. Partition ownership
@@ -700,10 +703,10 @@ Added later as an additive backend swap (D28/D21):
   assigns each receiver replica its owned partitions, replacing the hand-specified
   receiver config, and a `PartitionMove` propagates to the affected replicas
   through a subscription-level reassign so a move updates their live owned sets.
-- **To proceed (durable):** beyond the PoC, batched flushing, leases and
-  generation fencing on the reassignment apply step, one-quiver-per-owner with
-  per-partition streams (D24), and the durable registry half of Phase 1. The
-  standalone-logs key (D26) is decided but waits until logs are addressed.
+- **To proceed (durable):** beyond the PoC, leases and generation fencing on the
+  reassignment apply step, one-quiver-per-owner with per-partition streams (D24),
+  and the durable registry half of Phase 1. The standalone-logs key (D26) is
+  decided but waits until logs are addressed.
 
 **Related docs:** [`ingest-queue-design.md`](./ingest-queue-design.md) (D3
 per-signal partitioner; the consumer of this infrastructure),

@@ -31,10 +31,12 @@
 //!
 //! # Durability lifecycle (PoC)
 //!
-//! - **Publish** ingests the OTAP batch into the partition's quiver and flushes,
-//!   so the bundle is durable and immediately pollable before the publish
-//!   resolves. Flush-per-publish keeps latency low and the prototype simple; a
-//!   production path would batch flushes.
+//! - **Publish** ingests the OTAP batch into the partition's quiver, durable via
+//!   the WAL on return. A flush, which finalizes the segment that makes the data
+//!   pollable, is batched: a partition flushes at most once per
+//!   [`FLUSH_INTERVAL_MS`], so rapid publishes accumulate into one segment
+//!   instead of finalizing one segment per publish. A partition's first publish
+//!   flushes immediately, and `close` performs a final flush.
 //! - **Receive** claims the next durable bundle for an owned partition and
 //!   reconstructs `OtapPdata` (re-stamping the partition tag).
 //! - **Commit** acks the bundle, advancing durable progress so it is not
@@ -81,6 +83,22 @@ const SEGMENT_TARGET_BYTES: u64 = 1024 * 1024;
 const WAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// Per-partition WAL rotation target (must not exceed [`WAL_MAX_BYTES`]).
 const WAL_ROTATION_TARGET_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Minimum wall-clock interval between flushes of a single partition. Publishes
+/// within this window accumulate into one segment instead of finalizing one
+/// segment per publish, trading a small visibility latency for throughput. A
+/// partition's first publish always flushes (its last-flush timestamp starts at
+/// 0), and `close` performs a final flush so no data is left unflushed.
+const FLUSH_INTERVAL_MS: u64 = 50;
+
+/// Wall-clock milliseconds since the Unix epoch, used only as a coarse flush
+/// gate; a backwards clock at worst causes an extra or slightly delayed flush.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Maps a quiver error into the engine's durable-backend error.
 fn durable_err(message: impl std::fmt::Display) -> Error {
@@ -142,6 +160,8 @@ struct Shared {
     num_partitions: usize,
     /// One durable engine per partition; index is the partition.
     engines: Vec<Arc<QuiverEngine>>,
+    /// Last flush time (wall-clock ms) per partition, for the batched-flush gate.
+    last_flush_ms: Vec<AtomicU64>,
     subscriber_id: SubscriberId,
     routing: Mutex<Routing>,
     wakers: WakerSet,
@@ -162,9 +182,12 @@ impl Shared {
             .collect()
     }
 
-    /// Ingest one OTAP payload into partition `p`'s durable engine and flush so
-    /// it is durable and immediately pollable.
-    async fn ingest_and_flush(&self, p: usize, pdata: OtapPdata) -> Result<(), Error> {
+    /// Ingest one OTAP payload into partition `p`'s durable engine. The write is
+    /// durable on return (WAL append). Flush only if at least [`FLUSH_INTERVAL_MS`]
+    /// has elapsed since this partition last flushed, so rapid publishes batch
+    /// into one segment. Returns whether a flush happened, so the caller wakes
+    /// subscribers only when new data became pollable.
+    async fn ingest_and_maybe_flush(&self, p: usize, pdata: OtapPdata) -> Result<bool, Error> {
         let engine = &self.engines[p];
         let (_context, payload) = pdata.into_parts();
         match payload {
@@ -177,8 +200,33 @@ impl Shared {
                 engine.ingest(&adapter).await.map_err(durable_err)?;
             }
         }
-        engine.flush().await.map_err(durable_err)?;
-        Ok(())
+        let now = now_ms();
+        let last = self.last_flush_ms[p].load(Ordering::Relaxed);
+        let flush = now.saturating_sub(last) >= FLUSH_INTERVAL_MS
+            && self.last_flush_ms[p]
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
+        if flush {
+            engine.flush().await.map_err(durable_err)?;
+        }
+        Ok(flush)
+    }
+
+    /// Flush every partition engine, finalizing any accumulated open segment.
+    /// Used on close and after open (to finalize WAL-recovered data); finalizing
+    /// an empty segment is a cheap no-op.
+    async fn flush_all(&self) {
+        for (p, engine) in self.engines.iter().enumerate() {
+            if let Err(e) = engine.flush().await {
+                otel_warn!(
+                    "quiver_topic.flush.failed",
+                    error = e.to_string(),
+                    partition = p as u64
+                );
+            } else {
+                self.last_flush_ms[p].store(now_ms(), Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -279,6 +327,13 @@ impl QuiverPartitionDispatchTopic {
                         .build()
                         .await
                         .map_err(|e| durable_err(format!("failed to open partition engine: {e}")))?;
+                    // Finalize any data recovered from the WAL on open so it is
+                    // pollable, then register the drain subscriber. Flushing an
+                    // empty segment (the fresh-topic case) is a no-op.
+                    engine
+                        .flush()
+                        .await
+                        .map_err(|e| durable_err(format!("failed to flush on open: {e}")))?;
                     engine
                         .register_subscriber(subscriber_id.clone())
                         .map_err(|e| durable_err(format!("failed to register subscriber: {e}")))?;
@@ -294,6 +349,7 @@ impl QuiverPartitionDispatchTopic {
         let shared = Arc::new(Shared {
             name,
             num_partitions,
+            last_flush_ms: (0..num_partitions).map(|_| AtomicU64::new(0)).collect(),
             engines,
             subscriber_id,
             routing: Mutex::new(Routing {
@@ -330,8 +386,9 @@ impl TopicState<OtapPdata> for QuiverPartitionDispatchTopic {
                 return Err(Error::TopicClosed);
             }
             if let Some(partition) = Self::route(&shared, &msg) {
-                shared.ingest_and_flush(partition, (*msg).clone()).await?;
-                shared.wakers.wake_all();
+                if shared.ingest_and_maybe_flush(partition, (*msg).clone()).await? {
+                    shared.wakers.wake_all();
+                }
             }
             Ok(())
         })
@@ -351,22 +408,27 @@ impl TopicState<OtapPdata> for QuiverPartitionDispatchTopic {
             let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
             let receipt = shared.outcomes.register(id, timeout, permit);
             match Self::route(&shared, &msg) {
-                Some(partition) => match shared.ingest_and_flush(partition, (*msg).clone()).await {
-                    Ok(()) => {
-                        shared.wakers.wake_all();
-                        // Durability is the acknowledgement: once persisted, the
-                        // tracked publish has succeeded.
-                        let _ = shared.outcomes.resolve(id, TrackedPublishOutcome::Ack);
+                Some(partition) => {
+                    match shared.ingest_and_maybe_flush(partition, (*msg).clone()).await {
+                        Ok(flushed) => {
+                            if flushed {
+                                shared.wakers.wake_all();
+                            }
+                            // Durability is the acknowledgement: the WAL append in
+                            // ingest persists the message, independent of when its
+                            // segment is flushed for pollability.
+                            let _ = shared.outcomes.resolve(id, TrackedPublishOutcome::Ack);
+                        }
+                        Err(e) => {
+                            let _ = shared.outcomes.resolve(
+                                id,
+                                TrackedPublishOutcome::Nack {
+                                    reason: Arc::from(e.to_string().as_str()),
+                                },
+                            );
+                        }
                     }
-                    Err(e) => {
-                        let _ = shared.outcomes.resolve(
-                            id,
-                            TrackedPublishOutcome::Nack {
-                                reason: Arc::from(e.to_string().as_str()),
-                            },
-                        );
-                    }
-                },
+                }
                 None => {
                     // No durable home; resolve as acked so the publisher is not
                     // left waiting (mirrors the in-memory drop-on-no-owner path).
@@ -500,14 +562,21 @@ impl TopicState<OtapPdata> for QuiverPartitionDispatchTopic {
     }
 
     fn close(&self) {
+        // Reject new publishes first, then flush any data accumulated since the
+        // last batched flush so close-then-drain (and a clean restart) see it.
+        // Run the final flush on a fresh thread so this synchronous call works
+        // whether or not the caller is inside a tokio runtime.
         self.shared.closed.store(true, Ordering::Relaxed);
+        let shared = self.shared.clone();
+        block_on_init(async move { shared.flush_all().await });
         self.shared.outcomes.close_all();
         self.shared.wakers.wake_all();
     }
 }
 
-/// Submit a durable ingest+flush for `pdata` into partition `p` without blocking
-/// the caller. Resolves a tracked-publish outcome when `tracked_id` is set.
+/// Submit a durable ingest for `pdata` into partition `p` without blocking the
+/// caller (the durable write and any batched flush happen asynchronously).
+/// Resolves a tracked-publish outcome when `tracked_id` is set.
 fn spawn_durable_ingest(
     shared: Arc<Shared>,
     partition: usize,
@@ -515,9 +584,11 @@ fn spawn_durable_ingest(
     tracked_id: Option<u64>,
 ) {
     let task = async move {
-        match shared.ingest_and_flush(partition, pdata).await {
-            Ok(()) => {
-                shared.wakers.wake_all();
+        match shared.ingest_and_maybe_flush(partition, pdata).await {
+            Ok(flushed) => {
+                if flushed {
+                    shared.wakers.wake_all();
+                }
                 if let Some(id) = tracked_id {
                     let _ = shared.outcomes.resolve(id, TrackedPublishOutcome::Ack);
                 }
@@ -908,5 +979,26 @@ mod tests {
         let mut got = drain(&mut sub).await;
         got.sort_unstable();
         assert_eq!(got, vec![0, 0, 1]);
+    }
+
+    // Rapid publishes to a single partition are batched (most do not flush a
+    // segment of their own), yet every message is delivered without loss.
+    #[tokio::test]
+    async fn durable_batches_rapid_publishes_without_loss() {
+        let dir = TempDir::new().unwrap();
+        let name: TopicName = "durable-batch".into();
+        let state = QuiverPartitionDispatchTopic::open(name.clone(), config(&dir, 2)).unwrap();
+        let broker = TopicBroker::<OtapPdata>::new();
+        let handle = broker.create_topic_with_state(name, state).unwrap();
+
+        let mut sub = handle.subscribe(pd_mode(vec![0, 1]), SubscriberOptions::default()).unwrap();
+        for _ in 0..20 {
+            handle.publish(Arc::new(tagged_logs(0))).await.unwrap();
+        }
+        handle.close();
+
+        let got = drain(&mut sub).await;
+        assert_eq!(got.len(), 20, "all batched publishes must be delivered");
+        assert!(got.iter().all(|&p| p == 0), "every message is partition 0: {got:?}");
     }
 }
