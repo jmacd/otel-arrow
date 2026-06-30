@@ -20,9 +20,11 @@ use otap_df_engine::node::{NodeWithPDataReceiver, NodeWithPDataSender};
 use otap_df_engine::testing::exporter::create_test_pipeline_context;
 use otap_df_engine::testing::{create_not_send_channel, setup_test_runtime, test_node};
 use otap_df_engine::topic::{
-    TopicBroadcastAckMode, TopicBroadcastOnLagPolicy, TopicBroker, TopicOptions, TopicSet,
+    DurableDispatchConfig, DurableRetentionPolicy, TopicBroadcastAckMode, TopicBroadcastOnLagPolicy,
+    TopicBroker, TopicOptions, TopicSet,
 };
 use otap_df_otap::pdata::OtapPdata;
+use otap_df_otap::quiver_topic::QuiverPartitionDispatchTopic;
 use otap_df_pdata::OtlpProtoBytes;
 use otap_df_telemetry::reporter::MetricsReporter;
 use prost::Message as _;
@@ -317,6 +319,170 @@ fn topic_receiver_applies_source_tag_when_enabled() {
             delivered.get_source_node(),
             Some(receiver_node.index),
             "receiver should tag outgoing pdata with source node when enabled"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        exporter_ctrl
+            .send(NodeControlMsg::Shutdown {
+                deadline,
+                reason: "test shutdown".to_owned(),
+            })
+            .await
+            .expect("exporter shutdown should be sent");
+        receiver_ctrl
+            .send(NodeControlMsg::Shutdown {
+                deadline,
+                reason: "test shutdown".to_owned(),
+            })
+            .await
+            .expect("receiver shutdown should be sent");
+
+        let exporter_result = exporter_task.await.expect("exporter task should join");
+        let receiver_result = receiver_task.await.expect("receiver task should join");
+        assert!(exporter_result.is_ok(), "exporter should stop cleanly");
+        assert!(receiver_result.is_ok(), "receiver should stop cleanly");
+    }));
+}
+
+// A topic exporter publishes partition-tagged pdata to a durable, quiver-backed
+// partition-dispatch topic, and a topic receiver that owns the partition drains
+// it: the full node path over the durable backend (durable-dispatch Layer B).
+#[test]
+fn topic_exporter_to_quiver_partition_dispatch_receiver() {
+    let (rt, local_tasks) = setup_test_runtime();
+    rt.block_on(local_tasks.run_until(async move {
+        let data_dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let topic_name = TopicName::parse("durable-ingress").expect("topic name should parse");
+        let state = QuiverPartitionDispatchTopic::open(
+            topic_name.clone(),
+            DurableDispatchConfig {
+                data_dir: data_dir.path().to_path_buf(),
+                num_partitions: 4,
+                capacity: 16,
+                disk_budget_bytes: 256 * 1024 * 1024,
+                retention: DurableRetentionPolicy::Backpressure,
+            },
+        )
+        .expect("durable topic should open");
+
+        let broker = TopicBroker::<OtapPdata>::new();
+        let handle = broker
+            .create_topic_with_state(topic_name.clone(), state)
+            .expect("durable topic should register");
+
+        let exporter_set = TopicSet::new("exporter-set");
+        _ = exporter_set.insert(topic_name.clone(), handle.clone());
+        let receiver_set = TopicSet::new("receiver-set");
+        _ = receiver_set.insert(topic_name.clone(), handle);
+
+        let mut exporter_ctx = create_test_pipeline_context();
+        exporter_ctx.set_topic_set(exporter_set);
+        let mut receiver_ctx = create_test_pipeline_context();
+        receiver_ctx.set_topic_set(receiver_set);
+
+        let exporter_node = test_node("topic_exporter");
+        let receiver_node = test_node("topic_receiver");
+
+        let mut exporter_user_cfg = NodeUserConfig::new_exporter_config(TOPIC_EXPORTER_URN);
+        exporter_user_cfg.config = json!({
+            "topic": "durable-ingress",
+            "queue_on_full": "block"
+        });
+        let mut receiver_user_cfg = NodeUserConfig::new_receiver_config(TOPIC_RECEIVER_URN);
+        receiver_user_cfg.config = json!({
+            "topic": "durable-ingress",
+            "subscription": {
+                "mode": "partition_dispatch",
+                "owned_partitions": [0]
+            }
+        });
+
+        let mut exporter = (TOPIC_EXPORTER.create)(
+            exporter_ctx,
+            exporter_node.clone(),
+            Arc::new(exporter_user_cfg),
+            &ExporterConfig::new("topic_exporter"),
+            &otap_df_engine::capability::registry::Capabilities::empty(),
+        )
+        .expect("topic exporter should be created");
+
+        let mut receiver = (TOPIC_RECEIVER.create)(
+            receiver_ctx,
+            receiver_node.clone(),
+            Arc::new(receiver_user_cfg),
+            &ReceiverConfig::new("topic_receiver"),
+            &otap_df_engine::capability::registry::Capabilities::empty(),
+        )
+        .expect("topic receiver should be created");
+
+        let (exporter_input_tx, exporter_input_rx) = create_not_send_channel::<OtapPdata>(8);
+        exporter
+            .set_pdata_receiver(
+                exporter_node.clone(),
+                PDataReceiver::Local(LocalReceiver::mpsc(exporter_input_rx)),
+            )
+            .expect("exporter input channel should be wired");
+
+        let (receiver_output_tx, receiver_output_rx) = create_not_send_channel::<OtapPdata>(8);
+        receiver
+            .set_pdata_sender(
+                receiver_node.clone(),
+                "".into(),
+                PDataSender::Local(LocalSender::mpsc(receiver_output_tx)),
+            )
+            .expect("receiver output channel should be wired");
+
+        let exporter_ctrl = exporter.control_sender();
+        let receiver_ctrl = receiver.control_sender();
+        let (runtime_ctrl_tx, _runtime_ctrl_rx) = runtime_ctrl_msg_channel::<OtapPdata>(32);
+        let (pipeline_completion_tx, _pipeline_completion_rx) =
+            pipeline_completion_msg_channel::<OtapPdata>(32);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(64);
+        let exporter_metrics = metrics_reporter.clone();
+        let receiver_metrics = metrics_reporter.clone();
+        let exporter_ctrl_tx = runtime_ctrl_tx.clone();
+        let receiver_ctrl_tx = runtime_ctrl_tx.clone();
+        let exporter_completion_tx = pipeline_completion_tx.clone();
+        let receiver_completion_tx = pipeline_completion_tx.clone();
+
+        let exporter_task = tokio::task::spawn_local(async move {
+            exporter
+                .start(
+                    exporter_ctrl_tx,
+                    exporter_completion_tx,
+                    exporter_metrics,
+                    Interests::empty(),
+                )
+                .await
+        });
+        let receiver_task = tokio::task::spawn_local(async move {
+            receiver
+                .start(
+                    receiver_ctrl_tx,
+                    receiver_completion_tx,
+                    receiver_metrics,
+                    Interests::empty(),
+                )
+                .await
+        });
+
+        // Tag the message with partition 0, the partition the receiver owns.
+        let expected = make_test_pdata();
+        let mut tagged = expected.clone();
+        tagged.set_partition(0);
+        exporter_input_tx
+            .send(tagged)
+            .expect("message should be sent to topic exporter");
+
+        let delivered = tokio::time::timeout(Duration::from_secs(5), receiver_output_rx.recv())
+            .await
+            .expect("timed out waiting for durable topic receiver output")
+            .expect("receiver output channel should stay open");
+
+        assert_eq!(
+            delivered.num_items(),
+            expected.num_items(),
+            "durable topic receiver should forward one pdata message"
         );
 
         let deadline = Instant::now() + Duration::from_secs(1);
