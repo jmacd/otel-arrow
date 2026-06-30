@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Name of a topic declaration/reference.
@@ -175,10 +176,16 @@ pub struct TopicSpec {
     /// partition-dispatch design): each message is routed by the partition tag a
     /// split-by-key node stamped to the single subscriber that owns that
     /// partition. Subscribers declare their owned partitions in
-    /// `[0, num_partitions)`. Currently supported only with the `in_memory`
-    /// backend. When omitted, the topic uses balanced/broadcast delivery.
+    /// `[0, num_partitions)`. Supported with the `in_memory` backend (effective
+    /// once within a process) and the `quiver` backend (durable across restart).
+    /// The `quiver` backend requires this field. When omitted, the topic uses
+    /// balanced/broadcast delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_partitions: Option<NonZeroUsize>,
+    /// Durable backend settings, used when `backend = quiver` (durable-dispatch
+    /// Layer B). Required for the `quiver` backend, rejected otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiver: Option<QuiverTopicConfig>,
 }
 
 impl TopicSpec {
@@ -188,11 +195,30 @@ impl TopicSpec {
         let mut errors = self
             .policies
             .validation_errors(&format!("{path_prefix}.policies"));
-        if self.num_partitions.is_some() && self.backend != TopicBackendKind::InMemory {
-            errors.push(format!(
-                "{path_prefix}.num_partitions: partition-dispatch is currently supported \
-                 only with the in_memory backend"
-            ));
+        match self.backend {
+            TopicBackendKind::InMemory => {
+                if self.quiver.is_some() {
+                    errors.push(format!(
+                        "{path_prefix}.quiver: durable settings require the quiver backend"
+                    ));
+                }
+            }
+            TopicBackendKind::Quiver => {
+                // Durable topics are partition-dispatch (durable-dispatch Layer B):
+                // they require a partition count and a durable store location.
+                if self.num_partitions.is_none() {
+                    errors.push(format!(
+                        "{path_prefix}.num_partitions: the quiver backend requires num_partitions \
+                         (durable partition-dispatch)"
+                    ));
+                }
+                if self.quiver.is_none() {
+                    errors.push(format!(
+                        "{path_prefix}.quiver: the quiver backend requires durable settings \
+                         (a data_dir)"
+                    ));
+                }
+            }
         }
         errors
     }
@@ -220,6 +246,40 @@ impl std::fmt::Display for TopicBackendKind {
         };
         f.write_str(value)
     }
+}
+
+/// Default total disk budget for a durable topic (1 GiB), split across partitions.
+const fn default_quiver_disk_budget_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+/// Durable (quiver-backed) topic settings (durable-dispatch Layer B). Each
+/// partition is persisted under `{data_dir}/{topic}/partition_{p}` so published
+/// data survives restart and subscribers resume from durable progress.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QuiverTopicConfig {
+    /// Base directory under which the topic's per-partition durable stores live.
+    pub data_dir: PathBuf,
+    /// Total disk budget in bytes, shared across the topic's partitions. The
+    /// per-partition cap is an even split, floored at a single engine's minimum.
+    #[serde(default = "default_quiver_disk_budget_bytes")]
+    pub disk_budget_bytes: u64,
+    /// Behavior when the disk budget is exhausted.
+    #[serde(default)]
+    pub retention: QuiverRetentionPolicy,
+}
+
+/// Retention behavior for a durable topic when its disk budget is exhausted
+/// (durable-dispatch Layer B "QoS mapping"; ingest-queue D6).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuiverRetentionPolicy {
+    /// Lossless: apply backpressure to publishers until space is reclaimed.
+    #[default]
+    Backpressure,
+    /// Loss-tolerant: drop the oldest persisted data to admit new data.
+    DropOldest,
 }
 
 /// Policy controlling how the runtime selects the topic implementation variant.
@@ -434,10 +494,12 @@ const fn default_topic_ack_propagation_timeout() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        SubscriptionGroupName, TopicAckPropagationMode, TopicBackendKind, TopicBroadcastAckMode,
-        TopicBroadcastOnLagPolicy, TopicImplSelectionPolicy, TopicName, TopicQueueOnFullPolicy,
-        TopicSpec,
+        QuiverRetentionPolicy, QuiverTopicConfig, SubscriptionGroupName, TopicAckPropagationMode,
+        TopicBackendKind, TopicBroadcastAckMode, TopicBroadcastOnLagPolicy,
+        TopicImplSelectionPolicy, TopicName, TopicQueueOnFullPolicy, TopicSpec,
     };
+    use std::num::NonZeroUsize;
+    use std::path::PathBuf;
     use crate::error::Error;
     use serde::Deserialize;
     use std::collections::HashMap;
@@ -481,6 +543,74 @@ mod tests {
         assert!(errors[0].contains(".balanced.queue_capacity"));
         assert!(errors[1].contains(".broadcast.queue_capacity"));
         assert!(errors[2].contains(".ack_propagation.max_in_flight"));
+    }
+
+    fn quiver_settings() -> QuiverTopicConfig {
+        QuiverTopicConfig {
+            data_dir: PathBuf::from("/var/lib/otap/quiver"),
+            disk_budget_bytes: 256 * 1024 * 1024,
+            retention: QuiverRetentionPolicy::Backpressure,
+        }
+    }
+
+    #[test]
+    fn quiver_backend_requires_partitions_and_settings() {
+        let mut topic = TopicSpec {
+            backend: TopicBackendKind::Quiver,
+            ..TopicSpec::default()
+        };
+        let errors = topic.validation_errors("topics.durable");
+        assert_eq!(errors.len(), 2, "got: {errors:?}");
+        assert!(errors.iter().any(|e| e.contains(".num_partitions")));
+        assert!(errors.iter().any(|e| e.contains(".quiver")));
+
+        // A partition count and durable settings make it valid.
+        topic.num_partitions = Some(NonZeroUsize::new(4).unwrap());
+        topic.quiver = Some(quiver_settings());
+        assert!(topic.validation_errors("topics.durable").is_empty());
+    }
+
+    #[test]
+    fn in_memory_backend_rejects_quiver_settings() {
+        let topic = TopicSpec {
+            backend: TopicBackendKind::InMemory,
+            num_partitions: Some(NonZeroUsize::new(4).unwrap()),
+            quiver: Some(quiver_settings()),
+            ..TopicSpec::default()
+        };
+        let errors = topic.validation_errors("topics.mem");
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(errors[0].contains(".quiver"));
+    }
+
+    #[test]
+    fn in_memory_partition_dispatch_is_valid() {
+        let topic = TopicSpec {
+            backend: TopicBackendKind::InMemory,
+            num_partitions: Some(NonZeroUsize::new(8).unwrap()),
+            ..TopicSpec::default()
+        };
+        assert!(topic.validation_errors("topics.mem").is_empty());
+    }
+
+    #[test]
+    fn parses_quiver_topic_with_durable_settings() {
+        let yaml = r#"
+backend: quiver
+num_partitions: 4
+quiver:
+  data_dir: /var/lib/otap/quiver
+  disk_budget_bytes: 268435456
+  retention: drop_oldest
+"#;
+        let topic: TopicSpec = serde_yaml::from_str(yaml).expect("topic should parse");
+        assert_eq!(topic.backend, TopicBackendKind::Quiver);
+        assert_eq!(topic.num_partitions, Some(NonZeroUsize::new(4).unwrap()));
+        assert!(topic.validation_errors("topics.durable").is_empty());
+        let quiver = topic.quiver.expect("quiver settings present");
+        assert_eq!(quiver.data_dir, PathBuf::from("/var/lib/otap/quiver"));
+        assert_eq!(quiver.disk_budget_bytes, 268_435_456);
+        assert_eq!(quiver.retention, QuiverRetentionPolicy::DropOldest);
     }
 
     #[test]

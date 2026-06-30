@@ -101,6 +101,27 @@ impl<T: Send + Sync + 'static> TopicBroker<T> {
         self.create_topic(name, opts, InMemoryBackend)
     }
 
+    /// Register a pre-built topic state under `name`.
+    ///
+    /// Unlike [`create_topic`](Self::create_topic), which constructs the state
+    /// from an infallible [`TopicBackend`], this accepts a state that was built
+    /// by a fallible path (for example the durable quiver backend, whose
+    /// construction performs I/O and can fail). Returns an error if a topic with
+    /// the same name already exists.
+    pub fn create_topic_with_state(
+        &self,
+        name: impl Into<TopicName>,
+        state: Arc<dyn TopicState<T>>,
+    ) -> Result<TopicHandle<T>, Error> {
+        let name: TopicName = name.into();
+        let mut topics = self.inner.topics.write();
+        if topics.contains_key(&name) {
+            return Err(Error::TopicAlreadyExists { topic: name });
+        }
+        _ = topics.insert(name, state.clone());
+        Ok(TopicHandle::new(state))
+    }
+
     /// Convenience wrapper around [`create_topics`](Self::create_topics) that
     /// uses the default in-memory backend.
     pub fn create_in_memory_topics(

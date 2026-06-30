@@ -30,7 +30,8 @@ impl<
         + ReceivedAtNode
         + Unwindable
         + FlowMetricHook
-        + otap_df_engine::topic::Partitioned,
+        + otap_df_engine::topic::Partitioned
+        + otap_df_engine::topic::DurableDispatchPayload,
 > ControllerRuntime<PData>
 {
     /// Launches one regular pipeline instance on a specific core and generation.

@@ -70,8 +70,9 @@ tokio-rustls.workspace = true
 notify.workspace = true
 rustls-openssl = { workspace = true, optional = true }
 
-# Quiver persistence engine (durable buffer processor)
+# Quiver persistence engine (durable buffer processor + durable topic backend)
 quiver = { workspace = true }
+blake3 = { workspace = true }
 
 # Optional dev-tools dep used only by integration tests gated on the
 # `integration-tests` feature. Declaring it here (rather than as a dev-dep)
@@ -97,6 +98,7 @@ azure = ["object_store/azure", "object_store/cloud", "dep:azure_identity", "dep:
 aws = ["object_store/aws", "object_store/cloud"]
 
 [dev-dependencies]
+arrow-schema.workspace = true
 portpicker.workspace = true
 pretty_assertions.workspace = true
 tempfile.workspace = true

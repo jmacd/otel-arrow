@@ -59,8 +59,8 @@ use otap_df_config::policy::{
     ChannelCapacityPolicy, CoreAllocation, CoreAllocationStrategy, TelemetryPolicy,
 };
 use otap_df_config::topic::{
-    TopicAckPropagationMode, TopicBackendKind, TopicBroadcastAckMode, TopicBroadcastOnLagPolicy,
-    TopicImplSelectionPolicy, TopicSpec,
+    QuiverRetentionPolicy, TopicAckPropagationMode, TopicBackendKind, TopicBroadcastAckMode,
+    TopicBroadcastOnLagPolicy, TopicImplSelectionPolicy, TopicSpec,
 };
 use otap_df_config::transport_headers_policy::TransportHeadersPolicy;
 use otap_df_config::{
@@ -86,8 +86,8 @@ use otap_df_engine::memory_limiter::{
 };
 use otap_df_engine::processor::FlowMetricHook;
 use otap_df_engine::topic::{
-    InMemoryBackend, PartitionDispatchBackend, PipelineTopicBinding, TopicBroker, TopicOptions,
-    TopicPublishOutcomeConfig, TopicSet,
+    DurableDispatchConfig, DurableRetentionPolicy, InMemoryBackend, PartitionDispatchBackend,
+    PipelineTopicBinding, TopicBroker, TopicOptions, TopicPublishOutcomeConfig, TopicSet,
 };
 use otap_df_state::store::{ObservedStateHandle, ObservedStateStore};
 use otap_df_telemetry::event::{EngineEvent, ErrorSummary, ObservedEventReporter};
@@ -453,7 +453,8 @@ impl<
         + ReceivedAtNode
         + Unwindable
         + FlowMetricHook
-        + otap_df_engine::topic::Partitioned,
+        + otap_df_engine::topic::Partitioned
+        + otap_df_engine::topic::DurableDispatchPayload,
 > Controller<PData>
 {
     /// Creates a new controller with the given pipeline factory.
@@ -1085,6 +1086,10 @@ impl<
                 supports_ack_propagation_disabled: true,
                 supports_ack_propagation_auto: true,
             }),
+            // The quiver backend is durable partition-dispatch only
+            // (durable-dispatch Layer B), selected by `num_partitions` and built
+            // in `declare_topic`. It has no balanced/broadcast capabilities, so a
+            // non-partition-dispatch quiver topic is unsupported here.
             TopicBackendKind::Quiver => None,
         }
     }
@@ -1157,29 +1162,61 @@ impl<
     ) -> Result<(), Error> {
         // A partition-dispatch topic (Layer C) is selected by `num_partitions`,
         // orthogonal to the balanced/broadcast delivery the mode inference picks.
-        // It is in-memory only for now (the spec validation rejects other
-        // backends), and the placement-derived owned-partition sets come from
-        // each subscriber, so the inferred mode and options do not apply.
+        // The placement-derived owned-partition sets come from each subscriber,
+        // so the inferred mode and options do not apply. The backend chooses
+        // durability per location (durable-dispatch D27): `in_memory` (effective
+        // once within a process) or `quiver` (durable across restart, Layer B).
         if let Some(num_partitions) = spec.num_partitions {
-            if spec.backend != TopicBackendKind::InMemory {
-                return Err(Error::UnsupportedTopicBackend {
-                    topic: name,
-                    backend: spec.backend,
-                });
-            }
             let capacity = spec.policies.balanced.queue_capacity.max(1);
-            _ = broker
-                .create_topic(
-                    name,
-                    TopicOptions::default(),
-                    PartitionDispatchBackend {
+            match spec.backend {
+                TopicBackendKind::InMemory => {
+                    _ = broker
+                        .create_topic(
+                            name,
+                            TopicOptions::default(),
+                            PartitionDispatchBackend {
+                                num_partitions: num_partitions.get(),
+                                capacity,
+                            },
+                        )
+                        .map_err(|e| Error::PipelineRuntimeError {
+                            source: Box::new(e),
+                        })?;
+                }
+                TopicBackendKind::Quiver => {
+                    let quiver = spec.quiver.as_ref().ok_or_else(|| {
+                        Error::PipelineRuntimeError {
+                            source: Box::new(EngineError::InternalError {
+                                message: format!(
+                                    "topic `{}` uses the quiver backend but has no durable settings",
+                                    name.as_ref()
+                                ),
+                            }),
+                        }
+                    })?;
+                    let config = DurableDispatchConfig {
+                        data_dir: quiver.data_dir.clone(),
                         num_partitions: num_partitions.get(),
                         capacity,
-                    },
-                )
-                .map_err(|e| Error::PipelineRuntimeError {
-                    source: Box::new(e),
-                })?;
+                        disk_budget_bytes: quiver.disk_budget_bytes,
+                        retention: match quiver.retention {
+                            QuiverRetentionPolicy::Backpressure => {
+                                DurableRetentionPolicy::Backpressure
+                            }
+                            QuiverRetentionPolicy::DropOldest => DurableRetentionPolicy::DropOldest,
+                        },
+                    };
+                    let state = PData::create_durable_partition_dispatch_topic(name.clone(), config)
+                        .map_err(|e| Error::PipelineRuntimeError {
+                            source: Box::new(e),
+                        })?;
+                    _ = broker.create_topic_with_state(name, state).map_err(|e| {
+                        Error::PipelineRuntimeError {
+                            source: Box::new(e),
+                        }
+                    })?;
+                }
+            }
             return Ok(());
         }
         Self::validate_topic_runtime_support(&name, spec, inferred_mode)?;
@@ -1193,7 +1230,18 @@ impl<
                     })?;
                 Ok(())
             }
-            TopicBackendKind::Quiver => unreachable!("unsupported backend must be rejected above"),
+            // The quiver backend is durable partition-dispatch only (Layer B), so
+            // a quiver topic without `num_partitions` is handled above and config
+            // validation rejects it; reaching here means it slipped through.
+            TopicBackendKind::Quiver => Err(Error::PipelineRuntimeError {
+                source: Box::new(EngineError::InternalError {
+                    message: format!(
+                        "topic `{}` uses the quiver backend but is not partition-dispatch \
+                         (set num_partitions)",
+                        name.as_ref()
+                    ),
+                }),
+            }),
         }
     }
 
@@ -3358,12 +3406,19 @@ groups:
     }
 
     #[test]
-    fn declare_topics_rejects_unimplemented_backend_kind() {
+    fn declare_topics_quiver_durable_unavailable_for_unit_payload() {
+        // A valid durable partition-dispatch topic (quiver backend with a
+        // partition count and a data_dir). The planning-only `Controller::<()>`
+        // has no durable backend for the unit payload, so declaring it surfaces
+        // the durable-unsupported error rather than constructing a topic.
         let yaml = r#"
 version: otel_dataflow/v1
 topics:
   global_quiver:
     backend: quiver
+    num_partitions: 4
+    quiver:
+      data_dir: /tmp/otap-quiver-unit-unused
 groups:
   g1:
     pipelines:
@@ -3382,11 +3437,13 @@ groups:
 
         let config = OtelDataflowSpec::from_yaml(yaml).expect("test config should parse");
         match Controller::<()>::declare_topics(&config) {
-            Err(Error::UnsupportedTopicBackend { topic, backend }) => {
-                assert_eq!(topic.as_ref(), "global::global_quiver");
-                assert_eq!(backend, TopicBackendKind::Quiver);
+            Err(Error::PipelineRuntimeError { source }) => {
+                assert!(
+                    source.to_string().contains("durable"),
+                    "expected a durable-backend error, got: {source}"
+                );
             }
-            Ok(_) => panic!("quiver backend should be rejected"),
+            Ok(_) => panic!("quiver durable backend should be unavailable for the unit payload"),
             Err(other) => panic!("unexpected error: {other:?}"),
         }
     }

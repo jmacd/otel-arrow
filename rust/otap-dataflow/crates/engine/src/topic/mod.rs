@@ -6,6 +6,7 @@
 mod backend;
 mod binding;
 mod broker;
+mod durable;
 mod handle;
 mod load_feedback;
 mod partitioned;
@@ -20,10 +21,12 @@ mod types;
 mod tests;
 
 pub use backend::{
-    InMemoryBackend, PartitionDispatchBackend, SubscriptionBackend, TopicBackend, TopicState,
+    InMemoryBackend, PartitionDispatchBackend, PublishFuture, PublishTrackedFuture,
+    SubscriptionBackend, TopicBackend, TopicState,
 };
 pub use binding::PipelineTopicBinding;
 pub use broker::TopicBroker;
+pub use durable::{DurableDispatchConfig, DurableDispatchPayload, DurableRetentionPolicy};
 pub use handle::{TopicHandle, TrackedTopicPublisher};
 pub use load_feedback::{
     LoadReportSender, LoadWeights, PartitionLoad, PartitionLoadTracker, PartitionMove,
@@ -36,7 +39,7 @@ pub use otap_df_config::topic::{
 pub use otap_df_config::{SubscriptionGroupName, TopicName};
 pub use partitioned::Partitioned;
 pub use placement::{OwnerId, PartitionPlacement};
-pub use subscription::{Delivery, RecvDelivery, Subscription};
+pub use subscription::{Delivery, DeliveryBackend, RecvDelivery, Subscription};
 pub use topic_set::TopicSet;
 pub use types::{
     AckFromResult, BroadcastSubscriberId, Envelope, PublishOutcome, RecvItem, SubscriberOptions,

@@ -116,7 +116,8 @@ impl<
         + ReceivedAtNode
         + Unwindable
         + FlowMetricHook
-        + otap_df_engine::topic::Partitioned,
+        + otap_df_engine::topic::Partitioned
+        + otap_df_engine::topic::DurableDispatchPayload,
 > ControllerRuntime<PData>
 {
     #[allow(clippy::too_many_arguments)]
@@ -463,7 +464,8 @@ impl<
         + ReceivedAtNode
         + Unwindable
         + FlowMetricHook
-        + otap_df_engine::topic::Partitioned,
+        + otap_df_engine::topic::Partitioned
+        + otap_df_engine::topic::DurableDispatchPayload,
 > ControlPlane for ControllerControlPlane<PData>
 {
     fn shutdown_all(&self, timeout_secs: u64) -> Result<(), ControlPlaneError> {

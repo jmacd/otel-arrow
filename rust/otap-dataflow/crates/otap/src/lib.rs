@@ -15,6 +15,15 @@ pub mod accessory;
 
 pub mod pdata;
 
+/// OTAP ↔ Quiver `RecordBundle` adapter: converts `OtapPdata` to durable Quiver
+/// bundles and reconstructs `OtapPdata` from a `ReconstructedBundle`. Shared by
+/// the durable buffer processor and the quiver-backed partition-dispatch topic.
+pub mod quiver_bundle;
+
+/// Durable (quiver-backed) partition-dispatch topic backend: the durable form of
+/// the in-memory partition-dispatch topic (durable-dispatch design Layer B).
+pub mod quiver_topic;
+
 mod pdata_conversions;
 
 pub mod metrics;

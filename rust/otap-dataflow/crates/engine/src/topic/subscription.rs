@@ -46,17 +46,21 @@ pub enum RecvDelivery<T: Send + Sync + 'static> {
     },
 }
 
-// Reserved fallback hook for non-in-memory topic backends. The current tree
-// only ships the in-memory backend, so normal builds do not instantiate this
-// path yet.
-#[allow(dead_code)]
-pub(crate) trait DeliveryBackend<T: Send + Sync + 'static> {
+/// The delivery-finalization hook for non-in-memory topic backends. A durable
+/// (quiver-backed) subscription backend implements this to attach its own
+/// delivery resolution (for example, acking or deferring a persisted bundle)
+/// behind the same [`Delivery`] surface the in-memory backend uses.
+pub trait DeliveryBackend<T: Send + Sync + 'static>: Send {
+    /// The delivered message envelope (id, tracked flag, payload).
     fn envelope(&self) -> &Envelope<T>;
 
+    /// Finalize the delivery after a successful downstream handoff.
     fn commit(&mut self);
 
+    /// Reject the delivery before a successful handoff.
     fn abort(&mut self, reason: Arc<str>) -> Result<(), Error>;
 
+    /// Abandon an unresolved delivery (dropped without commit/abort).
     fn abandon(&mut self);
 }
 
@@ -77,10 +81,10 @@ pub struct Delivery<T: Send + Sync + 'static> {
 
 enum DeliveryFinalizer<T: Send + Sync + 'static> {
     InMemory(InMemoryDeliveryFinalizer),
-    // Keep the opaque finalizer path available so a future backend can attach
-    // its own delivery permit implementation without changing the public
-    // subscription API. The in-memory backend no longer uses this variant.
-    #[allow(dead_code)]
+    // The opaque finalizer path lets a non-in-memory backend (for example the
+    // durable quiver-backed partition-dispatch topic) attach its own delivery
+    // resolution without changing the public subscription API. The in-memory
+    // backend constructs specialized inline deliveries directly instead.
     Opaque(Box<dyn DeliveryBackend<T>>),
     Finished,
 }
@@ -96,11 +100,12 @@ impl<T: Send + Sync + 'static> Delivery<T> {
         }
     }
 
-    // Keep this constructor available for future non-in-memory backends. It is
-    // only used by tests today because the in-memory backend now constructs
-    // specialized inline deliveries directly.
-    #[allow(dead_code)]
-    pub(crate) fn new_opaque(inner: Box<dyn DeliveryBackend<T>>) -> Self {
+    /// Construct a delivery whose resolution is owned by a non-in-memory backend
+    /// via a [`DeliveryBackend`]. Used by the durable (quiver-backed)
+    /// partition-dispatch subscription to bridge a persisted bundle handle to
+    /// the standard commit/abort/abandon delivery lifecycle.
+    #[must_use]
+    pub fn new_opaque(inner: Box<dyn DeliveryBackend<T>>) -> Self {
         let envelope = inner.envelope().clone();
         Self {
             envelope,

@@ -49,7 +49,8 @@ impl<
         + ReceivedAtNode
         + Unwindable
         + FlowMetricHook
-        + otap_df_engine::topic::Partitioned,
+        + otap_df_engine::topic::Partitioned
+        + otap_df_engine::topic::DurableDispatchPayload,
 > ControllerRuntime<PData>
 {
     fn engine_operation_allows(state: &ControllerRuntimeState, operation_id: Option<&str>) -> bool {

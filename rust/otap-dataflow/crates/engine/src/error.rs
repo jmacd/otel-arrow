@@ -586,6 +586,19 @@ pub enum Error {
         num_owners: usize,
     },
 
+    /// A durable (quiver-backed) partition-dispatch topic was requested for a
+    /// payload type that does not implement a durable backend (for example the
+    /// planning-only unit payload).
+    #[error("durable partition-dispatch is not supported for this payload type")]
+    DurableDispatchUnsupported,
+
+    /// A durable (quiver-backed) topic backend failed to initialize or operate.
+    #[error("durable topic backend error: {message}")]
+    DurableBackendError {
+        /// A human-readable description of the durable backend failure.
+        message: String,
+    },
+
     /// This topic only supports a single consumer group, but a subscription request would violate that constraint.
     #[error("this topic only supports a single consumer group")]
     SubscribeSingleGroupViolation,
@@ -687,6 +700,8 @@ impl Error {
             Error::PartitionOutOfRange { .. } => "PartitionOutOfRange",
             Error::PartitionReassignNotSupported => "PartitionReassignNotSupported",
             Error::OwnerOutOfRange { .. } => "OwnerOutOfRange",
+            Error::DurableDispatchUnsupported => "DurableDispatchUnsupported",
+            Error::DurableBackendError { .. } => "DurableBackendError",
             Error::SubscribeSingleGroupViolation => "SubscribeSingleGroupViolation",
             Error::SubscriptionClosed => "SubscriptionClosed",
             Error::CapabilityAlreadyConsumed { .. } => "CapabilityAlreadyConsumed",

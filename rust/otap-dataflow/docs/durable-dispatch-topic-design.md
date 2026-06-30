@@ -11,23 +11,28 @@ engine has no key-deterministic cross-core dispatch and no durable topic
 backend, and that both should be built on shared infrastructure rather than
 bespoke parts.
 
-> Status: design ratified; the **in-memory core is implemented end-to-end**. The
-> orthogonal-axis model (D27), the layer decomposition, and all component
-> decisions are **ratified** (D18-D20, D22-D23, D25-D28); only the durable backend
-> (D21/D24) is **deferred** to a later effort, behind the same interface. See
-> "Decisions". Names are provisional. **Layer A (split-by-key) and Layer C
+> Status: design ratified; the **in-memory core and the durable backend are both
+> implemented end-to-end**. The orthogonal-axis model (D27), the layer
+> decomposition, and all component decisions are **ratified** (D18-D28). See
+> "Decisions". Names are provisional. **Layer A (split-by-key), Layer C
 > (placement map, the `Partitioned` seam, the in-memory partition-dispatch topic,
-> the load feedback loop, and the exporter/receiver/config/controller wiring) are
-> implemented and tested**, with the load feedback loop now driven end-to-end by
-> a real aggregating owner (the L2 event-time windower); the durable backend
-> (Layer B) is the remaining work.
+> the load feedback loop, and the exporter/receiver/config/controller wiring), and
+> Layer B (the Quiver durable backend) are implemented and tested**, with the load
+> feedback loop driven end-to-end by a real aggregating owner (the L2 event-time
+> windower).
 >
-> **Scope for this effort (D28):** build the **in-memory core only** -- Layer A
-> (split-by-key) + Layer C (partition-dispatch on the in-memory backend) = the
-> runnable aggregating load-balancer. **Layer B (the Quiver durable backend) is
-> deferred**: because durability is an additive backend behind the *same*
-> interface (D27), it can be added later as a pure backend swap with no redesign.
-> Decisions D21/D24 (durable backend) are therefore deferred, not open.
+> **Layer B status (D21/D24): implemented as a PoC.** The durable backend is the
+> additive backend behind the *same* `TopicState` interface (D27): a topic with
+> `backend: quiver` and `num_partitions` persists each partition's stream to a
+> per-partition Quiver store (`crates/otap/src/quiver_topic.rs`,
+> `QuiverPartitionDispatchTopic`), survives restart, and resumes subscribers from
+> durable progress. The PoC takes two deliberate simplifications, both swappable
+> later without an interface change: it uses **one Quiver engine per partition**
+> (D24's simpler option) and **flushes per publish** so a published bundle is
+> durable and immediately pollable. The controller arms that previously rejected
+> `TopicBackendKind::Quiver` are now filled, and the durable backend is reached
+> through the `DurableDispatchPayload` trait so the generic engine and controller
+> stay free of quiver and OTAP specifics.
 
 ## Motivation
 
@@ -75,6 +80,10 @@ in the Telemetry-Collection-Spec repo -- and ingest-queue D3).
 
 The capabilities factor so that the entire shuffle/aggregate/load-balance path
 is built and tested **in memory first**, with durability added as a backend swap.
+The master diagram in
+[`metrics-appliance-design.md`](./metrics-appliance-design.md#layered-architecture)
+shows this in-memory path end to end, including the partition-dispatch shuffle and
+the load-balancing feedback loop designed here.
 
 ```text
   Core (durability-independent):
@@ -106,16 +115,16 @@ is built and tested **in memory first**, with durability added as a backend swap
 
 ## How it maps onto existing primitives
 
-| Capability                           | Engine primitive                                                         | Status                                  |
-| ------------------------------------ | ------------------------------------------------------------------------ | --------------------------------------- |
-| Size-based batch split/merge         | `otap::groups` + `transform::split` (contiguous range split)             | exists                                  |
-| Selection-mask cascade (root->child) | `otap::filter::filter_otap_batch` (+ `filter_metrics_time_window`)       | exists (used by filter + admission)     |
-| Topic backend seam                   | `TopicBackend` / `TopicState` / `SubscriptionBackend`                    | exists; `InMemoryBackend` only          |
-| Durable buffer                       | `quiver` (WAL + Arrow IPC segments, at-least-once, multi-stream, budget) | exists (experimental)                   |
-| Reserved durable topic kind          | `TopicBackendKind::Quiver`                                               | reserved; currently rejected at startup |
-| Split-by-key (Layer A)               | `otap::partition` + `partition` processor                                | implemented + tested                    |
-| Quiver TopicBackend (Layer B)        | (this design)                                                            | deferred (durable backend)              |
-| Partition-dispatch + placement (C)   | `PartitionDispatchBackend` + placement map + load feedback loop          | implemented + tested                    |
+| Capability                           | Engine primitive                                                         | Status                                   |
+| ------------------------------------ | ------------------------------------------------------------------------ | ---------------------------------------- |
+| Size-based batch split/merge         | `otap::groups` + `transform::split` (contiguous range split)             | exists                                   |
+| Selection-mask cascade (root->child) | `otap::filter::filter_otap_batch` (+ `filter_metrics_time_window`)       | exists (used by filter + admission)      |
+| Topic backend seam                   | `TopicBackend` / `TopicState` / `SubscriptionBackend`                    | exists; in-memory + Quiver backends      |
+| Durable buffer                       | `quiver` (WAL + Arrow IPC segments, at-least-once, multi-stream, budget) | exists (experimental)                    |
+| Reserved durable topic kind          | `TopicBackendKind::Quiver`                                               | implemented (durable partition-dispatch) |
+| Split-by-key (Layer A)               | `otap::partition` + `partition` processor                                | implemented + tested                     |
+| Quiver TopicBackend (Layer B)        | `otap::quiver_topic::QuiverPartitionDispatchTopic`                       | implemented + tested (PoC)               |
+| Partition-dispatch + placement (C)   | `PartitionDispatchBackend` + placement map + load feedback loop          | implemented + tested                     |
 
 ## Layer A: Split-by-key
 
@@ -312,6 +321,38 @@ telemetry collection, and a test shows skewed series counts rebalancing a live
 partition-dispatch topic. The durable backend later adds leases and generation
 fencing to the apply step so a deposed owner's late writes are fenced.
 
+### Controller-driven placement lifecycle
+
+The load feedback loop computes reassignments, and two further steps make placement
+controller-driven rather than hand-specified. Both are in scope for the in-memory
+core.
+
+**Initial assignment.** The controller builds the placement map from the topic's
+`num_partitions` and the receiver replica count, using `PartitionPlacement::balanced`
+at first and `weighted` once a load history exists, and assigns each replica the
+partitions that map to it as its `PartitionDispatch` owned set. This replaces
+today's hand-specified owned partitions in receiver config. A replica's owner
+identity is its subscriber slot, and the controller keeps the replica-to-owner
+mapping so a later move addresses the right subscribers.
+
+**Dynamic owned-set propagation.** A `PartitionMove` must reach the two affected
+replicas, not only the topic's routing table. Applying a move does two things at
+an aggregation window boundary. First, `TopicHandle::apply_move` repoints the
+backend's partition-to-owner routing so future publishes enqueue to the new
+owner, which
+already exists. Second, a control notification updates the live owned set on each
+side: the losing replica drains and releases the partition's queue, and the gaining
+replica begins draining it and opens the partition's next window. The subscription
+fixes its owned set at subscribe time today, so this notification and a
+subscription-level reassign entry point are the remaining piece. Sequencing the
+change at a window boundary means the handoff carries no live per-series state,
+because the old owner has flushed the closed window and the new owner opens the
+next one.
+
+For the durable backend of Layer B, deferred, the same apply step stamps the lease
+generation so a deposed owner's late writes are fenced. The in-memory path
+reassigns directly and treats any unflushed data as best-effort, per decision D27.
+
 **Relationship to tenancy.** When the multitenancy descriptor system lands,
 condition-routing (named partitions for tenant/resource isolation) and
 hash-partitioning (N buckets for co-location) are the same dispatch mode with
@@ -320,29 +361,42 @@ designed to accept either; the ingest queue uses the hash-partition form.
 
 ## Layer B: Quiver TopicBackend (optional durability)
 
+> **Implemented as a PoC.** `crates/otap/src/quiver_topic.rs`
+> (`QuiverPartitionDispatchTopic`) implements `TopicState<OtapPdata>` durably; the
+> controller constructs it through the `DurableDispatchPayload` trait when a topic
+> sets `backend: quiver` and `num_partitions`. The PoC uses one Quiver engine per
+> partition and flushes per publish; both are swappable later without an interface
+> change.
+
 **Goal.** Make the *same* partition-dispatch topic durable: published items are
 persisted before acknowledgement and survive restart; subscribers resume from
 durable progress. This is an **additive backend** selected per location (D27),
 not a separate mechanism.
 
-**Mechanism.** Implement the three backend traits against a `quiver` instance:
+**Mechanism (implemented).** The durable topic implements the same `TopicState`
+and `SubscriptionBackend` surface against `quiver`:
 
-- `TopicState::publish*` -> quiver `ingest(bundle)` (WAL append + segment
-  accumulation), acknowledged once durable. The OTAP->bundle adapters already
-  exist in `durable_buffer_processor`.
-- the partition subscription -> a quiver subscriber per owned partition (stream).
-- `SubscriptionBackend::poll_recv_delivery` -> quiver `poll_next_bundle`;
-  `ack` / `nack` -> quiver `BundleHandle::{ack, reject/defer}`.
+- `TopicState::publish*` -> quiver `ingest(bundle)` then `flush`, so the bundle
+  is durable and immediately pollable before the publish resolves. The
+  OTAP->bundle adapter is shared from `otap_df_otap::quiver_bundle`, moved out of
+  the durable buffer processor so both use one implementation.
+- the partition subscription -> the owner drains the partitions it currently
+  owns; each partition is a distinct quiver engine with a single fixed subscriber
+  id, so ownership can change without disturbing durable progress.
+- `SubscriptionBackend::poll_recv_delivery` -> quiver `poll_next_bundle`, with the
+  delivery's `commit` acking the bundle and `abort`/`abandon` deferring it for
+  redelivery (`BundleHandle::{ack, defer}`).
 
-**QoS mapping** (ingest-queue D6): the topic's queue-on-full policy maps to
-quiver's `RetentionPolicy` -- `Backpressure` (lossless) vs `DropOldest`
+**QoS mapping** (ingest-queue D6): the durable topic's `retention` setting maps
+to quiver's `RetentionPolicy` -- `Backpressure` (lossless) vs `DropOldest`
 (loss-tolerant) -- wired to the `DiskBudget`.
 
-**Wiring.** `TopicBackendKind::Quiver` is currently rejected at startup
-(`topic_backend_capabilities` returns `None`,
-`validate_topic_runtime_support` errors, and `declare_topic`'s Quiver arm is
-`unreachable!`). Layer B fills those arms in and constructs a quiver-backed
-`TopicState`.
+**Wiring (implemented).** `TopicBackendKind::Quiver` was previously rejected at
+startup. The controller's `declare_topic` now constructs a quiver-backed
+`TopicState` for a partition-dispatch topic through the `DurableDispatchPayload`
+trait and registers it via `TopicBroker::create_topic_with_state`; config
+validation requires a quiver topic to set `num_partitions` and a `quiver`
+settings block.
 
 **Consequences.** Durability becomes a backend setting on the topic, so the
 existing `durable_buffer_processor` reduces to "set the topic backend to quiver"
@@ -372,22 +426,22 @@ log), replayed on startup -- so no hand-rolled WAL is needed.
 
 Continuing the shared decision ledger of the ingest-queue and appliance designs
 (D1-D17). Status is per-decision: **ratified**, decided and ready to build, or
-**deferred**, intentionally postponed beyond this effort and addressed later as
-an additive backend swap (D21/D24, the durable backend).
+**implemented**, built and tested. The durable backend (D21/D24), previously
+deferred, is now implemented as a PoC.
 
-| ID  | Decision                            | Recommendation                                      | Status   |
-| --- | ----------------------------------- | --------------------------------------------------- | -------- |
-| D18 | Layer decomposition + build order   | A split-by-key -> C in-memory dispatch -> B durable | ratified |
-| D19 | Split-by-key mechanism              | selection-mask radix cascade; batch processor       | ratified |
-| D20 | Shard key source                    | data-sourced; descriptor/tenant composes later      | ratified |
-| D21 | Durable backend                     | Quiver `TopicBackend`; durability is additive       | deferred |
-| D22 | Partition ownership                 | new partition-claim mode; in-memory first           | ratified |
-| D23 | Placement seam                      | controller map; static->rebalanced; leases          | ratified |
-| D24 | Quiver backend granularity          | one quiver/owner, per-partition IPC streams         | deferred |
-| D25 | Split and dispatch packaging        | separate composable nodes; fused fast-path later    | ratified |
-| D26 | Standalone logs (no `trace_id`) key | configured projection; default even spread          | ratified |
-| D27 | Optional, per-location durability   | delivery mode x backend are orthogonal axes         | ratified |
-| D28 | Scope for this effort               | in-memory core (A+C) only; defer Quiver (B)         | ratified |
+| ID  | Decision                            | Recommendation                                      | Status            |
+| --- | ----------------------------------- | --------------------------------------------------- | ----------------- |
+| D18 | Layer decomposition + build order   | A split-by-key -> C in-memory dispatch -> B durable | ratified          |
+| D19 | Split-by-key mechanism              | selection-mask radix cascade; batch processor       | ratified          |
+| D20 | Shard key source                    | data-sourced; descriptor/tenant composes later      | ratified          |
+| D21 | Durable backend                     | Quiver durable `TopicState`; durability is additive | implemented (PoC) |
+| D22 | Partition ownership                 | new partition-claim mode; in-memory first           | ratified          |
+| D23 | Placement seam                      | controller map; static->rebalanced; leases          | ratified          |
+| D24 | Quiver backend granularity          | one quiver per partition for the PoC                | implemented (PoC) |
+| D25 | Split and dispatch packaging        | separate composable nodes; fused fast-path later    | ratified          |
+| D26 | Standalone logs (no `trace_id`) key | configured projection; default even spread          | ratified          |
+| D27 | Optional, per-location durability   | delivery mode x backend are orthogonal axes         | ratified          |
+| D28 | Scope for this effort               | in-memory core (A+C) only; defer Quiver (B)         | ratified          |
 
 ### D18. Layer decomposition and build order
 
@@ -432,18 +486,22 @@ this is simpler than and orthogonal to header-sourced tenant descriptors.
 condition-routing composes as an additional partition function over the same
 dispatch mode (couples to ingest-queue D9 and the multitenancy design).
 
-### D21. Durable backend (additive) -- deferred this effort
+### D21. Durable backend (additive) -- implemented as a PoC
 
-**Deferred (D28):** not built in this effort. The plan stands for when it is:
-implement the reserved `TopicBackendKind::Quiver` as a durable `TopicBackend`
-selected **per location** (D27). Durability is **additive configuration, not a
-subsumption**: the same partition-dispatch topic runs over the in-memory backend
-(the default -- no durability) or the quiver backend (the durable option), with
-identical dispatch/ownership semantics. **Why deferrable:** because the backend
-sits behind the *same* interface, deferring it costs no redesign -- it is a later
-backend swap. **When built:** fill the rejected Quiver arms in the controller;
-the existing `durable_buffer_processor` becomes "set the topic backend to
-quiver" and can then be deprecated. Couples to ingest-queue D4/D6.
+**Implemented (PoC):** `TopicBackendKind::Quiver` is realized as a durable
+`TopicState` selected **per location** (D27). Durability is **additive
+configuration, not a subsumption**: the same partition-dispatch topic runs over
+the in-memory backend, the default with no durability, or the quiver backend, the
+durable option, with identical dispatch/ownership semantics. The backend sits
+behind the *same* interface, so it was added as a backend swap with no redesign:
+`crates/otap/src/quiver_topic.rs` implements `TopicState<OtapPdata>`, the
+controller's `declare_topic` constructs it through the `DurableDispatchPayload`
+trait, and config validation requires a quiver topic to be partition-dispatch.
+The existing `durable_buffer_processor` can now be reduced to "set the topic
+backend to quiver" and deprecated once the durable backend reaches parity. Couples
+to ingest-queue D4/D6. **Open follow-ups beyond the PoC:** batched rather than
+per-publish flush, leases and generation fencing on reassignment, and the durable
+registry half of ingest-queue Phase 1.
 
 ### D22. Partition ownership
 
@@ -477,16 +535,19 @@ possible without rehashing keys (ingest-queue D3 / Auto-sharding).
 **Implication:** this effort adds a minimal static placement map; the
 controller's lease and key-ownership primitive arrives with durability.
 
-### D24. Quiver backend granularity -- deferred this effort
+### D24. Quiver backend granularity -- implemented as a PoC
 
-**Deferred (D28), scoped to the durable backend.** How many quiver instances and
-streams back a partition-dispatch topic? Leading option (ingest-queue D5): **one
-quiver per owner**, with **each partition a distinct Arrow-IPC stream** within
-that owner's segments (quiver already supports multi-stream segments keyed by
-`(SlotId, SchemaFingerprint)`), sharing one per-owner WAL and disk budget.
-Alternative: one quiver per partition (simpler isolation and handoff, more WALs).
-The choice hinges on whether quiver can hand off a *single stream* out of a
-multi-stream instance on reassignment (to verify when Layer B is built).
+**Implemented (PoC): one quiver per partition.** How many quiver instances and
+streams back a partition-dispatch topic? The PoC takes the simpler option: **one
+quiver engine per partition**, drained by a single fixed subscriber id. This gives
+clean isolation and a trivial reassignment handoff, since repointing a partition
+to a new owner just changes which owner drains that partition's engine, with
+durable progress untouched. The cost is one WAL per partition. The leading
+production option (ingest-queue D5) remains **one quiver per owner** with each
+partition a distinct Arrow-IPC stream within that owner's segments, sharing one
+per-owner WAL and disk budget; moving to it is a backend-internal change behind
+the same `TopicState` interface, and hinges on quiver handing off a *single
+stream* out of a multi-stream instance on reassignment.
 
 ### D25. Split and dispatch packaging
 
@@ -560,16 +621,18 @@ backend per location; honors the engine's configurable-QoS posture
 
 ### D28. Scope for this effort
 
-**Ratified (this session):** build the **in-memory core only** -- Layer A
+**Ratified (this session):** build the **in-memory core** -- Layer A
 (split-by-key) and Layer C (partition-dispatch on the in-memory backend, static
 placement) -- which delivers the runnable aggregating load-balancer and the
-in-memory form of ingest-queue Phase 1. **Layer B (the Quiver durable backend)
-and the durable-registry half of Phase 1 are deferred.** **Why:** by D27
-durability sits behind the same `TopicBackend` interface, so the in-memory core
-"gets most of the value" and durability adds later as a pure backend swap with
-no redesign. **Implication:** D21 and D24 are deferred (not open); D23 needs only
-the static in-memory placement map now (leases/handoff defer with B); the
-registry stays in-memory and is relearned on restart (safe per ingest-queue D8).
+in-memory form of ingest-queue Phase 1. By D27 durability sits behind the same
+`TopicState` interface, so the in-memory core "gets most of the value" and
+durability adds as a pure backend swap with no redesign. **Update:** Layer B (the
+Quiver durable backend, D21/D24) has since been built as a PoC behind that same
+interface, so it is no longer deferred; the durable-registry half of Phase 1
+remains future work. D23 still uses the static placement map now, with
+leases/handoff to follow; the registry stays in-memory and is relearned on
+restart, which is safe because conflicts are warnings rather than rejections, per
+ingest-queue D2 and D7.
 
 ## Implementation order
 
@@ -585,24 +648,27 @@ In scope for this effort (the in-memory core, D28):
    the per-signal keys (hash `metric_name`, slice the low 56 bits of `trace_id`)
    are covered by tests. Durability-independent.
 2. **Layer C -- partition-dispatch subscription + static placement on the
-   in-memory backend.** With A, this is the complete, runnable in-memory
+   in-memory backend (DONE).** With A, this is the complete, runnable in-memory
    aggregating load-balancer (the "large-scale SDK") -- end-to-end, no durability.
    Delivers the in-memory form of ingest-queue Phase 1 (shuffle + per-owner
    authority). It consumes the `Context::partition` tag the `partition` node sets.
 
-Deferred (added later as an additive backend swap, D28/D21):
+Added later as an additive backend swap (D28/D21):
 
-- **Layer B -- Quiver `TopicBackend`** implementing the reserved kind: the same
-  dispatch/ownership made durable, selected per location (D27). Adds durable
-  registry/buffer and restart replay; replaces `durable_buffer_processor`.
-  Completes ingest-queue Phase 1 (durable registry) and Phase 2 (per-bucket
-  durability, leases, rebalancing).
+- **Layer B -- Quiver durable `TopicState` (DONE, PoC).** The same
+  dispatch/ownership made durable, selected per location (D27):
+  `crates/otap/src/quiver_topic.rs` persists each partition to its own quiver
+  engine, survives restart, and resumes subscribers from durable progress;
+  reached through the `DurableDispatchPayload` trait and a `backend: quiver`
+  topic with `num_partitions`. Restart replay and reassignment-resume are
+  tested. Adds a path to replace `durable_buffer_processor`; the durable
+  registry of Phase 1 and Phase 2 leases/rebalancing remain future work.
 
 ## Status and next steps
 
-- **The in-memory core is implemented end-to-end; the durable backend is not.**
-  All component decisions are now ratified (D18-D20, D22-D23, D25-D28); only the
-  durable backend (D21/D24) is deferred to Layer B.
+- **The in-memory core and the durable backend are both implemented end-to-end.**
+  All component decisions are now ratified or implemented (D18-D28); the durable
+  backend (D21/D24) is implemented as a PoC.
 - **Layer A delivered:** the `partition_otap_batch` primitive
   (`crates/pdata/src/otap/partition.rs`), the `partition` processor node
   (`crates/core-nodes/src/processors/partition_processor/`,
@@ -618,14 +684,26 @@ Deferred (added later as an additive backend swap, D28/D21):
   partition-dispatch topic from `TopicSpec.num_partitions`. Broker-level and
   end-to-end tests cover routing, exclusivity, placement, and the full
   tagged-`OtapPdata` path.
+- **Layer B delivered (PoC):** the durable `QuiverPartitionDispatchTopic`
+  (`crates/otap/src/quiver_topic.rs`) over one quiver engine per partition; the
+  `DurableDispatchPayload` seam (`crates/engine/src/topic/durable.rs`) and the
+  `OtapPdata` impl; the shared OTAP-to-bundle adapter
+  (`otap_df_otap::quiver_bundle`); the `backend: quiver` config with a `quiver`
+  settings block; and the controller wiring through
+  `TopicBroker::create_topic_with_state`. Tests cover durable routing,
+  exclusivity, reassignment-resume, and restart replay.
 - The substrate exists: the topic backend seam, `quiver`, the cascade filter
   (`filter_otap_batch` / `filter_metrics_time_window`), and the size-based batch
-  split. The reserved `TopicBackendKind::Quiver` is the (deferred) durable-backend
-  wiring point.
-- **To proceed:** Layer B (durability) as an additive backend swap behind the
-  same dispatch interface, plus the controller computing placement and assigning
-  owned partitions to receiver replicas (now hand-specified in receiver config).
-  The standalone-logs key (D26) is decided but waits until logs are addressed.
+  split.
+- **To proceed (in-memory):** the controller-driven placement lifecycle of Layer
+  C above, in two steps: the controller computes the initial placement map and
+  assigns each receiver replica its owned partitions, replacing the hand-specified
+  receiver config, and a `PartitionMove` propagates to the affected replicas
+  through a subscription-level reassign so a move updates their live owned sets.
+- **To proceed (durable):** beyond the PoC, batched flushing, leases and
+  generation fencing on the reassignment apply step, one-quiver-per-owner with
+  per-partition streams (D24), and the durable registry half of Phase 1. The
+  standalone-logs key (D26) is decided but waits until logs are addressed.
 
 **Related docs:** [`ingest-queue-design.md`](./ingest-queue-design.md) (D3
 per-signal partitioner; the consumer of this infrastructure),

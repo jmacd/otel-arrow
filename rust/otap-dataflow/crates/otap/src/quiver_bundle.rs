@@ -58,7 +58,7 @@ use otap_df_pdata::otap::{Logs, Metrics, OtapArrowRecords, OtapBatchStore, Trace
 use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use otap_df_pdata::{OtapPayload, OtapPayloadHelpers, OtlpProtoBytes};
 
-use otap_df_otap::pdata::{Context, OtapPdata};
+use crate::pdata::{Context, OtapPdata};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Slot ID Constants
@@ -104,7 +104,8 @@ const fn is_otlp_slot(slot: SlotId) -> Option<SignalType> {
 ///
 /// Returns `None` for shared slots (RESOURCE_ATTRS, SCOPE_ATTRS) or unknown
 /// slot IDs.
-pub(crate) fn signal_type_from_slot_id(slot: SlotId) -> Option<SignalType> {
+#[must_use]
+pub fn signal_type_from_slot_id(slot: SlotId) -> Option<SignalType> {
     // Check OTLP opaque slots first
     if let Some(st) = is_otlp_slot(slot) {
         return Some(st);
