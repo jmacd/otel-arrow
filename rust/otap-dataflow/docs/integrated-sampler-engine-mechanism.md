@@ -108,14 +108,14 @@ shape one level up and is left to the production sampler.
 ## Architecture overview
 
 ```text
-  side 1: per-worker integrated buffers          side 2: all-CPU processor
+  side 1: per-worker integrated buffers          side 2: the ITR's aggregator
   +---------------------------------+
   | ordinary logs --> criterion-one |  period-end sample (HT-weighted)
   |                   local reservoir|------------------------\
   |                   (reserved)     |                         \
   | span-selected, reservoir-rejected|  eager raw span-logs     \
-  |  + START/END    ----------------- }-----------------------> ITR --> WINDOWED
-  +---------------------------------+                                  PROCESSOR
+  |  + START/END    ----------------- }-----------------------> ITR'S WINDOWED
+  +---------------------------------+                                  AGGREGATOR
                  ^                                                          |
                  |  ArcSwap registry: heavy-hitter table + span-start table |
                  \----------------------------------------------------------/
@@ -285,21 +285,30 @@ the library:
 - **Criterion two.** Per-`span_id` `UniformReservoir`s over the union of the raw
   overflow records and the span-selected records in the per-worker samples.
   Keying by `span_id` reassembles spans whose records were produced on different
-  workers.
-- **Span-start value table.** The surprisal accumulator over in-span records,
-  keyed by `start_callsite`, plus the span-start counter over boundaries, exactly
-  `IntegratedSampler` today, feeding the next window's span-start threshold table.
+  workers. Span START and END ride the same per-span reservoir rather than being
+  kept verbatim as `IntegratedSampler` does, because the aggregator sees a sampled
+  stream without the span phase; keeping boundaries verbatim at the global level
+  is a noted refinement.
+- **Span-start value table.** A surprisal accumulator over the in-span records,
+  keyed by `start_callsite`, and a span-start volume counter. Because the
+  aggregator sees a sampled stream rather than the full one, the span-start volume
+  is summed over the distinct `span_id`s it observes rather than counting START
+  events, and the surprisal totals are sample-based estimates; unbiasing them by
+  adjusted count is a noted refinement. This feeds the next window's span-start
+  threshold table.
 
 At the window boundary the receiver annotates every retained record with the
 three adjusted counts via `annotate_log_record`, emits them as OTLP, and
 republishes both tables into the `ArcSwap` registry.
 
-`IntegratedSampler`
-(`crates/telemetry/src/self_tracing/sampling/processor.rs`) already implements
-these three estimators over one in-memory stream. The work is to feed it from the
-per-worker flushes, change criterion one from a single-level sample to the
-second-level aggregation of representatives, and drive its window and feedback
-from the seams below.
+`WindowAggregator` (`crates/telemetry/src/self_tracing/sampling/aggregator.rs`)
+implements these estimators over the per-worker flushes, reusing the library
+primitives and sharing the retained-record merge machinery
+(`sampling/record.rs`) with the single-stream `IntegratedSampler` so both produce
+identical output. It differs only where the second level requires: criterion one
+aggregates representatives weighted by their local `nhat`
+(`BottomFloor::observe_weighted`) rather than sampling a single-level stream, and
+additionally publishes the heavy-hitter table.
 
 ## Window mechanism
 
@@ -390,7 +399,8 @@ Resolved for Subsystem 3:
    registry: the tracer's `SpanStartSampler` reads the span-start table and each
    worker's binding gate reads the heavy-hitter table, both fail-safe no-ops
    until the aggregator publishes. Follow-ups: smoothing the global counts across
-   windows and the cross-process two-level log feedback.
+   windows, unbiasing the sampled surprisal and keeping span boundaries verbatim
+   at the global level, and the cross-process two-level log feedback.
 
 ## References
 

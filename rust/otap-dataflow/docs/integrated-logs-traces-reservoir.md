@@ -16,14 +16,15 @@ processor with the three estimators and exact-zero adjusted-count output, and
 the `SpanContext` extensions.
 
 The engine mechanism that drives this library from real telemetry is specified
-and partly built; see
+and built; see
 [`integrated-sampler-engine-mechanism.md`](integrated-sampler-engine-mechanism.md).
-The data-plane span-context propagation and the per-worker thread-local sample
-buffer are implemented, the latter in a local-only mode where each worker
-produces a self-contained sample. Remaining: the all-CPU aggregator that
-combines the per-worker samples and republishes the feedback tables, then the
-cross-process two-level log feedback and the optional SDK-wide span-log second
-stage.
+The data-plane span-context propagation, the per-worker thread-local sample
+buffer, and the all-CPU aggregator are implemented. The aggregator is built into
+the Internal Telemetry Receiver, which combines the per-worker samples and
+republishes both feedback tables; the tracer's span-start sampler and each
+worker's heavy-hitter binding gate read them, closing the intra-process two-level
+loop. Remaining: smoothing the global counts across windows, the cross-process
+two-level log feedback, and the optional SDK-wide span-log second stage.
 
 ## Audience and scope
 
