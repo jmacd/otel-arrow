@@ -124,8 +124,12 @@ pub enum TopicSubscriptionConfig {
     /// (Layer C of the partition-dispatch design). The owned set comes from the
     /// placement map.
     PartitionDispatch {
-        /// The partitions this receiver owns.
-        owned_partitions: Vec<u32>,
+        /// The partitions this receiver owns. When omitted, the controller
+        /// assigns each partition-dispatch receiver a balanced share of the
+        /// topic's partitions from the placement map (durable-dispatch I4);
+        /// set it explicitly to pin an owned set as an override.
+        #[serde(default)]
+        owned_partitions: Option<Vec<u32>>,
     },
 }
 
@@ -187,9 +191,16 @@ pub static TOPIC_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
                 group: group.clone(),
             },
             TopicSubscriptionConfig::PartitionDispatch { owned_partitions } => {
-                SubscriptionMode::PartitionDispatch {
-                    owned_partitions: owned_partitions.clone(),
-                }
+                let owned_partitions = owned_partitions.clone().ok_or_else(|| {
+                    ConfigError::InvalidUserConfig {
+                        error: format!(
+                            "partition_dispatch receiver for topic `{}` has no owned_partitions; \
+                             the controller assigns them from the topic placement when omitted",
+                            config.topic
+                        ),
+                    }
+                })?;
+                SubscriptionMode::PartitionDispatch { owned_partitions }
             }
         };
         let subscription = topic_binding
@@ -254,7 +265,10 @@ impl local::Receiver<OtapPdata> for TopicReceiver {
             TopicSubscriptionConfig::Broadcast {} => "broadcast".to_owned(),
             TopicSubscriptionConfig::Balanced { group } => format!("balanced(group={})", group),
             TopicSubscriptionConfig::PartitionDispatch { owned_partitions } => {
-                format!("partition_dispatch(owns={owned_partitions:?})")
+                format!(
+                    "partition_dispatch(owns={:?})",
+                    owned_partitions.clone().unwrap_or_default()
+                )
             }
         };
         let receiver_id = effect_handler.receiver_id();

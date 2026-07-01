@@ -64,7 +64,7 @@ use otap_df_config::topic::{
 };
 use otap_df_config::transport_headers_policy::TransportHeadersPolicy;
 use otap_df_config::{
-    DeployedPipelineKey, ExtensionId, PipelineGroupId, PipelineId, PipelineKey,
+    DeployedPipelineKey, ExtensionId, NodeId, PipelineGroupId, PipelineId, PipelineKey,
     SubscriptionGroupName, TopicName, pipeline::PipelineConfig,
 };
 use otap_df_engine::PipelineFactory;
@@ -87,7 +87,8 @@ use otap_df_engine::memory_limiter::{
 use otap_df_engine::processor::FlowMetricHook;
 use otap_df_engine::topic::{
     DurableDispatchConfig, DurableRetentionPolicy, InMemoryBackend, PartitionDispatchBackend,
-    PipelineTopicBinding, TopicBroker, TopicOptions, TopicPublishOutcomeConfig, TopicSet,
+    PartitionPlacement, PipelineTopicBinding, TopicBroker, TopicOptions, TopicPublishOutcomeConfig,
+    TopicSet,
 };
 use otap_df_state::store::{ObservedStateHandle, ObservedStateStore};
 use otap_df_telemetry::event::{EngineEvent, ErrorSummary, ObservedEventReporter};
@@ -100,6 +101,7 @@ use otap_df_telemetry::{
 use smallvec::smallvec;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -387,7 +389,18 @@ struct TopicUsageSummary {
 enum TopicReceiverMode {
     Broadcast,
     Balanced(SubscriptionGroupName),
+    PartitionDispatch { explicit: bool },
     Unknown,
+}
+
+/// A `topic` receiver that subscribes in `partition_dispatch` mode, collected for
+/// the controller's initial-placement computation (durable-dispatch I4).
+struct PartitionDispatchReceiver {
+    group_id: PipelineGroupId,
+    pipeline_id: PipelineId,
+    node_id: NodeId,
+    /// Whether the receiver pinned an explicit `owned_partitions` set.
+    explicit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -408,7 +421,7 @@ enum TopicWiringVertex {
     PipelineNode {
         pipeline_group_id: PipelineGroupId,
         pipeline_id: PipelineId,
-        node_id: otap_df_config::NodeId,
+        node_id: NodeId,
     },
     Topic {
         declared_name: TopicName,
@@ -719,6 +732,12 @@ impl<
                     Err(_) => TopicReceiverMode::Unknown,
                 }
             }
+            "partition_dispatch" => {
+                let explicit = subscription
+                    .get("owned_partitions")
+                    .is_some_and(|value| !value.is_null());
+                TopicReceiverMode::PartitionDispatch { explicit }
+            }
             _ => TopicReceiverMode::Unknown,
         }
     }
@@ -782,6 +801,12 @@ impl<
                             }
                             TopicReceiverMode::Balanced(group) => {
                                 _ = summary.balanced_groups.insert(group);
+                            }
+                            TopicReceiverMode::PartitionDispatch { .. } => {
+                                // Partition-dispatch topics are selected by
+                                // num_partitions and bypass mode inference; the
+                                // receiver is recognized here so it is not counted
+                                // as an unknown mode.
                             }
                             TopicReceiverMode::Unknown => {
                                 summary.has_unknown_receiver_mode = true;
@@ -1251,6 +1276,167 @@ impl<
         }
     }
 
+    /// Compute and inject the initial partition-dispatch placement
+    /// (durable-dispatch I4).
+    ///
+    /// Every `topic` receiver that subscribes in `partition_dispatch` mode without
+    /// an explicit `owned_partitions` set is a placement owner. The controller
+    /// assigns those owners a balanced share of the topic's `[0, num_partitions)`
+    /// range via [`PartitionPlacement::balanced`], the same map the load-feedback
+    /// coordinator starts from, and writes each owner's share into its node config
+    /// before the spec is resolved and the receivers are built. Receivers that pin
+    /// an explicit set are left untouched, and a topic must not mix explicit and
+    /// auto partition-dispatch receivers.
+    fn assign_partition_dispatch_placement(config: &mut OtelDataflowSpec) -> Result<(), Error> {
+        let (global_names, group_names) = Self::build_declared_topic_name_maps(config)?;
+
+        // Declared topic name -> its configured num_partitions (None when the
+        // topic is not partition-dispatch).
+        let mut num_partitions_by_topic: HashMap<TopicName, Option<NonZeroUsize>> = HashMap::new();
+        for (topic_name, spec) in &config.topics {
+            if let Some(declared) = global_names.get(topic_name) {
+                _ = num_partitions_by_topic.insert(declared.clone(), spec.num_partitions);
+            }
+        }
+        for (group_id, group_cfg) in &config.groups {
+            for (topic_name, spec) in &group_cfg.topics {
+                if let Some(declared) = group_names.get(&(group_id.clone(), topic_name.clone())) {
+                    _ = num_partitions_by_topic.insert(declared.clone(), spec.num_partitions);
+                }
+            }
+        }
+
+        // Gather partition-dispatch receivers grouped by the topic they own.
+        let mut receivers_by_topic: HashMap<TopicName, Vec<PartitionDispatchReceiver>> =
+            HashMap::new();
+        for (group_id, group_cfg) in &config.groups {
+            for (pipeline_id, pipeline_cfg) in &group_cfg.pipelines {
+                for (node_id, node_cfg) in pipeline_cfg.node_iter() {
+                    if node_cfg.r#type.id() != "topic" || node_cfg.kind() != NodeKind::Receiver {
+                        continue;
+                    }
+                    let TopicReceiverMode::PartitionDispatch { explicit } =
+                        Self::parse_topic_receiver_mode(node_cfg)
+                    else {
+                        continue;
+                    };
+                    let Some(raw_topic) = Self::parse_topic_name_from_node_config(node_cfg) else {
+                        continue;
+                    };
+                    let Some(declared) = Self::resolve_declared_topic_name(
+                        group_id,
+                        &raw_topic,
+                        &global_names,
+                        &group_names,
+                    ) else {
+                        continue;
+                    };
+                    receivers_by_topic.entry(declared).or_default().push(
+                        PartitionDispatchReceiver {
+                            group_id: group_id.clone(),
+                            pipeline_id: pipeline_id.clone(),
+                            node_id: node_id.clone(),
+                            explicit,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Plan each topic's injections, validating its receivers together.
+        let mut injections: Vec<(PipelineGroupId, PipelineId, NodeId, Vec<u32>)> = Vec::new();
+        for (declared, mut receivers) in receivers_by_topic {
+            let has_explicit = receivers.iter().any(|receiver| receiver.explicit);
+            let has_auto = receivers.iter().any(|receiver| !receiver.explicit);
+            if has_explicit && has_auto {
+                return Err(Error::PipelineRuntimeError {
+                    source: Box::new(EngineError::InternalError {
+                        message: format!(
+                            "topic `{}` mixes explicit and auto partition_dispatch receivers; \
+                             set owned_partitions on all of them or none",
+                            declared.as_ref()
+                        ),
+                    }),
+                });
+            }
+            // Explicit owners keep their hand-specified sets.
+            if has_explicit {
+                continue;
+            }
+            let Some(num_partitions) = num_partitions_by_topic.get(&declared).copied().flatten()
+            else {
+                return Err(Error::PipelineRuntimeError {
+                    source: Box::new(EngineError::InternalError {
+                        message: format!(
+                            "partition_dispatch receiver(s) reference topic `{}`, which is not a \
+                             partition-dispatch topic; set the topic's num_partitions or pin \
+                             owned_partitions on the receiver",
+                            declared.as_ref()
+                        ),
+                    }),
+                });
+            };
+            // Deterministic owner order so the assignment is stable across runs.
+            receivers.sort_by(|left, right| {
+                left.group_id
+                    .as_ref()
+                    .cmp(right.group_id.as_ref())
+                    .then_with(|| left.pipeline_id.as_ref().cmp(right.pipeline_id.as_ref()))
+                    .then_with(|| left.node_id.as_ref().cmp(right.node_id.as_ref()))
+            });
+            let num_owners =
+                NonZeroUsize::new(receivers.len()).expect("receivers vec is non-empty");
+            let placement = PartitionPlacement::balanced(num_partitions, num_owners);
+            for (owner_idx, receiver) in receivers.iter().enumerate() {
+                let owned: Vec<u32> = placement
+                    .partitions_of(owner_idx)
+                    .into_iter()
+                    .map(|partition| partition as u32)
+                    .collect();
+                injections.push((
+                    receiver.group_id.clone(),
+                    receiver.pipeline_id.clone(),
+                    receiver.node_id.clone(),
+                    owned,
+                ));
+            }
+        }
+
+        // Apply the injections into the receiver node configs.
+        for (group_id, pipeline_id, node_id, owned) in injections {
+            let Some(node) = config
+                .groups
+                .get_mut(&group_id)
+                .and_then(|group| group.pipelines.get_mut(&pipeline_id))
+                .and_then(|pipeline| pipeline.node_mut(node_id.as_ref()))
+            else {
+                continue;
+            };
+            let node = Arc::make_mut(node);
+            let Some(subscription) = node
+                .config
+                .get_mut("subscription")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                return Err(Error::PipelineRuntimeError {
+                    source: Box::new(EngineError::InternalError {
+                        message: format!(
+                            "partition_dispatch receiver `{}` has no subscription object to hold \
+                             its computed owned_partitions",
+                            node_id.as_ref()
+                        ),
+                    }),
+                });
+            };
+            _ = subscription.insert(
+                "owned_partitions".to_owned(),
+                serde_json::Value::from(owned),
+            );
+        }
+
+        Ok(())
+    }
+
     fn parse_topic_name(raw: &str) -> Result<TopicName, Error> {
         TopicName::parse(raw).map_err(|e| Error::PipelineRuntimeError {
             source: Box::new(EngineError::InternalError {
@@ -1399,11 +1585,14 @@ impl<
 
     fn run_with_mode(
         &self,
-        engine_config: OtelDataflowSpec,
+        mut engine_config: OtelDataflowSpec,
         run_mode: RunMode,
         options: ControllerRunOptions,
     ) -> Result<(), Error> {
         let num_pipeline_groups = engine_config.groups.len();
+        // Compute and inject the initial partition-dispatch placement before the
+        // spec is resolved into pipelines (durable-dispatch I4).
+        Self::assign_partition_dispatch_placement(&mut engine_config)?;
         let resolved_config = engine_config.resolve();
         let (mut engine, pipelines, observability_pipeline) = resolved_config.into_parts();
         let num_pipelines = pipelines.len();
@@ -3380,8 +3569,242 @@ groups:
         assert_eq!(declared.broker.topic_names().len(), 1);
     }
 
+    fn topic_receiver_owned_partitions(
+        config: &OtelDataflowSpec,
+        group: &str,
+        pipeline: &str,
+        node: &str,
+    ) -> Option<Vec<u32>> {
+        let (_, node_cfg) = config
+            .groups
+            .get(group)?
+            .pipelines
+            .get(pipeline)?
+            .node_iter()
+            .find(|(id, _)| id.as_ref() == node)?;
+        let owned = node_cfg
+            .config
+            .get("subscription")?
+            .get("owned_partitions")?;
+        serde_json::from_value(owned.clone()).ok()
+    }
+
+    fn partition_dispatch_receiver(topic: &str, owned: Option<&[u32]>) -> String {
+        let owned_line = match owned {
+            Some(owned) => format!("\n                owned_partitions: {owned:?}"),
+            None => String::new(),
+        };
+        format!(
+            r#"            type: "urn:otel:receiver:topic"
+            config:
+              topic: {topic}
+              subscription:
+                mode: partition_dispatch{owned_line}"#
+        )
+    }
+
     #[test]
-    fn config_rejects_partition_dispatch_on_quiver_backend() {
+    fn assign_partition_dispatch_placement_balances_auto_receivers() {
+        let yaml = format!(
+            r#"
+version: otel_dataflow/v1
+topics:
+  shuffle:
+    backend: in_memory
+    num_partitions: 4
+groups:
+  g1:
+    pipelines:
+      p1:
+        nodes:
+          owner_a:
+{}
+          owner_b:
+{}
+          sink:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: owner_a
+            to: sink
+          - from: owner_b
+            to: sink
+"#,
+            partition_dispatch_receiver("shuffle", None),
+            partition_dispatch_receiver("shuffle", None),
+        );
+        let mut config = OtelDataflowSpec::from_yaml(&yaml).expect("test config should parse");
+        Controller::<()>::assign_partition_dispatch_placement(&mut config)
+            .expect("placement should assign");
+        assert_eq!(
+            topic_receiver_owned_partitions(&config, "g1", "p1", "owner_a"),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            topic_receiver_owned_partitions(&config, "g1", "p1", "owner_b"),
+            Some(vec![2, 3])
+        );
+    }
+
+    #[test]
+    fn assign_partition_dispatch_placement_balances_unevenly() {
+        let yaml = format!(
+            r#"
+version: otel_dataflow/v1
+topics:
+  shuffle:
+    backend: in_memory
+    num_partitions: 5
+groups:
+  g1:
+    pipelines:
+      p1:
+        nodes:
+          owner_a:
+{}
+          owner_b:
+{}
+          sink:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: owner_a
+            to: sink
+          - from: owner_b
+            to: sink
+"#,
+            partition_dispatch_receiver("shuffle", None),
+            partition_dispatch_receiver("shuffle", None),
+        );
+        let mut config = OtelDataflowSpec::from_yaml(&yaml).expect("test config should parse");
+        Controller::<()>::assign_partition_dispatch_placement(&mut config)
+            .expect("placement should assign");
+        assert_eq!(
+            topic_receiver_owned_partitions(&config, "g1", "p1", "owner_a"),
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(
+            topic_receiver_owned_partitions(&config, "g1", "p1", "owner_b"),
+            Some(vec![3, 4])
+        );
+    }
+
+    #[test]
+    fn assign_partition_dispatch_placement_leaves_explicit_untouched() {
+        let yaml = format!(
+            r#"
+version: otel_dataflow/v1
+topics:
+  shuffle:
+    backend: in_memory
+    num_partitions: 4
+groups:
+  g1:
+    pipelines:
+      p1:
+        nodes:
+          owner_a:
+{}
+          owner_b:
+{}
+          sink:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: owner_a
+            to: sink
+          - from: owner_b
+            to: sink
+"#,
+            partition_dispatch_receiver("shuffle", Some(&[3, 2])),
+            partition_dispatch_receiver("shuffle", Some(&[1, 0])),
+        );
+        let mut config = OtelDataflowSpec::from_yaml(&yaml).expect("test config should parse");
+        Controller::<()>::assign_partition_dispatch_placement(&mut config)
+            .expect("explicit placement is left as-is");
+        assert_eq!(
+            topic_receiver_owned_partitions(&config, "g1", "p1", "owner_a"),
+            Some(vec![3, 2])
+        );
+        assert_eq!(
+            topic_receiver_owned_partitions(&config, "g1", "p1", "owner_b"),
+            Some(vec![1, 0])
+        );
+    }
+
+    #[test]
+    fn assign_partition_dispatch_placement_rejects_mixed_explicit_and_auto() {
+        let yaml = format!(
+            r#"
+version: otel_dataflow/v1
+topics:
+  shuffle:
+    backend: in_memory
+    num_partitions: 4
+groups:
+  g1:
+    pipelines:
+      p1:
+        nodes:
+          owner_a:
+{}
+          owner_b:
+{}
+          sink:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: owner_a
+            to: sink
+          - from: owner_b
+            to: sink
+"#,
+            partition_dispatch_receiver("shuffle", Some(&[0, 1])),
+            partition_dispatch_receiver("shuffle", None),
+        );
+        let mut config = OtelDataflowSpec::from_yaml(&yaml).expect("test config should parse");
+        let err = Controller::<()>::assign_partition_dispatch_placement(&mut config)
+            .expect_err("mixing explicit and auto is rejected");
+        assert!(
+            format!("{err:?}").contains("mixes explicit and auto"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn assign_partition_dispatch_placement_rejects_auto_on_non_partition_topic() {
+        let yaml = format!(
+            r#"
+version: otel_dataflow/v1
+topics:
+  plain: {{}}
+groups:
+  g1:
+    pipelines:
+      p1:
+        nodes:
+          owner_a:
+{}
+          sink:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: owner_a
+            to: sink
+"#,
+            partition_dispatch_receiver("plain", None),
+        );
+        let mut config = OtelDataflowSpec::from_yaml(&yaml).expect("test config should parse");
+        let err = Controller::<()>::assign_partition_dispatch_placement(&mut config)
+            .expect_err("auto placement needs a partition-dispatch topic");
+        assert!(
+            format!("{err:?}").contains("not a partition-dispatch topic"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_quiver_partition_dispatch_without_data_dir() {
         let yaml = r#"
 version: otel_dataflow/v1
 topics:
@@ -3404,11 +3827,8 @@ groups:
             to: exporter
 "#;
         let err = OtelDataflowSpec::from_yaml(yaml)
-            .expect_err("partition-dispatch on quiver should be rejected");
-        assert!(
-            format!("{err:?}").contains("in_memory backend"),
-            "got {err:?}"
-        );
+            .expect_err("a quiver topic without durable settings should be rejected");
+        assert!(format!("{err:?}").contains("data_dir"), "got {err:?}");
     }
 
     #[test]

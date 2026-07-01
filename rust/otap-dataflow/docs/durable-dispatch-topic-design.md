@@ -46,9 +46,13 @@ bespoke parts.
 > drains-and-forwards the partition's residual to the new owner's store; and (3)
 > **reassignments survive restart**: the routing overlay (owners + generations)
 > is persisted as an atomically-rewritten snapshot and restored on `open()`.
-> **Open follow-up (Phase 3):** wiring the controller so it computes the initial
-> placement and drives reassignment from the load-feedback scheduler
-> (`apply_move`).
+> **Phase 3 progress (I4, half 1): initial placement in the controller is done.**
+> The controller now computes the static `balanced(N, M)` map for a
+> partition-dispatch topic and assigns each partition-dispatch receiver its owned
+> partitions, so a receiver's `owned_partitions` is optional and defaults to the
+> controller's placement. **Open follow-up (I4, half 2):** driving reassignment
+> from the load-feedback scheduler (`apply_move`) on a window cadence and
+> propagating each move to the affected receivers' live owned sets.
 
 ## Motivation
 
@@ -916,33 +920,38 @@ Added later as an additive backend swap (D28/D21):
 
 ### Next step for a fresh session: I4 -- controller/scheduler wiring
 
-Everything above (Layers A/C, Layer B, and Phase 3 I1-I3 plus placement
-persistence) is implemented and tested. The **single remaining Phase 3 piece** is
-wiring the controller and the load-feedback scheduler to *drive* reassignment;
-the topic-level mechanism it calls (`reassign_partition`) is done and durable.
+Layers A/C, Layer B, and Phase 3 I1-I3 plus placement persistence are implemented
+and tested, and **I4 half 1 (initial placement in the controller) is now done**.
+The remaining piece is I4 half 2: the load-feedback scheduler *driving*
+reassignment. The topic-level mechanism it calls (`reassign_partition`) is done
+and durable.
 
-Concretely, I4 has two halves:
+I4 has two halves:
 
-1. **Initial placement from the controller.** Today receiver replicas are
-   hand-specified with `owned_partitions` in config
-   (`TopicSubscriptionConfig::PartitionDispatch { owned_partitions }`, consumed
-   by `crates/core-nodes/src/receivers/topic_receiver/mod.rs`). Instead, the
-   controller should compute the initial `partition -> owner` placement (a static
-   `balanced(N, M)`) and assign each receiver replica its owned stores. For the
-   durable backend, reconcile this with the persisted `placement.v1` snapshot the
-   topic restores on `open()`, so the controller's view and the topic's restored
-   overlay agree after a restart (open question: does the controller read the
-   snapshot, or does the topic remain the source of truth and hand the controller
-   the restored owned-partition sets?).
-2. **Scheduler-driven moves.** `crates/engine/src/topic/load_feedback.rs` already
-   has `PartitionLoad`/`PartitionLoadTracker` (owner-side reporting),
-   `PlacementCoordinator` (merges reports, runs the load-aware placement),
-   and `PlacementScheduler::tick` (drains reports, rebalances, calls
+1. **Initial placement from the controller -- done.** Receiver replicas no
+   longer hand-specify `owned_partitions`; it is optional in
+   `TopicSubscriptionConfig::PartitionDispatch`. When omitted, the controller
+   enumerates a topic's partition-dispatch receivers, computes the static
+   `balanced(N, M)` map, and injects each receiver's owned set into its node
+   config before the spec is resolved, in
+   `Controller::assign_partition_dispatch_placement` called from `run_with_mode`.
+   An explicit set is honored as an override, and a topic must not mix explicit
+   and auto receivers. **Still open for the durable backend:** reconciling this
+   initial map with the persisted `placement.v1` snapshot the topic restores on
+   `open()`, so the controller's view and the topic's restored overlay agree
+   after a restart. Open question: does the controller read the snapshot, or does
+   the topic stay the source of truth and hand the controller the restored
+   owned-partition sets?
+2. **Scheduler-driven moves -- remaining.**
+   `crates/engine/src/topic/load_feedback.rs` already has
+   `PartitionLoad`/`PartitionLoadTracker` (owner-side reporting),
+   `PlacementCoordinator` (merges reports, runs the load-aware placement), and
+   `PlacementScheduler::tick` (drains reports, rebalances, calls
    `TopicHandle::apply_move`). `apply_move` -> `reassign_partition` already works
-   on both backends. What's missing is running a `PlacementScheduler` on a cadence
-   aligned to the aggregation-window boundary, fed by real owner load reports, and
-   propagating each `PartitionMove` to the affected receiver replicas so their
-   live owned-partition sets update.
+   on both backends. What's missing is running a `PlacementScheduler` on a
+   cadence aligned to the aggregation-window boundary, fed by real owner load
+   reports, and propagating each `PartitionMove` to the affected receiver
+   replicas so their live owned-partition sets update.
 
 **Key files/seams for I4:**
 
@@ -953,10 +962,12 @@ Concretely, I4 has two halves:
 - `crates/otap/src/quiver_topic.rs` -- `reassign_partition` (durable, persists +
   drain-and-forward) and `persist_placement` / `load_placement` (the placement
   snapshot); reconcile the controller's initial map with the restored overlay.
-- `crates/controller/` -- where initial placement is computed and receiver
-  replicas are assigned their stores, replacing the hand-specified
-  `TopicSubscriptionConfig::PartitionDispatch { owned_partitions }` in
-  `crates/core-nodes/src/receivers/topic_receiver/mod.rs`.
+- `crates/controller/` -- `assign_partition_dispatch_placement` computes the
+  initial placement and injects each receiver's owned set before the spec is
+  resolved (half 1, done); `owned_partitions` in the topic receiver
+  (`crates/core-nodes/src/receivers/topic_receiver/mod.rs`) is now optional.
+  Half 2's scheduler wiring and live owned-set propagation land here and in the
+  receiver.
 
 **Out of scope / separate:** the durable registry half of ingest-queue Phase 1,
 and the standalone-logs key (D26, decided but waits until logs are addressed).

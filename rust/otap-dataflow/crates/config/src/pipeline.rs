@@ -372,6 +372,11 @@ impl PipelineNodes {
         self.0.get(id)
     }
 
+    /// Returns a mutable reference to the node with the given ID, if it exists.
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut Arc<NodeUserConfig>> {
+        self.0.get_mut(id)
+    }
+
     /// Returns true if a node with the given ID exists.
     #[must_use]
     pub fn contains_key(&self, id: &str) -> bool {
@@ -638,6 +643,15 @@ impl PipelineConfig {
     /// Returns an iterator visiting all data-path nodes in the pipeline.
     pub fn node_iter(&self) -> impl Iterator<Item = (&NodeId, &Arc<NodeUserConfig>)> {
         self.nodes.iter()
+    }
+
+    /// Returns a mutable reference to the data-path node with the given ID.
+    ///
+    /// Used by the controller to inject computed configuration (for example the
+    /// partition-dispatch placement's `owned_partitions` set) into a receiver node
+    /// before the pipeline is resolved and its nodes are instantiated.
+    pub fn node_mut(&mut self, id: &str) -> Option<&mut Arc<NodeUserConfig>> {
+        self.nodes.get_mut(id)
     }
 
     /// Returns an iterator visiting all extension nodes in the pipeline.
