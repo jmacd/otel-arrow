@@ -399,6 +399,21 @@ impl Threshold {
         self.0 <= randomness.0
     }
 
+    /// The adjusted count implied by this threshold, `2^56 / (2^56 - th)`.
+    ///
+    /// This is the estimated number of spans each sampled span represents under
+    /// a consistent-probability decision. [`Threshold::ALWAYS`] yields `1.0`,
+    /// and [`Threshold::NEVER`] yields infinity because no span is sampled.
+    #[must_use]
+    pub fn adjusted_count(self) -> f64 {
+        let denom = MAX_ADJUSTED_COUNT.saturating_sub(self.0);
+        if denom == 0 {
+            f64::INFINITY
+        } else {
+            MAX_ADJUSTED_COUNT as f64 / denom as f64
+        }
+    }
+
     /// Format as the `th` encoding: up to 14 hexadecimal digits with trailing
     /// zeros trimmed, and a single `0` for [`Threshold::ALWAYS`].
     ///
@@ -449,7 +464,7 @@ impl std::fmt::Debug for OtelTraceState {
 ///
 /// This is the unit of propagation. It is `Copy`, fixed-size, and never boxed on
 /// the hot path.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct SpanContext {
     /// The trace identifier, shared by all spans in a trace.
     pub trace_id: TraceId,
@@ -459,6 +474,21 @@ pub struct SpanContext {
     pub flags: TraceFlags,
     /// The OpenTelemetry probability sampling sub-state.
     pub ot: OtelTraceState,
+    /// Whether this span was selected by the local span-start sampler.
+    ///
+    /// This is the signal the log path reads to route in-span logs onto the
+    /// span-log reservoir path. It is distinct from the W3C `sampled` flag,
+    /// which a parent may have set for other reasons, although in this engine
+    /// it mirrors the local sampling decision. It is not propagated on the
+    /// wire; an extracted context defaults it to `false`.
+    pub locally_sampled: bool,
+    /// The span-start callsite identity, the hash of the span name.
+    ///
+    /// It keys the span-start value table over every in-span log, the per-span
+    /// reservoir, and the SDK-wide span-start weight table, so it is present on
+    /// every in-span record whether or not the span was locally sampled. It is
+    /// process-local and is not propagated on the wire.
+    pub start_callsite: u64,
 }
 
 impl SpanContext {
@@ -525,6 +555,8 @@ impl std::fmt::Debug for SpanContext {
             .field("span_id", &self.span_id)
             .field("flags", &self.flags)
             .field("ot", &self.ot)
+            .field("locally_sampled", &self.locally_sampled)
+            .field("start_callsite", &format_args!("{:#018x}", self.start_callsite))
             .finish()
     }
 }

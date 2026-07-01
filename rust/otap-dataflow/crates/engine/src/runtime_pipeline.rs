@@ -266,6 +266,13 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
         let metric_level = telemetry_policy.runtime_metrics;
         let node_interests = Interests::from_metric_level(metric_level);
 
+        // Install this worker's thread-local internal-telemetry sample buffer
+        // for the lifetime of the pipeline runtime on this thread. The tracing
+        // layer routes internal logs emitted by this worker's tasks into it, and
+        // the runtime control-message manager flushes it on a periodic window.
+        // The guard removes the buffer when the runtime winds down.
+        let _local_telemetry_buffer = otap_df_telemetry::install_local_telemetry_buffer();
+
         // Single-threaded runtime so we can drive !Send node tasks on the core thread.
         let rt = Builder::new_current_thread()
             .enable_all()

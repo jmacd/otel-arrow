@@ -301,6 +301,21 @@ pub fn append_int_attribute<B: BoundedBuf>(buf: &mut B, key: &str, value: i64) -
     })
 }
 
+/// Append a double-valued attribute as a `LogRecord.attributes` entry.
+///
+/// Used to stamp records with the integrated sampler's adjusted-count
+/// attributes, whose exact-zero values are meaningful and so are always
+/// written.
+pub fn append_double_attribute<B: BoundedBuf>(buf: &mut B, key: &str, value: f64) -> EncodeResult {
+    buf.encode_len_delimited(LOG_RECORD_ATTRIBUTES, |buf| {
+        buf.encode_string(KEY_VALUE_KEY, key)?;
+        buf.encode_len_delimited(KEY_VALUE_VALUE, |buf| {
+            buf.encode_field_tag(ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64)?;
+            buf.extend_from_slice(&value.to_le_bytes())
+        })
+    })
+}
+
 /// Compute the per-attribute budget: at most half of remaining space, but
 /// at least 1 byte (to ensure a chance of a tag byte being written and
 /// triggering an atomic drop). Intentionally halves for every attribute,
@@ -1218,6 +1233,7 @@ mod tests {
             span_id: SpanId(0x0102_0304_0506_0708),
             flags: TraceFlags::new(true, true),
             ot: OtelTraceState::default(),
+            ..Default::default()
         };
         let record = __log_record_impl!(Level::INFO, "trace.test")
             .into_record(LogContext::new())

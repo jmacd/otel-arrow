@@ -658,7 +658,23 @@ impl<PData> ProcessorWrapper<PData> {
                             _ => {}
                         }
                     }
-                    processor.process(msg, &mut effect_handler).await?;
+                    // Scope the data's span context as ambient for the
+                    // duration of processing so node telemetry links to the
+                    // trace of the data being processed.
+                    let span_ctx = match &msg {
+                        Message::PData(data) => data.span_context(),
+                        _ => None,
+                    };
+                    match span_ctx {
+                        Some(span_ctx) => {
+                            otap_df_telemetry::scope_span_context(
+                                span_ctx,
+                                processor.process(msg, &mut effect_handler),
+                            )
+                            .await?;
+                        }
+                        None => processor.process(msg, &mut effect_handler).await?,
+                    }
                 }
                 // Collect final metrics before exiting
                 if effect_handler.is_flow_start()
@@ -717,7 +733,23 @@ impl<PData> ProcessorWrapper<PData> {
                             _ => {}
                         }
                     }
-                    processor.process(msg, &mut effect_handler).await?;
+                    // Scope the data's span context as ambient for the
+                    // duration of processing so node telemetry links to the
+                    // trace of the data being processed.
+                    let span_ctx = match &msg {
+                        Message::PData(data) => data.span_context(),
+                        _ => None,
+                    };
+                    match span_ctx {
+                        Some(span_ctx) => {
+                            otap_df_telemetry::scope_span_context(
+                                span_ctx,
+                                processor.process(msg, &mut effect_handler),
+                            )
+                            .await?;
+                        }
+                        None => processor.process(msg, &mut effect_handler).await?,
+                    }
                 }
                 // Collect final metrics before exiting
                 if effect_handler.is_flow_start()

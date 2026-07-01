@@ -140,7 +140,16 @@ pub use self_tracing::LogContext;
 pub use self_tracing::propagation::{Injector, inject};
 pub use self_tracing::sampler::{ComposableSampler, Sampler, SpanKind};
 pub use self_tracing::{SpanContext, SpanId, TraceFlags, TraceId};
-pub use tracing_init::current_span_context;
+pub use self_tracing::local_buffer::{
+    LocalBufferGuard, flush_to as flush_local_telemetry_buffer,
+    install as install_local_telemetry_buffer,
+};
+pub use self_tracing::aggregation::{
+    AggregatorGuard as SampleAggregatorGuard, dropped_flushes as sample_aggregator_dropped_flushes,
+    start as start_sample_aggregator,
+};
+pub use self_tracing::sampling::ProcessorConfig as SampleAggregatorConfig;
+pub use tracing_init::{ambient_span_context, current_span_context, scope_span_context};
 
 /// The URN for the internal telemetry receiver.
 /// Defined here so it can be used by controller, engine, otap, and other crates.

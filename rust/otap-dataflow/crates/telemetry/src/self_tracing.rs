@@ -7,10 +7,13 @@
 //! primitive fields and static references. The remaining data are
 //! placed in a partial OTLP encoding.
 
+pub mod aggregation;
 pub mod encoder;
 pub mod formatter;
+pub mod local_buffer;
 pub mod propagation;
 pub mod sampler;
+pub mod sampling;
 pub mod span;
 
 use crate::registry::EntityKey;

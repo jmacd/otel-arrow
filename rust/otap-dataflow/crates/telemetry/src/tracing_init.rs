@@ -12,6 +12,7 @@ use crate::self_tracing::encoder::{
     DirectFieldVisitor, append_int_attribute, append_string_attribute,
 };
 use crate::self_tracing::sampler::{self, ComposableSampler, Sampler, SpanKind};
+use crate::self_tracing::sampling::callsite::callsite_identity;
 use crate::self_tracing::span::{SpanContext, SpanId, TraceId};
 use crate::self_tracing::{
     ATTR_SPAN_DURATION_NANO, ATTR_SPAN_PARENT_SPAN_ID, ATTR_SPAN_PHASE, ConsoleWriter,
@@ -221,14 +222,50 @@ thread_local! {
         RefCell::new(SmallVec::new());
 }
 
-/// Returns the trace context of the span currently entered on this thread, if
-/// any.
+tokio::task_local! {
+    /// Ambient data-plane span context for the current task.
+    ///
+    /// Swapped in around a node's processing of one data item so that logs and
+    /// child spans emitted during processing link to the data's trace, even
+    /// across `await` points and thread migration. This is a `tokio` task-local,
+    /// not a thread-local, precisely because node processing is asynchronous: a
+    /// thread-local set around an `.await` would leak to other tasks and would
+    /// not follow a work-stolen future. It is distinct from the synchronous
+    /// [`CURRENT_SPAN_CONTEXT`] stack of entered tracing spans, which the tracing
+    /// machinery maintains per poll.
+    static AMBIENT_SPAN_CONTEXT: SpanContext;
+}
+
+/// Run `fut` with `ctx` installed as the ambient data-plane span context.
+///
+/// The engine wraps a node's per-message processing in this scope so that the
+/// node's emitted logs and child spans inherit the data's trace. Receivers,
+/// which originate spans, may use it directly while building outbound data.
+pub fn scope_span_context<F>(ctx: SpanContext, fut: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    AMBIENT_SPAN_CONTEXT.scope(ctx, fut)
+}
+
+/// The ambient data-plane span context for the current task, if one is in
+/// scope. Returns `None` outside any [`scope_span_context`] and outside a
+/// `tokio` task.
+#[must_use]
+pub fn ambient_span_context() -> Option<SpanContext> {
+    AMBIENT_SPAN_CONTEXT.try_with(|ctx| *ctx).ok()
+}
+
+/// Returns the trace context of the span currently entered on this thread, or
+/// the ambient data-plane span context when no tracing span is entered.
 ///
 /// This is the value to pass to [`crate::self_tracing::propagation::inject`]
 /// when propagating context to an outgoing carrier.
 #[must_use]
 pub fn current_span_context() -> Option<SpanContext> {
-    CURRENT_SPAN_CONTEXT.with(|stack| stack.borrow().last().copied())
+    CURRENT_SPAN_CONTEXT
+        .with(|stack| stack.borrow().last().copied())
+        .or_else(ambient_span_context)
 }
 
 /// Build a span START log record from the span attributes and trace context.
@@ -331,8 +368,14 @@ impl StructuredLoggingLayer {
                 w.format_entity_suffix_without_registry(&record.context);
             });
         }
-        if let Some(reporter) = &self.reporter {
-            reporter.log(LogEvent { time, record });
+        let Some(reporter) = &self.reporter else {
+            return;
+        };
+        // Route through the per-worker sample buffer when one is installed,
+        // otherwise forward the record directly to the reporter.
+        match crate::self_tracing::local_buffer::route(time, record) {
+            None => {}
+            Some((time, record)) => reporter.log(LogEvent { time, record }),
         }
     }
 }
@@ -352,14 +395,22 @@ where
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let metadata = attrs.metadata();
 
-        // Resolve the parent trace context from the tokio span parent chain.
+        // Resolve the parent trace context from the tokio span parent chain,
+        // falling back to the ambient data-plane span context so a node's root
+        // span links to the trace of the data it is processing.
         let parent = ctx
             .span(id)
             .and_then(|span| span.parent())
-            .and_then(|parent| parent.extensions().get::<SpanState>().map(|st| st.context));
+            .and_then(|parent| parent.extensions().get::<SpanState>().map(|st| st.context))
+            .or_else(ambient_span_context);
 
         let trace_id = parent.map_or_else(TraceId::generate, |p| p.trace_id);
         let span_id = SpanId::generate();
+
+        // The span-start callsite identity comes from the Tokio tracing
+        // callsite, the canonical per-site identity, rather than re-hashing the
+        // span name. It is process-local and is never serialized.
+        let start_callsite = callsite_identity(&metadata.callsite());
 
         let decision = sampler::evaluate(
             self.sampler.as_ref(),
@@ -367,6 +418,7 @@ where
             trace_id,
             span_id,
             metadata.name(),
+            start_callsite,
             SpanKind::Internal,
         );
 
@@ -430,9 +482,13 @@ where
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let time = SystemTime::now();
         let context = (self.context_fn)();
+        // Stamp the event with the enclosing tracing span's context, falling
+        // back to the ambient data-plane span context so a plain log emitted
+        // while processing a data item still links to that data's trace.
         let trace = ctx
             .event_span(event)
-            .and_then(|span| span.extensions().get::<SpanState>().map(|st| st.context));
+            .and_then(|span| span.extensions().get::<SpanState>().map(|st| st.context))
+            .or_else(ambient_span_context);
         let record = LogRecord::new(event, context).with_trace(trace);
         self.emit(time, record);
     }
@@ -684,6 +740,63 @@ mod tests {
             let event = receiver.try_recv().expect("should receive warn");
             assert!(matches!(event, ObservedEvent::Log(_)));
             assert!(receiver.try_recv().is_err(), "should only have one event");
+        });
+    }
+
+    #[test]
+    fn ambient_span_context_scope_sets_and_clears() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let ctx = SpanContext {
+            trace_id: TraceId(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+            span_id: SpanId(0x42),
+            ..Default::default()
+        };
+        rt.block_on(async {
+            assert_eq!(ambient_span_context(), None);
+            scope_span_context(ctx, async {
+                assert_eq!(ambient_span_context(), Some(ctx));
+                // The task-local survives an await point, unlike a thread-local
+                // around the same await.
+                tokio::task::yield_now().await;
+                assert_eq!(ambient_span_context(), Some(ctx));
+            })
+            .await;
+            assert_eq!(ambient_span_context(), None);
+        });
+    }
+
+    #[test]
+    fn ambient_span_context_stamps_in_scope_logs() {
+        crate::with_cleared_rust_log(|| {
+            let (reporter, receiver) = test_reporter();
+            let setup = test_setup(internal_async_provider(reporter), level("info"));
+            let ctx = SpanContext {
+                trace_id: TraceId(0x0fed_cba9_8765_4321_0fed_cba9_8765_4321),
+                span_id: SpanId(0x7),
+                ..Default::default()
+            };
+            setup.with_subscriber_ignoring_env(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("runtime");
+                // A plain log emitted while the ambient span context is in scope
+                // is stamped with that context, even though no tracing span was
+                // entered.
+                rt.block_on(scope_span_context(ctx, async {
+                    otel_info!("in_scope");
+                }));
+            });
+            drop(setup);
+
+            let event = receiver.try_recv().expect("should receive the in-scope log");
+            match event {
+                ObservedEvent::Log(log) => {
+                    assert_eq!(log.record.trace, Some(ctx));
+                }
+                other => panic!("expected a log event, got {other:?}"),
+            }
         });
     }
 

@@ -2,10 +2,28 @@
 
 ## Status
 
-Design proposal. No implementation yet. This document specifies an integrated
-sampler for the OTAP-Dataflow internal telemetry system that samples logs and
-traces together under fixed budgets, and emits standard OpenTelemetry logs that
-carry their own sampling weights.
+Partially implemented. This document specifies an integrated sampler for the
+OTAP-Dataflow internal telemetry system that samples logs and traces together
+under fixed budgets, and emits standard OpenTelemetry logs that carry their own
+sampling weights.
+
+The sampling library and its statistical core are implemented in the
+`otap-df-telemetry` crate under
+[`self_tracing::sampling`](../crates/telemetry/src/self_tracing/sampling/README.md):
+the Bottom-Floor weighted bottom-k sampler, the span-start sampler with its
+`ArcSwap` threshold table and target-rate feedback, the windowed integrated
+processor with the three estimators and exact-zero adjusted-count output, and
+the `SpanContext` extensions.
+
+The engine mechanism that drives this library from real telemetry is specified
+and partly built; see
+[`integrated-sampler-engine-mechanism.md`](integrated-sampler-engine-mechanism.md).
+The data-plane span-context propagation and the per-worker thread-local sample
+buffer are implemented, the latter in a local-only mode where each worker
+produces a self-contained sample. Remaining: the all-CPU aggregator that
+combines the per-worker samples and republishes the feedback tables, then the
+cross-process two-level log feedback and the optional SDK-wide span-log second
+stage.
 
 ## Audience and scope
 
@@ -480,6 +498,12 @@ design continue to hold; the new table only changes how root and unparented
 span thresholds are chosen.
 
 ### Value-weighted coverage from the global log sample
+
+A dedicated companion document,
+[`span-start-value-sampling.md`](span-start-value-sampling.md), specifies this
+algorithm self-contained and frames its divergence-reduction objective as a
+research question for empirical study. This section summarizes it in the context
+of the integrated sampler.
 
 Equal coverage across span-start callsites spends the span budget without regard
 to what a span reveals. At a low span-sample rate the per-span reservoir alone
@@ -1042,11 +1066,16 @@ It extends that work in the following ways:
 These points are settled enough to build a first version but are flagged for
 review.
 
-- Span-start callsite identity. The recommendation is a 64-bit FNV-1a hash of
-  the span name, the `event.name` of the span, mirroring the log callsite
-  identity used by the two-level log sampler. This keeps the key stable and
-  fleet-wide comparable as long as span names are consistent. An alternative is
-  to hash `file:line`, which is more specific but less stable across builds.
+- Span-start callsite identity. The implementation derives the key from the
+  Tokio `tracing` callsite `Identifier`, the canonical per-site identity the
+  tracing system already assigns, folded into a 64-bit value through its stable
+  hash. This is more specific than the span name, because it distinguishes two
+  same-named spans created at different sites, and needs no string hashing on
+  the hot path. Because the key is process-local and is never serialized, its
+  pointer-based, per-run nature is not a limitation. A name-based FNV-1a hash
+  (`span_start_identity`) is retained for any future cross-process or persisted
+  use, where name-based identity is the comparable one, mirroring the
+  metric-identity philosophy; an alternative is to hash `file:line`.
 - Span-start threshold feedback transport. The recommendation is a
   process-local `ArcSwap` registry keyed by channel name, the same pattern the
   two-level log table already uses for co-located nodes. No OTLP wire codec is

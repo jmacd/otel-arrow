@@ -60,6 +60,9 @@ pub struct SamplingParameters<'a> {
     pub randomness: Randomness,
     /// The span name.
     pub name: &'a str,
+    /// The span-start callsite identity, the hash of the span name. A
+    /// span-start sampler keys its threshold table on this value.
+    pub start_callsite: u64,
     /// The span kind.
     pub kind: SpanKind,
 }
@@ -175,6 +178,14 @@ pub struct SamplingDecision {
 /// The driver derives randomness, reconciles the parent threshold against the
 /// parent sampled flag, invokes the pluggable `sampler`, decides sampled when
 /// `threshold <= randomness`, and assembles the child [`SpanContext`].
+///
+/// `start_callsite` is the span-start callsite identity. It keys the span-start
+/// sampler's threshold table and rides on every in-span record through the
+/// child context. The caller chooses how to derive it, for example from the
+/// span name with
+/// [`span_start_identity`](super::sampling::callsite::span_start_identity) or
+/// from the Tokio `tracing` callsite with
+/// [`callsite_identity`](super::sampling::callsite::callsite_identity).
 #[must_use]
 pub fn evaluate(
     sampler: &dyn Sampler,
@@ -182,6 +193,7 @@ pub fn evaluate(
     trace_id: TraceId,
     span_id: SpanId,
     name: &str,
+    start_callsite: u64,
     kind: SpanKind,
 ) -> SamplingDecision {
     // Randomness is a trace-level property: inherit an explicit rv, otherwise
@@ -211,6 +223,7 @@ pub fn evaluate(
         trace_id,
         randomness,
         name,
+        start_callsite,
         kind,
     };
     let intent = sampler.sampling_intent(&params);
@@ -237,6 +250,11 @@ pub fn evaluate(
         span_id,
         flags,
         ot: OtelTraceState { rv, th: child_th },
+        // The local sampling decision routes in-span logs onto the span-log
+        // path. A child of a locally-sampled parent is itself in-span, so it
+        // inherits the bit when the sampler keeps it by inheritance.
+        locally_sampled: sampled,
+        start_callsite,
     };
     SamplingDecision { sampled, context }
 }
@@ -252,6 +270,7 @@ mod tests {
             TraceId(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
             SpanId(0x1),
             "root",
+            super::super::sampling::callsite::span_start_identity("root"),
             SpanKind::Internal,
         )
     }
@@ -283,6 +302,7 @@ mod tests {
             TraceId(u128::MAX),
             SpanId(1),
             "s",
+            0,
             SpanKind::Internal,
         );
         assert!(d.sampled);
@@ -295,6 +315,7 @@ mod tests {
             TraceId(0),
             SpanId(1),
             "s",
+            0,
             SpanKind::Internal,
         );
         assert!(!d.sampled);
@@ -312,6 +333,7 @@ mod tests {
             parent.trace_id,
             SpanId(2),
             "child",
+            0,
             SpanKind::Internal,
         );
         assert!(d.sampled);

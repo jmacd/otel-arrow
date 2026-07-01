@@ -28,6 +28,7 @@ use otap_df_engine::{
     ProducerEffectHandlerExtension,
 };
 use otap_df_pdata::OtapPayload;
+use otap_df_telemetry::self_tracing::SpanContext;
 
 use crate::transport_headers::TransportHeaders;
 
@@ -63,6 +64,14 @@ pub struct Context {
     /// 1ns sentinel is acceptable drift. At most one flow_metric can be
     /// active at a time (non-overlapping ranges).
     flow_compute_ns: Option<NonZeroU64>,
+    /// Data-plane span context, the trace this data belongs to.
+    ///
+    /// Set by the receiver (or a processor that opens a span) and preserved
+    /// across nodes and transport boundaries, like the transport headers. The
+    /// engine scopes it as the ambient span context while a processor or
+    /// exporter handles the data, so node telemetry links to the data's trace.
+    /// `None` for data produced outside any span.
+    span_context: Option<SpanContext>,
 }
 
 impl Context {
@@ -75,6 +84,7 @@ impl Context {
             transport_headers: None,
             peer_addr: None,
             flow_compute_ns: None,
+            span_context: None,
         }
     }
 
@@ -321,6 +331,17 @@ impl Context {
         self.transport_headers = Some(headers);
     }
 
+    /// Returns the data-plane span context this data belongs to, if any.
+    #[must_use]
+    pub fn span_context(&self) -> Option<SpanContext> {
+        self.span_context
+    }
+
+    /// Set the data-plane span context for this data.
+    pub fn set_span_context(&mut self, span_context: Option<SpanContext>) {
+        self.span_context = span_context;
+    }
+
     /// Returns the peer address observed by the receiving socket, if any.
     #[must_use]
     pub fn peer_addr(&self) -> Option<SocketAddr> {
@@ -526,6 +547,26 @@ impl OtapPdata {
         Self { context, payload }
     }
 
+    /// Returns the data-plane span context this data belongs to, if any.
+    #[must_use]
+    pub fn span_context(&self) -> Option<SpanContext> {
+        self.context.span_context()
+    }
+
+    /// Set the data-plane span context for this data.
+    pub fn set_span_context(&mut self, span_context: Option<SpanContext>) {
+        self.context.set_span_context(span_context);
+    }
+
+    /// Builder form that sets the data-plane span context. Receivers that open
+    /// a span for an inbound unit of work stamp the outbound data with it so
+    /// downstream processors and exporters inherit the trace.
+    #[must_use]
+    pub fn with_span_context(mut self, span_context: SpanContext) -> Self {
+        self.context.set_span_context(Some(span_context));
+        self
+    }
+
     /// Returns the type of signal represented by this `OtapPdata` instance.
     #[must_use]
     pub fn signal_type(&self) -> SignalType {
@@ -583,6 +624,7 @@ impl OtapPdata {
                 transport_headers: self.context.transport_headers.clone(),
                 peer_addr: self.context.peer_addr,
                 flow_compute_ns: None,
+                span_context: self.context.span_context,
             },
             payload: self.payload.clone(),
         }
@@ -964,6 +1006,10 @@ impl_message_source_ext!(
 impl otap_df_engine::ReceivedAtNode for OtapPdata {
     fn received_at_node(&mut self, node_id: usize, node_interests: Interests) {
         self.context.push_entry_frame(node_id, node_interests);
+    }
+
+    fn span_context(&self) -> Option<SpanContext> {
+        self.context.span_context()
     }
 }
 

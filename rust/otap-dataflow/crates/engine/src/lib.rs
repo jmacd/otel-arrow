@@ -389,6 +389,17 @@ impl Unwindable for String {
 pub trait ReceivedAtNode {
     /// Called automatically when a PData message is received from the input channel.
     fn received_at_node(&mut self, node_id: usize, node_interests: Interests);
+
+    /// The data-plane span context carried by this message, if any.
+    ///
+    /// The engine reads this when a `PData` message reaches a processor or
+    /// exporter and scopes it as the ambient span context for the duration of
+    /// the node's handling, so the node's logs and child spans link to the
+    /// trace of the data it is processing. The default returns `None`; real
+    /// PData types that carry a context override it.
+    fn span_context(&self) -> Option<otap_df_telemetry::self_tracing::SpanContext> {
+        None
+    }
 }
 
 // No-op implementations for types used as PData in tests.

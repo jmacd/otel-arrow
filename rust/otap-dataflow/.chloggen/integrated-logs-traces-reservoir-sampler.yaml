@@ -1,0 +1,39 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: enhancement
+
+# The name of the component, or a single word describing the area of concern, (e.g. engine, otap).
+# Must be one of the components listed in rust/otap-dataflow/.chloggen/config.yaml.
+component: observability
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: >-
+  Add the integrated logs-and-traces reservoir sampler for internal telemetry to
+  the `otap-df-telemetry` crate (`self_tracing::sampling`). It samples logs and
+  spans together under fixed budgets and emits standard OpenTelemetry logs that
+  carry their own sampling weights as three independent adjusted-count
+  attributes with exact-zero semantics. The pieces are the Bottom-Floor weighted
+  bottom-k sampler with Horvitz-Thompson correction and the rarest-seen floor, a
+  span-start sampler driven by a wait-free `ArcSwap` threshold table with
+  target-rate feedback, a windowed integrated processor that maintains the
+  criterion-one global log sample, the criterion-two per-span reservoirs, and
+  the span-start surprisal value table, and an all-CPU windowed aggregator that
+  combines the per-worker sample buffers into one process-global sample over a
+  channel to a single finalizer and republishes the span-start and heavy-hitter
+  feedback tables through their `ArcSwap`s.
+
+# Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
+issues: [2405]
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries.
+subtext: >-
+  This version provides the sampling library, its statistical core, and the
+  intra-process two-level engine mechanism, validated per-crate. The all-CPU
+  aggregator is activated through its lifecycle guard by the observability
+  pipeline configuration; the worker heavy-hitter binding gate, the live tracer
+  span-start sampler, and the cross-process two-level log feedback are follow-ups.
+  See docs/integrated-logs-traces-reservoir.md and
+  docs/integrated-sampler-engine-mechanism.md for the design.

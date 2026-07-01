@@ -60,6 +60,7 @@ mod tests {
             span_id: SpanId::from_bytes([0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]),
             flags: TraceFlags::new(true, true),
             ot: OtelTraceState { rv, th },
+            ..Default::default()
         }
     }
 

@@ -357,6 +357,11 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
         let mut consecutive_runtime_ctrl = 0usize;
         let mut retry_delay: Option<clock::Sleep> = None;
         let mut metrics_flush_delay: Option<clock::Sleep> = None;
+        // Always-armed periodic flush of this worker's thread-local internal
+        // telemetry sample buffer. A no-op when no buffer is installed on this
+        // thread.
+        let mut local_telemetry_flush_delay: Option<clock::Sleep> =
+            Some(clock::sleep(self.control_plane_metrics_flush_interval));
         let mut shutdown_deadline_forced = false;
         let mut memory_pressure_updates_open = true;
 
@@ -692,6 +697,20 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
                     metrics_flush_delay = None;
                     self.report_runtime_control_metrics();
                 }
+
+                _ = async {
+                    if let Some(delay) = local_telemetry_flush_delay.as_mut() {
+                        delay.await;
+                    }
+                }, if local_telemetry_flush_delay.is_some() => {
+                    // Re-arm for the next window and flush this worker's
+                    // thread-local internal-telemetry sample buffer to the
+                    // reporter. The worker's nodes and this controller share the
+                    // OS thread, so the buffer they fill is the one flushed here.
+                    local_telemetry_flush_delay =
+                        Some(clock::sleep(self.control_plane_metrics_flush_interval));
+                    otap_df_telemetry::flush_local_telemetry_buffer(&self.event_reporter);
+                }
             }
         }
 
@@ -703,6 +722,9 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
         // backlog transitions are not lost if the loop terminates before the
         // next periodic interval elapses.
         self.report_runtime_control_metrics();
+        // Drain any records still held in this worker's internal-telemetry
+        // sample buffer before the thread winds down.
+        otap_df_telemetry::flush_local_telemetry_buffer(&self.event_reporter);
 
         if self.telemetry.runtime_metrics >= MetricLevel::Normal {
             let _ = self.report_node_metrics();
