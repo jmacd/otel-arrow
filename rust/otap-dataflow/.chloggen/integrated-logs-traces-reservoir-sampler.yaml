@@ -24,7 +24,10 @@ note: >-
   feedback tables through their `ArcSwap`s. The aggregator is built into the
   Internal Telemetry Receiver, which owns it behind an `integrated_sampling`
   config flag, ingests the worker flushes, and emits the aggregated sample as
-  OTLP on each telemetry-collection tick.
+  OTLP on each telemetry-collection tick. Both feedback loops are closed over a
+  process-global registry: the tracer's default sampler reads the span-start
+  table, and each worker's criterion one applies the heavy-hitter binding gate,
+  both fail-safe no-ops until the aggregator publishes.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 issues: [2405]
@@ -33,10 +36,12 @@ issues: [2405]
 # These lines will be padded with 2 spaces and then inserted directly into the document.
 # Use pipe (|) for multiline entries.
 subtext: >-
-  This version provides the sampling library, its statistical core, and the
-  intra-process two-level engine mechanism, validated per-crate. The all-CPU
-  aggregator is built into the Internal Telemetry Receiver and enabled by its
-  `integrated_sampling` config; the worker heavy-hitter binding gate, the live
-  tracer span-start sampler, and the cross-process two-level log feedback are
-  follow-ups. See docs/integrated-logs-traces-reservoir.md and
+  This version provides the sampling library, its statistical core, the
+  intra-process two-level engine mechanism, and both closed feedback loops
+  (the tracer span-start sampler and the worker heavy-hitter binding gate over a
+  process-global registry), validated per-crate. The all-CPU aggregator is built
+  into the Internal Telemetry Receiver and enabled by its `integrated_sampling`
+  config. Smoothing the global counts across windows and the cross-process
+  two-level log feedback are follow-ups. See
+  docs/integrated-logs-traces-reservoir.md and
   docs/integrated-sampler-engine-mechanism.md for the design.

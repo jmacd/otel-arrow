@@ -37,7 +37,7 @@ use crate::event::LogEvent;
 use crate::self_tracing::local_buffer::BufferedRecord;
 use crate::self_tracing::sampling::{
     BufferFlush, ProcessorConfig, RawInput, RepInput, WindowAggregator, WorkerFlush,
-    annotate_log_record, log_callsite_identity, shared_always, shared_local_only,
+    annotate_log_record, heavy_hitter_table, log_callsite_identity, span_start_table,
 };
 
 /// The seed for the process-global aggregator. Fixed so a run is reproducible;
@@ -89,8 +89,12 @@ impl IntegratedSampleAggregator {
             let mut slot = AGGREGATOR.lock().expect("aggregator lock poisoned");
             *slot = Some(sender);
         }
-        let aggregator =
-            WindowAggregator::new(config, shared_always(), shared_local_only(), AGGREGATOR_SEED);
+        let aggregator = WindowAggregator::new(
+            config,
+            span_start_table(),
+            heavy_hitter_table(),
+            AGGREGATOR_SEED,
+        );
         Self {
             flush_rx,
             aggregator,
@@ -238,7 +242,7 @@ mod tests {
     use super::*;
     use crate::__log_record_impl;
     use crate::self_tracing::LogContext;
-    use crate::self_tracing::sampling::SampledRecord;
+    use crate::self_tracing::sampling::{SampledRecord, shared_always, shared_local_only};
     use std::time::SystemTime;
     use tracing::Level;
 

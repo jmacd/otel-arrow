@@ -11,7 +11,8 @@ use crate::event::{LogEvent, ObservedEventReporter};
 use crate::self_tracing::encoder::{
     DirectFieldVisitor, append_int_attribute, append_string_attribute,
 };
-use crate::self_tracing::sampler::{self, ComposableSampler, Sampler, SpanKind};
+use crate::self_tracing::sampler::{self, Sampler, SpanKind};
+use crate::self_tracing::sampling::SpanStartSampler;
 use crate::self_tracing::sampling::callsite::callsite_identity;
 use crate::self_tracing::span::{SpanContext, SpanId, TraceId};
 use crate::self_tracing::{
@@ -380,12 +381,17 @@ impl StructuredLoggingLayer {
     }
 }
 
-/// The default sampler: a root sampler that always records, with children
-/// honoring the propagated threshold.
+/// The default sampler: the span-start sampler reading the process-global
+/// feedback registry.
+///
+/// With the registry's fail-safe table it samples every root span, exactly like
+/// `ParentThreshold(AlwaysOn)` did; once the all-CPU aggregator publishes a
+/// span-start threshold table it selects root spans toward the target rate.
+/// Children inherit the reconciled parent threshold either way.
 fn default_sampler() -> Arc<dyn Sampler> {
-    Arc::new(ComposableSampler::ParentThreshold(Box::new(
-        ComposableSampler::AlwaysOn,
-    )))
+    Arc::new(SpanStartSampler::new(
+        crate::self_tracing::sampling::span_start_table(),
+    ))
 }
 
 impl<S> TracingLayer<S> for StructuredLoggingLayer
@@ -499,6 +505,7 @@ mod tests {
     use super::*;
     use crate::event::ObservedEvent;
     use crate::self_tracing::LogContext;
+    use crate::self_tracing::sampler::ComposableSampler;
     use crate::{otel_debug, otel_error, otel_info, otel_warn};
     use otap_df_config::observed_state::SendPolicy;
 

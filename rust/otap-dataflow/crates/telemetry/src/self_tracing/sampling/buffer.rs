@@ -30,12 +30,15 @@
 //! overflow. Each record is therefore flushed exactly once, and a span-selected
 //! record that the reservoir kept serves both populations.
 //!
-//! This buffer covers the emit/sample mechanism. The criterion-one weights come
-//! from the reservoir's own inverse-frequency feedback for now; the global
-//! heavy-hitter binding gate is a later refinement, consistent with this phase's
-//! focus on mechanism rather than probability tuning.
+//! This buffer covers the emit/sample mechanism. Criterion one applies the
+//! stage-two heavy-hitter binding gate when constructed with
+//! [`new_gated`](LocalSampleBuffer::new_gated), reading the process-global
+//! heavy-hitter table so a globally abundant callsite is throttled here in
+//! proportion to the fleet-wide congestion; the local-only fail-safe table never
+//! binds, leaving plain inverse-frequency local sampling.
 
 use super::bottom_floor::BottomFloor;
+use super::heavy_hitter::SharedHeavyHitterTable;
 
 /// A record together with whether it belongs to a locally-sampled span.
 struct Held<R> {
@@ -80,6 +83,18 @@ impl<R> LocalSampleBuffer<R> {
     pub fn new(budget: usize, seed: u64) -> Self {
         Self {
             reservoir: BottomFloor::new(budget, seed),
+            overflow: Vec::new(),
+        }
+    }
+
+    /// Create a buffer whose criterion one applies the stage-two heavy-hitter
+    /// binding gate from `gate`, so a globally abundant callsite is throttled at
+    /// this worker in proportion to the fleet-wide congestion. The local-only
+    /// fail-safe table never binds, leaving plain local sampling.
+    #[must_use]
+    pub fn new_gated(budget: usize, seed: u64, gate: SharedHeavyHitterTable) -> Self {
+        Self {
+            reservoir: BottomFloor::new_gated(budget, seed, gate),
             overflow: Vec::new(),
         }
     }

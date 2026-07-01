@@ -55,6 +55,13 @@ re-derive the sampling probabilities or define a configuration surface.
   are resolved below: the in-memory worker-to-aggregator transfer, the
   receiver-owned single-threaded aggregator, the `CollectTelemetry` window, and
   the back-pressure policy.
+- **Feedback loops closed.** Both tables travel over a process-global registry
+  (`sampling/registry.rs`): the tracer's default sampler is the
+  `SpanStartSampler` reading the span-start table, and each worker's criterion
+  one applies the heavy-hitter binding gate (`BottomFloor::new_gated`) reading
+  the heavy-hitter table. Both read the registry's fail-safe tables until the
+  aggregator publishes, so they are exact no-ops when Subsystem 3 is off and need
+  no per-worker configuration.
 
 ## Purpose and scope
 
@@ -379,8 +386,11 @@ Resolved for Subsystem 3:
    aggregator and the two `ArcSwap` feedback tables turn the per-worker flushes
    into the annotated OTLP stream, over a channel to the receiver-owned handle,
    enabled by the receiver's `integrated_sampling` config with the local-only
-   path as the fallback. Follow-ups: the worker heavy-hitter binding gate, the
-   live tracer span-start sampler, and the cross-process two-level log feedback.
+   path as the fallback. The feedback loops are closed over the process-global
+   registry: the tracer's `SpanStartSampler` reads the span-start table and each
+   worker's binding gate reads the heavy-hitter table, both fail-safe no-ops
+   until the aggregator publishes. Follow-ups: smoothing the global counts across
+   windows and the cross-process two-level log feedback.
 
 ## References
 

@@ -23,6 +23,7 @@ pub mod encode;
 pub mod heavy_hitter;
 pub mod processor;
 pub mod record;
+pub mod registry;
 pub mod span_start;
 
 pub use aggregator::{RawInput, RepInput, WindowAggregator, WorkerFlush};
@@ -33,6 +34,7 @@ pub use encode::annotate_log_record;
 pub use heavy_hitter::{HeavyHitterTable, SharedHeavyHitterTable, shared_local_only};
 pub use processor::{IncomingRecord, IntegratedSampler, ProcessorConfig, SpanPhase};
 pub use record::FlushedRecord;
+pub use registry::{heavy_hitter_table, span_start_table};
 pub use span_start::{
     SharedSpanStartTable, SpanStartSampler, SpanStartTable, build_span_start_table, shared_always,
 };

@@ -36,6 +36,9 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use super::heavy_hitter::{HeavyHitterTable, SharedHeavyHitterTable};
 
 /// One retained arrival together with the data needed to finalize it.
 struct Entry<P> {
@@ -208,6 +211,19 @@ pub fn inclusion_probability(tau: f64, weight: f64) -> f64 {
     (-((-x).exp_m1())).clamp(0.0, 1.0)
 }
 
+/// The inclusion probability `1 - exp(-cut)` for a combined cutoff, computed
+/// accurately for small cutoffs and clamped into `[0, 1]`. An infinite cutoff
+/// means the arrival was never gated on that side, so it contributes no
+/// suppression. Used for the composed local-and-global cutoff of the binding
+/// gate.
+#[must_use]
+fn inclusion_probability_from_cut(cut: f64) -> f64 {
+    if !cut.is_finite() {
+        return 1.0;
+    }
+    (-((-cut).exp_m1())).clamp(0.0, 1.0)
+}
+
 /// A small seedable xorshift64* generator, matching the dependency-free style of
 /// the surrounding self-tracing code and keeping windows reproducible in tests.
 struct Rng {
@@ -240,20 +256,27 @@ impl Rng {
 }
 
 /// Group the kept sample by its grouping key, summing the value `m_c` each
-/// group stands for and computing the inclusion probability `pi_c` from the
-/// threshold and each group's weight. For a first-level window every entry has
-/// unit value, so `m_c` is the kept count; for a second-level window each entry
-/// carries the local adjusted count it represents.
+/// group stands for and computing the effective inclusion probability `pi_c`.
+/// For a first-level window every entry has unit value, so `m_c` is the kept
+/// count; for a second-level window each entry carries the local adjusted count
+/// it represents. When `gate` is present the probability composes the local
+/// cutoff `tau_l * w_local_c` with the global cutoff `tau_g * g_c` by their
+/// minimum, matching the binding gate that produced the sample.
 fn group_counts<P>(
     tau: f64,
     sample: &[Entry<P>],
     weight_of: impl Fn(u64) -> f64,
+    gate: Option<&HeavyHitterTable>,
 ) -> HashMap<u64, (f64, f64)> {
     let mut counts: HashMap<u64, (f64, f64)> = HashMap::new();
     for entry in sample {
         let slot = counts.entry(entry.group).or_insert_with(|| {
-            let pi = inclusion_probability(tau, weight_of(entry.group));
-            (0.0, pi)
+            let local_cut = tau * weight_of(entry.group);
+            let cut = match gate {
+                Some(gate) => local_cut.min(gate.global_score(entry.group)),
+                None => local_cut,
+            };
+            (0.0, inclusion_probability_from_cut(cut))
         });
         slot.0 += entry.value;
     }
@@ -274,6 +297,14 @@ pub struct BottomFloor<P> {
     /// The rarest-seen floor weight for callsites absent from `weights`.
     w_unseen: f64,
     rng: Rng,
+    /// The optional stage-two heavy-hitter gate. When present, an arrival is
+    /// additionally subject to the global cutoff `tau_g * g_c`, and kept records
+    /// are corrected by the composed inclusion probability. Absent for the
+    /// aggregator's own second level and the per-span reservoirs.
+    gate: Option<SharedHeavyHitterTable>,
+    /// The heavy-hitter table snapshot taken for the current window, so observe
+    /// and finalize agree on the same global cutoffs. Reset each window.
+    window_gate: Option<Arc<HeavyHitterTable>>,
 }
 
 impl<P> BottomFloor<P> {
@@ -285,6 +316,27 @@ impl<P> BottomFloor<P> {
             weights: HashMap::new(),
             w_unseen: 1.0,
             rng: Rng::new(seed),
+            gate: None,
+            window_gate: None,
+        }
+    }
+
+    /// Create a sampler with a stage-two heavy-hitter binding gate.
+    ///
+    /// Each window it snapshots `gate` and rejects an arrival whose global score
+    /// `tau_g * g_c` binds before the local threshold, correcting the kept counts
+    /// by the composed inclusion probability
+    /// `pi_eff_c = 1 - exp(-min(tau_l * w_local_c, tau_g * g_c))`. Used by the
+    /// per-worker criterion one; the local-only fail-safe table never binds.
+    #[must_use]
+    pub fn new_gated(budget: usize, seed: u64, gate: SharedHeavyHitterTable) -> Self {
+        Self {
+            heap: KeyedHeap::new(budget),
+            weights: HashMap::new(),
+            w_unseen: 1.0,
+            rng: Rng::new(seed),
+            gate: Some(gate),
+            window_gate: None,
         }
     }
 
@@ -292,6 +344,22 @@ impl<P> BottomFloor<P> {
     #[must_use]
     fn weight_of(&self, callsite: u64) -> f64 {
         self.weights.get(&callsite).copied().unwrap_or(self.w_unseen)
+    }
+
+    /// The global binding cutoff `tau_g * g_c` for this window, snapshotting the
+    /// heavy-hitter table once so observe and finalize agree. Infinite, never
+    /// binding, when ungated.
+    fn window_global_cut(&mut self, callsite: u64) -> f64 {
+        let Some(gate) = &self.gate else {
+            return f64::INFINITY;
+        };
+        if self.window_gate.is_none() {
+            self.window_gate = Some(gate.load_full());
+        }
+        self.window_gate
+            .as_ref()
+            .expect("snapshot set above")
+            .global_score(callsite)
     }
 
     /// Offer one arrival of `callsite` carrying `payload`, returning the
@@ -320,6 +388,15 @@ impl<P> BottomFloor<P> {
             return Some(payload);
         }
         let (key, u) = exponential_key(&mut self.rng, weight);
+        // Stage-two binding gate: reject when the global score binds this window,
+        // sharing the one draw `u` across the local and global cutoffs. A no-op
+        // when ungated, since the cutoff is then infinite.
+        if self.gate.is_some() {
+            let x = key * weight; // -ln(u)
+            if x >= self.window_global_cut(callsite) {
+                return Some(payload);
+            }
+        }
         self.heap.offer(key, callsite, u, value, payload)
     }
 
@@ -329,9 +406,11 @@ impl<P> BottomFloor<P> {
     pub fn finalize(&mut self) -> WindowOutput<P> {
         let (tau, boundary, sample) = self.heap.drain_with_boundary();
 
-        // The inclusion probabilities use the weights that drove this window,
-        // so compute them before overwriting the map.
-        let counts = group_counts(tau, &sample, |c| self.weight_of(c));
+        // The inclusion probabilities use the weights that drove this window and,
+        // when gated, the same heavy-hitter snapshot the observes used. Take the
+        // snapshot so it resets for the next window.
+        let gate = self.window_gate.take();
+        let counts = group_counts(tau, &sample, |c| self.weight_of(c), gate.as_deref());
 
         let kept = sample
             .into_iter()
@@ -443,6 +522,7 @@ fn adjusted_count(pi: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::heavy_hitter::shared_local_only;
 
     #[test]
     fn keeps_everything_when_under_budget() {
@@ -628,6 +708,88 @@ mod tests {
         assert!(
             (ratio - 1.0).abs() < 0.05,
             "weighted estimated/true total ratio {ratio} not within 5%"
+        );
+    }
+
+    fn shared_heavy_hitter(estimates: &[(u64, f64)], tau_g: f64) -> SharedHeavyHitterTable {
+        use arc_swap::ArcSwap;
+        use std::sync::Arc;
+        let map: HashMap<u64, f64> = estimates.iter().copied().collect();
+        Arc::new(ArcSwap::from_pointee(HeavyHitterTable::from_estimates(
+            &map, tau_g,
+        )))
+    }
+
+    #[test]
+    fn gate_local_only_matches_ungated() {
+        // The local-only fail-safe table has an infinite global threshold, so a
+        // gated sampler makes exactly the same keep and drop decisions and the
+        // same adjusted counts as an ungated one with the same seed.
+        let mut gated = BottomFloor::<u32>::new_gated(16, 42, shared_local_only());
+        let mut plain = BottomFloor::<u32>::new(16, 42);
+        for i in 0..2000u32 {
+            let g = gated.observe(u64::from(i % 8), i);
+            let p = plain.observe(u64::from(i % 8), i);
+            assert_eq!(g.is_some(), p.is_some(), "keep/drop diverged at {i}");
+        }
+        let go = gated.finalize();
+        let po = plain.finalize();
+        assert_eq!(go.kept.len(), po.kept.len());
+        let ge: f64 = go.kept.iter().map(|k| k.adjusted_count).sum();
+        let pe: f64 = po.kept.iter().map(|k| k.adjusted_count).sum();
+        assert!((ge - pe).abs() < 1e-9, "adjusted totals diverged");
+    }
+
+    #[test]
+    fn binding_gate_throttles_abundant_and_stays_unbiased() {
+        // Callsite 1 is globally abundant (g_1 = 1/10000) and callsite 2 rare
+        // (g_2 = 1/10). With a finite tau_g the global cut binds callsite 1 far
+        // harder. The budget is large so the local threshold never binds, so the
+        // effective inclusion is the global cut alone.
+        let table = shared_heavy_hitter(&[(1, 10_000.0), (2, 10.0)], 5.0);
+        let mut bf = BottomFloor::<u64>::new_gated(1024, 7, table);
+
+        let windows = 400;
+        let (n1, n2) = (2000u64, 200u64);
+        let (mut true1, mut est1, mut kept1) = (0.0_f64, 0.0_f64, 0usize);
+        let (mut true2, mut est2, mut kept2) = (0.0_f64, 0.0_f64, 0usize);
+        for w in 0..windows {
+            for _ in 0..n1 {
+                let _ = bf.observe(1, 1);
+            }
+            for _ in 0..n2 {
+                let _ = bf.observe(2, 2);
+            }
+            let out = bf.finalize();
+            if w >= 20 {
+                for k in &out.kept {
+                    match k.group {
+                        1 => {
+                            est1 += k.adjusted_count;
+                            kept1 += 1;
+                        }
+                        2 => {
+                            est2 += k.adjusted_count;
+                            kept2 += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                true1 += n1 as f64;
+                true2 += n2 as f64;
+            }
+        }
+        // Unbiased: the composed Horvitz-Thompson correction recovers each true
+        // arrival total despite the gate dropping most abundant arrivals.
+        let r1 = est1 / true1;
+        let r2 = est2 / true2;
+        assert!((r1 - 1.0).abs() < 0.1, "abundant callsite ratio {r1}");
+        assert!((r2 - 1.0).abs() < 0.1, "rare callsite ratio {r2}");
+        // Throttled: the abundant callsite, with ten times the arrivals, keeps
+        // far fewer records than the rare one.
+        assert!(
+            kept1 < kept2,
+            "abundant kept {kept1} should be far below rare kept {kept2}"
         );
     }
 }

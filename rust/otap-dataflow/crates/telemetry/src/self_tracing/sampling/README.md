@@ -49,6 +49,9 @@ attributes.
   carried local counts, reassembles spans across workers by `span_id`, and at each
   window republishes the span-start and heavy-hitter tables while emitting one
   process-global annotated stream.
+- [`registry`](registry.rs) - the process-global feedback registry: the two
+  `ArcSwap` tables the aggregator publishes and the tracer's `SpanStartSampler`
+  and each worker's binding gate read, in their fail-safe states until published.
 - [`encode`](encode.rs) - stamps a flushed `LogRecord` with the three
   adjusted-count attributes, including meaningful exact zeros.
 
@@ -113,12 +116,15 @@ process-global aggregator and falls back to the **local-only** self-contained
 sample when none is running. The aggregator is owned by the Internal Telemetry
 Receiver and enabled by its `integrated_sampling` config, which finalizes each
 window on the receiver's `CollectTelemetry` tick and emits the aggregated sample
-as OTLP. See
+as OTLP. Both feedback tables travel over a process-global registry
+([`registry`](registry.rs)): the tracer's default sampler is the
+`SpanStartSampler` reading the span-start table, and each worker's criterion one
+applies the heavy-hitter binding gate reading the heavy-hitter table, both
+fail-safe no-ops until the aggregator publishes. See
 [`docs/integrated-sampler-engine-mechanism.md`](../../../../../docs/integrated-sampler-engine-mechanism.md)
 for the mechanism and the resolved decisions.
 
-Follow-ups: the worker heavy-hitter binding gate that reads `g_c` on the hot
-path, wiring the `SpanStartSampler` onto the live tracer, smoothing the global
-counts `N_c` across windows at the aggregator, the cross-process two-level log
-feedback over the OTLP response path, the optional SDK-wide span-log second
-stage, and a configuration surface.
+Follow-ups: smoothing the global counts `N_c` across windows at the aggregator,
+the cross-process two-level log feedback over the OTLP response path, the
+optional SDK-wide span-log second stage, and a configuration surface for the
+budgets.

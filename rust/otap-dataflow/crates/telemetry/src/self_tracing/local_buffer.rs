@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::event::{LogEvent, ObservedEventReporter};
-use crate::self_tracing::sampling::{LocalSampleBuffer, annotate_log_record, log_callsite_identity};
+use crate::self_tracing::sampling::{
+    LocalSampleBuffer, annotate_log_record, heavy_hitter_table, log_callsite_identity,
+};
 use crate::self_tracing::{LogRecord, Threshold};
 
 /// The criterion-one budget for a per-worker buffer. Fixed for now; a
@@ -58,7 +60,14 @@ static SEED_COUNTER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 pub fn install() -> LocalBufferGuard {
     let seed = SEED_COUNTER.fetch_add(0x2545_F491_4F6C_DD1D, Ordering::Relaxed);
     LOCAL_BUFFER.with(|cell| {
-        *cell.borrow_mut() = Some(LocalSampleBuffer::new(LOCAL_SAMPLE_BUDGET, seed));
+        // Criterion one reads the process-global heavy-hitter table so a
+        // globally abundant callsite is throttled here in proportion to the
+        // fleet-wide congestion; the local-only fail-safe never binds.
+        *cell.borrow_mut() = Some(LocalSampleBuffer::new_gated(
+            LOCAL_SAMPLE_BUDGET,
+            seed,
+            heavy_hitter_table(),
+        ));
     });
     LocalBufferGuard { _private: () }
 }
