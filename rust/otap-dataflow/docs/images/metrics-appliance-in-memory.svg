@@ -1,0 +1,297 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="912" viewBox="0 0 1360 912" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <style>
+    .t      { fill:#2f3640; }
+    .title  { font-size:24px; font-weight:700; }
+    .sub    { font-size:13px; fill:#5b636e; }
+    .scope  { font-size:11px; fill:#6b7785; }
+    .h      { font-size:13px; font-weight:700; }
+    .h2     { font-size:12px; font-weight:700; }
+    .s      { font-size:11px; }
+    .xs     { font-size:10px; fill:#5b636e; }
+    .mono   { font-family:Consolas, "SF Mono", Menlo, monospace; font-size:10.5px; fill:#2f3640; }
+    .monos  { font-family:Consolas, "SF Mono", Menlo, monospace; font-size:9.5px; fill:#5b636e; }
+    .box    { stroke:#3a414a; stroke-width:1.5; }
+    .lbl    { font-size:9.5px; fill:#5b636e; }
+  </style>
+
+  <rect x="0" y="0" width="1360" height="912" fill="#ffffff"/>
+
+  <!-- ===== Title ===== -->
+  <text class="t title" x="40" y="42">In-Memory Metrics Appliance — a visual overview</text>
+  <text class="t sub"   x="40" y="64">Shuffle · event-time bucketing · load balancing across cores. Thread-per-core, no durable storage: the large-scale aggregating telemetry-SDK profile.</text>
+  <text class="t scope" x="40" y="82">Branch jmacd/planning · stages: receiver → partition (split-by-key) → partition-dispatch topic (placement + load_feedback) → metrics_admission + event_time_window (windowing) per core.</text>
+  <line x1="40" y1="90" x2="1320" y2="90" stroke="#d3d8de" stroke-width="1"/>
+
+  <!-- ===== Arrow markers ===== -->
+  <defs>
+    <marker id="ad" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#2c6e9b"/></marker>
+    <marker id="ac" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#c46a1b"/></marker>
+    <marker id="ag" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#6b7785"/></marker>
+  </defs>
+
+  <!-- ===== Band A: ingress ===== -->
+  <rect class="box" x="40"  y="100" width="220" height="50" rx="8" fill="#eceff1"/>
+  <text class="t h2" x="150" y="120" text-anchor="middle">Lightweight metric SDKs</text>
+  <text class="t xs" x="150" y="138" text-anchor="middle">EWT · many per host · small metric events</text>
+
+  <rect class="box" x="300" y="100" width="220" height="50" rx="8" fill="#e9f2f9" stroke="#2c6e9b"/>
+  <text class="t h2" x="410" y="120" text-anchor="middle">Receiver</text>
+  <text class="t xs" x="410" y="138" text-anchor="middle">decode OTLP / OTAP → OTAP</text>
+
+  <text class="t xs" x="560" y="118">Engine runs a strict thread-per-core model</text>
+  <text class="t xs" x="560" y="134">with replicated pipeline groups (morsel-driven).</text>
+
+  <path d="M260,125 L298,125" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+
+  <!-- ===== Band B: stateless split-by-key ===== -->
+  <rect class="box" x="300" y="170" width="220" height="52" rx="8" fill="#e9f2f9" stroke="#2c6e9b"/>
+  <text class="t h2" x="410" y="190" text-anchor="middle">partition — split-by-key</text>
+  <text class="t monos" x="410" y="208" text-anchor="middle">partition = hash(metric_name) mod N</text>
+
+  <rect x="556" y="168" width="354" height="56" rx="6" fill="#f7fafc" stroke="#9fb3c2" stroke-width="1"/>
+  <text class="t xs" x="566" y="186">stateless · work-stealing for transient balance</text>
+  <text class="t monos" x="566" y="202">tags Context::partition (rides to the dispatch hop)</text>
+  <text class="t monos" x="566" y="216">selection-mask radix cascade (filter_otap_batch)</text>
+
+  <path d="M410,150 L410,168" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+  <path d="M410,222 L410,250" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+
+  <!-- ===== Band C: the shuffle (partition-dispatch topic + placement) ===== -->
+  <rect class="box" x="40" y="250" width="870" height="60" rx="8" fill="#e4e7eb"/>
+  <text class="t h" x="56" y="276">Shuffle — partition-dispatch topic (in-memory backend)</text>
+  <text class="t xs" x="56" y="296">SubscriptionMode::PartitionDispatch · exclusive partition → owner · keys fixed to buckets</text>
+
+  <rect x="626" y="258" width="276" height="44" rx="6" fill="#ffffff" stroke="#3a414a" stroke-width="1.2"/>
+  <text class="t h2" x="764" y="275" text-anchor="middle">placement map</text>
+  <text class="t monos" x="764" y="291" text-anchor="middle">PartitionPlacement · bucket→owner</text>
+
+  <!-- fan-out arrows to cores -->
+  <path d="M177,310 L177,330" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+  <path d="M475,310 L475,330" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+  <path d="M773,310 L773,330" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+
+  <!-- ===== Band D: owner cores ===== -->
+  <!-- Core template repeated at x = 40, 338, 636 -->
+  <!-- Core 1 -->
+  <g>
+    <rect class="box" x="40" y="330" width="274" height="360" rx="8" fill="#f7f8f9"/>
+    <rect x="40" y="330" width="274" height="34" rx="8" fill="#dfe3e8"/>
+    <rect x="40" y="350" width="274" height="14" fill="#dfe3e8"/>
+    <text class="t h2" x="54" y="352">Core 1</text>
+    <text class="t monos" x="304" y="352" text-anchor="end">owns {p0, p3, p6, …}</text>
+
+    <!-- admission (co-located authority) -->
+    <rect x="52" y="372" width="250" height="84" rx="6" fill="#efe9f6" stroke="#6f5499" stroke-width="1.3"/>
+    <text class="t h2" x="62" y="390">metrics_admission</text>
+    <text class="t s"  x="62" y="408">time-window gate</text>
+    <text class="t monos" x="62" y="422">[now−max_lag, now+max_skew]</text>
+    <text class="t s"  x="62" y="438">per-core TypeRegistry</text>
+    <text class="t xs" x="62" y="451">admit all · warn on name conflict</text>
+
+    <path d="M177,456 L177,470" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+
+    <!-- event-time windower -->
+    <rect x="52" y="470" width="250" height="168" rx="6" fill="#e8f1e8" stroke="#4f7d54" stroke-width="1.3"/>
+    <text class="t h2" x="62" y="488">event-time windower (L2)</text>
+    <text class="t xs" x="62" y="503">TumblingWindows + Watermark · cap @ now</text>
+    <!-- mini timeline -->
+    <rect x="64"  y="512" width="40" height="16" fill="#cfe3cf" stroke="#4f7d54" stroke-width="1"/>
+    <rect x="106" y="512" width="40" height="16" fill="#cfe3cf" stroke="#4f7d54" stroke-width="1"/>
+    <rect x="148" y="512" width="40" height="16" fill="#cfe3cf" stroke="#4f7d54" stroke-width="1"/>
+    <rect x="190" y="512" width="40" height="16" fill="#ffffff" stroke="#4f7d54" stroke-width="1.6" stroke-dasharray="3 2"/>
+    <rect x="232" y="512" width="40" height="16" fill="#eef0f1" stroke="#9aa4ad" stroke-width="1"/>
+    <path d="M190,508 L190,530" stroke="#c0392b" stroke-width="1.2"/>
+    <text class="t lbl" x="64" y="540">fired → emitted</text>
+    <text class="t lbl" x="210" y="540" text-anchor="middle">open</text>
+    <text class="t lbl" x="252" y="540" text-anchor="middle">future</text>
+    <text class="t monos" x="62" y="560">(stream, window) → aggregate</text>
+    <text class="t monos" x="62" y="576">+ cumulative anchor / stream (D17)</text>
+    <text class="t xs" x="62" y="592">reset · gap · overlap (OTel data model)</text>
+    <text class="t xs" x="62" y="606">timer drain · idle-stream aging</text>
+    <text class="t xs" x="62" y="624">epoch-aligned · mergeable across appliances</text>
+
+    <!-- pinned footer -->
+    <rect x="52" y="648" width="250" height="32" rx="6" fill="#eef4ee" stroke="#4f7d54" stroke-width="1"/>
+    <text class="t xs" x="62" y="662">pinned · single writer per series</text>
+    <text class="t xs" x="62" y="675">→ complete windowed OTAP batches</text>
+  </g>
+
+  <!-- Core 2 -->
+  <g>
+    <rect class="box" x="338" y="330" width="274" height="360" rx="8" fill="#f7f8f9"/>
+    <rect x="338" y="330" width="274" height="34" rx="8" fill="#dfe3e8"/>
+    <rect x="338" y="350" width="274" height="14" fill="#dfe3e8"/>
+    <text class="t h2" x="352" y="352">Core 2</text>
+    <text class="t monos" x="602" y="352" text-anchor="end">owns {p1, p4, p7, …}</text>
+
+    <rect x="350" y="372" width="250" height="84" rx="6" fill="#efe9f6" stroke="#6f5499" stroke-width="1.3"/>
+    <text class="t h2" x="360" y="390">metrics_admission</text>
+    <text class="t s"  x="360" y="408">time-window gate</text>
+    <text class="t monos" x="360" y="422">[now−max_lag, now+max_skew]</text>
+    <text class="t s"  x="360" y="438">per-core TypeRegistry</text>
+    <text class="t xs" x="360" y="451">admit all · warn on name conflict</text>
+
+    <path d="M475,456 L475,470" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+
+    <rect x="350" y="470" width="250" height="168" rx="6" fill="#e8f1e8" stroke="#4f7d54" stroke-width="1.3"/>
+    <text class="t h2" x="360" y="488">event-time windower (L2)</text>
+    <text class="t xs" x="360" y="503">TumblingWindows + Watermark · cap @ now</text>
+    <rect x="362" y="512" width="40" height="16" fill="#cfe3cf" stroke="#4f7d54" stroke-width="1"/>
+    <rect x="404" y="512" width="40" height="16" fill="#cfe3cf" stroke="#4f7d54" stroke-width="1"/>
+    <rect x="446" y="512" width="40" height="16" fill="#cfe3cf" stroke="#4f7d54" stroke-width="1"/>
+    <rect x="488" y="512" width="40" height="16" fill="#ffffff" stroke="#4f7d54" stroke-width="1.6" stroke-dasharray="3 2"/>
+    <rect x="530" y="512" width="40" height="16" fill="#eef0f1" stroke="#9aa4ad" stroke-width="1"/>
+    <path d="M488,508 L488,530" stroke="#c0392b" stroke-width="1.2"/>
+    <text class="t lbl" x="362" y="540">fired → emitted</text>
+    <text class="t lbl" x="508" y="540" text-anchor="middle">open</text>
+    <text class="t lbl" x="550" y="540" text-anchor="middle">future</text>
+    <text class="t monos" x="360" y="560">(stream, window) → aggregate</text>
+    <text class="t monos" x="360" y="576">+ cumulative anchor / stream (D17)</text>
+    <text class="t xs" x="360" y="592">reset · gap · overlap (OTel data model)</text>
+    <text class="t xs" x="360" y="606">timer drain · idle-stream aging</text>
+    <text class="t xs" x="360" y="624">epoch-aligned · mergeable across appliances</text>
+
+    <rect x="350" y="648" width="250" height="32" rx="6" fill="#eef4ee" stroke="#4f7d54" stroke-width="1"/>
+    <text class="t xs" x="360" y="662">pinned · single writer per series</text>
+    <text class="t xs" x="360" y="675">→ complete windowed OTAP batches</text>
+  </g>
+
+  <!-- ellipsis between core 2 and core N -->
+  <text class="t h" x="624" y="514" text-anchor="middle" fill="#6b7785">···</text>
+
+  <!-- Core N -->
+  <g>
+    <rect class="box" x="636" y="330" width="274" height="360" rx="8" fill="#f7f8f9"/>
+    <rect x="636" y="330" width="274" height="34" rx="8" fill="#dfe3e8"/>
+    <rect x="636" y="350" width="274" height="14" fill="#dfe3e8"/>
+    <text class="t h2" x="650" y="352">Core N</text>
+    <text class="t monos" x="900" y="352" text-anchor="end">owns {p2, p5, p8, …}</text>
+
+    <rect x="648" y="372" width="250" height="84" rx="6" fill="#efe9f6" stroke="#6f5499" stroke-width="1.3"/>
+    <text class="t h2" x="658" y="390">metrics_admission</text>
+    <text class="t s"  x="658" y="408">time-window gate</text>
+    <text class="t monos" x="658" y="422">[now−max_lag, now+max_skew]</text>
+    <text class="t s"  x="658" y="438">per-core TypeRegistry</text>
+    <text class="t xs" x="658" y="451">admit all · warn on name conflict</text>
+
+    <path d="M773,456 L773,470" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+
+    <rect x="648" y="470" width="250" height="168" rx="6" fill="#e8f1e8" stroke="#4f7d54" stroke-width="1.3"/>
+    <text class="t h2" x="658" y="488">event-time windower (L2)</text>
+    <text class="t xs" x="658" y="503">TumblingWindows + Watermark · cap @ now</text>
+    <rect x="660" y="512" width="40" height="16" fill="#cfe3cf" stroke="#4f7d54" stroke-width="1"/>
+    <rect x="702" y="512" width="40" height="16" fill="#cfe3cf" stroke="#4f7d54" stroke-width="1"/>
+    <rect x="744" y="512" width="40" height="16" fill="#cfe3cf" stroke="#4f7d54" stroke-width="1"/>
+    <rect x="786" y="512" width="40" height="16" fill="#ffffff" stroke="#4f7d54" stroke-width="1.6" stroke-dasharray="3 2"/>
+    <rect x="828" y="512" width="40" height="16" fill="#eef0f1" stroke="#9aa4ad" stroke-width="1"/>
+    <path d="M786,508 L786,530" stroke="#c0392b" stroke-width="1.2"/>
+    <text class="t lbl" x="660" y="540">fired → emitted</text>
+    <text class="t lbl" x="806" y="540" text-anchor="middle">open</text>
+    <text class="t lbl" x="848" y="540" text-anchor="middle">future</text>
+    <text class="t monos" x="658" y="560">(stream, window) → aggregate</text>
+    <text class="t monos" x="658" y="576">+ cumulative anchor / stream (D17)</text>
+    <text class="t xs" x="658" y="592">reset · gap · overlap (OTel data model)</text>
+    <text class="t xs" x="658" y="606">timer drain · idle-stream aging</text>
+    <text class="t xs" x="658" y="624">epoch-aligned · mergeable across appliances</text>
+
+    <rect x="648" y="648" width="250" height="32" rx="6" fill="#eef4ee" stroke="#4f7d54" stroke-width="1"/>
+    <text class="t xs" x="658" y="662">pinned · single writer per series</text>
+    <text class="t xs" x="658" y="675">→ complete windowed OTAP batches</text>
+  </g>
+
+  <!-- cores → output -->
+  <path d="M177,690 L177,712" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+  <path d="M475,690 L475,712" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+  <path d="M773,690 L773,712" stroke="#2c6e9b" stroke-width="1.6" fill="none" marker-end="url(#ad)"/>
+
+  <!-- ===== Band E: output ===== -->
+  <rect class="box" x="40" y="712" width="870" height="66" rx="8" fill="#f2f3f5"/>
+  <text class="t h" x="56" y="734">Aggregated cumulative OTAP (in-memory)</text>
+  <text class="t xs" x="56" y="752">stored cumulative · output temporality projected per consumer (cumulative as-is, or delta by differencing)</text>
+  <text class="t xs" x="56" y="768">downstream: L4 pull query (DataFusion TableProvider · OPL/OTTL → OTAP) · L5 forward (OTAP push) — durable store/forward is an additive backend, deferred</text>
+
+  <!-- ===== Control plane: load-balancing feedback loop ===== -->
+  <rect x="952" y="168" width="384" height="522" rx="10" fill="#ffffff" stroke="#c46a1b" stroke-width="1.6"/>
+  <rect x="952" y="168" width="384" height="30" rx="10" fill="#fbeede"/>
+  <rect x="952" y="186" width="384" height="12" fill="#fbeede"/>
+  <text class="t h" x="968" y="188" fill="#9a5314">Load-balancing control plane (in-memory)</text>
+
+  <!-- step 1 measure -->
+  <rect x="968" y="210" width="352" height="92" rx="6" fill="#fdf4e8" stroke="#c46a1b" stroke-width="1.2"/>
+  <text class="t h2" x="980" y="230">1 · Measure  (each owner core)</text>
+  <text class="t monos" x="980" y="248">PartitionLoadTracker</text>
+  <text class="t xs"  x="980" y="264">active_series (from aggregators) + points/s,</text>
+  <text class="t xs"  x="980" y="278">bucketed by the partition tag dispatch delivered;</text>
+  <text class="t xs"  x="980" y="292">heavier weight for exponential histograms.</text>
+
+  <!-- step 2 report -->
+  <rect x="968" y="318" width="352" height="80" rx="6" fill="#fdf4e8" stroke="#c46a1b" stroke-width="1.2"/>
+  <text class="t h2" x="980" y="338">2 · Report</text>
+  <text class="t monos" x="980" y="356">LoadReportSender → PlacementCoordinator</text>
+  <text class="t xs"  x="980" y="372">merge (latest wins per partition) into a global</text>
+  <text class="t xs"  x="980" y="386">weight vector via LoadWeights.</text>
+
+  <!-- step 3 decide -->
+  <rect x="968" y="414" width="352" height="86" rx="6" fill="#fdf4e8" stroke="#c46a1b" stroke-width="1.2"/>
+  <text class="t h2" x="980" y="434">3 · Decide</text>
+  <text class="t monos" x="980" y="452">rebalance_weighted (greedy LPT, 4/3-approx)</text>
+  <text class="t xs"  x="980" y="468">busiest core sheds fewest buckets to coldest;</text>
+  <text class="t monos" x="980" y="484">replan() on big owner-count change ·</text>
+  <text class="t monos" x="980" y="497">hot_partitions() → key sub-partition</text>
+
+  <!-- step 4 apply -->
+  <rect x="968" y="516" width="352" height="84" rx="6" fill="#fdf4e8" stroke="#c46a1b" stroke-width="1.2"/>
+  <text class="t h2" x="980" y="536">4 · Apply  (PlacementScheduler::tick)</text>
+  <text class="t monos" x="980" y="554">PartitionMove → TopicHandle::apply_move</text>
+  <text class="t xs"  x="980" y="570">repoint partition→owner; keys never move.</text>
+  <text class="t xs"  x="980" y="584">Lease + generation fencing arrive with durability.</text>
+
+  <text class="t xs" x="968" y="624" fill="#9a5314">Moves apply at an aggregation window boundary,</text>
+  <text class="t xs" x="968" y="638" fill="#9a5314">so the handoff carries no live per-series state.</text>
+  <text class="t xs" x="968" y="660">Stateless stages work-steal for transient balance;</text>
+  <text class="t xs" x="968" y="674">stateful aggregation balances only via placement.</text>
+
+  <!-- vertical 1->2->3->4 arrows -->
+  <path d="M1144,302 L1144,316" stroke="#c46a1b" stroke-width="1.6" fill="none" marker-end="url(#ac)"/>
+  <path d="M1144,398 L1144,412" stroke="#c46a1b" stroke-width="1.6" fill="none" marker-end="url(#ac)"/>
+  <path d="M1144,500 L1144,514" stroke="#c46a1b" stroke-width="1.6" fill="none" marker-end="url(#ac)"/>
+
+  <!-- measure source: cores -> step 1 (dashed grey) -->
+  <path d="M910,430 L940,430 L940,250 L966,250" stroke="#6b7785" stroke-width="1.4" fill="none" stroke-dasharray="5 3" marker-end="url(#ag)"/>
+  <text class="t lbl" x="916" y="424">per-partition load</text>
+
+  <!-- apply -> placement map (orange L route through the gutter) -->
+  <path d="M966,558 L928,558 L928,280 L904,280" stroke="#c46a1b" stroke-width="1.6" fill="none" marker-end="url(#ac)"/>
+  <text class="t lbl" x="872" y="250" fill="#9a5314">reassign</text>
+  <text class="t lbl" x="872" y="262" fill="#9a5314">partition→owner</text>
+
+  <!-- return loop 4 -> 1 on the far right -->
+  <path d="M1322,558 L1344,558 L1344,250 L1322,250" stroke="#c46a1b" stroke-width="1.4" fill="none" marker-end="url(#ac)"/>
+  <text class="t lbl" x="1352" y="408" fill="#9a5314" transform="rotate(90 1352 408)" text-anchor="middle">feedback loop</text>
+
+  <!-- ===== Legend ===== -->
+  <rect x="40" y="798" width="1296" height="96" rx="8" fill="#fbfcfd" stroke="#d3d8de" stroke-width="1"/>
+  <text class="t h2" x="56" y="820">Legend</text>
+
+  <!-- data plane -->
+  <path d="M56,838 L92,838" stroke="#2c6e9b" stroke-width="1.8" fill="none" marker-end="url(#ad)"/>
+  <text class="t s" x="100" y="842">data plane (OTAP)</text>
+  <!-- control plane -->
+  <path d="M250,838 L286,838" stroke="#c46a1b" stroke-width="1.8" fill="none" marker-end="url(#ac)"/>
+  <text class="t s" x="294" y="842">control plane (placement / apply)</text>
+  <!-- measurement -->
+  <path d="M520,838 L556,838" stroke="#6b7785" stroke-width="1.6" fill="none" stroke-dasharray="5 3" marker-end="url(#ag)"/>
+  <text class="t s" x="564" y="842">load measurement (owner → controller)</text>
+
+  <!-- swatches -->
+  <rect x="56"  y="858" width="16" height="12" fill="#e9f2f9" stroke="#2c6e9b"/><text class="t s" x="78"  y="868">stateless (work-stealing)</text>
+  <rect x="250" y="858" width="16" height="12" fill="#e4e7eb" stroke="#3a414a"/><text class="t s" x="272" y="868">shuffle / placement</text>
+  <rect x="430" y="858" width="16" height="12" fill="#efe9f6" stroke="#6f5499"/><text class="t s" x="452" y="868">admission + type registry</text>
+  <rect x="640" y="858" width="16" height="12" fill="#e8f1e8" stroke="#4f7d54"/><text class="t s" x="662" y="868">stateful aggregation (pinned)</text>
+  <rect x="876" y="858" width="16" height="12" fill="#fdf4e8" stroke="#c46a1b"/><text class="t s" x="898" y="868">load feedback</text>
+
+  <text class="t xs" x="1040" y="844">In-memory: effective-once within a process</text>
+  <text class="t xs" x="1040" y="858">lifetime. Durability (quiver backend, registry</text>
+  <text class="t xs" x="1040" y="872">+ per-bucket WAL, leases) is an additive</text>
+  <text class="t xs" x="1040" y="886">backend behind the same interface — deferred.</text>
+</svg>

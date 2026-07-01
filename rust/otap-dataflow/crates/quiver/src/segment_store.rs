@@ -820,6 +820,20 @@ impl SegmentProvider for SegmentStore {
             .unwrap_or(0))
     }
 
+    fn bundle_user_meta(&self, bundle_ref: BundleRef) -> Result<u64> {
+        let segments = self.segments.read();
+        let handle = segments
+            .get(&bundle_ref.segment_seq)
+            .ok_or_else(|| SubscriberError::segment_not_found(bundle_ref.segment_seq.raw()))?;
+        let idx = bundle_ref.bundle_index.raw() as usize;
+        Ok(handle
+            .reader
+            .manifest()
+            .get(idx)
+            .map(|e| e.user_meta())
+            .unwrap_or(0))
+    }
+
     fn bundle_metadata(
         &self,
         segment_seq: SegmentSeq,
@@ -835,6 +849,7 @@ impl SegmentProvider for SegmentStore {
             .iter()
             .map(|entry| crate::subscriber::BundleMetadata {
                 item_count: entry.item_count(),
+                user_meta: entry.user_meta(),
                 slot_ids: entry.slot_ids().collect(),
             })
             .collect())

@@ -22,6 +22,7 @@ use crate::topic::types::{
     Envelope, PublishOutcome, SubscriberOptions, TopicOptions, TrackedPublishOutcome,
     TrackedPublishPermit, TrackedPublishReceipt, TrackedPublishTracker, TrackedTryPublishOutcome,
 };
+use arc_swap::ArcSwap;
 use futures_core::Stream;
 use otap_df_config::topic::TopicBroadcastOnLagPolicy;
 use otap_df_config::{SubscriptionGroupName, TopicName};
@@ -596,13 +597,41 @@ struct PartitionOwnerQueue<T> {
     admission: Arc<Semaphore>,
 }
 
-/// Mutable routing state of a [`PartitionDispatchTopic`]: the per-owner queues
-/// and the `partition -> owner` index built as subscribers claim partitions.
+// Manual `Clone` (not derived) so cloning does not require `T: Clone`: the
+// channel endpoints and the semaphore are all cheap `Arc`-backed handles that
+// clone independently of the message type. Used for the copy-on-write routing
+// snapshot below.
+impl<T> Clone for PartitionOwnerQueue<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            rx: self.rx.clone(),
+            admission: self.admission.clone(),
+        }
+    }
+}
+
+/// Routing state of a [`PartitionDispatchTopic`]: the per-owner queues and the
+/// `partition -> owner` index built as subscribers claim partitions.
+///
+/// Held behind an [`ArcSwap`] on the topic so the publish hot path reads it
+/// **lock-free**; the rare writers (subscribe, reassign) build an updated
+/// snapshot under a small write lock and swap it in (copy-on-write). Owner
+/// indices are append-only and stable, so a repointed `owner_of` never dangles.
 struct PartitionRouting<T> {
     owners: Vec<PartitionOwnerQueue<T>>,
     /// `owner_of[p]` is the index into `owners` for partition `p`, or `None`
     /// while no subscriber owns it. Length is `num_partitions`.
     owner_of: Vec<Option<usize>>,
+}
+
+impl<T> Clone for PartitionRouting<T> {
+    fn clone(&self) -> Self {
+        Self {
+            owners: self.owners.clone(),
+            owner_of: self.owner_of.clone(),
+        }
+    }
 }
 
 /// A topic that routes each published message to the single subscriber owning
@@ -616,7 +645,12 @@ pub(crate) struct PartitionDispatchTopic<T: Send + Sync + 'static> {
     next_id: AtomicU64,
     outcomes: TrackedPublishTracker,
     closed: AtomicBool,
-    routing: Mutex<PartitionRouting<T>>,
+    /// The routing snapshot, read lock-free on the publish hot path via
+    /// [`ArcSwap::load`] and swapped by the writers below (copy-on-write).
+    routing: ArcSwap<PartitionRouting<T>>,
+    /// Serializes the rare writers (subscribe, reassign, close) so a
+    /// validate-then-swap is atomic; publishers never take it.
+    write_lock: Mutex<()>,
 }
 
 impl<T: Send + Sync + 'static> PartitionDispatchTopic<T> {
@@ -628,10 +662,11 @@ impl<T: Send + Sync + 'static> PartitionDispatchTopic<T> {
             next_id: AtomicU64::new(1),
             outcomes: TrackedPublishTracker::new(),
             closed: AtomicBool::new(false),
-            routing: Mutex::new(PartitionRouting {
+            routing: ArcSwap::from_pointee(PartitionRouting {
                 owners: Vec::new(),
                 owner_of: vec![None; num_partitions],
             }),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -644,14 +679,14 @@ impl<T: Send + Sync + 'static> PartitionDispatchTopic<T> {
 impl<T: Partitioned + Send + Sync + 'static> PartitionDispatchTopic<T> {
     /// The destination queue (sender + admission semaphore) for a message, or
     /// `None` when the message is untagged, out of range, or its partition is
-    /// owned by no subscriber. The lock is released before the returned handles
-    /// are awaited.
+    /// owned by no subscriber. Reads the routing snapshot lock-free; the returned
+    /// handles are clones, so the snapshot guard is dropped before they are used.
     fn route(&self, msg: &T) -> Option<(async_channel::Sender<QueuedEnvelope<T>>, Arc<Semaphore>)> {
         let partition = msg.partition()?;
         if partition as usize >= self.num_partitions {
             return None;
         }
-        let routing = self.routing.lock();
+        let routing = self.routing.load();
         let owner = routing.owner_of[partition as usize]?;
         let queue = &routing.owners[owner];
         Some((queue.tx.clone(), queue.admission.clone()))
@@ -779,7 +814,10 @@ impl<T: Partitioned + Send + Sync + 'static> TopicState<T> for PartitionDispatch
         if self.closed.load(Ordering::Relaxed) {
             return Err(TopicClosed);
         }
-        let mut routing = self.routing.lock();
+        // Serialize writers so this validate-then-swap is atomic; publishers read
+        // the snapshot lock-free.
+        let _write = self.write_lock.lock();
+        let current = self.routing.load_full();
         // Validate the whole claim before mutating, so a rejected subscription
         // leaves no partial ownership.
         for &partition in &owned_partitions {
@@ -789,24 +827,25 @@ impl<T: Partitioned + Send + Sync + 'static> TopicState<T> for PartitionDispatch
                     num_partitions: self.num_partitions,
                 });
             }
-            if routing.owner_of[partition as usize].is_some() {
+            if current.owner_of[partition as usize].is_some() {
                 return Err(PartitionAlreadyClaimed { partition });
             }
         }
 
         let (tx, rx) = async_channel::bounded(self.capacity);
         let admission = Arc::new(Semaphore::new(self.capacity));
-        let owner_idx = routing.owners.len();
-        routing
-            .owners
-            .push(PartitionOwnerQueue { tx, rx, admission });
+        // Copy-on-write: build the next snapshot, then publish it atomically.
+        let mut next = (*current).clone();
+        let owner_idx = next.owners.len();
+        next.owners.push(PartitionOwnerQueue { tx, rx, admission });
         for &partition in &owned_partitions {
-            routing.owner_of[partition as usize] = Some(owner_idx);
+            next.owner_of[partition as usize] = Some(owner_idx);
         }
 
         // The owner queue retains the receiver so the channel stays open for the
         // topic's lifetime; the subscriber drains a clone of it.
-        let sub_rx = routing.owners[owner_idx].rx.clone();
+        let sub_rx = next.owners[owner_idx].rx.clone();
+        self.routing.store(Arc::new(next));
         Ok(Box::new(BalancedSub {
             rx: Box::pin(sub_rx),
             ack_state: AckState {
@@ -825,18 +864,21 @@ impl<T: Partitioned + Send + Sync + 'static> TopicState<T> for PartitionDispatch
                 num_partitions: self.num_partitions,
             });
         }
-        let mut routing = self.routing.lock();
-        if to_owner >= routing.owners.len() {
+        let _write = self.write_lock.lock();
+        let current = self.routing.load_full();
+        if to_owner >= current.owners.len() {
             return Err(OwnerOutOfRange {
                 owner: to_owner,
-                num_owners: routing.owners.len(),
+                num_owners: current.owners.len(),
             });
         }
         // Repoint future publishes to the new owner. Messages already enqueued
         // for the previous owner remain in its queue and are drained there, so a
         // reassignment applied at a window boundary hands off no overlapping
-        // state.
-        routing.owner_of[partition] = Some(to_owner);
+        // state. Copy-on-write so publishers reading the snapshot are lock-free.
+        let mut next = (*current).clone();
+        next.owner_of[partition] = Some(to_owner);
+        self.routing.store(Arc::new(next));
         Ok(())
     }
 
@@ -847,8 +889,11 @@ impl<T: Partitioned + Send + Sync + 'static> TopicState<T> for PartitionDispatch
     fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         self.outcomes.close_all();
-        let routing = self.routing.lock();
-        for owner in &routing.owners {
+        // Take the write lock so no subscribe/reassign races the teardown, then
+        // close each owner's queue on the current snapshot.
+        let _write = self.write_lock.lock();
+        let routing = self.routing.load_full();
+        for owner in routing.owners.iter() {
             owner.admission.close();
             let _ = owner.tx.close();
         }

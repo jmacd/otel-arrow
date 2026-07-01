@@ -15,6 +15,11 @@
 > When the event-time path graduates, this crate should be **deleted** and its
 > behavior folded into the temporal reaggregation processor (which keys per-stream
 > state and flushes on a processing-time period today). Do not build on this PoC.
+>
+> The concrete fold-in plan, including which `identity` and `builder` modules to
+> reuse and the migration steps, is "Folding the proof of concept into
+> `temporal_reaggregation`" in
+> [`docs/metrics-appliance-design.md`](../../../../../docs/metrics-appliance-design.md).
 
 ## What it does
 

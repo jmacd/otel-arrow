@@ -101,18 +101,37 @@ pub(crate) use cursor_sidecar::CURSOR_SIDECAR_FILENAME;
 /// See ARCHITECTURE.md: "File header: fixed-width preamble (`b\"QUIVER\\0WAL\"`)"
 pub(crate) const WAL_MAGIC: &[u8; 10] = b"QUIVER\0WAL";
 
-/// Entry type marker for a serialized [`RecordBundle`].
+/// Entry type marker for a v1 serialized [`RecordBundle`] (no `user_meta`).
 ///
-/// Currently the only defined entry type. Future versions may add additional
-/// types (e.g., for schema evolution or control records).
+/// This is the original entry type. Bundles written with it carry no opaque
+/// `user_meta`, so replaying them recovers `user_meta` as `0`. Still read for
+/// backward compatibility; the writer now emits [`ENTRY_TYPE_RECORD_BUNDLE_V2`].
 /// See ARCHITECTURE.md: "Entry header (`u8 entry_type`, currently `0 = RecordBundle`)"
 pub(crate) const ENTRY_TYPE_RECORD_BUNDLE: u8 = 0;
 
-/// Size of the entry header in bytes: `entry_type(1) + timestamp(8) + sequence(8) + bitmap(8)`.
+/// Entry type marker for a v2 serialized [`RecordBundle`], adding the opaque
+/// per-bundle `user_meta` (durable-dispatch Phase 3) after the slot bitmap.
+///
+/// The `entry_type` byte makes each entry self-describing, so a v2-capable
+/// writer can safely append v2 entries to a WAL file that still contains v1
+/// entries (`WalWriter::open` appends to a pre-existing file rather than
+/// rotating), and the reader decodes each entry by its own type. New writes use
+/// this type; a future field would take the next type rather than a breaking
+/// re-layout.
+pub(crate) const ENTRY_TYPE_RECORD_BUNDLE_V2: u8 = 1;
+
+/// Size of the base (v1) entry header in bytes: `entry_type(1) + timestamp(8) +
+/// sequence(8) + bitmap(8)`.
 ///
 /// Layout: `{ u8 entry_type, i64 ingestion_ts_nanos, u64 per_core_sequence, u64 slot_bitmap }`
 /// See ARCHITECTURE.md § "Framed entries" for the complete entry structure.
 pub(crate) const ENTRY_HEADER_LEN: usize = 1 + 8 + 8 + 8;
+
+/// Size of the v2 entry header in bytes: the base header plus a `user_meta(8)`
+/// field appended after the slot bitmap (durable-dispatch Phase 3).
+///
+/// Layout: `{ ..base header.., u64 user_meta }`
+pub(crate) const ENTRY_HEADER_LEN_V2: usize = ENTRY_HEADER_LEN + 8;
 
 /// Size of a schema fingerprint (BLAKE3 truncated to 256 bits).
 pub(crate) const SCHEMA_FINGERPRINT_LEN: usize = 32;

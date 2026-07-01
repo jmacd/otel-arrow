@@ -70,6 +70,7 @@ impl FixtureSlot {
 struct FixtureBundle {
     descriptor: BundleDescriptor,
     ingestion_time: SystemTime,
+    user_meta: u64,
     slots: Vec<FixtureSlot>,
 }
 
@@ -78,12 +79,18 @@ impl FixtureBundle {
         Self {
             descriptor,
             ingestion_time: UNIX_EPOCH + Duration::from_secs(42),
+            user_meta: 0,
             slots,
         }
     }
 
     fn with_ingestion_time(mut self, ts: SystemTime) -> Self {
         self.ingestion_time = ts;
+        self
+    }
+
+    fn with_user_meta(mut self, user_meta: u64) -> Self {
+        self.user_meta = user_meta;
         self
     }
 }
@@ -105,6 +112,10 @@ impl RecordBundle for FixtureBundle {
                 schema_fingerprint: slot.fingerprint,
                 batch: &slot.batch,
             })
+    }
+
+    fn user_meta(&self) -> u64 {
+        self.user_meta
     }
 }
 
@@ -407,6 +418,33 @@ async fn wal_writer_reader_roundtrip_recovers_payloads() {
         .map(|value| value.expect("non-null"))
         .collect();
     assert_eq!(collected2, vec![99]);
+}
+
+// A bundle's opaque user_meta rides in the v2 WAL entry and is recovered by the
+// reader, so a partition/generation survives WAL replay after an unclean stop
+// (durable-dispatch Phase 3).
+#[tokio::test]
+async fn wal_writer_reader_roundtrips_user_meta() {
+    let (_dir, wal_path) = temp_wal("user_meta.wal");
+    let hash = [0xCD; 16];
+    const META: u64 = 0x0000_0007_0000_002A; // e.g. partition 42, generation 7
+
+    let descriptor = BundleDescriptor::new(vec![slot_descriptor(0, "Logs")]);
+    let bundle = FixtureBundle::new(
+        descriptor,
+        vec![FixtureSlot::new(SlotId::new(0), 0x11, &[1, 2, 3])],
+    )
+    .with_user_meta(META);
+
+    let options = WalWriterOptions::new(wal_path.clone(), hash, FlushPolicy::Immediate);
+    let mut writer = WalWriter::open(options).await.expect("writer");
+    let _ = writer.append_bundle(&bundle).await.expect("append succeeds");
+    drop(writer);
+
+    let mut reader = WalReader::open(&wal_path).expect("reader");
+    let mut iter = reader.iter_from(0).expect("iterator");
+    let record = iter.next().expect("entry present").expect("entry ok");
+    assert_eq!(record.user_meta, META, "user_meta round-trips through the WAL");
 }
 
 #[tokio::test]

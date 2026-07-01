@@ -28,6 +28,10 @@ pub(crate) struct ReplayBundle {
     descriptor: BundleDescriptor,
     /// The ingestion timestamp from the WAL entry.
     ingestion_time: SystemTime,
+    /// Opaque per-bundle metadata from the WAL entry (`0` for legacy v1 entries),
+    /// carried through replay so the recovered segment manifest keeps it
+    /// (durable-dispatch Phase 3).
+    user_meta: u64,
     /// Decoded slots with their Arrow RecordBatch data.
     slots: Vec<ReplaySlot>,
 }
@@ -104,6 +108,7 @@ impl ReplayBundle {
         Some(Self {
             descriptor: BundleDescriptor::new(descriptors),
             ingestion_time,
+            user_meta: entry.user_meta,
             slots,
         })
     }
@@ -126,6 +131,10 @@ impl RecordBundle for ReplayBundle {
                 schema_fingerprint: s.schema_fingerprint,
                 batch: &s.batch,
             })
+    }
+
+    fn user_meta(&self) -> u64 {
+        self.user_meta
     }
 }
 
@@ -209,6 +218,7 @@ mod tests {
             ingestion_ts_nanos,
             sequence,
             slot_bitmap,
+            user_meta: 0,
             slots,
         }
     }

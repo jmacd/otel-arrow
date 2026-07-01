@@ -218,6 +218,19 @@ impl TopicSpec {
                          (a data_dir)"
                     ));
                 }
+                // num_owners, when set, must not exceed num_partitions: a static
+                // balanced placement assigns each partition to one owner, so more
+                // owners than partitions would leave owners with no work.
+                if let (Some(num_partitions), Some(quiver)) = (self.num_partitions, &self.quiver) {
+                    if let Some(num_owners) = quiver.num_owners {
+                        if num_owners > num_partitions {
+                            errors.push(format!(
+                                "{path_prefix}.quiver.num_owners: must not exceed num_partitions \
+                                 ({num_owners} > {num_partitions})"
+                            ));
+                        }
+                    }
+                }
             }
         }
         errors
@@ -253,21 +266,30 @@ const fn default_quiver_disk_budget_bytes() -> u64 {
     1024 * 1024 * 1024
 }
 
-/// Durable (quiver-backed) topic settings (durable-dispatch Layer B). Each
-/// partition is persisted under `{data_dir}/{topic}/partition_{p}` so published
-/// data survives restart and subscribers resume from durable progress.
+/// Durable (quiver-backed) topic settings (durable-dispatch Layer B). Each owner
+/// holds one durable store under `{data_dir}/{topic}/owner_{o}` (durable-dispatch
+/// D24: one quiver per owner), with each partition a distinct durable substream
+/// within its owner's store, so published data survives restart and subscribers
+/// resume from durable progress.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct QuiverTopicConfig {
-    /// Base directory under which the topic's per-partition durable stores live.
+    /// Base directory under which the topic's per-owner durable stores live.
     pub data_dir: PathBuf,
-    /// Total disk budget in bytes, shared across the topic's partitions. The
-    /// per-partition cap is an even split, floored at a single engine's minimum.
+    /// Total disk budget in bytes, shared across the topic's owners. The
+    /// per-owner cap is an even split, floored at a single engine's minimum.
     #[serde(default = "default_quiver_disk_budget_bytes")]
     pub disk_budget_bytes: u64,
     /// Behavior when the disk budget is exhausted.
     #[serde(default)]
     pub retention: QuiverRetentionPolicy,
+    /// Number of durable owners `M` the `N` partitions are placed across
+    /// (durable-dispatch D24, one quiver per owner). Must be in
+    /// `1..=num_partitions`; a static `balanced(N, M)` placement assigns each
+    /// partition to one owner. When omitted, defaults to `num_partitions` (one
+    /// owner per partition), reproducing the original per-partition layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_owners: Option<NonZeroUsize>,
 }
 
 /// Retention behavior for a durable topic when its disk budget is exhausted
@@ -498,11 +520,11 @@ mod tests {
         TopicBackendKind, TopicBroadcastAckMode, TopicBroadcastOnLagPolicy,
         TopicImplSelectionPolicy, TopicName, TopicQueueOnFullPolicy, TopicSpec,
     };
-    use std::num::NonZeroUsize;
-    use std::path::PathBuf;
     use crate::error::Error;
     use serde::Deserialize;
     use std::collections::HashMap;
+    use std::num::NonZeroUsize;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     #[test]
@@ -550,7 +572,38 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/otap/quiver"),
             disk_budget_bytes: 256 * 1024 * 1024,
             retention: QuiverRetentionPolicy::Backpressure,
+            num_owners: None,
         }
+    }
+
+    #[test]
+    fn quiver_num_owners_must_not_exceed_partitions() {
+        let topic = TopicSpec {
+            backend: TopicBackendKind::Quiver,
+            num_partitions: Some(NonZeroUsize::new(4).unwrap()),
+            quiver: Some(QuiverTopicConfig {
+                num_owners: Some(NonZeroUsize::new(8).unwrap()),
+                ..quiver_settings()
+            }),
+            ..TopicSpec::default()
+        };
+        let errors = topic.validation_errors("topics.durable");
+        assert!(
+            errors.iter().any(|e| e.contains(".quiver.num_owners")),
+            "got: {errors:?}"
+        );
+
+        // Equal to num_partitions (the default per-partition layout) is valid.
+        let topic = TopicSpec {
+            backend: TopicBackendKind::Quiver,
+            num_partitions: Some(NonZeroUsize::new(4).unwrap()),
+            quiver: Some(QuiverTopicConfig {
+                num_owners: Some(NonZeroUsize::new(4).unwrap()),
+                ..quiver_settings()
+            }),
+            ..TopicSpec::default()
+        };
+        assert!(topic.validation_errors("topics.durable").is_empty());
     }
 
     #[test]

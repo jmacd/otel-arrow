@@ -45,6 +45,7 @@ cpu-time = { workspace = true }
 memory-stats = { workspace = true }
 nix = { workspace = true, features = ["resource"] }
 parking_lot = { workspace = true }
+arc-swap = { workspace = true }
 futures-core = { workspace = true }
 async-channel = { workspace = true }
 

@@ -1197,6 +1197,11 @@ impl<
                     let config = DurableDispatchConfig {
                         data_dir: quiver.data_dir.clone(),
                         num_partitions: num_partitions.get(),
+                        // Default to one owner per partition (the original
+                        // per-partition layout) when unset (durable-dispatch D24).
+                        num_owners: quiver
+                            .num_owners
+                            .map_or_else(|| num_partitions.get(), |n| n.get()),
                         capacity,
                         disk_budget_bytes: quiver.disk_budget_bytes,
                         retention: match quiver.retention {
@@ -1206,10 +1211,11 @@ impl<
                             QuiverRetentionPolicy::DropOldest => DurableRetentionPolicy::DropOldest,
                         },
                     };
-                    let state = PData::create_durable_partition_dispatch_topic(name.clone(), config)
-                        .map_err(|e| Error::PipelineRuntimeError {
-                            source: Box::new(e),
-                        })?;
+                    let state =
+                        PData::create_durable_partition_dispatch_topic(name.clone(), config)
+                            .map_err(|e| Error::PipelineRuntimeError {
+                                source: Box::new(e),
+                            })?;
                     _ = broker.create_topic_with_state(name, state).map_err(|e| {
                         Error::PipelineRuntimeError {
                             source: Box::new(e),

@@ -34,14 +34,19 @@ pub enum DurableRetentionPolicy {
 /// [`DurableDispatchPayload::create_durable_partition_dispatch_topic`].
 #[derive(Clone, Debug)]
 pub struct DurableDispatchConfig {
-    /// Base directory under which one per-partition durable store is created
-    /// (`{data_dir}/{topic}/partition_{p}`).
+    /// Base directory under which one per-owner durable store is created
+    /// (`{data_dir}/{topic}/owner_{o}`).
     pub data_dir: PathBuf,
     /// The number of partitions `N` (matches the split-by-key node's `N`).
     pub num_partitions: usize,
+    /// The number of durable owners `M` the partitions are placed across
+    /// (durable-dispatch D24, one quiver per owner). Must be in
+    /// `1..=num_partitions`; a static `balanced(N, M)` placement maps each
+    /// partition to one owner. `M == N` reproduces the per-partition layout.
+    pub num_owners: usize,
     /// Per-partition in-flight delivery capacity.
     pub capacity: usize,
-    /// Total disk budget in bytes, shared across the topic's partitions.
+    /// Total disk budget in bytes, shared across the topic's owners.
     pub disk_budget_bytes: u64,
     /// Behavior when the disk budget is exhausted.
     pub retention: DurableRetentionPolicy,

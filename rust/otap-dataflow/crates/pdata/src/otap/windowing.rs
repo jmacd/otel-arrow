@@ -15,8 +15,8 @@
 //!   **epoch-aligned** windows over event time (D10), so two appliances and the
 //!   central platform produce mergeable buckets for the same series.
 //! - [`Watermark`] is the per-stream completeness estimate: `max(observed
-//!   event_time) - allowed_lateness`, with a `processing_time - max_lag` idle
-//!   floor so idle streams still close (D11).
+//!   event_time) - allowed_lateness`, capped at processing time and floored at
+//!   `processing_time - max_lag` so idle streams still close (D11).
 //! - [`WatermarkPolicy`] turns a watermark into the v1 triggers (D12): a window
 //!   is complete when the watermark reaches `window_end + allowed_lateness`
 //!   (single on-time firing), and a point is late when its event time is below
@@ -138,13 +138,17 @@ pub struct WatermarkPolicy {
 
 impl WatermarkPolicy {
     /// The watermark value for a stream at `processing_time_nanos`:
-    /// `max(max_event - allowed_lateness, processing_time - max_lag)` (D11). With
-    /// no observed event the value is the idle floor.
+    /// `max(min(max_event, processing_time) - allowed_lateness, processing_time -
+    /// max_lag)` (D11). The `min` against processing time is a forward cap so an
+    /// early, in-acceptance-window point (event time up to `max_skew` ahead of
+    /// now) cannot advance completeness past real time and prematurely close an
+    /// earlier window. With no observed event the value is the idle floor.
     #[must_use]
     pub fn watermark(&self, watermark: &Watermark, processing_time_nanos: i64) -> i64 {
         let idle_floor = processing_time_nanos.saturating_sub(self.max_lag_nanos);
         match watermark.max_event() {
             Some(max_event) => max_event
+                .min(processing_time_nanos)
                 .saturating_sub(self.allowed_lateness_nanos)
                 .max(idle_floor),
             None => idle_floor,
@@ -368,6 +372,22 @@ mod tests {
     }
 
     #[test]
+    fn future_event_does_not_advance_watermark_past_processing_time() {
+        let policy = WatermarkPolicy {
+            allowed_lateness_nanos: 2 * SEC,
+            max_lag_nanos: 3600 * SEC,
+        };
+        // An early, in-acceptance-window point: event time is 10s ahead of the
+        // wall clock. The forward cap holds the watermark at processing time minus
+        // allowed_lateness rather than letting the future event push it ahead and
+        // prematurely close earlier windows.
+        let mut wm = Watermark::new();
+        wm.observe(110 * SEC);
+        let processing = 100 * SEC;
+        assert_eq!(policy.watermark(&wm, processing), 98 * SEC);
+    }
+
+    #[test]
     fn idle_floor_advances_a_stale_stream() {
         let policy = WatermarkPolicy {
             allowed_lateness_nanos: 5 * SEC,
@@ -454,11 +474,13 @@ mod tests {
     #[test]
     fn late_points_are_dropped_and_counted() {
         let mut w = windower();
-        assert!(fold(&mut w, "a", 100 * SEC, 1)); // max_event = 100s
-        // 99s is within allowed_lateness (2s) of the max -> admitted.
-        assert!(fold(&mut w, "a", 99 * SEC, 1));
-        // 50s is far behind the max -> late (50 < watermark 98s).
-        assert!(!fold(&mut w, "a", 50 * SEC, 999));
+        // Wall clock is ~100s as these arrive, so processing time is 100s for each.
+        let now = 100 * SEC;
+        assert!(w.admit("a", 100 * SEC, now).is_some()); // max_event = 100s
+        // 99s is within allowed_lateness (2s) of the watermark (98s) -> admitted.
+        assert!(w.admit("a", 99 * SEC, now).is_some());
+        // 50s is far behind the watermark (98s) -> late.
+        assert!(w.admit("a", 50 * SEC, now).is_none());
         assert_eq!(w.late_points(), 1);
     }
 

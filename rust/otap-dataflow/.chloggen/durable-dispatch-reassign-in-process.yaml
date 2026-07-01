@@ -1,0 +1,30 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: enhancement
+
+# The name of the component, or a single word describing the area of concern, (e.g. engine, otap).
+# Must be one of the components listed in rust/otap-dataflow/.chloggen/config.yaml.
+component: engine
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Support live partition reassignment on the durable partition-dispatch topic via a lease-generation routing overlay and drain-and-forward handoff (durable-dispatch Phase 3).
+
+# Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
+issues: [3359]
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries.
+subtext: |
+  `reassign_partition` on the durable (`backend: quiver`) partition-dispatch topic
+  no longer rejects the move. It repoints a partition's new publishes to a
+  different owner store and bumps the partition's lease generation, and the former
+  owner drains-and-forwards the partition's already-persisted residual to the new
+  owner's store before acking it in its own, so no data is lost or
+  double-processed. The lease generation rides in the per-bundle `user_meta`
+  (durable via the WAL); in a single process the owner-identity check is the
+  authoritative fence and the generation is the durable ownership-epoch marker for
+  future cross-node fencing. The routing overlay is persisted as a snapshot and
+  restored on `open()`, so reassignments survive restart. Wiring the controller so
+  the load-feedback scheduler drives reassignment is the remaining follow-up.

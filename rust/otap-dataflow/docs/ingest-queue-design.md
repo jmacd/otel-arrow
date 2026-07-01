@@ -126,6 +126,11 @@ beyond.
 
 ## Architecture
 
+For a visual overview of how this shuffle composes with per-core admission,
+event-time bucketing, and the load-balancing feedback loop, see the master
+diagram in
+[`metrics-appliance-design.md`](./metrics-appliance-design.md#layered-architecture).
+
 ```text
  OTAP/OTLP    +----------+   +--------------+   +----------------------+   +--------------+
  ---------->  | Receiver |-->| Shuffle by   |-->| Admission +          |-->| Per-bucket   |--> balanced
@@ -172,7 +177,10 @@ signal has its own *identity key* and its own manifest, because each has
 different identifying properties (OTel's term for the fields that determine
 identity). The reserved `signal` tenant descriptor distinguishes them. This
 document develops the metric case in detail; traces and logs follow the same
-admission-and-manifest pattern with signal-specific identity keys.
+admission-and-manifest pattern with signal-specific identity keys. What a trace
+or log type descriptor contains, and what its admission validates, is not yet
+designed: only the metric case and the per-signal shard keys of D3 and D26 are
+specified, and the trace and log admission semantics are deferred.
 
 For metrics, two tuples are extracted from OTAP columns (via `pdata-views`):
 
@@ -331,10 +339,14 @@ retention window. No transactional broker is required.
   attribute/exemplar children. Tests cover conflict warning, window rejection,
   the accept path, strict mode, and end-to-end admission. Single-tenant
   (D9 default); the per-tenant projection arrives with later phases.
-- **Phase 1 -- per-core registry and durability:** shuffle by signal key so
-  each core owns its names; maintain the registry locally (no broadcast).
-  Persist the registry (snapshot plus WAL, Quiver-backed) with startup replay.
-  Tests cover restart replay and conflict-flagging.
+- **Phase 1 -- per-core registry (in-memory):** shuffle by signal key so each
+  core owns its names and maintains the registry locally with no broadcast, built
+  on the partition-dispatch topic's in-memory backend. The registry is relearned
+  on restart, which is safe because conflicts are warnings rather than rejections,
+  per D2 and D7. Tests cover the name-keyed shuffle and conflict-flagging. Registry
+  durability is deferred with the Quiver backend, durable-dispatch Layer B and
+  decisions D21 and D28: switching the registry's topic to that backend persists
+  it as a snapshot plus log replayed on startup and adds restart-replay tests.
 - **Phase 2 -- auto-sharder and per-bucket durability:** shuffle by signal key
   into N buckets; a placement map in the controller (`bucket -> core`); one
   `quiver` per core with per-bucket Arrow IPC streams (D5); balanced-topic
@@ -758,10 +770,12 @@ which the downstream watermark operates.
    `trace_id` for traces/correlated-logs -- and `metrics_admission` subscribes to
    the partition-dispatch topic (`partition_dispatch` mode, owned partitions) so
    each owner's `TypeRegistry` is the sole authority for its keys.
-3. Phase 1 registry stays **in-memory** (relearned on restart, safe per D8).
-   Durable registry is deferred with Layer B (then: switch the registry's topic
-   to the Quiver backend, replayed on startup; the `TypeDescriptor`/`observe` API
-   is already in `metrics_admission_processor/registry.rs`).
+3. Phase 1 registry stays **in-memory**, relearned on restart. Relearning is safe
+   because conflicts are warnings rather than rejections, per D2 and D7; D8 records
+   the same relearn safety for eviction. Durable registry is deferred with Layer
+   B: switch the registry's topic to the Quiver backend, replayed on startup. The
+   `TypeDescriptor`/`observe` API is already in
+   `metrics_admission_processor/registry.rs`.
 4. Conflict-flagging tests exist for admission; the split-by-key node has
    cascade, determinism, and conservation tests. (Restart-replay tests arrive
    with Layer B.)

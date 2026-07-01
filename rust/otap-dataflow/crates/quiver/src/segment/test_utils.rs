@@ -92,6 +92,7 @@ pub fn slot_descriptors() -> Vec<SlotDescriptor> {
 pub struct TestBundle {
     descriptor: BundleDescriptor,
     payloads: HashMap<SlotId, (SchemaFingerprint, RecordBatch)>,
+    user_meta: u64,
 }
 
 impl TestBundle {
@@ -101,6 +102,7 @@ impl TestBundle {
         Self {
             descriptor: BundleDescriptor::new(slots),
             payloads: HashMap::new(),
+            user_meta: 0,
         }
     }
 
@@ -113,6 +115,13 @@ impl TestBundle {
         batch: RecordBatch,
     ) -> Self {
         let _ = self.payloads.insert(slot_id, (fingerprint, batch));
+        self
+    }
+
+    /// Sets the opaque per-bundle metadata value for this bundle.
+    #[must_use]
+    pub const fn with_user_meta(mut self, user_meta: u64) -> Self {
+        self.user_meta = user_meta;
         self
     }
 }
@@ -139,5 +148,9 @@ impl RecordBundle for TestBundle {
             .next()
             .map(|(_, batch)| batch.num_rows() as u64)
             .unwrap_or(0)
+    }
+
+    fn user_meta(&self) -> u64 {
+        self.user_meta
     }
 }

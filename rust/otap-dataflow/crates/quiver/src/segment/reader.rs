@@ -901,6 +901,7 @@ impl SegmentReader {
     ///
     /// - `bundle_index`: UInt32
     /// - `item_count`: UInt64 (optional; defaults to 0 for legacy segments)
+    /// - `user_meta`: UInt64 (optional; defaults to 0 for legacy segments)
     /// - `slot_refs`: List<Struct<slot_id: UInt16, stream_id: UInt32, chunk_index: UInt32>>
     ///
     /// Each row represents one [`ManifestEntry`] describing which stream chunks
@@ -935,6 +936,11 @@ impl SegmentReader {
         let item_counts: Option<Vec<u64>> =
             Self::get_primitive_column::<arrow_array::types::UInt64Type>(&batch, "item_count").ok();
 
+        // user_meta is optional for backward compatibility with segments written
+        // before the opaque per-bundle metadata field existed.
+        let user_metas: Option<Vec<u64>> =
+            Self::get_primitive_column::<arrow_array::types::UInt64Type>(&batch, "user_meta").ok();
+
         // Get the slot_refs list column
         let slot_refs_col =
             batch
@@ -966,7 +972,8 @@ impl SegmentReader {
         let mut entries = Vec::with_capacity(batch.num_rows());
         for (i, &bundle_index) in bundle_indices.iter().enumerate() {
             let item_count = item_counts.as_ref().map(|counts| counts[i]).unwrap_or(0);
-            let mut entry = ManifestEntry::new(bundle_index, item_count);
+            let user_meta = user_metas.as_ref().map(|metas| metas[i]).unwrap_or(0);
+            let mut entry = ManifestEntry::new(bundle_index, item_count).with_user_meta(user_meta);
 
             // Get the struct array for this bundle's slot refs
             let slot_refs_for_bundle = slot_refs_list.value(i);

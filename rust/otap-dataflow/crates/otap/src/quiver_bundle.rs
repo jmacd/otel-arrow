@@ -230,6 +230,10 @@ pub struct OtapRecordBundleAdapter {
     descriptor: BundleDescriptor,
     /// Ingestion timestamp
     ingestion_time: SystemTime,
+    /// Opaque per-bundle metadata persisted by quiver and returned on drain. The
+    /// partition-dispatch topic packs `(partition, generation)` here so a drained
+    /// bundle can be routed and (later) fenced without re-deriving its key.
+    user_meta: u64,
 }
 
 impl OtapRecordBundleAdapter {
@@ -247,7 +251,16 @@ impl OtapRecordBundleAdapter {
             signal_type,
             descriptor,
             ingestion_time: SystemTime::now(),
+            user_meta: 0,
         }
+    }
+
+    /// Set the opaque per-bundle metadata value quiver will persist for this
+    /// bundle (see [`RecordBundle::user_meta`]).
+    #[must_use]
+    pub const fn with_user_meta(mut self, user_meta: u64) -> Self {
+        self.user_meta = user_meta;
+        self
     }
 
     /// Consume the adapter and return the original OtapArrowRecords.
@@ -309,6 +322,10 @@ impl RecordBundle for OtapRecordBundleAdapter {
     fn item_count(&self) -> u64 {
         self.records.num_items() as u64
     }
+
+    fn user_meta(&self) -> u64 {
+        self.user_meta
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -334,6 +351,8 @@ pub struct OtlpBytesAdapter {
     /// format without full deserialization, to avoid repeated O(n) scans
     /// on the hot path).
     cached_item_count: u64,
+    /// Opaque per-bundle metadata persisted by quiver and returned on drain.
+    user_meta: u64,
 }
 
 impl OtlpBytesAdapter {
@@ -395,6 +414,7 @@ impl OtlpBytesAdapter {
             descriptor,
             ingestion_time: SystemTime::now(),
             cached_item_count,
+            user_meta: 0,
         })
     }
 
@@ -405,6 +425,14 @@ impl OtlpBytesAdapter {
     #[must_use]
     pub fn into_inner(self) -> OtlpProtoBytes {
         self.bytes
+    }
+
+    /// Set the opaque per-bundle metadata value quiver will persist for this
+    /// bundle (see [`RecordBundle::user_meta`]).
+    #[must_use]
+    pub const fn with_user_meta(mut self, user_meta: u64) -> Self {
+        self.user_meta = user_meta;
+        self
     }
 
     /// Returns the cached item count (computed once during construction).
@@ -438,6 +466,10 @@ impl RecordBundle for OtlpBytesAdapter {
 
     fn item_count(&self) -> u64 {
         self.cached_item_count
+    }
+
+    fn user_meta(&self) -> u64 {
+        self.user_meta
     }
 }
 

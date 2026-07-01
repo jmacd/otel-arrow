@@ -76,6 +76,11 @@ pub struct BundleHandle<C: ResolutionCallback> {
     /// Number of logical data items in this bundle (from the segment manifest).
     /// Zero for legacy segments that pre-date item_count tracking.
     item_count: u64,
+    /// Opaque, application-defined per-bundle metadata (from the segment
+    /// manifest). Zero for segments that pre-date this field. Quiver does not
+    /// interpret it; see
+    /// [`RecordBundle::user_meta`](crate::record_bundle::RecordBundle::user_meta).
+    user_meta: u64,
 }
 
 impl<C: ResolutionCallback> BundleHandle<C> {
@@ -89,6 +94,7 @@ impl<C: ResolutionCallback> BundleHandle<C> {
         data: ReconstructedBundle,
         callback: Arc<C>,
         item_count: u64,
+        user_meta: u64,
     ) -> Self {
         Self {
             bundle_ref,
@@ -97,6 +103,7 @@ impl<C: ResolutionCallback> BundleHandle<C> {
             callback,
             resolved: false,
             item_count,
+            user_meta,
         }
     }
 
@@ -120,6 +127,17 @@ impl<C: ResolutionCallback> BundleHandle<C> {
     #[must_use]
     pub const fn item_count(&self) -> u64 {
         self.item_count
+    }
+
+    /// Returns the opaque, application-defined per-bundle metadata value that was
+    /// stamped at ingest (see
+    /// [`RecordBundle::user_meta`](crate::record_bundle::RecordBundle::user_meta)).
+    ///
+    /// This value comes from the segment manifest. Returns 0 for segments that
+    /// pre-date this field, or for bundles recovered by WAL replay.
+    #[must_use]
+    pub const fn user_meta(&self) -> u64 {
+        self.user_meta
     }
 
     /// Returns the subscriber ID.
@@ -238,7 +256,7 @@ mod tests {
         let subscriber_id = SubscriberId::new("test-sub").unwrap();
         let data = ReconstructedBundle::empty();
 
-        BundleHandle::new(bundle_ref, subscriber_id, data, callback, 0)
+        BundleHandle::new(bundle_ref, subscriber_id, data, callback, 0, 0)
     }
 
     #[test]

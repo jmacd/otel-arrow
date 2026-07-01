@@ -577,6 +577,21 @@ pub enum Error {
     #[error("partition reassignment is not supported on this topic")]
     PartitionReassignNotSupported,
 
+    /// A partition-dispatch subscriber over the durable one-quiver-per-owner
+    /// backend claimed only part of an owner's partition block. Because each
+    /// owner is one durable store drained by a single subscriber, a subscriber
+    /// must claim every partition an owner holds (a whole owner block).
+    #[error(
+        "partition {partition} belongs to owner {owner} whose block is only partially claimed; \
+         a durable subscriber must claim every partition the owner holds"
+    )]
+    PartitionOwnerBlockIncomplete {
+        /// A partition of the owner whose block was not fully claimed.
+        partition: u32,
+        /// The owner whose partition block was only partially claimed.
+        owner: usize,
+    },
+
     /// A partition reassignment targeted an owner that has not subscribed.
     #[error("owner {owner} is out of range for {num_owners} subscribed owners")]
     OwnerOutOfRange {
@@ -699,6 +714,7 @@ impl Error {
             Error::PartitionAlreadyClaimed { .. } => "PartitionAlreadyClaimed",
             Error::PartitionOutOfRange { .. } => "PartitionOutOfRange",
             Error::PartitionReassignNotSupported => "PartitionReassignNotSupported",
+            Error::PartitionOwnerBlockIncomplete { .. } => "PartitionOwnerBlockIncomplete",
             Error::OwnerOutOfRange { .. } => "OwnerOutOfRange",
             Error::DurableDispatchUnsupported => "DurableDispatchUnsupported",
             Error::DurableBackendError { .. } => "DurableBackendError",

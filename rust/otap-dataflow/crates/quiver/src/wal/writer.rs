@@ -129,7 +129,7 @@ use super::cursor_sidecar::CursorSidecar;
 use super::header::{WAL_HEADER_MIN_LEN, WalHeader};
 use super::reader::WalReader;
 use super::{
-    ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, MAX_ROTATION_TARGET_BYTES, WalConsumerCursor,
+    ENTRY_HEADER_LEN_V2, ENTRY_TYPE_RECORD_BUNDLE_V2, MAX_ROTATION_TARGET_BYTES, WalConsumerCursor,
     WalError, WalResult,
 };
 
@@ -589,17 +589,22 @@ impl WalWriter {
             }
         }
 
-        let mut entry_header = [0u8; ENTRY_HEADER_LEN];
+        let mut entry_header = [0u8; ENTRY_HEADER_LEN_V2];
         let mut cursor = 0;
-        entry_header[cursor] = ENTRY_TYPE_RECORD_BUNDLE;
+        entry_header[cursor] = ENTRY_TYPE_RECORD_BUNDLE_V2;
         cursor += 1;
         entry_header[cursor..cursor + 8].copy_from_slice(&ingestion_ts_nanos.to_le_bytes());
         cursor += 8;
         entry_header[cursor..cursor + 8].copy_from_slice(&sequence.to_le_bytes());
         cursor += 8;
         entry_header[cursor..cursor + 8].copy_from_slice(&slot_bitmap.to_le_bytes());
+        cursor += 8;
+        // v2: the opaque per-bundle user_meta rides after the slot bitmap so a
+        // partition/generation survives WAL replay after an unclean stop
+        // (durable-dispatch Phase 3). v1 entries omit it and recover it as 0.
+        entry_header[cursor..cursor + 8].copy_from_slice(&bundle.user_meta().to_le_bytes());
 
-        let entry_body_len = ENTRY_HEADER_LEN + self.active_file.payload_buffer.len();
+        let entry_body_len = ENTRY_HEADER_LEN_V2 + self.active_file.payload_buffer.len();
         let entry_len =
             u32::try_from(entry_body_len).map_err(|_| WalError::EntryTooLarge(entry_body_len))?;
 
@@ -795,7 +800,7 @@ impl ActiveWalFile {
     async fn write_entry(
         &mut self,
         entry_len: u32,
-        entry_header: &[u8; ENTRY_HEADER_LEN],
+        entry_header: &[u8; ENTRY_HEADER_LEN_V2],
         payload: &[u8],
         crc: u32,
     ) -> WalResult<u64> {
@@ -803,7 +808,7 @@ impl ActiveWalFile {
         let entry_start = self.current_len;
 
         // Calculate total entry size: 4 (len) + header + payload + 4 (crc)
-        let total_size = 4 + ENTRY_HEADER_LEN + payload.len() + 4;
+        let total_size = 4 + entry_header.len() + payload.len() + 4;
 
         // Reuse the buffer: clear sets len=0 but preserves capacity.
         // Only reserve additional capacity if needed (reserve is a no-op if

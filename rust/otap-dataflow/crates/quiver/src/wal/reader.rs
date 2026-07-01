@@ -70,8 +70,9 @@ use crate::record_bundle::{SchemaFingerprint, SlotId};
 
 use super::header::WalHeader;
 use super::{
-    ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, MAX_ROTATION_TARGET_BYTES, SCHEMA_FINGERPRINT_LEN,
-    SLOT_HEADER_LEN, WalError, WalOffset, WalResult,
+    ENTRY_HEADER_LEN, ENTRY_HEADER_LEN_V2, ENTRY_TYPE_RECORD_BUNDLE, ENTRY_TYPE_RECORD_BUNDLE_V2,
+    MAX_ROTATION_TARGET_BYTES, SCHEMA_FINGERPRINT_LEN, SLOT_HEADER_LEN, WalError, WalOffset,
+    WalResult,
 };
 
 /// Maximum allowed entry size, derived from [`MAX_ROTATION_TARGET_BYTES`].
@@ -473,6 +474,9 @@ pub(crate) struct WalRecordBundle {
     pub ingestion_ts_nanos: i64,
     pub sequence: u64,
     pub slot_bitmap: u64,
+    /// Opaque per-bundle metadata, recovered from a v2 entry; `0` for v1 entries
+    /// (durable-dispatch Phase 3).
+    pub user_meta: u64,
     pub slots: Vec<DecodedWalSlot>,
 }
 
@@ -604,8 +608,8 @@ fn decode_entry(
     header_size: u64,
     wal_position_start: u64,
 ) -> WalResult<WalRecordBundle> {
-    if body.len() < ENTRY_HEADER_LEN {
-        return Err(WalError::InvalidEntry("body shorter than header"));
+    if body.is_empty() {
+        return Err(WalError::InvalidEntry("empty entry body"));
     }
 
     // Convert file offsets to global WAL positions:
@@ -619,13 +623,28 @@ fn decode_entry(
     let mut cursor = 0;
     let entry_type = body[cursor];
     cursor += 1;
-    if entry_type != ENTRY_TYPE_RECORD_BUNDLE {
-        return Err(WalError::UnsupportedEntry(entry_type));
+    // Each entry is self-describing via its type byte, so a WAL file may hold a
+    // mix of v1 (no user_meta) and v2 (with user_meta) entries, which happens
+    // when a v2-capable writer appends to a WAL created by an older run.
+    let header_len = match entry_type {
+        ENTRY_TYPE_RECORD_BUNDLE => ENTRY_HEADER_LEN,
+        ENTRY_TYPE_RECORD_BUNDLE_V2 => ENTRY_HEADER_LEN_V2,
+        other => return Err(WalError::UnsupportedEntry(other)),
+    };
+    if body.len() < header_len {
+        return Err(WalError::InvalidEntry("body shorter than header"));
     }
 
     let ingestion_ts_nanos = read_i64(body, &mut cursor, "ingestion timestamp")?;
     let sequence = read_u64(body, &mut cursor, "sequence")?;
     let slot_bitmap = read_u64(body, &mut cursor, "slot bitmap")?;
+    // v2 entries carry the opaque user_meta after the slot bitmap; v1 entries do
+    // not, so they recover it as 0 (durable-dispatch Phase 3).
+    let user_meta = if entry_type == ENTRY_TYPE_RECORD_BUNDLE_V2 {
+        read_u64(body, &mut cursor, "user_meta")?
+    } else {
+        0
+    };
 
     let expected_slots = slot_bitmap.count_ones() as usize;
     let mut slots = Vec::with_capacity(expected_slots);
@@ -675,6 +694,7 @@ fn decode_entry(
         ingestion_ts_nanos,
         sequence,
         slot_bitmap,
+        user_meta,
         slots,
     })
 }
@@ -1023,5 +1043,57 @@ pub(super) mod test_support {
 
     pub fn reset_failures() {
         NEXT_FAILURE.with(|slot| slot.set(None));
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use crate::wal::{ENTRY_TYPE_RECORD_BUNDLE, ENTRY_TYPE_RECORD_BUNDLE_V2};
+
+    /// Build a slot-less entry body of the given type. v2 appends `user_meta`
+    /// after the slot bitmap; v1 omits it.
+    fn slotless_body(entry_type: u8, user_meta: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(entry_type);
+        body.extend_from_slice(&7i64.to_le_bytes()); // ingestion ts
+        body.extend_from_slice(&3u64.to_le_bytes()); // sequence
+        body.extend_from_slice(&0u64.to_le_bytes()); // slot bitmap (no slots)
+        if entry_type == ENTRY_TYPE_RECORD_BUNDLE_V2 {
+            body.extend_from_slice(&user_meta.to_le_bytes());
+        }
+        body
+    }
+
+    // A v2 entry carries user_meta after the slot bitmap and decodes it back.
+    #[test]
+    fn decode_entry_reads_v2_user_meta() {
+        const META: u64 = 0x0000_0007_0000_002A;
+        let body = slotless_body(ENTRY_TYPE_RECORD_BUNDLE_V2, META);
+        let entry = decode_entry(0, body.len() as u64, &body, 0, 0).expect("v2 decodes");
+        assert_eq!(entry.user_meta, META);
+        assert_eq!(entry.sequence, 3);
+        assert!(entry.slots.is_empty());
+    }
+
+    // A legacy v1 entry has no user_meta field; it recovers as 0 (durable-dispatch
+    // Phase 3 back-compat: v2-capable readers still replay v1 WALs).
+    #[test]
+    fn decode_entry_defaults_v1_user_meta_to_zero() {
+        let body = slotless_body(ENTRY_TYPE_RECORD_BUNDLE, 0);
+        let entry = decode_entry(0, body.len() as u64, &body, 0, 0).expect("v1 decodes");
+        assert_eq!(entry.user_meta, 0);
+        assert_eq!(entry.sequence, 3);
+        assert!(entry.slots.is_empty());
+    }
+
+    // An unknown entry type is rejected rather than silently misparsed.
+    #[test]
+    fn decode_entry_rejects_unknown_type() {
+        let body = slotless_body(0xFE, 0);
+        match decode_entry(0, body.len() as u64, &body, 0, 0) {
+            Err(WalError::UnsupportedEntry(t)) => assert_eq!(t, 0xFE),
+            other => panic!("expected UnsupportedEntry, got {other:?}"),
+        }
     }
 }

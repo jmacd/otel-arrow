@@ -3,7 +3,8 @@
 
 //! WAL file header encoding and validation.
 //!
-//! Every WAL file starts with a variable-size header (38 bytes for version 1):
+//! Every WAL file starts with a variable-size header (38 bytes for versions 1
+//! and 2, which share the same header layout):
 //!
 //! ```text
 //! ┌────────────┬─────────┬──────────────┬──────────────────┬────────────────────┐
@@ -12,7 +13,7 @@
 //! ```
 //!
 //! - **magic**: `b"QUIVER\0WAL"` identifies the file type
-//! - **version**: Format version (currently 1)
+//! - **version**: Format version (currently 2; version 1 is still read)
 //! - **header_size**: Total size of the header in bytes (allows future expansion)
 //! - **segment_hash**: MD5 of segment configuration; mismatches reject the file
 //! - **wal_pos_start**: WAL stream position at the start of this file. Used to
@@ -31,7 +32,24 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::{WAL_MAGIC, WalError};
 
-pub(crate) const WAL_VERSION: u16 = 1;
+/// Current WAL format version, written into the header of newly created files.
+///
+/// Bumped to 2 for durable-dispatch Phase 3: v2 WAL entries carry the opaque
+/// per-bundle `user_meta`. The on-disk *header* layout is unchanged between v1
+/// and v2 (same [`HEADER_V1_LEN`] bytes); the version marks that the writer may
+/// emit v2 entries. Entries are self-describing via their type byte, so both
+/// versions are read back regardless of the file's declared version.
+pub(crate) const WAL_VERSION: u16 = 2;
+
+/// Oldest WAL format version this build can read. Files declaring a version in
+/// `WAL_VERSION_MIN..=WAL_VERSION` are accepted (version-aware replay); older or
+/// newer versions are rejected.
+pub(crate) const WAL_VERSION_MIN: u16 = 1;
+
+/// Whether a WAL header version is readable by this build.
+const fn is_supported_wal_version(version: u16) -> bool {
+    version >= WAL_VERSION_MIN && version <= WAL_VERSION
+}
 
 /// Minimum header size to read magic, version, and header_size fields.
 /// Future versions may increase the full header size, but this prefix is stable.
@@ -139,7 +157,7 @@ impl WalHeader {
 
         // Validate version
         let version = u16::from_le_bytes([min_buf[WAL_MAGIC.len()], min_buf[WAL_MAGIC.len() + 1]]);
-        if version != WAL_VERSION {
+        if !is_supported_wal_version(version) {
             return Err(WalError::InvalidHeader("unsupported version"));
         }
 
@@ -187,7 +205,7 @@ impl WalHeader {
 
         // Validate version
         let version = u16::from_le_bytes([buf[WAL_MAGIC.len()], buf[WAL_MAGIC.len() + 1]]);
-        if version != WAL_VERSION {
+        if !is_supported_wal_version(version) {
             return Err(WalError::InvalidHeader("unsupported version"));
         }
 
@@ -216,7 +234,7 @@ impl WalHeader {
 
         // Validate version
         let version = u16::from_le_bytes([min_buf[WAL_MAGIC.len()], min_buf[WAL_MAGIC.len() + 1]]);
-        if version != WAL_VERSION {
+        if !is_supported_wal_version(version) {
             return Err(WalError::InvalidHeader("unsupported version"));
         }
 
@@ -260,7 +278,7 @@ impl WalHeader {
         // Version
         let version = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
         cursor += 2;
-        if version != WAL_VERSION {
+        if !is_supported_wal_version(version) {
             return Err(WalError::InvalidHeader("unsupported version"));
         }
 
@@ -383,12 +401,32 @@ mod tests {
     fn decode_rejects_unsupported_version() {
         let mut encoded = WalHeader::new(sample_hash()).encode();
         let version_idx = WAL_MAGIC.len();
-        encoded[version_idx..version_idx + 2].copy_from_slice(&2u16.to_le_bytes());
+        // A version newer than this build can read is rejected.
+        encoded[version_idx..version_idx + 2].copy_from_slice(&(WAL_VERSION + 1).to_le_bytes());
         let err = WalHeader::decode(&encoded).unwrap_err();
         assert!(matches!(
             err,
             WalError::InvalidHeader("unsupported version")
         ));
+
+        // Version 0 (below the minimum supported version) is also rejected.
+        encoded[version_idx..version_idx + 2].copy_from_slice(&0u16.to_le_bytes());
+        let err = WalHeader::decode(&encoded).unwrap_err();
+        assert!(matches!(
+            err,
+            WalError::InvalidHeader("unsupported version")
+        ));
+    }
+
+    #[test]
+    fn decode_accepts_legacy_v1_header() {
+        // A v1 file (written before the Phase 3 user_meta stamping) is still
+        // readable: version-aware replay accepts WAL_VERSION_MIN..=WAL_VERSION.
+        let mut encoded = WalHeader::new(sample_hash()).encode();
+        let version_idx = WAL_MAGIC.len();
+        encoded[version_idx..version_idx + 2].copy_from_slice(&1u16.to_le_bytes());
+        let header = WalHeader::decode(&encoded).expect("v1 header must decode");
+        assert_eq!(header.segment_cfg_hash, sample_hash());
     }
 
     #[test]

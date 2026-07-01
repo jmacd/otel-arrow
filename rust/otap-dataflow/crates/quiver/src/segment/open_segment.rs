@@ -163,7 +163,8 @@ impl OpenSegment {
         }
 
         let bundle_index = self.manifest.len() as u32;
-        let mut entry = ManifestEntry::new(bundle_index, bundle.item_count());
+        let mut entry = ManifestEntry::new(bundle_index, bundle.item_count())
+            .with_user_meta(bundle.user_meta());
 
         // Iterate over all slots defined in the bundle's descriptor
         for slot_desc in &bundle.descriptor().slots {
@@ -265,6 +266,7 @@ impl OpenSegment {
             let slot_ids: Vec<SlotId> = entry.slot_ids().collect();
             summaries.push(OpenSegmentBundleSummary {
                 item_count: entry.item_count(),
+                user_meta: entry.user_meta(),
                 slot_ids,
             });
         }
@@ -277,6 +279,9 @@ impl OpenSegment {
 pub struct OpenSegmentBundleSummary {
     /// Number of logical data items in the bundle.
     pub item_count: u64,
+    /// Opaque, application-defined per-bundle metadata (see
+    /// [`RecordBundle::user_meta`](crate::record_bundle::RecordBundle::user_meta)).
+    pub user_meta: u64,
     /// Slot IDs populated in the bundle.
     pub slot_ids: Vec<SlotId>,
 }

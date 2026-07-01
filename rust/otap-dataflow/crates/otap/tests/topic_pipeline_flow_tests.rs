@@ -20,8 +20,8 @@ use otap_df_engine::node::{NodeWithPDataReceiver, NodeWithPDataSender};
 use otap_df_engine::testing::exporter::create_test_pipeline_context;
 use otap_df_engine::testing::{create_not_send_channel, setup_test_runtime, test_node};
 use otap_df_engine::topic::{
-    DurableDispatchConfig, DurableRetentionPolicy, TopicBroadcastAckMode, TopicBroadcastOnLagPolicy,
-    TopicBroker, TopicOptions, TopicSet,
+    DurableDispatchConfig, DurableRetentionPolicy, TopicBroadcastAckMode,
+    TopicBroadcastOnLagPolicy, TopicBroker, TopicOptions, TopicSet,
 };
 use otap_df_otap::pdata::OtapPdata;
 use otap_df_otap::quiver_topic::QuiverPartitionDispatchTopic;
@@ -358,6 +358,7 @@ fn topic_exporter_to_quiver_partition_dispatch_receiver() {
             DurableDispatchConfig {
                 data_dir: data_dir.path().to_path_buf(),
                 num_partitions: 4,
+                num_owners: 4,
                 capacity: 16,
                 disk_budget_bytes: 256 * 1024 * 1024,
                 retention: DurableRetentionPolicy::Backpressure,

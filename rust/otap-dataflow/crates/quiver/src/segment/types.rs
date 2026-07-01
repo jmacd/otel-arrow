@@ -305,25 +305,48 @@ pub struct ManifestEntry {
     /// bundles this is the count of log records, metric data points,
     /// or spans. Zero if unknown (e.g. legacy segments without this field).
     item_count: u64,
+    /// Opaque, application-defined per-bundle metadata that Quiver persists and
+    /// returns unmodified on the drain path. Quiver does not interpret it; see
+    /// [`RecordBundle::user_meta`](crate::record_bundle::RecordBundle::user_meta).
+    /// Zero if unset or for legacy segments without this field.
+    user_meta: u64,
     /// Mapping from slot to the stream/chunk containing that slot's data.
     slot_refs: HashMap<SlotId, SlotChunkRef>,
 }
 
 impl ManifestEntry {
     /// Creates a new manifest entry for the given bundle index and item count.
+    /// The opaque `user_meta` defaults to `0`; set it with
+    /// [`with_user_meta`](ManifestEntry::with_user_meta).
     #[must_use]
     pub fn new(bundle_index: u32, item_count: u64) -> Self {
         Self {
             bundle_index,
             item_count,
+            user_meta: 0,
             slot_refs: HashMap::new(),
         }
+    }
+
+    /// Sets the opaque per-bundle metadata value, returning the entry for
+    /// builder-style chaining.
+    #[must_use]
+    pub const fn with_user_meta(mut self, user_meta: u64) -> Self {
+        self.user_meta = user_meta;
+        self
     }
 
     /// Returns the number of logical data items in this bundle.
     #[must_use]
     pub const fn item_count(&self) -> u64 {
         self.item_count
+    }
+
+    /// Returns the opaque, application-defined per-bundle metadata value. Zero if
+    /// unset or for legacy segments that pre-date this field.
+    #[must_use]
+    pub const fn user_meta(&self) -> u64 {
+        self.user_meta
     }
 
     /// Adds a slot reference to this manifest entry.

@@ -21,19 +21,34 @@ bespoke parts.
 > feedback loop driven end-to-end by a real aggregating owner (the L2 event-time
 > windower).
 >
-> **Layer B status (D21/D24): implemented as a PoC.** The durable backend is the
-> additive backend behind the *same* `TopicState` interface (D27): a topic with
-> `backend: quiver` and `num_partitions` persists each partition's stream to a
-> per-partition Quiver store (`crates/otap/src/quiver_topic.rs`,
+> **Layer B status (D21/D24): implemented.** The durable backend is the additive
+> backend behind the *same* `TopicState` interface (D27): a topic with
+> `backend: quiver` and `num_partitions` persists published data to durable
+> Quiver stores (`crates/otap/src/quiver_topic.rs`,
 > `QuiverPartitionDispatchTopic`), survives restart, and resumes subscribers from
-> durable progress. The PoC's one deliberate simplification, swappable later
-> without an interface change, is that it uses **one Quiver engine per partition**
-> (D24's simpler option). Publishes are durable on return via the WAL, and a
-> partition's segment flush is **batched**: at most once per a short interval so
-> rapid publishes do not each finalize a segment. The controller arms that
-> previously rejected `TopicBackendKind::Quiver` are now filled, and the durable
-> backend is reached through the `DurableDispatchPayload` trait so the generic
-> engine and controller stay free of quiver and OTAP specifics.
+> durable progress. The backend now uses **one Quiver engine per owner** (D24's
+> production option): the `N` partitions are placed across `M` owners
+> (`num_owners`, default `N`) by a static `balanced(N, M)` map, each owner's store
+> interleaves the partitions it holds, and the partition is stamped into a generic
+> opaque **per-bundle `user_meta`** in Quiver (the Phase 1 enabling primitive) so
+> a drained bundle's partition is recovered without re-deriving its key. `M == N`
+> reproduces the original one-engine-per-partition layout. Publishes are durable
+> on return via the WAL, and an owner's segment flush is **batched**: at most once
+> per a short interval so rapid publishes do not each finalize a segment. The
+> controller arms that previously rejected `TopicBackendKind::Quiver` are now
+> filled, and the durable backend is reached through the `DurableDispatchPayload`
+> trait so the generic engine and controller stay free of quiver and OTAP
+> specifics. **Phase 3 progress:** (1) the WAL now stamps the opaque per-bundle
+> `user_meta` (partition + lease generation) into a versioned v2 entry, so a
+> partition survives WAL replay after an unclean stop; (2) **live partition
+> reassignment works**: `reassign_partition` repoints a partition's new publishes
+> to a different owner store and bumps its lease generation, and the deposed owner
+> drains-and-forwards the partition's residual to the new owner's store; and (3)
+> **reassignments survive restart**: the routing overlay (owners + generations)
+> is persisted as an atomically-rewritten snapshot and restored on `open()`.
+> **Open follow-up (Phase 3):** wiring the controller so it computes the initial
+> placement and drives reassignment from the load-feedback scheduler
+> (`apply_move`).
 
 ## Motivation
 
@@ -124,7 +139,7 @@ the load-balancing feedback loop designed here.
 | Durable buffer                       | `quiver` (WAL + Arrow IPC segments, at-least-once, multi-stream, budget) | exists (experimental)                    |
 | Reserved durable topic kind          | `TopicBackendKind::Quiver`                                               | implemented (durable partition-dispatch) |
 | Split-by-key (Layer A)               | `otap::partition` + `partition` processor                                | implemented + tested                     |
-| Quiver TopicBackend (Layer B)        | `otap::quiver_topic::QuiverPartitionDispatchTopic`                       | implemented + tested (PoC)               |
+| Quiver TopicBackend (Layer B)        | `otap::quiver_topic::QuiverPartitionDispatchTopic`                       | implemented + tested                     |
 | Partition-dispatch + placement (C)   | `PartitionDispatchBackend` + placement map + load feedback loop          | implemented + tested                     |
 
 ## Layer A: Split-by-key
@@ -362,12 +377,15 @@ designed to accept either; the ingest queue uses the hash-partition form.
 
 ## Layer B: Quiver TopicBackend (optional durability)
 
-> **Implemented as a PoC.** `crates/otap/src/quiver_topic.rs`
+> **Implemented (one quiver per owner).** `crates/otap/src/quiver_topic.rs`
 > (`QuiverPartitionDispatchTopic`) implements `TopicState<OtapPdata>` durably; the
 > controller constructs it through the `DurableDispatchPayload` trait when a topic
-> sets `backend: quiver` and `num_partitions`. The PoC uses one Quiver engine per
-> partition; segment flushes are batched per partition. The granularity is
-> swappable later without an interface change.
+> sets `backend: quiver` and `num_partitions`. The backend uses one Quiver engine
+> per owner over a static `balanced(N, M)` placement (`num_owners`, default `N`);
+> each bundle's partition rides Quiver's opaque per-bundle `user_meta`. Segment
+> flushes are batched per owner. Live reassignment works via a dynamic routing
+> overlay that is persisted as a snapshot and restored on `open()`, so
+> reassignments survive restart (Phase 3, below).
 
 **Goal.** Make the *same* partition-dispatch topic durable: published items are
 persisted before acknowledgement and survive restart; subscribers resume from
@@ -377,15 +395,17 @@ not a separate mechanism.
 **Mechanism (implemented).** The durable topic implements the same `TopicState`
 and `SubscriptionBackend` surface against `quiver`:
 
-- `TopicState::publish*` -> quiver `ingest(bundle)`, durable on return via the
-  WAL. The segment flush that makes data pollable is batched per partition (at
+- `TopicState::publish*` -> route the message to its partition's owner via the
+  static placement, then quiver `ingest(bundle)` into that owner's store, durable
+  on return via the WAL, stamping the partition into the bundle's opaque
+  `user_meta`. The segment flush that makes data pollable is batched per owner (at
   most once per a short interval, plus a final flush on close), so rapid
   publishes accumulate into one segment instead of finalizing one per publish.
   The OTAP->bundle adapter is shared from `otap_df_otap::quiver_bundle`, moved out
   of the durable buffer processor so both use one implementation.
-- the partition subscription -> the owner drains the partitions it currently
-  owns; each partition is a distinct quiver engine with a single fixed subscriber
-  id, so ownership can change without disturbing durable progress.
+- the partition subscription -> the owner drains the owner stores it claimed (a
+  subscription claims whole owner blocks), recovering each bundle's partition from
+  `user_meta` since one store interleaves the owner's partitions.
 - `SubscriptionBackend::poll_recv_delivery` -> quiver `poll_next_bundle`, with the
   delivery's `commit` acking the bundle and `abort`/`abandon` deferring it for
   redelivery (`BundleHandle::{ack, defer}`).
@@ -408,6 +428,153 @@ topology fork). The same backend **backs per-owner state durability** -- the
 metric type registry persists through a small Quiver-backed topic (snapshot +
 log), replayed on startup -- so no hand-rolled WAL is needed.
 
+## Phase 3: leases, generation fencing, and reassignment handoff
+
+Phases 1 and 2 delivered the durable one-quiver-per-owner backend over a
+**static** placement. Phase 3 makes the placement **dynamic** so a partition can
+move between owners at runtime without losing or double-processing data. It is
+the durable counterpart of the in-memory reassignment already wired for Layer C,
+and it is the piece the load-feedback rebalancer needs before the durable backend
+can rebalance under load.
+
+**Status: implemented** (increments I1-I3 plus placement persistence): the WAL
+`user_meta` stamping (below), a dynamic per-partition routing overlay with lease
+generations, the drain-and-forward handoff, and a persisted placement snapshot so
+reassignments survive restart. **Deferred (next increment):** wiring the
+controller so it computes the initial placement and drives reassignment from the
+load-feedback scheduler (`apply_move`, I4).
+
+### Current substrate (what Phases 1 and 2 already provide)
+
+- A generic opaque per-bundle `user_meta` in quiver, recorded in the segment
+  manifest **and (Phase 3, done) the v2 WAL entry**, exposed on the drain path as
+  `BundleHandle::user_meta()` (`crates/quiver/`), so it survives WAL replay after
+  an unclean stop.
+- One quiver engine per owner over a static `balanced(N, M)` placement, with the
+  partition packed into `user_meta` at publish and recovered on drain (Phase 2,
+  `crates/otap/src/quiver_topic.rs`).
+- `pack_user_meta(partition, generation)` packs the lease generation into the
+  high 32 bits of `user_meta` and `unpack_partition` reads the low 32;
+  `unpack_generation` reads the high 32 (stamped and carried today; the read-side
+  comparison is used by cross-node fencing later).
+- `reassign_partition` **now repoints the dynamic routing overlay and bumps the
+  generation** (it no longer rejects the move); the drain path fences and forwards
+  residual.
+
+### Why reassignment is hard on the durable backend
+
+One quiver per owner binds a partition's persisted data to its owner's store.
+When partition `p` moves from owner A to owner B, the bundles A already persisted
+for `p` live in A's engine, while new publishes for `p` must go to B's engine. B
+drains only its own store, so A's residual `p` bundles are unreachable to B
+unless they are moved. The in-memory backend avoids this because reassignment
+just repoints an in-memory queue.
+
+### Mechanism
+
+Three pieces compose, following Centrifuge and Slicer (ingest-queue "Leases and
+fencing"):
+
+1. **Lease generation.** Each partition carries a monotonic generation in the
+   routing. `reassign_partition` bumps that generation instead of rejecting the
+   move, and the publish path stamps the current generation into the `user_meta`
+   bits `pack_user_meta` already reserves.
+2. **Drain-and-forward handoff.** After `p` moves from A to B, new publishes for
+   `p` route to B's store at the new generation. A drains its residual `p`
+   bundles at the old generation, re-ingests them into B's store, then acks them
+   in A's store, migrating the partition tail without quiver extracting a stream.
+   Sequenced at an aggregation-window boundary per Layer C, the forwarded tail is
+   the closing window, so no live per-series state crosses.
+3. **Generation fencing.** A write or ack carrying a generation older than the
+   partition's current generation is rejected, so a deposed owner slow to observe
+   the move cannot corrupt the new owner's state. The generation rides in
+   `user_meta`, so a fence compares a bundle's unpacked generation against the
+   routing's current generation for that partition.
+
+**How the three questions resolved (in-process implementation).** Because this
+topic runs in one process and publishing is centralized through the topic, a live
+write always carries the partition's *current* owner and generation, so there is
+no deposed writer to fence on the write path. The only stale data is residual
+already persisted in a former owner's store, so the fence lives on the **drain
+path**: a bundle drained from a store that is no longer the partition's current
+owner is forwarded to the current owner's store and acked in the old one. The
+forwarding owner reaches the new store directly through `Shared::engines`, since
+the topic owns every engine. The generation is **per-partition**. In one process
+the owner-identity check is the authoritative fence and the generation is stamped
+as the durable ownership-epoch marker that a future cross-node fence compares.
+The routing overlay is persisted as a snapshot and restored on `open()` (below),
+so reassignments survive restart.
+
+### WAL durability of `user_meta` (implemented)
+
+Phase 1 recorded `user_meta` in the segment manifest, not the WAL, matching how
+`item_count` behaves, so a partition and generation came back as 0 for bundles
+recovered by WAL replay after an unclean stop. **Phase 3 now stamps `user_meta`
+into the WAL entry** so a partition and generation survive a crash
+(`crates/quiver/`).
+
+The chosen mechanism is **version-aware replay** with self-describing entries.
+Rather than keying the entry layout off the file-header version (which breaks
+because `WalWriter::open` appends to a pre-existing WAL file instead of rotating,
+so a v2-capable writer would write new-format entries into an old-header file),
+each entry carries a type byte: `ENTRY_TYPE_RECORD_BUNDLE_V2 = 1` appends
+`user_meta` after the slot bitmap, while the legacy `= 0` entry omits it and
+recovers `user_meta` as 0. The file header `WAL_VERSION` is bumped to `2` and the
+reader accepts `WAL_VERSION_MIN..=WAL_VERSION`, so existing v1 WALs still replay.
+`item_count` remains manifest-only for now; a future field takes the next entry
+type rather than a breaking re-layout.
+
+### Placement persistence (implemented)
+
+The routing overlay is persisted so reassignments survive restart. Because the
+placement is a tiny map rewritten wholesale, it is a **snapshot, not a log**:
+Quiver's WAL/segment/compaction machinery is built for high-volume append
+streams and would be over-engineered here. `reassign_partition` writes the
+updated `(partition -> owner, generation)` map to
+`{data_dir}/{topic}/placement.v1` via a temp-file-fsync-rename so the write is
+atomic and crash-durable, **before** the in-memory swap takes effect, so a
+reassignment is durable before it is observable; a snapshot write failure leaves
+the overlay unchanged and reports the move as failed. `open()` restores the
+overlay from the snapshot, falling back to
+the static `balanced` placement when the file is absent or the topology changed
+(`num_partitions` / `num_owners`). The persist/load pair (`persist_placement` /
+`load_placement` in `crates/otap/src/quiver_topic.rs`) is a small seam, so it
+could later be swapped for a Quiver-backed control stream without touching the
+topic logic.
+
+### Implementation status by increment
+
+- **I1 -- WAL `user_meta` durability (done):** `crates/quiver/` `wal/{mod,header,
+  writer,reader,replay}.rs`, above.
+- **I2/I3 -- generation lease + drain-and-forward (done):**
+  `crates/otap/src/quiver_topic.rs`: the dynamic `partition_owner` /
+  `partition_generation` `RoutingOverlay`, held in an `ArcSwap` so the publish and
+  drain hot paths read it lock-free while `reassign_partition` swaps in an updated
+  snapshot (subscribe-time claim state stays under a separate `Mutex`);
+  `unpack_generation`; `reassign_partition` (repoint + bump); and fence-and-forward
+  in `QuiverDispatchSub::poll_recv_delivery` / `forward_fenced_bundle`.
+- **Placement persistence (done):** the overlay is persisted as a snapshot and
+  restored on `open()` (above), so a reassignment survives restart.
+- **I4 -- controller wiring (next):** the controller computes the initial
+  placement and assigns each receiver replica its stores (replacing the
+  hand-specified config), and drives reassignment from
+  `crates/engine/src/topic/load_feedback.rs` (`PartitionMove`,
+  `PlacementCoordinator`, `PlacementScheduler` -> `apply_move`), which the durable
+  backend now honors through `reassign_partition`.
+
+### Open questions -- resolved
+
+- ~~Fence at the write path, the ack path, or both, and what the deposed owner
+  does with a fenced bundle.~~ **Resolved:** fence on the drain path (publishing
+  is centralized, so there is no stale writer); the deposed owner forwards the
+  fenced residual to the current owner's store and acks it in its own.
+- ~~How the forwarding owner reaches the new owner's store.~~ **Resolved:**
+  directly through `Shared::engines`; the topic owns every engine.
+- ~~Whether the generation is per-partition or per-owner-block.~~ **Resolved:**
+  per-partition.
+- ~~The WAL format-versioning approach for `user_meta`.~~ **Resolved:** per-entry
+  type discriminator + `WAL_VERSION` bump to 2 with version-aware replay.
+
 ## How the ingest queue rides this
 
 - **Phase 1 shuffle (in-memory).** `metrics_admission` (or its replicas)
@@ -420,7 +587,10 @@ log), replayed on startup -- so no hand-rolled WAL is needed.
   `metrics_admission_processor/registry.rs`.
 - **Phase 2 per-bucket durability + placement.** One quiver per owner with
   per-partition Arrow-IPC streams (ingest-queue D5); the controller placement
-  map; leases + generation fencing.
+  map; leases + generation fencing. The durable-dispatch infrastructure this
+  needs is now built: one quiver per owner (D24), the persisted routing overlay,
+  and lease-generation reassignment with drain-and-forward. What the ingest queue
+  still needs on top is the controller placement wiring (I4).
 - **Raw buffer (L1) and stage-2 feed (L3 of the appliance).** Topics whose
   backend is chosen per location (D27): in-memory for the SDK profile, quiver for
   the durable appliance.
@@ -430,17 +600,18 @@ log), replayed on startup -- so no hand-rolled WAL is needed.
 Continuing the shared decision ledger of the ingest-queue and appliance designs
 (D1-D17). Status is per-decision: **ratified**, decided and ready to build, or
 **implemented**, built and tested. The durable backend (D21/D24), previously
-deferred, is now implemented as a PoC.
+deferred, is now implemented (one quiver per owner) with live, restart-durable
+reassignment; the remaining Phase 3 work is the controller/scheduler wiring (I4).
 
 | ID  | Decision                            | Recommendation                                      | Status            |
 | --- | ----------------------------------- | --------------------------------------------------- | ----------------- |
 | D18 | Layer decomposition + build order   | A split-by-key -> C in-memory dispatch -> B durable | ratified          |
 | D19 | Split-by-key mechanism              | selection-mask radix cascade; batch processor       | ratified          |
 | D20 | Shard key source                    | data-sourced; descriptor/tenant composes later      | ratified          |
-| D21 | Durable backend                     | Quiver durable `TopicState`; durability is additive | implemented (PoC) |
+| D21 | Durable backend                     | Quiver durable `TopicState`; durability is additive | implemented       |
 | D22 | Partition ownership                 | new partition-claim mode; in-memory first           | ratified          |
 | D23 | Placement seam                      | controller map; static->rebalanced; leases          | ratified          |
-| D24 | Quiver backend granularity          | one quiver per partition for the PoC                | implemented (PoC) |
+| D24 | Quiver backend granularity          | one quiver per owner; user_meta carries partition   | implemented       |
 | D25 | Split and dispatch packaging        | separate composable nodes; fused fast-path later    | ratified          |
 | D26 | Standalone logs (no `trace_id`) key | configured projection; default even spread          | ratified          |
 | D27 | Optional, per-location durability   | delivery mode x backend are orthogonal axes         | ratified          |
@@ -489,9 +660,9 @@ this is simpler than and orthogonal to header-sourced tenant descriptors.
 condition-routing composes as an additional partition function over the same
 dispatch mode (couples to ingest-queue D9 and the multitenancy design).
 
-### D21. Durable backend (additive) -- implemented as a PoC
+### D21. Durable backend (additive) -- implemented
 
-**Implemented (PoC):** `TopicBackendKind::Quiver` is realized as a durable
+**Implemented:** `TopicBackendKind::Quiver` is realized as a durable
 `TopicState` selected **per location** (D27). Durability is **additive
 configuration, not a subsumption**: the same partition-dispatch topic runs over
 the in-memory backend, the default with no durability, or the quiver backend, the
@@ -502,9 +673,12 @@ controller's `declare_topic` constructs it through the `DurableDispatchPayload`
 trait, and config validation requires a quiver topic to be partition-dispatch.
 The existing `durable_buffer_processor` can now be reduced to "set the topic
 backend to quiver" and deprecated once the durable backend reaches parity. Couples
-to ingest-queue D4/D6. **Open follow-ups beyond the PoC:** leases and generation
-fencing on reassignment, one-quiver-per-owner granularity (D24), and the durable
-registry half of ingest-queue Phase 1.
+to ingest-queue D4/D6. **Phase 3 done:** stamping `user_meta` into the WAL so a
+partition survives WAL-replay after an unclean stop; leases and generation fencing
+on reassignment (the drain-and-forward handoff); and persisting the routing
+overlay as a snapshot so reassignments survive restart. **Open follow-ups:**
+wiring the controller/scheduler to drive reassignment, and the durable registry
+half of ingest-queue Phase 1.
 
 ### D22. Partition ownership
 
@@ -517,8 +691,8 @@ consumers race on with no stable "subscriber N of M" identity, and
 partition to one owner. A subscriber declares its owned partitions, sourced
 from the placement map (D23), at subscribe time, and publish routes by the
 item's partition tag to the owning subscriber. Built on the **in-memory backend
-first** per D18/D27; the quiver backend (D21, deferred) implements the same
-ownership durably. **Why:** stable *exclusive* ownership is what makes a
+first** per D18/D27; the quiver backend (D21) implements the same ownership
+durably. **Why:** stable *exclusive* ownership is what makes a
 per-core registry or aggregator the single writer for its keys, the opposite of
 balanced's sharing, and round-robin cannot provide it. **Implication:** a new
 subscription mode and per-partition (or per-owner) queues; the partition tag
@@ -538,19 +712,44 @@ possible without rehashing keys (ingest-queue D3 / Auto-sharding).
 **Implication:** this effort adds a minimal static placement map; the
 controller's lease and key-ownership primitive arrives with durability.
 
-### D24. Quiver backend granularity -- implemented as a PoC
+**Status update (Phase 3):** the durable backend's placement is now **dynamic and
+restart-durable** at the topic level: `reassign_partition` repoints a per-partition
+routing overlay (owner + lease generation), migrates residual by drain-and-forward,
+and persists the overlay as a snapshot restored on `open()`. What remains (I4) is
+the **controller half** of this decision: computing the initial placement map,
+assigning each receiver replica its stores, and driving reassignment from the
+load-feedback scheduler.
 
-**Implemented (PoC): one quiver per partition.** How many quiver instances and
-streams back a partition-dispatch topic? The PoC takes the simpler option: **one
-quiver engine per partition**, drained by a single fixed subscriber id. This gives
-clean isolation and a trivial reassignment handoff, since repointing a partition
-to a new owner just changes which owner drains that partition's engine, with
-durable progress untouched. The cost is one WAL per partition. The leading
-production option (ingest-queue D5) remains **one quiver per owner** with each
-partition a distinct Arrow-IPC stream within that owner's segments, sharing one
-per-owner WAL and disk budget; moving to it is a backend-internal change behind
-the same `TopicState` interface, and hinges on quiver handing off a *single
-stream* out of a multi-stream instance on reassignment.
+### D24. Quiver backend granularity -- implemented (one quiver per owner)
+
+**Implemented: one quiver per owner.** How many quiver instances back a
+partition-dispatch topic? The backend takes the production option (ingest-queue
+D5): **one quiver engine per owner**. The `N` partitions are placed across `M`
+owners (`num_owners`, configured; default `N`) by a static `balanced(N, M)` map,
+so each owner's single store interleaves the partitions it holds, sharing one
+per-owner WAL and disk budget. Because the engine no longer implies the partition,
+each bundle carries its partition in a generic opaque **per-bundle `user_meta`**
+that quiver persists and returns on drain (Phase 1: a `u64` quiver never
+interprets, threaded through the segment manifest exactly as `item_count` is; the
+topic packs `(partition, generation)`). A subscription claims whole owner blocks
+and drains those stores, recovering each bundle's partition from `user_meta`.
+Setting `M == N` makes every owner hold exactly one partition, reproducing the
+earlier one-engine-per-partition layout as a special case.
+
+The build sequenced this as: Phase 1, the opaque `user_meta` primitive in quiver;
+Phase 2, the one-quiver-per-owner topic over a *static* placement. The
+intermediate PoC (one quiver per partition, drained by a fixed subscriber id) is
+now the `M == N` case. **Implemented in Phase 3:** live reassignment over the
+durable backend, which binds a partition's data to its owner's store and so needs
+the lease + generation-fencing **drain-and-forward** handoff (the deposed owner
+forwards a moved partition's residual to the new owner's store); a dynamic
+`partition_owner` / `partition_generation` overlay repoints routing and
+`reassign_partition` no longer rejects the move. The overlay is persisted as a
+snapshot and restored on `open()`, so reassignments survive restart.
+`user_meta` is now recorded in **both** the segment manifest and the v2 WAL entry
+(Phase 3, done), so the partition of un-flushed bundles recovered by WAL replay
+after an unclean stop survives; only legacy v1 WALs recover it as `0`. `item_count`
+remains the manifest-only gap.
 
 ### D25. Split and dispatch packaging
 
@@ -630,12 +829,13 @@ placement) -- which delivers the runnable aggregating load-balancer and the
 in-memory form of ingest-queue Phase 1. By D27 durability sits behind the same
 `TopicState` interface, so the in-memory core "gets most of the value" and
 durability adds as a pure backend swap with no redesign. **Update:** Layer B (the
-Quiver durable backend, D21/D24) has since been built as a PoC behind that same
-interface, so it is no longer deferred; the durable-registry half of Phase 1
-remains future work. D23 still uses the static placement map now, with
-leases/handoff to follow; the registry stays in-memory and is relearned on
-restart, which is safe because conflicts are warnings rather than rejections, per
-ingest-queue D2 and D7.
+Quiver durable backend, D21/D24) has since been built behind that same interface,
+one quiver per owner, so it is no longer deferred; the durable-registry half of
+Phase 1 remains future work. D23's placement is now **dynamic and restart-durable**
+(reassignment repoints a persisted routing overlay), with the controller-driven
+placement lifecycle (I4) still to follow; the registry stays in-memory and is
+relearned on restart, which is safe because conflicts are warnings rather than
+rejections, per ingest-queue D2 and D7.
 
 ## Implementation order
 
@@ -658,20 +858,23 @@ In scope for this effort (the in-memory core, D28):
 
 Added later as an additive backend swap (D28/D21):
 
-- **Layer B -- Quiver durable `TopicState` (DONE, PoC).** The same
-  dispatch/ownership made durable, selected per location (D27):
-  `crates/otap/src/quiver_topic.rs` persists each partition to its own quiver
-  engine, survives restart, and resumes subscribers from durable progress;
-  reached through the `DurableDispatchPayload` trait and a `backend: quiver`
-  topic with `num_partitions`. Restart replay and reassignment-resume are
-  tested. Adds a path to replace `durable_buffer_processor`; the durable
-  registry of Phase 1 and Phase 2 leases/rebalancing remain future work.
+- **Layer B -- Quiver durable `TopicState` (DONE).** The same dispatch/ownership
+  made durable, selected per location (D27): `crates/otap/src/quiver_topic.rs`
+  persists each partition into its owner's quiver store (one quiver per owner over
+  a static `balanced(N, M)` placement), survives restart, and resumes subscribers
+  from durable progress; reached through the `DurableDispatchPayload` trait and
+  a `backend: quiver` topic with `num_partitions` (and optional `num_owners`).
+  Restart replay and partition recovery from `user_meta` are tested. Adds a path
+  to replace `durable_buffer_processor`. **Phase 3 (done):** live, restart-durable
+  reassignment (lease-generation routing overlay + drain-and-forward handoff +
+  persisted placement snapshot). The durable registry of Phase 1 and the
+  controller/scheduler wiring (I4) remain future work.
 
 ## Status and next steps
 
 - **The in-memory core and the durable backend are both implemented end-to-end.**
   All component decisions are now ratified or implemented (D18-D28); the durable
-  backend (D21/D24) is implemented as a PoC.
+  backend (D21/D24) is implemented as one quiver per owner.
 - **Layer A delivered:** the `partition_otap_batch` primitive
   (`crates/pdata/src/otap/partition.rs`), the `partition` processor node
   (`crates/core-nodes/src/processors/partition_processor/`,
@@ -687,26 +890,76 @@ Added later as an additive backend swap (D28/D21):
   partition-dispatch topic from `TopicSpec.num_partitions`. Broker-level and
   end-to-end tests cover routing, exclusivity, placement, and the full
   tagged-`OtapPdata` path.
-- **Layer B delivered (PoC):** the durable `QuiverPartitionDispatchTopic`
-  (`crates/otap/src/quiver_topic.rs`) over one quiver engine per partition; the
-  `DurableDispatchPayload` seam (`crates/engine/src/topic/durable.rs`) and the
-  `OtapPdata` impl; the shared OTAP-to-bundle adapter
-  (`otap_df_otap::quiver_bundle`); the `backend: quiver` config with a `quiver`
-  settings block; and the controller wiring through
-  `TopicBroker::create_topic_with_state`. Tests cover durable routing,
-  exclusivity, reassignment-resume, and restart replay.
+- **Layer B delivered:** the durable `QuiverPartitionDispatchTopic`
+  (`crates/otap/src/quiver_topic.rs`) over one quiver engine per owner with a
+  static `balanced(N, M)` placement and the partition carried in Quiver's opaque
+  per-bundle `user_meta`; the `DurableDispatchPayload` seam
+  (`crates/engine/src/topic/durable.rs`) and the `OtapPdata` impl; the shared
+  OTAP-to-bundle adapter (`otap_df_otap::quiver_bundle`); the `backend: quiver`
+  config with a `quiver` settings block (`num_owners`, default `num_partitions`);
+  and the controller wiring through `TopicBroker::create_topic_with_state`. Tests
+  cover durable routing, exclusivity, whole-owner-block claims, a shared owner
+  store, restart recovery of partitions from `user_meta`, and reassignment.
 - The substrate exists: the topic backend seam, `quiver`, the cascade filter
   (`filter_otap_batch` / `filter_metrics_time_window`), and the size-based batch
   split.
-- **To proceed (in-memory):** the controller-driven placement lifecycle of Layer
-  C above, in two steps: the controller computes the initial placement map and
-  assigns each receiver replica its owned partitions, replacing the hand-specified
-  receiver config, and a `PartitionMove` propagates to the affected replicas
-  through a subscription-level reassign so a move updates their live owned sets.
-- **To proceed (durable):** beyond the PoC, leases and generation fencing on the
-  reassignment apply step, one-quiver-per-owner with per-partition streams (D24),
-  and the durable registry half of Phase 1. The standalone-logs key (D26) is
-  decided but waits until logs are addressed.
+- **Phase 3 progress (durable):** (1) the WAL now stamps `user_meta` into a
+  versioned v2 entry (`crates/quiver/` `wal/`), so a partition and lease
+  generation survive WAL replay after an unclean stop; version-aware replay still
+  reads legacy v1 WALs. (2) **Live reassignment works and survives restart**
+  (`crates/otap/src/quiver_topic.rs`): a dynamic `partition_owner` /
+  `partition_generation` overlay repoints a partition's publishes and bumps its
+  generation, the deposed owner drains-and-forwards the residual to the new
+  owner's store, and the overlay is persisted as a snapshot and restored on
+  `open()`. Covered by WAL round-trip, `decode_entry` v1/v2 dispatch, an engine
+  replay test, and reassignment routing/forward/validation/restart tests.
+
+### Next step for a fresh session: I4 -- controller/scheduler wiring
+
+Everything above (Layers A/C, Layer B, and Phase 3 I1-I3 plus placement
+persistence) is implemented and tested. The **single remaining Phase 3 piece** is
+wiring the controller and the load-feedback scheduler to *drive* reassignment;
+the topic-level mechanism it calls (`reassign_partition`) is done and durable.
+
+Concretely, I4 has two halves:
+
+1. **Initial placement from the controller.** Today receiver replicas are
+   hand-specified with `owned_partitions` in config
+   (`TopicSubscriptionConfig::PartitionDispatch { owned_partitions }`, consumed
+   by `crates/core-nodes/src/receivers/topic_receiver/mod.rs`). Instead, the
+   controller should compute the initial `partition -> owner` placement (a static
+   `balanced(N, M)`) and assign each receiver replica its owned stores. For the
+   durable backend, reconcile this with the persisted `placement.v1` snapshot the
+   topic restores on `open()`, so the controller's view and the topic's restored
+   overlay agree after a restart (open question: does the controller read the
+   snapshot, or does the topic remain the source of truth and hand the controller
+   the restored owned-partition sets?).
+2. **Scheduler-driven moves.** `crates/engine/src/topic/load_feedback.rs` already
+   has `PartitionLoad`/`PartitionLoadTracker` (owner-side reporting),
+   `PlacementCoordinator` (merges reports, runs the load-aware placement),
+   and `PlacementScheduler::tick` (drains reports, rebalances, calls
+   `TopicHandle::apply_move`). `apply_move` -> `reassign_partition` already works
+   on both backends. What's missing is running a `PlacementScheduler` on a cadence
+   aligned to the aggregation-window boundary, fed by real owner load reports, and
+   propagating each `PartitionMove` to the affected receiver replicas so their
+   live owned-partition sets update.
+
+**Key files/seams for I4:**
+
+- `crates/engine/src/topic/load_feedback.rs` -- `PlacementScheduler`,
+  `PlacementCoordinator`, `PartitionMove`; the brain is built and unit-tested.
+- `crates/engine/src/topic/handle.rs` -- `TopicHandle::apply_move` /
+  `reassign_partition` (the seam both backends honor).
+- `crates/otap/src/quiver_topic.rs` -- `reassign_partition` (durable, persists +
+  drain-and-forward) and `persist_placement` / `load_placement` (the placement
+  snapshot); reconcile the controller's initial map with the restored overlay.
+- `crates/controller/` -- where initial placement is computed and receiver
+  replicas are assigned their stores, replacing the hand-specified
+  `TopicSubscriptionConfig::PartitionDispatch { owned_partitions }` in
+  `crates/core-nodes/src/receivers/topic_receiver/mod.rs`.
+
+**Out of scope / separate:** the durable registry half of ingest-queue Phase 1,
+and the standalone-logs key (D26, decided but waits until logs are addressed).
 
 **Related docs:** [`ingest-queue-design.md`](./ingest-queue-design.md) (D3
 per-signal partitioner; the consumer of this infrastructure),

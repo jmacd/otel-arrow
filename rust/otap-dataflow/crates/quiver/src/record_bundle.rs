@@ -238,6 +238,26 @@ pub trait RecordBundle {
     fn item_count(&self) -> u64 {
         0
     }
+
+    /// Returns an opaque, application-defined per-bundle metadata value that
+    /// Quiver persists alongside the bundle and returns unmodified on the drain
+    /// path (via [`BundleHandle::user_meta`](crate::subscriber::BundleHandle::user_meta)).
+    ///
+    /// Quiver does **not** interpret this value; it is a small, signal-agnostic
+    /// tag for higher layers. For example, the partition-dispatch topic packs a
+    /// partition index and an ownership lease generation into it so a drained
+    /// bundle can be routed and fenced without re-deriving its key.
+    ///
+    /// This is persisted in **both** the segment manifest and the v2 WAL entry
+    /// (unlike [`item_count`](RecordBundle::item_count), which is manifest-only),
+    /// so it survives WAL replay after an unclean shutdown. Bundles recovered
+    /// from a legacy v1 WAL (written before this stamping) report `0`.
+    ///
+    /// Returns `0` when unset.
+    #[must_use]
+    fn user_meta(&self) -> u64 {
+        0
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,30 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: enhancement
+
+# The name of the component, or a single word describing the area of concern, (e.g. engine, otap).
+# Must be one of the components listed in rust/otap-dataflow/.chloggen/config.yaml.
+component: engine
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Persist the Quiver per-bundle `user_meta` in the write-ahead log so a durable-dispatch partition survives WAL replay after an unclean stop (durable-dispatch Phase 3).
+
+# Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
+issues: [3359]
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries.
+subtext: |
+  Previously the opaque per-bundle `user_meta` (which the durable
+  partition-dispatch topic uses to carry a partition index and lease generation)
+  was recorded only in the segment manifest, so bundles recovered by WAL replay
+  after an unclean shutdown came back with `user_meta` as 0 and lost their
+  partition. The WAL entry format now stamps `user_meta` into a new v2 entry
+  type. Recovery is version-aware: `WAL_VERSION` is bumped to 2, but each entry
+  is self-describing via its type byte, so existing v1 WALs still replay
+  (recovering `user_meta` as 0) and a v2-capable writer can safely append to a
+  WAL created by an older run. This closes the documented gap for the durable
+  backend and is the foundation for the Phase 3 lease + generation-fencing
+  reassignment handoff. `item_count` remains manifest-only.

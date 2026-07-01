@@ -70,6 +70,11 @@ use crate::record_bundle::SlotId;
 pub struct BundleMetadata {
     /// Number of logical data items in this bundle.
     pub item_count: u64,
+    /// Opaque, application-defined per-bundle metadata that Quiver persists and
+    /// returns unmodified (see
+    /// [`RecordBundle::user_meta`](crate::record_bundle::RecordBundle::user_meta)).
+    /// Zero for segments that pre-date this field.
+    pub user_meta: u64,
     /// All populated slot IDs for this bundle.
     ///
     /// The consumer is responsible for interpreting these IDs.  For
@@ -96,6 +101,16 @@ pub trait SegmentProvider: Send + Sync {
     /// Returns 0 if the segment pre-dates item_count tracking or the
     /// bundle index is out of range.
     fn bundle_item_count(&self, bundle_ref: BundleRef) -> Result<u64>;
+
+    /// Returns the opaque per-bundle metadata for a specific bundle (see
+    /// [`RecordBundle::user_meta`](crate::record_bundle::RecordBundle::user_meta)).
+    ///
+    /// Returns 0 if the segment pre-dates this field or the bundle index is out
+    /// of range. Defaults to `Ok(0)` so providers that do not track it need no
+    /// override.
+    fn bundle_user_meta(&self, _bundle_ref: BundleRef) -> Result<u64> {
+        Ok(0)
+    }
 
     /// Returns per-bundle metadata (item count) for a segment.
     ///
@@ -429,6 +444,12 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
             .bundle_item_count(bundle_ref)
             .unwrap_or(0);
 
+        // Look up the opaque per-bundle metadata stamped at ingest.
+        let user_meta = self
+            .segment_provider
+            .bundle_user_meta(bundle_ref)
+            .unwrap_or(0);
+
         let callback = Arc::new(RegistryCallback {
             registry: self.clone(),
         });
@@ -439,6 +460,7 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
             data,
             callback,
             item_count,
+            user_meta,
         )))
     }
 
@@ -625,6 +647,12 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
             .bundle_item_count(bundle_ref)
             .unwrap_or(0);
 
+        // Look up the opaque per-bundle metadata stamped at ingest.
+        let user_meta = self
+            .segment_provider
+            .bundle_user_meta(bundle_ref)
+            .unwrap_or(0);
+
         let callback = Arc::new(RegistryCallback {
             registry: self.clone(),
         });
@@ -635,6 +663,7 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
             data,
             callback,
             item_count,
+            user_meta,
         ))
     }
 
@@ -1106,6 +1135,7 @@ mod tests {
             Ok((0..info.bundle_count)
                 .map(|_| BundleMetadata {
                     item_count: info.items_per_bundle,
+                    user_meta: 0,
                     slot_ids: Vec::new(),
                 })
                 .collect())

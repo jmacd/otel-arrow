@@ -59,6 +59,17 @@ in [`durable-dispatch-topic-design.md`](./durable-dispatch-topic-design.md)
 
 ## Layered architecture
 
+The master diagram below is the in-memory overview: ingress, the shuffle, the
+per-core event-time bucketing, and the load-balancing feedback loop, as built on
+this branch. It spans all three designs -- the ingest queue's shuffle
+([`ingest-queue-design.md`](./ingest-queue-design.md)), this document's L2
+windowing, and the partition-dispatch and placement of
+[`durable-dispatch-topic-design.md`](./durable-dispatch-topic-design.md).
+
+![In-memory metrics appliance: shuffle, event-time bucketing, and load balancing across cores](./images/metrics-appliance-in-memory.svg)
+
+The layered view in text:
+
 ```text
   OTAP/OTLP                                                       central
   in (gRPC)                                                       platform
@@ -154,25 +165,38 @@ stream: a claim that no (or few) points with `event_time < watermark` will still
 arrive. When the watermark passes a window's end, that window is considered
 complete and can be emitted.
 
-The watermark is derived heuristically **per stream** -- for example
-`max(observed event_time) - allowed_lateness` -- with a **per-bucket idle
-floor** of `processing_time - max_lag` so an idle stream's windows still close
-(D11). Per-stream rather than per-bucket is deliberate: a single per-bucket
-watermark advanced by the fastest stream would prematurely close a slower or
-idle stream's window; per-stream state is bounded by the processor's existing
-cardinality limit. Its safety
-is bounded by the ingest queue's admission control: L1 already rejects points
-older than `max_lag` and further-future than `max_skew` (the time-window
-filter). Those bounds are the **floor and ceiling** of what L2 must consider:
+The watermark is derived heuristically **per stream**. It trails the maximum
+observed event time by `allowed_lateness` but never advances past real time:
 
-- nothing older than `now - max_lag` can be admitted, so `allowed_lateness` need
-  never exceed `max_lag`;
-- nothing further ahead than `now + max_skew` can be admitted, so a misaligned
-  (fast) clock cannot push the watermark arbitrarily into the future.
+```text
+watermark = max(min(max_event, processing_time) - allowed_lateness,
+                processing_time - max_lag)
+```
 
-This is the key reuse: the ingest queue's admission window already does the
-crude, protective time bounding; L2's watermark does the fine-grained,
-per-stream completeness estimation within those bounds.
+The `processing_time - max_lag` term is a per-stream idle floor so an idle
+stream's windows still close (D11). The inner `min` against `processing_time`
+caps the forward push, explained below. Per-stream rather than per-bucket is
+deliberate: a single per-bucket watermark advanced by the fastest stream would
+prematurely close a slower or idle stream's window. Per-stream state is bounded
+by the processor's existing cardinality limit.
+
+L1's admission is an **acceptance window** banded around real time: data is
+accepted from `now - max_lag`, the late bound, for example one day, to
+`now + max_skew`, the early bound, for example ten minutes. The watermark lives
+inside that band:
+
+- nothing older than `now - max_lag` is admitted, so a window need stay open no
+  longer than `max_lag`, and `allowed_lateness` need never exceed it;
+- nothing further ahead than `now + max_skew` is admitted, and the forward cap
+  at `processing_time` keeps an early but in-band point in its correct future
+  window without advancing completeness for earlier windows. Without the cap a
+  point up to `max_skew` early would push the watermark to `now + max_skew -
+  allowed_lateness` and prematurely close earlier windows, dropping their still
+  on-time points; the cap removes that, so a fast clock corrupts nothing.
+
+This is the key reuse: the ingest queue's admission window does the crude,
+protective real-time bounding, and L2's watermark does the fine-grained,
+per-stream completeness estimation within that band.
 
 ### Triggers: when a window emits
 
@@ -200,9 +224,14 @@ These are the real-world conditions the design must name explicitly:
   telemetry) -- the simplest correct behavior. Phase 2 adds **restate**: re-open
   the window, re-aggregate, and emit a correction to L3 (D12). The bounded late
   horizon never exceeds L1's `max_lag`, so late state is bounded either way.
-- **Early / future-dated arrival** (`event_time > now + skew`): rejected at L1
-  by `max_skew`; L2 never sees a point beyond the skew bound, so a single fast
-  clock cannot corrupt far-future windows.
+  `allowed_lateness` is L2's on-time wait and is typically far smaller than
+  `max_lag`, so a point admitted by L1 but arriving later than `allowed_lateness`
+  is late at L2: dropped and counted in v1, restated in phase 2 up to `max_lag`.
+- **Early / future-dated arrival**: a point beyond `now + max_skew` is rejected
+  at L1, so L2 never sees it. A point within `max_skew` is admitted and lands in
+  its correct future window; the watermark's forward cap at `processing_time`
+  keeps it from advancing completeness for earlier windows, so a fast clock
+  cannot prematurely close or corrupt them.
 - **Misaligned clocks across producers**: epoch-aligned windows mean each
   producer's points land in the correct absolute-time bucket regardless of
   delivery order; per-producer clock offset shows up as ordinary lateness or
@@ -224,6 +253,43 @@ These are the real-world conditions the design must name explicitly:
 
   Reset detection extends the existing processor's logic from processing-time to
   event-time windows.
+
+### Draining idle streams and bounding state
+
+Two mechanisms keep an always-on aggregator's state bounded and its idle streams
+flushing.
+
+**Timer-driven drain.** A window must be able to close when no further batch
+arrives for its stream, otherwise an idle producer's last window never fires. The
+production processor schedules a processing-time timer at a cadence no longer than
+the window size and, on each tick, drains the windower at the current processing
+time. The watermark policy already raises an idle stream's watermark to its
+`processing_time - max_lag` floor, so a tick alone closes any window whose
+completion time has passed. The proof of concept closes windows only when a batch
+arrives; the production node adds this timer so idle streams flush. This drain
+cadence is also the natural rebalance point, because a reassignment applied at a
+window boundary carries no live aggregator state, as the dispatch design's load
+feedback loop describes.
+
+**Bounded per-stream state.** Within the lateness horizon a stream keeps at most
+`ceil(allowed_lateness / window_size) + 1` open windows, since an older window has
+already fired and drained. Total open aggregator state is therefore the active
+stream count times that small factor, plus one watermark and one cumulative anchor
+per stream. The processor's cardinality limit bounds the active stream count, so
+the whole footprint is bounded.
+
+**Idle-stream eviction.** The windowing core keeps a stream's watermark
+indefinitely so it can keep rejecting late points for windows that already fired,
+which retains state for every stream ever seen. An aging pass evicts a stream once
+it has no open windows and its watermark has trailed the processing time by more
+than an idle time-to-live. Setting that time-to-live at or above `max_lag` makes
+eviction safe: the ingest queue already rejects any point older than
+`now - max_lag`, so once that horizon passes with no activity no admissible point
+can still arrive for the stream, and its watermark and anchor can be dropped. A
+later point for the same identity then starts a fresh segment, which a cumulative
+producer expresses as an unknown-start reset, so no value is corrupted. This needs
+a small eviction entry point on the windowing core, which today exposes only admit
+and drain.
 
 ### Accumulation and the OTel temporality interplay
 
@@ -277,6 +343,64 @@ where contributions are summable across the merged series within a window --
 then projected to the chosen output temporality, reset-aware so series with
 differing start times merge correctly. It is therefore *temporality-agnostic*
 and belongs after window close and reset resolution.
+
+### Event-time cumulative conversion: the per-stream anchor (D17)
+
+The aggregate handed back by the windowing core is per `(stream, window)`, but the
+OTel data model stores a cumulative series whose running total spans windows. A
+per-stream **cumulative anchor**, kept by the processor alongside the
+signal-agnostic windower, bridges the two. For one stream the anchor records the
+running cumulative value, the current segment's start time, and the event time
+of the last point folded in. The anchor persists across windows, while
+the windower's per-window aggregate accumulates only within a window. The shuffle
+by metric name makes the owner core the single writer for a stream, so the anchor
+advances without a lock or a cross-core race, which is the single-writer
+destination the data model requires for delta-to-cumulative conversion.
+
+**Delta inputs.** A delta point carries the increment for its `[start, time]`
+interval, and within a window the aggregate sums these increments. When the
+window closes at its end boundary the processor emits one cumulative point whose
+value is the anchor's running total plus the window's summed delta, whose start
+time is the segment start, and whose time is the window end, then advances the
+anchor by that delta. Consecutive closed windows therefore carry a monotonically
+increasing cumulative value sampled at epoch-aligned boundaries, which is the
+stored timeseries form.
+
+**Cumulative inputs.** A cumulative point already carries the running total, so
+the window aggregate keeps the latest such point by event time. On close the
+processor emits that latest value and sets the anchor to it. A name that carries
+both temporalities is reconciled through the same anchor, so mixed-temporality
+intake still yields one consistent cumulative series, per decision D17.
+
+**Resets.** Reset detection drives the anchor and follows the data model. A
+point with `start < time` continues the current segment, or opens a new one at a
+known start when its start moves forward, with zero implied at that start. A
+point with `start == time` is a reset at an unknown start, contributes zero to
+the running rate, and restarts the segment. A cumulative value that regresses
+below the anchor with no declared start change is also a reset. On any reset the
+processor begins a new segment and updates the anchor start time, and the next
+emitted cumulative point reflects the post-reset total.
+
+**Gaps.** A window index for which a stream folded no point has no aggregate, so
+the drain produces no stored point there. The series reads as undefined across that
+range rather than zero, which is the property a disconnected appliance must
+preserve so an outage shows as a gap. The anchor persists across the gap, so the
+next point continues the same cumulative segment.
+
+**Overlap.** Two points whose intervals overlap for one stream are a single-writer
+violation. The processor de-overlaps by keeping one and counting the other in
+telemetry, and may interpolate sums at the change-over per the data model's overlap
+rules.
+
+**Applying windows in order.** `drain_complete` returns closed windows across
+all streams, so the processor groups them by stream and applies them in
+ascending window-index order so the anchor advances monotonically. The windower
+already drains a stream's windows ascending, and event time advances the
+watermark monotonically, so a closed window is never applied out of order. A
+stream's anchor is freed when the stream is aged out, as described under
+"Draining idle streams and bounding state"; after a stream is freed a later
+point starts a fresh segment, which a cumulative producer expresses as an
+unknown-start reset, so eviction is safe.
 
 ### Output to L3
 
@@ -424,14 +548,17 @@ levels later without a migration. Sliding/session windows are out of scope.
 
 ### D11. Watermark policy
 
-**Decided:** a **per-stream** heuristic watermark
-(`max observed event_time - allowed_lateness`), with a per-bucket idle floor of
-`processing_time - max_lag` so idle streams still close, `allowed_lateness <=
-max_lag`, and the future bound supplied by `max_skew`. Per-stream (not
-per-bucket) avoids the fastest stream prematurely closing a slower stream's
-window; state is bounded by the processor's cardinality limit. The ingest
-queue's admission window is the safety envelope; the watermark is the
-fine-grained completeness estimate within it.
+**Decided:** a **per-stream** heuristic watermark that trails the maximum
+observed event time by `allowed_lateness` and is capped at processing time so
+early in-band data cannot advance it:
+`max(min(max_event, processing_time) - allowed_lateness, processing_time -
+max_lag)`. The `processing_time - max_lag` idle floor closes idle streams, and
+`allowed_lateness <= max_lag`. L1's admission is an acceptance window banded
+around real time, `max_lag` late to `max_skew` early, and the watermark lives
+inside it; the forward cap is what stops a within-`max_skew` point from
+prematurely closing earlier windows. Per-stream rather than per-bucket avoids the
+fastest stream prematurely closing a slower stream's window; state is bounded by
+the processor's cardinality limit.
 
 ### D12. Late arrival, early arrival, and accumulation
 
@@ -537,9 +664,12 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
   independent windower per partition tag, so a partition's `active_series` is
   exactly its aggregator's stream count, and reports per-partition load through
   a `LoadReportSender` to the `PlacementScheduler` on each telemetry collection.
-  What remains for A0 is OTAP columnar output, the reset/gap/overlap and
-  cumulative-conversion rules (D17), histograms, a timer-driven drain, and
-  idle-stream aging -- then folding the PoC into `temporal_reaggregation`.
+  What remains for A0 is now specified in this document: the cumulative-conversion,
+  reset, gap, and overlap rules of decision D17 under "Event-time cumulative
+  conversion", the timer-driven drain and idle-stream aging under "Draining idle
+  streams and bounding state", and OTAP columnar output through the fold-in of
+  "Folding the proof of concept into `temporal_reaggregation`". Histograms remain
+  after the number path.
 - **A1 -- stage-2 store (L3 core).** The store seam (writer + `TableProvider`)
   with the Vortex backend, keyed `(metric_name, resolution, window_index)`;
   fixed-window drop-oldest retention (D13, D15, D16). Can be prototyped in
@@ -555,6 +685,48 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
   firings and accumulation modes (D12), rollup/downsampling resolutions (D10),
   metric attribute reduction (D17), Grafana datasource adapter, spans/logs sample
   queries (D14).
+
+### Folding the proof of concept into `temporal_reaggregation`
+
+Phase A0's production home is the existing `temporal_reaggregation` processor,
+not the throwaway `event_time_window` proof of concept. The processor already
+holds the parts the appliance needs apart from the clock that defines a window,
+so the fold-in reuses them rather than maintaining a second aggregator:
+
+- **Stream identity.** Reuse the processor's `identity` module, whose
+  `stream_id_of`, `metric_id_of`, and `metric_type_info_of` already derive the
+  `(resource, scope, metric, attributes)` stream identity and the instrument type.
+  The proof of concept duplicated this only because those modules are private; the
+  fold-in makes them the shared path and deletes the duplicate.
+- **OTAP columnar output.** Reuse the processor's `builder` module, whose
+  `MetricSignalBuilder` and per-type appenders emit OTAP record batches with
+  start and time columns, replacing the proof of concept's OTLP re-encode. This
+  gives the cumulative output form and, later, histogram support.
+- **Ack tracking.** Reuse the processor's inbound and outbound request tracking
+  for ack and nack fan-in, rather than the proof of concept's detached context.
+
+The one substantive change is the trigger. The processor flushes on a
+processing-time `collection_period`; the fold-in swaps that single periodic
+flush for the event-time windowing core, draining on the timer of "Draining idle
+streams and bounding state" and keying a per-stream cumulative anchor for the
+conversion of "Event-time cumulative conversion". The migration steps:
+
+1. Add an event-time mode to the processor config carrying `window_size`,
+   `allowed_lateness`, and `max_lag`, coexisting with the legacy `period` until
+   that is retired.
+2. Replace the period flush with a `WindowedAggregators` keyed by the processor's
+   `StreamId`, admitting each data point at its event time and draining complete
+   windows on the timer.
+3. Add the per-stream cumulative anchor and the reset, gap, and overlap rules of
+   decision D17.
+4. Emit through `MetricSignalBuilder` in the stored cumulative form, projecting
+   output temporality per consumer at query or forward time.
+5. Delete the `event_time_window` processor and its URN once parity is reached,
+   and update both READMEs.
+
+The proof of concept's one durable contribution, acting as the first real shuffle
+owner that closes the load feedback loop, transfers directly: the folded processor
+becomes that owner and reports per-partition load on each telemetry collection.
 
 ## Status and next steps
 

@@ -1783,6 +1783,7 @@ mod tests {
     struct DummyBundle {
         descriptor: BundleDescriptor,
         batch: arrow_array::RecordBatch,
+        user_meta: u64,
     }
 
     impl DummyBundle {
@@ -1798,6 +1799,7 @@ mod tests {
                     "Logs",
                 )]),
                 batch: arrow_array::RecordBatch::new_empty(schema),
+                user_meta: 0,
             }
         }
 
@@ -1824,7 +1826,14 @@ mod tests {
                     "Logs",
                 )]),
                 batch,
+                user_meta: 0,
             }
+        }
+
+        /// Sets the opaque per-bundle metadata value.
+        fn with_user_meta(mut self, user_meta: u64) -> Self {
+            self.user_meta = user_meta;
+            self
         }
     }
 
@@ -1846,6 +1855,10 @@ mod tests {
             } else {
                 None
             }
+        }
+
+        fn user_meta(&self) -> u64 {
+            self.user_meta
         }
     }
 
@@ -3725,7 +3738,100 @@ mod tests {
         assert!(bundle.is_none(), "should have no bundles");
     }
 
-    /// Integration test for crash recovery with progress files.
+    #[tokio::test]
+    async fn user_meta_round_trips_from_ingest_to_drain() {
+        let temp_dir = tempdir().expect("tempdir");
+        let config = QuiverConfig::default().with_data_dir(temp_dir.path());
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine created");
+
+        // The partition-dispatch topic packs (partition, generation) into this
+        // opaque value; here we just assert it survives ingest -> segment -> drain.
+        const META: u64 = 0x0000_0007_0000_002A; // e.g. partition 42, generation 7
+        let bundle = DummyBundle::with_rows(5).with_user_meta(META);
+        engine.ingest(&bundle).await.expect("ingest succeeds");
+        engine.flush().await.expect("flush finalizes the segment");
+
+        let sub_id = SubscriberId::new("meta-sub").expect("valid id");
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+
+        let handle = engine
+            .poll_next_bundle(&sub_id)
+            .expect("poll succeeds")
+            .expect("a bundle is available");
+        assert_eq!(handle.user_meta(), META, "opaque metadata round-trips");
+        // DummyBundle leaves item_count unset (defaults to 0), so this also shows
+        // user_meta is carried independently of item_count.
+        assert_eq!(
+            handle.item_count(),
+            0,
+            "DummyBundle does not set item_count"
+        );
+        handle.ack();
+    }
+
+    // Durable-dispatch Phase 3: a bundle's opaque user_meta must survive an
+    // unclean stop that leaves it WAL-only (not yet finalized to a segment).
+    // Before v2 WAL entries, replay recovered user_meta as 0; now it is stamped
+    // into the WAL entry and comes back intact after reopening the engine.
+    #[tokio::test]
+    async fn wal_replay_preserves_user_meta() {
+        let dir = tempdir().expect("tempdir");
+        // Large segment target so the ingest stays WAL-only (never finalized).
+        let config = QuiverConfig::builder()
+            .data_dir(dir.path())
+            .segment(SegmentConfig {
+                target_size_bytes: NonZeroU64::new(100 * 1024 * 1024).unwrap(),
+                ..Default::default()
+            })
+            .build()
+            .expect("config");
+
+        const META: u64 = 0x0000_0007_0000_002A; // e.g. partition 42, generation 7
+
+        // Run 1: ingest with user_meta, never flush, drop (simulated crash).
+        {
+            let engine = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("engine");
+            let bundle = DummyBundle::with_rows(10).with_user_meta(META);
+            engine.ingest(&bundle).await.expect("ingest");
+            assert_eq!(
+                engine.total_segments_written(),
+                0,
+                "bundle stays WAL-only, nothing finalized"
+            );
+        }
+
+        // Run 2: reopen replays the WAL entry into a segment; user_meta survives.
+        {
+            let engine = QuiverEngine::open(config, test_budget())
+                .await
+                .expect("engine reopen");
+            engine.flush().await.expect("finalize the replayed segment");
+
+            let sub_id = SubscriberId::new("meta-replay-sub").expect("valid id");
+            engine
+                .register_subscriber(sub_id.clone())
+                .expect("register");
+            engine.activate_subscriber(&sub_id).expect("activate");
+
+            let handle = engine
+                .poll_next_bundle(&sub_id)
+                .expect("poll succeeds")
+                .expect("a replayed bundle is available");
+            assert_eq!(
+                handle.user_meta(),
+                META,
+                "user_meta survives WAL replay after an unclean stop"
+            );
+            handle.ack();
+        }
+    }
     ///
     /// This test simulates a crash-recovery scenario:
     /// 1. Ingest bundles and consume some (partially)

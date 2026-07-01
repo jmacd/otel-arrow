@@ -478,6 +478,7 @@ impl SegmentWriter {
         let schema = Arc::new(Schema::new(vec![
             Field::new("bundle_index", DataType::UInt32, false),
             Field::new("item_count", DataType::UInt64, false),
+            Field::new("user_meta", DataType::UInt64, false),
             Field::new(
                 "slot_refs",
                 DataType::List(Arc::new(Field::new_struct(
@@ -491,6 +492,7 @@ impl SegmentWriter {
 
         let mut bundle_index_builder = UInt32Builder::with_capacity(entries.len());
         let mut item_count_builder = UInt64Builder::with_capacity(entries.len());
+        let mut user_meta_builder = UInt64Builder::with_capacity(entries.len());
 
         // Create the list builder with a struct builder inside
         let struct_builder = StructBuilder::from_fields(
@@ -502,6 +504,7 @@ impl SegmentWriter {
         for entry in entries {
             bundle_index_builder.append_value(entry.bundle_index);
             item_count_builder.append_value(entry.item_count());
+            user_meta_builder.append_value(entry.user_meta());
 
             // Get the struct builder from the list builder
             let struct_builder = slot_refs_builder.values();
@@ -533,6 +536,7 @@ impl SegmentWriter {
             vec![
                 Arc::new(bundle_index_builder.finish()),
                 Arc::new(item_count_builder.finish()),
+                Arc::new(user_meta_builder.finish()),
                 Arc::new(slot_refs_builder.finish()),
             ],
         )
@@ -821,6 +825,40 @@ mod tests {
         let reconstructed = reader.read_bundle(&manifest[0]).unwrap();
         let payload = reconstructed.payload(SlotId::new(0)).unwrap();
         assert_eq!(payload.num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn segment_manifest_round_trips_user_meta() {
+        use crate::segment::test_utils::{TestBundle, slot_descriptors, test_fingerprint};
+        use crate::segment::{OpenSegment, SegmentReader};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("user_meta.qseg");
+
+        let schema = test_schema();
+        let descriptors = slot_descriptors();
+        let batch = make_batch(&schema, &[1, 2, 3], &["a", "b", "c"]);
+
+        // Two bundles with distinct opaque per-bundle metadata values; the
+        // partition-dispatch topic packs (partition, generation) here.
+        let mut open_segment = OpenSegment::new();
+        let bundle0 = TestBundle::new(descriptors.clone())
+            .with_payload(SlotId::new(0), test_fingerprint(), batch.clone())
+            .with_user_meta(0xABCD_0001);
+        let bundle1 = TestBundle::new(descriptors)
+            .with_payload(SlotId::new(0), test_fingerprint(), batch.clone())
+            .with_user_meta(0x1234_5678_9ABC_DEF0);
+        let _ = open_segment.append(&bundle0).unwrap();
+        let _ = open_segment.append(&bundle1).unwrap();
+
+        let writer = SegmentWriter::new(SegmentSeq::new(7), true);
+        let _ = writer.write_segment(&path, open_segment).await.unwrap();
+
+        // The opaque value survives the manifest encode/decode round-trip.
+        let reader = SegmentReader::open(&path).unwrap();
+        let manifest = reader.manifest();
+        assert_eq!(manifest[0].user_meta(), 0xABCD_0001);
+        assert_eq!(manifest[1].user_meta(), 0x1234_5678_9ABC_DEF0);
     }
 
     #[test]
