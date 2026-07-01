@@ -438,13 +438,19 @@ async fn wal_writer_reader_roundtrips_user_meta() {
 
     let options = WalWriterOptions::new(wal_path.clone(), hash, FlushPolicy::Immediate);
     let mut writer = WalWriter::open(options).await.expect("writer");
-    let _ = writer.append_bundle(&bundle).await.expect("append succeeds");
+    let _ = writer
+        .append_bundle(&bundle)
+        .await
+        .expect("append succeeds");
     drop(writer);
 
     let mut reader = WalReader::open(&wal_path).expect("reader");
     let mut iter = reader.iter_from(0).expect("iterator");
     let record = iter.next().expect("entry present").expect("entry ok");
-    assert_eq!(record.user_meta, META, "user_meta round-trips through the WAL");
+    assert_eq!(
+        record.user_meta, META,
+        "user_meta round-trips through the WAL"
+    );
 }
 
 #[tokio::test]

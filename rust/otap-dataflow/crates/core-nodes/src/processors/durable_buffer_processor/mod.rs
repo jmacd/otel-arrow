@@ -94,13 +94,13 @@ use otap_df_otap::OTAP_PROCESSOR_FACTORIES;
 use otap_df_otap::pdata::OtapPdata;
 use otap_df_pdata::TryIntoWithOptions;
 
-use otap_df_otap::quiver_bundle::{
-    OtapRecordBundleAdapter, OtlpBytesAdapter, convert_bundle_to_pdata, signal_type_from_slot_id,
-};
 pub use config::{DurableBufferConfig, OtlpHandling, SizeCapPolicy};
 use deferred_retry_state::DeferredRetryState;
 #[cfg(test)]
 use deferred_retry_state::RETRY_WAKEUP_SLOT;
+use otap_df_otap::quiver_bundle::{
+    OtapRecordBundleAdapter, OtlpBytesAdapter, convert_bundle_to_pdata, signal_type_from_slot_id,
+};
 
 use otap_df_config::SignalType;
 use otap_df_config::error::Error as ConfigError;

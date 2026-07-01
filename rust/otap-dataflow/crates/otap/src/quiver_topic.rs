@@ -849,8 +849,7 @@ impl TopicState<OtapPdata> for QuiverPartitionDispatchTopic {
             partition_generation: self.shared.routing.load().partition_generation.clone(),
         };
         next.partition_owner[partition] = to_owner;
-        next.partition_generation[partition] =
-            next.partition_generation[partition].wrapping_add(1);
+        next.partition_generation[partition] = next.partition_generation[partition].wrapping_add(1);
         persist_placement(&self.shared.topic_dir, &next, num_owners).map_err(|e| {
             durable_err(format!("failed to persist placement on reassignment: {e}"))
         })?;
@@ -966,7 +965,10 @@ fn forward_fenced_bundle(
     };
     let user_meta = pack_user_meta(partition, generation);
     let task = async move {
-        match shared.ingest_and_maybe_flush(to_owner, pdata, user_meta).await {
+        match shared
+            .ingest_and_maybe_flush(to_owner, pdata, user_meta)
+            .await
+        {
             Ok(_) => {
                 // Force the forwarded data to a segment so the new owner can poll
                 // it promptly instead of waiting for the batched-flush window;
@@ -1515,7 +1517,11 @@ mod tests {
             got0.sort_unstable();
             got1.sort_unstable();
             assert_eq!(got0, vec![1], "partition 1 stays on owner0");
-            assert_eq!(got1, vec![0, 2], "partition 0 moved to owner1 and survived restart");
+            assert_eq!(
+                got1,
+                vec![0, 2],
+                "partition 0 moved to owner1 and survived restart"
+            );
         }
     }
 
