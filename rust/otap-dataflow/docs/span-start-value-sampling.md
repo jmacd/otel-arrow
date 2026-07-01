@@ -263,7 +263,7 @@ To keep the study honest, the following are deliberately separated.
    prediction is no gain when profiles are homogeneous and a large gain when a
    few kinds carry the rare tail. Quantify the relationship.
 
-3. **Allocation law.** Does the proportional-to-value rule `A_s ∝ V_s` match a
+3. **Allocation law.** Does the proportional-to-value rule `A_s = k*V_s` match a
    square-root or other Neyman-style allocation, and by how much on real data?
    Is the simple rule within noise of the best allocation tried?
 

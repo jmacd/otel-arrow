@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The process-global aggregation seam, Subsystem 3's transport and finalizer.
+//! The process-global aggregation seam, Subsystem 3's transport and handle.
 //!
 //! Every engine worker flushes its thread-local
 //! [`LocalSampleBuffer`](super::sampling::LocalSampleBuffer) once per window. In
@@ -13,24 +13,27 @@
 //!
 //! The aggregator shares a record between the two criteria within a window by
 //! reference count, so it is single-threaded. The transport is therefore a
-//! non-blocking channel to one finalizer thread rather than a lock-shared
-//! instance: a worker [`try_push`]es its flush and never blocks, a full channel
-//! drops a whole flush and counts it, and the finalizer thread owns the
-//! aggregator, drains the channel, and finalizes on its own timer. See
-//! [`docs/integrated-sampler-engine-mechanism.md`][mechanism].
+//! non-blocking channel to one owner rather than a lock-shared instance: a
+//! worker [`try_push`]es its flush and never blocks, a full channel drops a
+//! whole flush and counts it, and the [`IntegratedSampleAggregator`] handle owns
+//! the aggregator, drains the channel, and finalizes on demand.
+//!
+//! The handle is owned and driven by the Internal Telemetry Receiver: on each
+//! `CollectTelemetry` tick the receiver [`finalize`](IntegratedSampleAggregator::finalize)s
+//! the window and emits the annotated records as OTLP, since the receiver is the
+//! single per-process bridge from internal telemetry into the pipeline. The
+//! handle installs the process-global sender when built and clears it on drop.
 //!
 //! When no aggregator is installed, [`try_push`] hands the flush back so the
 //! caller can fall back to the local-only path, which is the design's sanctioned
-//! fail-safe.
+//! fail-safe. See [`docs/integrated-sampler-engine-mechanism.md`][mechanism].
 //!
 //! [mechanism]: https://github.com/open-telemetry/otel-arrow/blob/main/rust/otap-dataflow/docs/integrated-sampler-engine-mechanism.md
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
-use crate::event::{LogEvent, ObservedEventReporter};
+use crate::event::LogEvent;
 use crate::self_tracing::local_buffer::BufferedRecord;
 use crate::self_tracing::sampling::{
     BufferFlush, ProcessorConfig, RawInput, RepInput, WindowAggregator, WorkerFlush,
@@ -53,29 +56,99 @@ static AGGREGATOR: Mutex<Option<flume::Sender<BufferFlush<BufferedRecord>>>> = M
 /// The count of per-worker flushes dropped because the inbound channel was full.
 static DROPPED_FLUSHES: AtomicU64 = AtomicU64::new(0);
 
-/// Start the process-global aggregator, returning a guard that stops the
-/// finalizer thread and detaches the seam on drop.
+/// The process-global integrated-sample aggregator, owned by the Internal
+/// Telemetry Receiver.
 ///
-/// The finalizer emits its annotated global stream to `reporter`, runs the
-/// three estimators under `config`, and finalizes every `window`. Call once when
-/// internal telemetry starts.
-#[must_use]
-pub fn start(
-    reporter: ObservedEventReporter,
-    config: ProcessorConfig,
-    window: Duration,
-) -> AggregatorGuard {
-    let (sender, receiver) = flume::bounded(CHANNEL_CAPACITY);
-    {
-        let mut slot = AGGREGATOR.lock().expect("aggregator lock poisoned");
-        *slot = Some(sender);
+/// Building one installs the process-global sender so every worker's
+/// [`flush_to`](super::local_buffer::flush_to) routes into it; dropping it
+/// clears the sender so workers revert to the local-only fallback. The receiver
+/// [`recv`](Self::recv)s worker flushes, [`ingest`](Self::ingest)s them, and on
+/// each `CollectTelemetry` tick [`finalize`](Self::finalize)s the window into the
+/// annotated records to emit as OTLP.
+pub struct IntegratedSampleAggregator {
+    flush_rx: flume::Receiver<BufferFlush<BufferedRecord>>,
+    aggregator: WindowAggregator<BufferedRecord>,
+    /// Whether this handle installed the process-global sender, so only the
+    /// installing handle clears it on drop.
+    installed_global: bool,
+}
+
+/// A worker flush received from the channel, awaiting ingestion. Opaque so the
+/// receiver crate need not name the internal buffer types.
+pub struct PendingSampleFlush(BufferFlush<BufferedRecord>);
+
+impl IntegratedSampleAggregator {
+    /// Build the aggregator under `config` and install the process-global sender.
+    ///
+    /// The span-start table starts in the sample-everything state and the
+    /// heavy-hitter table in the local-only state until the first window flush.
+    #[must_use]
+    pub fn new(config: ProcessorConfig) -> Self {
+        let (sender, flush_rx) = flume::bounded(CHANNEL_CAPACITY);
+        {
+            let mut slot = AGGREGATOR.lock().expect("aggregator lock poisoned");
+            *slot = Some(sender);
+        }
+        let aggregator =
+            WindowAggregator::new(config, shared_always(), shared_local_only(), AGGREGATOR_SEED);
+        Self {
+            flush_rx,
+            aggregator,
+            installed_global: true,
+        }
     }
-    let thread = std::thread::Builder::new()
-        .name("otap-sample-aggregator".to_string())
-        .spawn(move || run_finalizer(&receiver, &reporter, config, window))
-        .expect("failed to spawn sample aggregator thread");
-    AggregatorGuard {
-        thread: Some(thread),
+
+    /// Await the next worker flush. `None` once the channel has closed, which the
+    /// caller treats as a signal to stop ingesting.
+    pub async fn recv(&self) -> Option<PendingSampleFlush> {
+        self.flush_rx.recv_async().await.ok().map(PendingSampleFlush)
+    }
+
+    /// Take one already-available worker flush without blocking, for draining the
+    /// channel at a window boundary or on shutdown.
+    #[must_use]
+    pub fn try_recv(&self) -> Option<PendingSampleFlush> {
+        self.flush_rx.try_recv().ok().map(PendingSampleFlush)
+    }
+
+    /// Fold a received flush into the aggregator's estimators.
+    pub fn ingest(&mut self, flush: PendingSampleFlush) {
+        self.aggregator.push(to_worker_flush(flush.0));
+    }
+
+    /// Close the window: finalize the estimators, republish both feedback tables,
+    /// and return the retained records annotated with the three adjusted counts,
+    /// ready for the caller to encode as OTLP.
+    #[must_use]
+    pub fn finalize(&mut self) -> Vec<LogEvent> {
+        self.aggregator
+            .finalize()
+            .into_iter()
+            .map(|record| {
+                let BufferedRecord { time, record: log } = record.payload;
+                let annotated = annotate_log_record(
+                    &log,
+                    record.logs_adjusted_count,
+                    record.traces_adjusted_count,
+                    record.span_logs_adjusted_count,
+                );
+                LogEvent {
+                    time,
+                    record: annotated,
+                }
+            })
+            .collect()
+    }
+}
+
+impl Drop for IntegratedSampleAggregator {
+    fn drop(&mut self) {
+        // Detach the worker seam so workers revert to local-only emission, but
+        // only when this handle installed it.
+        if self.installed_global {
+            let mut slot = AGGREGATOR.lock().expect("aggregator lock poisoned");
+            *slot = None;
+        }
     }
 }
 
@@ -108,76 +181,6 @@ pub(crate) fn try_push(
             Ok(())
         }
         Err(flume::TrySendError::Disconnected(flush)) => Err(flush),
-    }
-}
-
-/// A guard that stops the process-global aggregator on drop.
-pub struct AggregatorGuard {
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Drop for AggregatorGuard {
-    fn drop(&mut self) {
-        // Drop the sender so the finalizer's channel disconnects and its loop
-        // exits after a final flush, then join the thread.
-        {
-            let mut slot = AGGREGATOR.lock().expect("aggregator lock poisoned");
-            *slot = None;
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// The finalizer loop: own the aggregator, drain the channel, and finalize on a
-/// fixed-period timer. Exits on channel disconnect after one last flush.
-fn run_finalizer(
-    receiver: &flume::Receiver<BufferFlush<BufferedRecord>>,
-    reporter: &ObservedEventReporter,
-    config: ProcessorConfig,
-    window: Duration,
-) {
-    let mut aggregator =
-        WindowAggregator::<BufferedRecord>::new(config, shared_always(), shared_local_only(), AGGREGATOR_SEED);
-    let mut deadline = Instant::now() + window;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            emit_flushed(reporter, aggregator.finalize());
-            deadline = now + window;
-            continue;
-        }
-        match receiver.recv_timeout(deadline - now) {
-            Ok(flush) => aggregator.push(to_worker_flush(flush)),
-            Err(flume::RecvTimeoutError::Timeout) => {
-                emit_flushed(reporter, aggregator.finalize());
-                deadline = Instant::now() + window;
-            }
-            Err(flume::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    // Drain any records still buffered before the thread winds down.
-    emit_flushed(reporter, aggregator.finalize());
-}
-
-/// Emit one window's annotated records to the reporter.
-fn emit_flushed(
-    reporter: &ObservedEventReporter,
-    flushed: Vec<crate::self_tracing::sampling::FlushedRecord<BufferedRecord>>,
-) {
-    for record in flushed {
-        let BufferedRecord { time, record: log } = record.payload;
-        let annotated = annotate_log_record(
-            &log,
-            record.logs_adjusted_count,
-            record.traces_adjusted_count,
-            record.span_logs_adjusted_count,
-        );
-        reporter.log(LogEvent {
-            time,
-            record: annotated,
-        });
     }
 }
 
@@ -234,16 +237,34 @@ fn log_callsite_of(buffered: &BufferedRecord) -> u64 {
 mod tests {
     use super::*;
     use crate::__log_record_impl;
-    use crate::event::ObservedEvent;
     use crate::self_tracing::LogContext;
     use crate::self_tracing::sampling::SampledRecord;
-    use otap_df_config::observed_state::SendPolicy;
     use std::time::SystemTime;
     use tracing::Level;
 
-    fn reporter() -> (ObservedEventReporter, flume::Receiver<ObservedEvent>) {
-        let (tx, rx) = flume::bounded(256);
-        (ObservedEventReporter::new(SendPolicy::default(), tx), rx)
+    impl IntegratedSampleAggregator {
+        /// Build a handle for tests without touching the process-global sender,
+        /// so parallel tests never interfere through the global seam. Returns the
+        /// handle and a sender to feed it directly.
+        fn detached(
+            config: ProcessorConfig,
+        ) -> (Self, flume::Sender<BufferFlush<BufferedRecord>>) {
+            let (sender, flush_rx) = flume::bounded(CHANNEL_CAPACITY);
+            let aggregator = WindowAggregator::new(
+                config,
+                shared_always(),
+                shared_local_only(),
+                AGGREGATOR_SEED,
+            );
+            (
+                Self {
+                    flush_rx,
+                    aggregator,
+                    installed_global: false,
+                },
+                sender,
+            )
+        }
     }
 
     fn buffered() -> BufferedRecord {
@@ -272,15 +293,10 @@ mod tests {
     }
 
     #[test]
-    fn finalizer_emits_global_annotated_stream() {
-        let (reporter, rx) = reporter();
-        let (tx, finalizer_rx) = flume::bounded::<BufferFlush<BufferedRecord>>(16);
-        let window = Duration::from_millis(30);
-        let handle = std::thread::spawn(move || {
-            run_finalizer(&finalizer_rx, &reporter, ProcessorConfig::default(), window);
-        });
+    fn handle_ingests_and_finalizes_to_annotated_events() {
+        let (mut agg, tx) = IntegratedSampleAggregator::detached(ProcessorConfig::default());
 
-        // Two representatives carrying local counts, aggregated globally.
+        // Two representatives carrying local counts, delivered over the channel.
         tx.send(BufferFlush {
             sample: vec![
                 SampledRecord {
@@ -298,15 +314,18 @@ mod tests {
         })
         .unwrap();
 
-        // Disconnect so the finalizer flushes and exits.
-        drop(tx);
-        handle.join().unwrap();
-
-        let emitted: Vec<_> = rx.drain().collect();
+        // Drain the channel and close the window.
+        while let Some(pending) = agg.try_recv() {
+            agg.ingest(pending);
+        }
+        let events = agg.finalize();
         assert!(
-            emitted.len() >= 2,
+            events.len() >= 2,
             "expected the two representatives to be emitted, got {}",
-            emitted.len()
+            events.len()
         );
+
+        // A fresh window starts empty.
+        assert!(agg.finalize().is_empty());
     }
 }

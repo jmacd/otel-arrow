@@ -26,6 +26,7 @@ use otap_df_pdata::otlp::ProtoBuffer;
 use otap_df_telemetry::event::{LogEvent, ObservedEvent};
 use otap_df_telemetry::metrics::MetricSetSnapshot;
 use otap_df_telemetry::self_tracing::{ScopeToBytesMap, encode_export_logs_request};
+use otap_df_telemetry::{IntegratedSampleAggregator, SampleAggregatorConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -36,7 +37,14 @@ pub use otap_df_telemetry::INTERNAL_TELEMETRY_RECEIVER_URN;
 /// Configuration for the internal telemetry receiver.
 #[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct Config {}
+pub struct Config {
+    /// Enable the integrated all-CPU sample aggregator. When set, this receiver
+    /// owns the process-global aggregator: it ingests every worker's per-window
+    /// sample flush and, on each telemetry-collection tick, emits one aggregated
+    /// global sample as OTLP instead of the workers emitting local-only samples.
+    #[serde(default)]
+    integrated_sampling: bool,
+}
 
 /// A receiver that consumes internal logs from the logging channel and emits OTLP logs.
 pub struct InternalTelemetryReceiver {
@@ -114,6 +122,14 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
         let log_tap = internal.log_tap;
         let mut scope_cache = ScopeToBytesMap::new(internal.registry);
 
+        // When integrated sampling is enabled this receiver owns the
+        // process-global aggregator: it ingests per-worker sample flushes and
+        // emits the aggregated global sample on each `CollectTelemetry` tick.
+        let mut sampler = self
+            .config
+            .integrated_sampling
+            .then(|| IntegratedSampleAggregator::new(SampleAggregatorConfig::default()));
+
         loop {
             tokio::select! {
                 biased;
@@ -130,6 +146,14 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                                     Self::send_log_event(&effect_handler, log_event, &resource_bytes, &mut scope_cache).await?;
                                 }
                             }
+                            Self::drain_and_finalize_sampler(
+                                sampler.as_mut(),
+                                &effect_handler,
+                                &resource_bytes,
+                                &mut scope_cache,
+                                log_tap.as_ref(),
+                            )
+                            .await?;
                             effect_handler.notify_receiver_drained().await?;
                             return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
                         }
@@ -143,10 +167,30 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                                     Self::send_log_event(&effect_handler, log_event, &resource_bytes, &mut scope_cache).await?;
                                 }
                             }
+                            Self::drain_and_finalize_sampler(
+                                sampler.as_mut(),
+                                &effect_handler,
+                                &resource_bytes,
+                                &mut scope_cache,
+                                log_tap.as_ref(),
+                            )
+                            .await?;
                             return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
                         }
                         Ok(NodeControlMsg::CollectTelemetry { .. }) => {
-                            // No metrics to report for now
+                            // The telemetry-collection tick is the aggregator's
+                            // window boundary: finalize and emit the global
+                            // sample, republishing the feedback tables.
+                            if let Some(sampler) = sampler.as_mut() {
+                                Self::emit_log_events(
+                                    &effect_handler,
+                                    sampler.finalize(),
+                                    &resource_bytes,
+                                    &mut scope_cache,
+                                    log_tap.as_ref(),
+                                )
+                                .await?;
+                            }
                         }
                         Err(e) => {
                             return Err(Error::ChannelRecvError(e));
@@ -175,12 +219,76 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
                         }
                     }
                 }
+
+                // Ingest per-worker sample flushes when integrated sampling is
+                // enabled. Records accumulate in the aggregator until the next
+                // `CollectTelemetry` tick closes the window.
+                pending = async {
+                    // Armed only when the sampler is present, so the handle is set.
+                    sampler.as_ref().expect("sampler present when armed").recv().await
+                }, if sampler.is_some() => {
+                    match pending {
+                        Some(pending) => {
+                            if let Some(sampler) = sampler.as_mut() {
+                                sampler.ingest(pending);
+                            }
+                        }
+                        None => {
+                            // The sample channel closed; drop the handle so this
+                            // branch disarms and workers revert to local-only.
+                            sampler = None;
+                        }
+                    }
+                }
             }
         }
     }
 }
 
 impl InternalTelemetryReceiver {
+    /// Emit a batch of aggregated log events as OTLP, recording each in the log
+    /// tap when one is present.
+    async fn emit_log_events(
+        effect_handler: &local::EffectHandler<OtapPdata>,
+        events: Vec<LogEvent>,
+        resource_bytes: &Bytes,
+        scope_cache: &mut ScopeToBytesMap,
+        log_tap: Option<&otap_df_telemetry::log_tap::InternalLogTapHandle>,
+    ) -> Result<(), Error> {
+        for event in events {
+            if let Some(log_tap) = log_tap {
+                log_tap.record(event.clone());
+            }
+            Self::send_log_event(effect_handler, event, resource_bytes, scope_cache).await?;
+        }
+        Ok(())
+    }
+
+    /// Drain any buffered sample flushes into the aggregator and emit its final
+    /// window, for the drain and shutdown paths.
+    async fn drain_and_finalize_sampler(
+        sampler: Option<&mut IntegratedSampleAggregator>,
+        effect_handler: &local::EffectHandler<OtapPdata>,
+        resource_bytes: &Bytes,
+        scope_cache: &mut ScopeToBytesMap,
+        log_tap: Option<&otap_df_telemetry::log_tap::InternalLogTapHandle>,
+    ) -> Result<(), Error> {
+        if let Some(sampler) = sampler {
+            while let Some(pending) = sampler.try_recv() {
+                sampler.ingest(pending);
+            }
+            Self::emit_log_events(
+                effect_handler,
+                sampler.finalize(),
+                resource_bytes,
+                scope_cache,
+                log_tap,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Send a log event as OTLP logs with scope attributes from entity context.
     async fn send_log_event(
         effect_handler: &local::EffectHandler<OtapPdata>,

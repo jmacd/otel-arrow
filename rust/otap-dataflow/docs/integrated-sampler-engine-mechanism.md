@@ -5,10 +5,11 @@
 Implemented. Subsystems 1 and 2 are built and validated in the
 `otap-df-telemetry` and `otap-df-engine` crates; Subsystem 3, the all-CPU
 aggregator and its two feedback tables, is built and validated in
-`otap-df-telemetry` as a library capability that the observability pipeline
-configuration activates. This document is mechanism-focused: it specifies how the
-OTAP-Dataflow engine consumes itself as the telemetry SDK for logs and spans,
-wiring the integrated sampler into one pipeline runtime. It deliberately does not
+`otap-df-telemetry` and wired into the Internal Telemetry Receiver, which owns it
+when its `integrated_sampling` config is enabled. This document is
+mechanism-focused: it specifies how the OTAP-Dataflow engine consumes itself as
+the telemetry SDK for logs and spans, wiring the integrated sampler into one
+pipeline runtime. It deliberately does not
 re-derive the sampling probabilities or define a configuration surface.
 
 ### Implementation status
@@ -35,24 +36,25 @@ re-derive the sampling probabilities or define a configuration surface.
   `run_forever` installs it for the worker's lifetime. In this phase the flush
   annotates each record with **local-only** adjusted counts and forwards to the
   reporter, so each worker's sample stands alone as an unbiased local sample.
-- **Subsystem 3 (all-CPU aggregation + feedback): built as a library
-  capability.** `WindowAggregator`
+- **Subsystem 3 (all-CPU aggregation + feedback): built into the Internal
+  Telemetry Receiver.** `WindowAggregator`
   (`crates/telemetry/src/self_tracing/sampling/aggregator.rs`) combines the
   per-worker flushes into one process-global sample and republishes the
   span-start and heavy-hitter tables; `HeavyHitterTable`
   (`sampling/heavy_hitter.rs`) is criterion one's second-level feedback.
   `crates/telemetry/src/self_tracing/aggregation.rs` carries each worker's raw
-  `BufferFlush` over a channel to a single finalizer thread that owns the
-  aggregator, and `flush_to` (`self_tracing/local_buffer.rs`) prefers that
-  aggregator and falls back to the local-only path when none is running. The
-  finalizer is started and stopped through its lifecycle guard,
-  `start_sample_aggregator`, by the observability pipeline configuration rather
-  than unconditionally, so the default remains the Subsystem 2 local-only
-  behavior until it is configured. The previously-open decisions are resolved
-  below: the in-memory worker-to-aggregator transfer, the standalone
-  process-global finalizer, the worker-to-aggregator window alignment, and the
-  back-pressure
-  policy.
+  `BufferFlush` over a channel to one owner, the `IntegratedSampleAggregator`
+  handle, and `flush_to` (`self_tracing/local_buffer.rs`) prefers that aggregator
+  and falls back to the local-only path when none is running. The Internal
+  Telemetry Receiver (`crates/core-nodes/.../internal_telemetry_receiver`) owns
+  the handle when its `integrated_sampling` config is set: it ingests the
+  flushes, finalizes on each `CollectTelemetry` tick, and emits the aggregated
+  sample as OTLP directly, since it is the single per-process bridge from
+  internal telemetry into the pipeline. The default leaves the flag off, so
+  workers keep the Subsystem 2 local-only behavior. The previously-open decisions
+  are resolved below: the in-memory worker-to-aggregator transfer, the
+  receiver-owned single-threaded aggregator, the `CollectTelemetry` window, and
+  the back-pressure policy.
 
 ## Purpose and scope
 
@@ -113,9 +115,10 @@ shape one level up and is left to the production sampler.
                                                        --> emit annotated logs
 ```
 
-Side 1 produces, side 2 aggregates and feeds back. The reporter-to-ITR path
-(the implemented `InternalTelemetryReceiver`) carries side 1's output into the
-internal telemetry pipeline where the processor node lives.
+Side 1 produces, side 2 aggregates and feeds back. When integrated sampling is
+enabled the per-worker `BufferFlush`es travel in memory to the aggregator that
+the `InternalTelemetryReceiver` owns, which emits the aggregated sample as OTLP;
+otherwise the local-only records take the reporter path into the same receiver.
 
 ## Subsystem 1: span context in the data plane
 
@@ -222,8 +225,9 @@ why, and the decision it turns on.
 
 The aggregator is the second side of the SDK: it turns the per-worker flushes
 into one process-global sample, emits the final annotated stream, and publishes
-the two feedback tables. It is not started; this section specifies it for a fresh
-start, and names the one decision that shapes it.
+the two feedback tables. It is built into the Internal Telemetry Receiver, which
+owns it behind an `integrated_sampling` config flag. This section specifies the
+mechanism and the decisions that shape it.
 
 ### The decision: how a worker's flush reaches the aggregator
 
@@ -243,27 +247,28 @@ versus raw span record versus boundary), the local `nhat`, the `span_id`, and th
   reporter into a process-global aggregator, handing over the `BufferFlush`
   (`SampledRecord` with `adjusted_count`, `span_selected`, and the full
   `LogRecord`, plus the raw span `LogRecord`s) with all fields intact and no
-  serialization. The aggregator, not the worker, annotates and emits the final
-  stream to the reporter. This matches the design's all-CPU-in-shared-memory
-  intent and is the reason the feedback also rides shared memory rather than a
-  wire codec.
-- **Serialized transfer, rejected.** Keep flushing to the ITR and have
-  the aggregator be a pipeline node reading the OTLP stream. Simpler wiring, but
-  it cannot rebuild `start_callsite`, so the span-start value table cannot be
-  formed globally and the aggregator would fall back to equal coverage. Recover
-  the missing fields as extra attributes only if the in-memory path proves
-  impractical.
+  serialization. The Internal Telemetry Receiver that owns the aggregator, not
+  the worker, annotates and emits the final stream as OTLP. This matches the
+  design's all-CPU-in-shared-memory intent and is the reason the feedback also
+  rides shared memory rather than a wire codec.
+- **Serialized transfer, rejected.** Keep flushing to the ITR and have the
+  aggregator run downstream as a pipeline node reading the ITR's OTLP output
+  stream. Simpler wiring, but it cannot rebuild `start_callsite`, so the
+  span-start value table cannot be formed globally and the aggregator would fall
+  back to equal coverage. Recover the missing fields as extra attributes only if
+  the in-memory path proves impractical.
 
 The chosen path replaces Subsystem 2's local-only `flush_to` destination: a
 worker flushes into the shared aggregator instead of the reporter.
 
 ### The aggregator structure
 
-A process-global structure owned by a single finalizer thread, into which every
-worker pushes its flush over a non-blocking channel and from which the finalizer
-drains. It runs on one thread rather than behind a shared lock because it shares
-a record between the two criteria within a window by reference count, which is a
-single-thread construct. Per window it maintains the three estimators, reusing
+A process-global structure owned by the Internal Telemetry Receiver on its
+single-threaded task, into which every worker pushes its flush over a
+non-blocking channel and from which the receiver drains. It runs on one thread
+rather than behind a shared lock because it shares a record between the two
+criteria within a window by reference count, which is a single-thread construct.
+Per window it maintains the three estimators, reusing
 the library:
 
 - **Criterion one, second level.** Aggregate the per-worker criterion-one
@@ -278,9 +283,9 @@ the library:
   keyed by `start_callsite`, plus the span-start counter over boundaries, exactly
   `IntegratedSampler` today, feeding the next window's span-start threshold table.
 
-At the window boundary it annotates every retained record with the three adjusted
-counts via `annotate_log_record`, emits to the reporter, and republishes both
-tables into the `ArcSwap` registry.
+At the window boundary the receiver annotates every retained record with the
+three adjusted counts via `annotate_log_record`, emits them as OTLP, and
+republishes both tables into the `ArcSwap` registry.
 
 `IntegratedSampler`
 (`crates/telemetry/src/self_tracing/sampling/processor.rs`) already implements
@@ -296,18 +301,15 @@ The per-worker flush is implemented on the pipeline controller's own periodic
 (`crates/engine/src/pipeline_ctrl.rs`), plus a final flush on loop exit. Each
 worker flushes its own thread-local buffer, so the window is per worker.
 
-The aggregator finalizes on its own timer as a standalone process-global
-structure rather than as a pipeline node, for the reasons resolved under [Open
-mechanism decisions](#open-mechanism-decisions). Its window is set equal to the
-per-worker flush interval, `control_plane_metrics_flush_interval`, and its
-finalizer runs an independent timer at that period, so the phase between a
-worker's flush and the finalizer is arbitrary but fixed for a run. A per-worker
-flush is atomic, so the aggregator never sees a split window, only whole
-per-worker windows, and the arbitrary phase averages out over windows rather
-than splitting any worker's contribution. The engine's periodic, coalesced
-`CollectTelemetry` tick (`crates/control-channel/src/core.rs`) remains available
-as an alternative finalize signal if folding the finalizer into the existing
-cadence later proves preferable.
+The aggregator finalizes on the Internal Telemetry Receiver's `CollectTelemetry`
+control tick (`crates/control-channel/src/core.rs`), not on a timer of its own,
+so the window is the engine's telemetry-collection cadence and needs no separate
+clock. The receiver ingests each worker flush as it arrives and closes the window
+on the tick, emitting the global sample and republishing the feedback tables. A
+per-worker flush is atomic, so the aggregator never sees a split window, only
+whole per-worker windows; the phase between a worker's flush and the tick is
+arbitrary but averages out over windows rather than splitting any worker's
+contribution.
 
 ## Feedback transport: a process-global ArcSwap registry
 
@@ -336,38 +338,35 @@ Resolved during implementation:
 
 Resolved for Subsystem 3:
 
-- **Aggregator form: a standalone process-global structure, not a pipeline
-  node.** The aggregator sits upstream of the reporter, since it produces the
-  annotated log events the reporter carries into the Internal Telemetry Receiver,
-  so modeling it as a data-plane node would invert the flow. It also spans every
-  core-pinned pipeline runtime in the process, whereas a node lives inside one
-  pipeline and would bind process-global aggregation to that pipeline's lifecycle.
-  It is a library capability started and stopped through a lifecycle guard,
-  `start_sample_aggregator`, which the observability pipeline configuration
-  activates rather than the controller starting it unconditionally; until then
-  the workers keep the Subsystem 2 local-only behavior.
-- **Window alignment: aggregator window equal to the worker flush interval on an
-  independent timer.** A per-worker flush is atomic, so each push delivers one
-  complete per-worker window and the aggregator never observes a split window.
-  The finalizer runs its own timer at the same period as the worker flush rather
-  than on a shared clock, so the phase between a worker's flush and the finalizer
-  is arbitrary but fixed for a run. No cross-worker barrier is needed: a late
-  worker's window lands in the next aggregator window and the estimators stay
-  unbiased in expectation, so the arbitrary phase averages out over windows and
-  trades a small, self-correcting wobble for freedom from coordination.
+- **Aggregator form: built into the Internal Telemetry Receiver, not a separate
+  or downstream node.** The aggregator is upstream of the OTLP data plane: it
+  consumes the structured per-worker `BufferFlush`es and produces annotated
+  records, so a node placed downstream of the receiver would only see flattened
+  OTLP that has lost the per-worker sampling structure. The receiver is already
+  the single per-process bridge from the in-memory internal-telemetry channels
+  into OTLP, and it runs single-threaded, so it is the natural owner of the
+  reference-counted aggregator. It builds and drives the aggregator when its
+  `integrated_sampling` config is set and drops it on shutdown; until then the
+  workers keep the Subsystem 2 local-only behavior.
+- **Window: the receiver's `CollectTelemetry` tick.** A per-worker flush is
+  atomic, so each push delivers one complete per-worker window and the aggregator
+  never observes a split window. The receiver ingests flushes as they arrive and
+  finalizes on the engine's telemetry-collection tick, so the aggregation window
+  is that cadence and needs no separate clock. No cross-worker barrier is needed:
+  a late worker's window lands in the next tick and the estimators stay unbiased
+  in expectation, so the arbitrary phase averages out over windows.
 - **Back-pressure: never block a worker, sample rather than drop, keep the
   reporter lossy.** The worker-to-aggregator hop is a non-blocking channel send,
-  so a worker never blocks on it; the aggregator runs on a single finalizer
-  thread because it shares records between the two criteria by reference count
-  within a window, which rules out a lock-shared instance. The aggregator's
+  so a worker never blocks on it; the aggregator runs single-threaded on the
+  receiver's task because it shares records between the two criteria by reference
+  count within a window, which rules out a lock-shared instance. The aggregator's
   per-window budgets bound its memory and reduce over-budget records by sampling
   rather than losing them, the mechanism's intended reduction. Because a
   core-pinned worker must never block on telemetry, a full inbound channel drops
   a whole per-worker flush and counts it rather than stalling the worker. The
-  aggregator-to-reporter hop keeps the reporter's existing non-blocking,
-  lossy-under-back-pressure send policy, since the output is already a bounded
-  sample travelling the same reporter-to-Internal-Telemetry-Receiver path
-  Subsystem 2 used.
+  aggregator-to-OTLP hop is the receiver's own downstream send, the same path its
+  local-log passthrough already uses, since the aggregated output is a bounded
+  sample encoded to OTLP exactly like every other internal log.
 
 ## Sequencing
 
@@ -376,12 +375,12 @@ Resolved for Subsystem 3:
 2. **Subsystem 2: done, local-only.** The per-worker integrated buffer, its
    install, and the controller flush branch, replacing the direct-to-channel log
    path for worker threads.
-3. **Subsystem 3: built as a library capability.** The all-CPU aggregator and the
-   two `ArcSwap` feedback tables turn the per-worker flushes into the annotated
-   stream, over a channel to a single finalizer thread, with the local-only path
-   as the fallback until the observability pipeline configuration activates the
-   aggregator. Follow-ups: the worker heavy-hitter binding gate, the live tracer
-   span-start sampler, and the cross-process two-level log feedback.
+3. **Subsystem 3: built into the Internal Telemetry Receiver.** The all-CPU
+   aggregator and the two `ArcSwap` feedback tables turn the per-worker flushes
+   into the annotated OTLP stream, over a channel to the receiver-owned handle,
+   enabled by the receiver's `integrated_sampling` config with the local-only
+   path as the fallback. Follow-ups: the worker heavy-hitter binding gate, the
+   live tracer span-start sampler, and the cross-process two-level log feedback.
 
 ## References
 

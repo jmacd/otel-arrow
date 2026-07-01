@@ -20,8 +20,11 @@ note: >-
   criterion-one global log sample, the criterion-two per-span reservoirs, and
   the span-start surprisal value table, and an all-CPU windowed aggregator that
   combines the per-worker sample buffers into one process-global sample over a
-  channel to a single finalizer and republishes the span-start and heavy-hitter
-  feedback tables through their `ArcSwap`s.
+  channel to a single owner and republishes the span-start and heavy-hitter
+  feedback tables through their `ArcSwap`s. The aggregator is built into the
+  Internal Telemetry Receiver, which owns it behind an `integrated_sampling`
+  config flag, ingests the worker flushes, and emits the aggregated sample as
+  OTLP on each telemetry-collection tick.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 issues: [2405]
@@ -32,8 +35,8 @@ issues: [2405]
 subtext: >-
   This version provides the sampling library, its statistical core, and the
   intra-process two-level engine mechanism, validated per-crate. The all-CPU
-  aggregator is activated through its lifecycle guard by the observability
-  pipeline configuration; the worker heavy-hitter binding gate, the live tracer
-  span-start sampler, and the cross-process two-level log feedback are follow-ups.
-  See docs/integrated-logs-traces-reservoir.md and
+  aggregator is built into the Internal Telemetry Receiver and enabled by its
+  `integrated_sampling` config; the worker heavy-hitter binding gate, the live
+  tracer span-start sampler, and the cross-process two-level log feedback are
+  follow-ups. See docs/integrated-logs-traces-reservoir.md and
   docs/integrated-sampler-engine-mechanism.md for the design.

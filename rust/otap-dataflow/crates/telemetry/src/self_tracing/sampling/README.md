@@ -8,13 +8,13 @@ attributes.
 
 ## Module map
 
-- [`callsite`](callsite.rs) — the stable identities the sampler keys on. The
+- [`callsite`](callsite.rs) - the stable identities the sampler keys on. The
   span-start key is derived from the Tokio `tracing` callsite `Identifier`
   (`callsite_identity`), the canonical per-site identity, which is process-local
   and is never serialized. A name-based hash (`span_start_identity`) is retained
   for any future cross-process or persisted use. The log callsite identity is an
   FNV-1a hash of target, name, file, and line.
-- [`bottom_floor`](bottom_floor.rs) — the statistical core. `BottomFloor` is the
+- [`bottom_floor`](bottom_floor.rs) - the statistical core. `BottomFloor` is the
   self-calibrating weighted bottom-k sampler with the Horvitz-Thompson inclusion
   correction and the rarest-seen floor. `observe` is a first-level arrival and
   `observe_weighted` is a second-level representative that stands for a carried
@@ -23,33 +23,33 @@ attributes.
   `BottomFloor::observe` returns the displaced (terminally rejected or evicted)
   payload, and `WindowOutput` exposes the dropped boundary record, so a caller
   can conserve records the bottom-k would otherwise discard.
-- [`buffer`](buffer.rs) — `LocalSampleBuffer`, the per-worker integrated buffer.
+- [`buffer`](buffer.rs) - `LocalSampleBuffer`, the per-worker integrated buffer.
   It reserves the criterion-one sample and routes every span-selected record that
   the reservoir does not keep, including evicted records and the boundary, to an
   overflow, so span-selected records are never lost. `flush` yields the
   Horvitz-Thompson weighted sample and the raw span stream.
-- [`span_start`](span_start.rs) — `SpanStartSampler`, a `Sampler` that selects
+- [`span_start`](span_start.rs) - `SpanStartSampler`, a `Sampler` that selects
   root spans from a wait-free `ArcSwap` threshold table, `build_span_start_table`,
   the target-rate feedback that rebuilds the table each window with equal coverage
   or surprisal-value weighting, and `SpanStartValues`, the surprisal accumulator
   shared by the processor and the aggregator.
-- [`heavy_hitter`](heavy_hitter.rs) — `HeavyHitterTable`, criterion one's
+- [`heavy_hitter`](heavy_hitter.rs) - `HeavyHitterTable`, criterion one's
   second-level feedback: the global inverse-frequency weights `g_c = 1 / N_c`, a
   scalar floor, and the global threshold `tau_g`, published wait-free through an
   `ArcSwap` with a local-only fail-safe.
-- [`record`](record.rs) — the retained-record machinery shared by the processor
+- [`record`](record.rs) - the retained-record machinery shared by the processor
   and the aggregator: `FlushedRecord`, the reference-counted `Retained`, and the
   `Annotated` merge by allocation identity, so both stages produce identical
   output.
-- [`processor`](processor.rs) — `IntegratedSampler`, the windowed processor that
+- [`processor`](processor.rs) - `IntegratedSampler`, the windowed processor that
   maintains all three estimators over the one emitted stream and flushes the
   retained set annotated with three adjusted counts.
-- [`aggregator`](aggregator.rs) — `WindowAggregator`, the all-CPU second level.
+- [`aggregator`](aggregator.rs) - `WindowAggregator`, the all-CPU second level.
   It recurses Bottom-Floor over the per-worker representatives weighted by their
   carried local counts, reassembles spans across workers by `span_id`, and at each
   window republishes the span-start and heavy-hitter tables while emitting one
   process-global annotated stream.
-- [`encode`](encode.rs) — stamps a flushed `LogRecord` with the three
+- [`encode`](encode.rs) - stamps a flushed `LogRecord` with the three
   adjusted-count attributes, including meaningful exact zeros.
 
 The per-worker installation and flush live one level up in
@@ -110,8 +110,10 @@ mechanism that drives them is built across all three subsystems: Subsystem 1
 install, and the controller flush), and Subsystem 3 (the all-CPU
 `WindowAggregator` and its two feedback tables). A worker flush prefers the
 process-global aggregator and falls back to the **local-only** self-contained
-sample when none is running. The aggregator is activated through its lifecycle
-guard by the observability pipeline configuration. See
+sample when none is running. The aggregator is owned by the Internal Telemetry
+Receiver and enabled by its `integrated_sampling` config, which finalizes each
+window on the receiver's `CollectTelemetry` tick and emits the aggregated sample
+as OTLP. See
 [`docs/integrated-sampler-engine-mechanism.md`](../../../../../docs/integrated-sampler-engine-mechanism.md)
 for the mechanism and the resolved decisions.
 
