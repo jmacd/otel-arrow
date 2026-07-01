@@ -164,6 +164,15 @@ impl EventTimeWindowProcessor {
             allowed_lateness_nanos: duration_to_nanos_i64(config.allowed_lateness),
             max_lag_nanos: duration_to_nanos_i64(config.max_lag),
         };
+        // If configured as a partition-dispatch owner, pull the topic's load-report
+        // sender so each telemetry collection reports per-partition load to the
+        // placement scheduler, closing the load feedback loop (durable-dispatch I4).
+        let load_sender = config.report_load_to.as_ref().and_then(|topic| {
+            pipeline_ctx
+                .topic_set::<OtapPdata>()
+                .and_then(|topic_set| topic_set.get_required(topic).ok())
+                .and_then(|binding| binding.load_report_sender())
+        });
         Ok(Self {
             metrics,
             compute_duration,
@@ -171,7 +180,7 @@ impl EventTimeWindowProcessor {
             policy,
             aggregators: BTreeMap::new(),
             load: PartitionLoadTracker::new(),
-            load_sender: None,
+            load_sender,
         })
     }
 
@@ -826,9 +835,12 @@ mod tests {
 
         phase
             .run_test(move |mut ctx| async move {
-                // Align a base to a 10s window boundary near now.
+                // Place the window base in the past so the later point (base +
+                // 20s) is still at or before wall-clock processing time; the
+                // watermark's forward cap holds completeness to real time, so a
+                // future-dated point would not advance it.
                 let now = unix_now_nanos() as u64;
-                let base = (now / (10 * SEC_NS)) * (10 * SEC_NS);
+                let base = ((now - 100 * SEC_NS) / (10 * SEC_NS)) * (10 * SEC_NS);
 
                 // Two points in window W0: delta-sum = 5 + 7 = 12.
                 ctx.process(Message::PData(as_input(metrics_data(vec![sum_metric(
@@ -923,8 +935,11 @@ mod tests {
 
         phase
             .run_test(move |mut ctx| async move {
+                // Place the window base in the past so the later point (base +
+                // 20s) is still at or before wall-clock processing time; the
+                // watermark's forward cap holds completeness to real time.
                 let now = unix_now_nanos() as u64;
-                let base = (now / (10 * SEC_NS)) * (10 * SEC_NS);
+                let base = ((now - 100 * SEC_NS) / (10 * SEC_NS)) * (10 * SEC_NS);
 
                 // Gauge points in W0: latest by event time (base+2s) wins -> 30.
                 ctx.process(Message::PData(as_input(metrics_data(vec![gauge_metric(

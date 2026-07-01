@@ -15,7 +15,9 @@ use crate::error::Error::{
     SubscribeBalancedNotSupported, SubscribeBroadcastNotSupported, SubscribeSingleGroupViolation,
     SubscriptionClosed, TopicClosed,
 };
-use crate::topic::backend::{PublishFuture, PublishTrackedFuture, SubscriptionBackend, TopicState};
+use crate::topic::backend::{
+    PartitionRoutingSnapshot, PublishFuture, PublishTrackedFuture, SubscriptionBackend, TopicState,
+};
 use crate::topic::partitioned::Partitioned;
 use crate::topic::subscription::{Delivery, RecvDelivery};
 use crate::topic::types::{
@@ -880,6 +882,14 @@ impl<T: Partitioned + Send + Sync + 'static> TopicState<T> for PartitionDispatch
         next.owner_of[partition] = Some(to_owner);
         self.routing.store(Arc::new(next));
         Ok(())
+    }
+
+    fn partition_routing(&self) -> Option<PartitionRoutingSnapshot> {
+        let routing = self.routing.load();
+        Some(PartitionRoutingSnapshot {
+            owner_of: routing.owner_of.clone(),
+            num_owners: routing.owners.len(),
+        })
     }
 
     fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy {

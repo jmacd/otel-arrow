@@ -86,9 +86,9 @@ use otap_df_engine::memory_limiter::{
 };
 use otap_df_engine::processor::FlowMetricHook;
 use otap_df_engine::topic::{
-    DurableDispatchConfig, DurableRetentionPolicy, InMemoryBackend, PartitionDispatchBackend,
-    PartitionPlacement, PipelineTopicBinding, TopicBroker, TopicOptions, TopicPublishOutcomeConfig,
-    TopicSet,
+    DurableDispatchConfig, DurableRetentionPolicy, InMemoryBackend, LoadReportSender, LoadWeights,
+    PartitionDispatchBackend, PartitionPlacement, PipelineTopicBinding, PlacementScheduler,
+    TopicBroker, TopicOptions, TopicPublishOutcomeConfig, TopicSet,
 };
 use otap_df_state::store::{ObservedStateHandle, ObservedStateStore};
 use otap_df_telemetry::event::{EngineEvent, ErrorSummary, ObservedEventReporter};
@@ -308,6 +308,74 @@ struct DeclaredTopics<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
     global_names: HashMap<TopicName, TopicName>,
     group_names: HashMap<(PipelineGroupId, TopicName), TopicName>,
     inferred_mode_reports: Vec<InferredTopicModeReport>,
+    /// Load-report senders for in-memory partition-dispatch topics that have a
+    /// running placement scheduler, keyed by declared topic name. Attached to
+    /// topic bindings so windower owners can report load (durable-dispatch I4).
+    load_report_senders: HashMap<TopicName, LoadReportSender>,
+}
+
+/// How often the placement scheduler thread rebalances each in-memory
+/// partition-dispatch topic (durable-dispatch I4, half 2). A fixed default for
+/// now; a per-topic cadence aligned to the aggregation window is a follow-up.
+const PLACEMENT_TICK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The allowed ratio of the busiest owner's load to the mean before the scheduler
+/// moves partitions.
+const PLACEMENT_MAX_IMBALANCE: f64 = 1.2;
+
+/// Owns the background thread that ticks the in-memory partition-dispatch
+/// placement schedulers on a cadence. Dropping it stops the thread because the
+/// stop channel disconnects; `shutdown` also joins it.
+struct PlacementSchedulerRuntime {
+    stop: Option<std_mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PlacementSchedulerRuntime {
+    /// Spawn a single thread that ticks every scheduler on
+    /// `PLACEMENT_TICK_INTERVAL` until stopped. Spawns no thread when there are no
+    /// schedulers.
+    fn spawn<PData: Send + Sync + 'static>(mut schedulers: Vec<PlacementScheduler<PData>>) -> Self {
+        if schedulers.is_empty() {
+            return Self {
+                stop: None,
+                handle: None,
+            };
+        }
+        let (stop, stop_rx) = std_mpsc::channel::<()>();
+        let handle = thread::Builder::new()
+            .name("placement-scheduler".to_owned())
+            .spawn(move || {
+                loop {
+                    match stop_rx.recv_timeout(PLACEMENT_TICK_INTERVAL) {
+                        Ok(()) | Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                            for scheduler in &mut schedulers {
+                                if let Err(err) = scheduler.tick() {
+                                    otel_warn!(
+                                        "placement_scheduler.tick_failed",
+                                        error = format!("{err}")
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn placement scheduler thread");
+        Self {
+            stop: Some(stop),
+            handle: Some(handle),
+        }
+    }
+
+    /// Stop the scheduler thread and wait for it to exit.
+    fn shutdown(mut self) {
+        drop(self.stop.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1517,6 +1585,7 @@ impl<
             global_names,
             group_names,
             inferred_mode_reports,
+            load_report_senders: HashMap::new(),
         })
     }
 
@@ -1546,9 +1615,12 @@ impl<
                 let handle = handle.with_default_publish_outcome_config(
                     Self::map_topic_spec_to_publish_outcome_config(topic_spec),
                 );
-                let binding = PipelineTopicBinding::from(handle)
+                let mut binding = PipelineTopicBinding::from(handle)
                     .with_default_queue_on_full(topic_spec.policies.balanced.on_full.clone())
                     .with_default_ack_propagation_mode(topic_spec.policies.ack_propagation.mode);
+                if let Some(sender) = declared.load_report_senders.get(declared_name) {
+                    binding = binding.with_load_report_sender(sender.clone());
+                }
                 _ = set.insert(global_topic_name.clone(), binding);
             }
         }
@@ -1569,11 +1641,14 @@ impl<
                     let handle = handle.with_default_publish_outcome_config(
                         Self::map_topic_spec_to_publish_outcome_config(topic_spec),
                     );
-                    let binding = PipelineTopicBinding::from(handle)
+                    let mut binding = PipelineTopicBinding::from(handle)
                         .with_default_queue_on_full(topic_spec.policies.balanced.on_full.clone())
                         .with_default_ack_propagation_mode(
                             topic_spec.policies.ack_propagation.mode,
                         );
+                    if let Some(sender) = declared.load_report_senders.get(declared_name) {
+                        binding = binding.with_load_report_sender(sender.clone());
+                    }
                     // Group-local declarations override globals with the same local name.
                     _ = set.insert(group_topic_name.clone(), binding);
                 }
@@ -1581,6 +1656,136 @@ impl<
         }
 
         Ok(set)
+    }
+
+    /// Count the partition-dispatch receiver owners of each declared topic, so a
+    /// scheduler is created with the right owner-slot count (durable-dispatch I4).
+    fn count_partition_dispatch_owners(
+        config: &OtelDataflowSpec,
+        declared: &DeclaredTopics<PData>,
+    ) -> HashMap<TopicName, usize> {
+        let mut counts: HashMap<TopicName, usize> = HashMap::new();
+        for (group_id, group_cfg) in &config.groups {
+            for pipeline_cfg in group_cfg.pipelines.values() {
+                for (_node_id, node_cfg) in pipeline_cfg.node_iter() {
+                    if node_cfg.r#type.id() != "topic" || node_cfg.kind() != NodeKind::Receiver {
+                        continue;
+                    }
+                    if !matches!(
+                        Self::parse_topic_receiver_mode(node_cfg),
+                        TopicReceiverMode::PartitionDispatch { .. }
+                    ) {
+                        continue;
+                    }
+                    let Some(raw_topic) = Self::parse_topic_name_from_node_config(node_cfg) else {
+                        continue;
+                    };
+                    let Some(declared_name) = Self::resolve_declared_topic_name(
+                        group_id,
+                        &raw_topic,
+                        &declared.global_names,
+                        &declared.group_names,
+                    ) else {
+                        continue;
+                    };
+                    *counts.entry(declared_name).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    /// Create a placement scheduler for each in-memory partition-dispatch topic and
+    /// spawn the thread that ticks them (durable-dispatch I4, half 2). Returns the
+    /// per-topic load-report senders to attach to topic bindings, and the thread's
+    /// lifecycle handle. Durable partition-dispatch topics are deferred.
+    fn spawn_placement_schedulers(
+        config: &OtelDataflowSpec,
+        declared: &DeclaredTopics<PData>,
+    ) -> Result<
+        (
+            HashMap<TopicName, LoadReportSender>,
+            PlacementSchedulerRuntime,
+        ),
+        Error,
+    > {
+        let owner_counts = Self::count_partition_dispatch_owners(config, declared);
+        let mut senders = HashMap::new();
+        let mut schedulers = Vec::new();
+
+        for (topic_name, spec) in &config.topics {
+            if let Some(declared_name) = declared.global_names.get(topic_name) {
+                Self::try_make_scheduler(
+                    declared,
+                    declared_name,
+                    spec,
+                    &owner_counts,
+                    &mut senders,
+                    &mut schedulers,
+                )?;
+            }
+        }
+        for (group_id, group_cfg) in &config.groups {
+            for (topic_name, spec) in &group_cfg.topics {
+                if let Some(declared_name) = declared
+                    .group_names
+                    .get(&(group_id.clone(), topic_name.clone()))
+                {
+                    Self::try_make_scheduler(
+                        declared,
+                        declared_name,
+                        spec,
+                        &owner_counts,
+                        &mut senders,
+                        &mut schedulers,
+                    )?;
+                }
+            }
+        }
+
+        Ok((senders, PlacementSchedulerRuntime::spawn(schedulers)))
+    }
+
+    /// Create a scheduler for one topic when it is an in-memory partition-dispatch
+    /// topic with at least one owner, recording its load-report sender.
+    fn try_make_scheduler(
+        declared: &DeclaredTopics<PData>,
+        declared_name: &TopicName,
+        spec: &TopicSpec,
+        owner_counts: &HashMap<TopicName, usize>,
+        senders: &mut HashMap<TopicName, LoadReportSender>,
+        schedulers: &mut Vec<PlacementScheduler<PData>>,
+    ) -> Result<(), Error> {
+        // In-memory partition-dispatch only; durable placement is deferred.
+        if spec.backend != TopicBackendKind::InMemory {
+            return Ok(());
+        }
+        let Some(num_partitions) = spec.num_partitions else {
+            return Ok(());
+        };
+        let Some(num_owners) = owner_counts
+            .get(declared_name)
+            .copied()
+            .and_then(NonZeroUsize::new)
+        else {
+            return Ok(());
+        };
+        let handle = declared
+            .broker
+            .get_topic_required(declared_name)
+            .map_err(|e| Error::PipelineRuntimeError {
+                source: Box::new(e),
+            })?;
+        let scheduler = PlacementScheduler::new(
+            handle,
+            num_partitions,
+            num_owners,
+            LoadWeights::default(),
+            PLACEMENT_MAX_IMBALANCE,
+        );
+        _ = senders.insert(declared_name.clone(), scheduler.report_sender());
+        schedulers.push(scheduler);
+        Ok(())
     }
 
     fn run_with_mode(
@@ -1763,7 +1968,13 @@ impl<
             )?);
         }
         // Declare all topics up front before any pipeline thread starts.
-        let declared_topics = Self::declare_topics(&engine_config)?;
+        let mut declared_topics = Self::declare_topics(&engine_config)?;
+        // Create and start the in-memory partition-dispatch placement schedulers
+        // (durable-dispatch I4, half 2). Their load-report senders ride the topic
+        // bindings so windower owners report load to the right scheduler.
+        let (load_report_senders, placement_scheduler_runtime) =
+            Self::spawn_placement_schedulers(&engine_config, &declared_topics)?;
+        declared_topics.load_report_senders = load_report_senders;
 
         for pipeline_entry in &pipelines {
             let pipeline_key = PipelineKey::new(
@@ -2047,7 +2258,9 @@ impl<
             thread::park();
         }
 
-        // All pipelines have finished; shut down the admin HTTP server and metric aggregator gracefully.
+        // All pipelines have finished; stop the placement scheduler thread, then
+        // shut down the admin HTTP server and metric aggregator gracefully.
+        placement_scheduler_runtime.shutdown();
         engine_metrics_handle.shutdown_and_join()?;
         if let Some(handle) = memory_limiter_handle {
             handle.shutdown_and_join()?;

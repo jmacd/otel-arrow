@@ -60,6 +60,19 @@ pub trait TopicBackend<T: Send + Sync + 'static>: Send + Sync + 'static {
     fn create_topic(&self, name: TopicName, opts: TopicOptions) -> Arc<dyn TopicState<T>>;
 }
 
+/// A read-only snapshot of a partition-dispatch topic's `partition -> owner`
+/// routing. The placement scheduler reconciles its model to this before
+/// rebalancing so its owner indices match the topic's real owner slots, which are
+/// assigned in subscription order.
+#[derive(Debug, Clone)]
+pub struct PartitionRoutingSnapshot {
+    /// `owner_of[p]` is the owner slot of partition `p`, or `None` when the
+    /// partition has no subscribed owner yet.
+    pub owner_of: Vec<Option<usize>>,
+    /// The number of subscribed owner slots.
+    pub num_owners: usize,
+}
+
 /// Per-topic operations. Shared across all handles via `Arc`.
 pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
     /// Topic name.
@@ -133,6 +146,13 @@ pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
     /// single-writer-per-series handoff carries no overlapping state.
     fn reassign_partition(&self, _partition: usize, _to_owner: usize) -> Result<(), Error> {
         Err(Error::PartitionReassignNotSupported)
+    }
+    /// The current `partition -> owner` routing for a partition-dispatch topic and
+    /// the number of subscribed owners, or `None` for other topics. The placement
+    /// scheduler reconciles to this before rebalancing so its owner indices match
+    /// the topic's real owner slots.
+    fn partition_routing(&self) -> Option<PartitionRoutingSnapshot> {
+        None
     }
     /// Effective broadcast lag policy for this topic.
     fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy;

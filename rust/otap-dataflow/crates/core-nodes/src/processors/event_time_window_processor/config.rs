@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use otap_df_config::TopicName;
 use otap_df_config::error::Error as ConfigError;
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,13 @@ pub struct Config {
     /// idle streams' windows still close. Matches the ingest queue's `max_lag`.
     #[serde(with = "humantime_serde", default = "default_max_lag")]
     pub max_lag: Duration,
+
+    /// The partition-dispatch topic this windower is an owner of. When set, the
+    /// windower pulls the topic's load-report sender from the pipeline's topic set
+    /// and reports its per-partition load to the placement scheduler, closing the
+    /// load feedback loop (durable-dispatch I4). When unset, load reporting is off.
+    #[serde(default)]
+    pub report_load_to: Option<TopicName>,
 }
 
 impl Config {
@@ -50,6 +58,7 @@ impl Default for Config {
             window_size: default_window_size(),
             allowed_lateness: default_allowed_lateness(),
             max_lag: default_max_lag(),
+            report_load_to: None,
         }
     }
 }

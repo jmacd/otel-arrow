@@ -133,6 +133,20 @@ impl PartitionPlacement {
         }
     }
 
+    /// Adopt an explicit `owner_of` map, so a coordinator can reconcile its model
+    /// to a topic's real routing instead of assuming a fresh `balanced` map.
+    /// `owner_of[p]` is the owner of partition `p`; owner ids at or beyond
+    /// `num_owners` are clamped into range.
+    #[must_use]
+    pub fn from_owner_of(owner_of: Vec<OwnerId>, num_owners: NonZeroUsize) -> Self {
+        let m = num_owners.get();
+        let owner_of = owner_of.into_iter().map(|owner| owner.min(m - 1)).collect();
+        Self {
+            owner_of,
+            num_owners: m,
+        }
+    }
+
     /// The total load on each owner under `weights`, indexed by owner id.
     #[must_use]
     pub fn owner_loads(&self, weights: &[u64]) -> Vec<u64> {

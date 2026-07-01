@@ -231,6 +231,27 @@ impl PlacementCoordinator {
         &self.placement
     }
 
+    /// The number of owners this coordinator places partitions across.
+    #[must_use]
+    pub fn num_owners(&self) -> usize {
+        self.num_owners.get()
+    }
+
+    /// Reconcile the placement to a topic's real `owner_of` routing so the owner
+    /// indices this coordinator emits address the topic's actual owner slots,
+    /// which are assigned in subscription order and need not match the initial
+    /// placement order. A partition with no current owner keeps its existing
+    /// assignment; a mismatched partition count is ignored.
+    pub fn reconcile(&mut self, owner_of: &[Option<OwnerId>]) {
+        if owner_of.len() != self.placement.num_partitions() {
+            return;
+        }
+        let reconciled: Vec<OwnerId> = (0..self.placement.num_partitions())
+            .map(|p| owner_of[p].unwrap_or_else(|| self.placement.owner_of(p)))
+            .collect();
+        self.placement = PartitionPlacement::from_owner_of(reconciled, self.num_owners);
+    }
+
     /// The current load on each owner, indexed by owner id.
     #[must_use]
     pub fn owner_loads(&self) -> Vec<u64> {
@@ -348,6 +369,16 @@ impl<T: Send + Sync + 'static> PlacementScheduler<T> {
     /// Returns the first error from applying a move (for example if the
     /// coordinator and topic disagree on the owner set).
     pub fn tick(&mut self) -> Result<Vec<PartitionMove>, Error> {
+        // Reconcile to the topic's real owner slots before deciding, so the owner
+        // indices in emitted moves address the right owners even when subscription
+        // order does not match the initial placement order. If not every owner has
+        // subscribed yet, wait for the full set rather than rebalance a partial one.
+        if let Some(routing) = self.topic.partition_routing() {
+            if routing.num_owners < self.coordinator.num_owners() {
+                return Ok(Vec::new());
+            }
+            self.coordinator.reconcile(&routing.owner_of);
+        }
         while let Ok(snapshot) = self.rx.try_recv() {
             self.coordinator.report(&snapshot);
         }
@@ -618,5 +649,131 @@ mod tests {
         let max_after = *coord.owner_loads().iter().max().unwrap();
         assert!(!moves.is_empty());
         assert!(max_after < max_before);
+    }
+
+    #[test]
+    fn reconcile_adopts_the_topics_owner_of_routing() {
+        let mut coord = PlacementCoordinator::new(nz(4), nz(2), LoadWeights::default(), 1.2);
+        // Default balanced start: owner0 -> {0,1}, owner1 -> {2,3}.
+        assert_eq!(coord.placement().owner_of(0), 0);
+        assert_eq!(coord.placement().owner_of(2), 1);
+        // Adopt a reversed routing: partitions 0,1 -> owner1; 2,3 -> owner0.
+        coord.reconcile(&[Some(1), Some(1), Some(0), Some(0)]);
+        assert_eq!(coord.placement().owner_of(0), 1);
+        assert_eq!(coord.placement().owner_of(2), 0);
+        // A partition with no current owner keeps its existing assignment.
+        coord.reconcile(&[None, Some(1), Some(0), Some(0)]);
+        assert_eq!(coord.placement().owner_of(0), 1);
+        // A mismatched partition count is ignored.
+        coord.reconcile(&[Some(0)]);
+        assert_eq!(coord.placement().owner_of(0), 1);
+    }
+
+    #[test]
+    fn scheduler_tick_reconciles_to_real_owner_slots() {
+        use crate::topic::{
+            PartitionDispatchBackend, SubscriberOptions, SubscriptionMode, TopicBroker,
+            TopicOptions,
+        };
+
+        let broker = TopicBroker::<()>::new();
+        let topic = broker
+            .create_topic(
+                "shuffle",
+                TopicOptions::default(),
+                PartitionDispatchBackend {
+                    num_partitions: 4,
+                    capacity: 16,
+                },
+            )
+            .expect("create topic");
+        // Subscribe in reversed order: the first subscriber (owner slot 0) owns
+        // {2,3}; the second (slot 1) owns {0,1}. So the topic's owner_of is
+        // [1,1,0,0], the opposite of balanced(4,2).
+        let _s0 = topic
+            .subscribe(
+                SubscriptionMode::PartitionDispatch {
+                    owned_partitions: vec![2, 3],
+                },
+                SubscriberOptions::default(),
+            )
+            .expect("owner slot 0");
+        let _s1 = topic
+            .subscribe(
+                SubscriptionMode::PartitionDispatch {
+                    owned_partitions: vec![0, 1],
+                },
+                SubscriberOptions::default(),
+            )
+            .expect("owner slot 1");
+
+        let mut scheduler =
+            PlacementScheduler::new(topic.clone(), nz(4), nz(2), LoadWeights::default(), 1.2);
+        // Pile load on partitions 2 and 3, which owner slot 0 holds. Without
+        // reconciling to the real routing the coordinator would assume the balanced
+        // map (slot 0 owns {0,1}) and shed from the cold owner; reconciling makes it
+        // shed from the actually-hot slot 0.
+        scheduler.report(&[
+            (2, series(50)),
+            (3, series(50)),
+            (0, series(1)),
+            (1, series(1)),
+        ]);
+        let moves = scheduler.tick().expect("tick");
+
+        assert!(!moves.is_empty(), "skew must produce a move");
+        assert!(
+            moves.iter().all(|m| m.from == 0 && m.to == 1),
+            "sheds from the real hot slot 0 onto the idle slot 1: {moves:?}"
+        );
+        assert!(
+            moves.iter().all(|m| m.partition == 2 || m.partition == 3),
+            "moves one of the hot partitions: {moves:?}"
+        );
+        // The move was applied to the topic, so its routing now reflects it.
+        let routing = topic
+            .partition_routing()
+            .expect("partition-dispatch routing");
+        assert_eq!(routing.num_owners, 2);
+        assert_eq!(routing.owner_of[moves[0].partition], Some(1));
+    }
+
+    #[test]
+    fn scheduler_tick_waits_until_all_owners_subscribe() {
+        use crate::topic::{
+            PartitionDispatchBackend, SubscriberOptions, SubscriptionMode, TopicBroker,
+            TopicOptions,
+        };
+
+        let broker = TopicBroker::<()>::new();
+        let topic = broker
+            .create_topic(
+                "shuffle",
+                TopicOptions::default(),
+                PartitionDispatchBackend {
+                    num_partitions: 4,
+                    capacity: 16,
+                },
+            )
+            .expect("create topic");
+        // Only one of the two expected owners has subscribed so far.
+        let _s0 = topic
+            .subscribe(
+                SubscriptionMode::PartitionDispatch {
+                    owned_partitions: vec![0, 1],
+                },
+                SubscriberOptions::default(),
+            )
+            .expect("owner slot 0");
+
+        let mut scheduler =
+            PlacementScheduler::new(topic, nz(4), nz(2), LoadWeights::default(), 1.2);
+        scheduler.report(&[(0, series(50)), (1, series(50))]);
+        // The scheduler waits for the full owner set rather than rebalance onto an
+        // owner slot that does not exist yet.
+        assert!(
+            scheduler.tick().expect("tick").is_empty(),
+            "no moves until every owner has subscribed"
+        );
     }
 }

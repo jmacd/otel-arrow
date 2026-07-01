@@ -21,8 +21,8 @@ mod types;
 mod tests;
 
 pub use backend::{
-    InMemoryBackend, PartitionDispatchBackend, PublishFuture, PublishTrackedFuture,
-    SubscriptionBackend, TopicBackend, TopicState,
+    InMemoryBackend, PartitionDispatchBackend, PartitionRoutingSnapshot, PublishFuture,
+    PublishTrackedFuture, SubscriptionBackend, TopicBackend, TopicState,
 };
 pub use binding::PipelineTopicBinding;
 pub use broker::TopicBroker;

@@ -6,6 +6,7 @@
 use std::ops::Deref;
 
 use crate::topic::handle::TopicHandle;
+use crate::topic::load_feedback::LoadReportSender;
 use otap_df_config::topic::{TopicAckPropagationMode, TopicQueueOnFullPolicy};
 
 /// Pipeline-scoped topic binding with resolved wiring defaults.
@@ -18,6 +19,7 @@ pub struct PipelineTopicBinding<T: Send + Sync + 'static> {
     handle: TopicHandle<T>,
     queue_on_full_default: TopicQueueOnFullPolicy,
     ack_propagation_mode_default: TopicAckPropagationMode,
+    load_report_sender: Option<LoadReportSender>,
 }
 
 impl<T: Send + Sync + 'static> Clone for PipelineTopicBinding<T> {
@@ -26,6 +28,7 @@ impl<T: Send + Sync + 'static> Clone for PipelineTopicBinding<T> {
             handle: self.handle.clone(),
             queue_on_full_default: self.queue_on_full_default.clone(),
             ack_propagation_mode_default: self.ack_propagation_mode_default,
+            load_report_sender: self.load_report_sender.clone(),
         }
     }
 }
@@ -38,6 +41,7 @@ impl<T: Send + Sync + 'static> PipelineTopicBinding<T> {
             handle,
             queue_on_full_default: TopicQueueOnFullPolicy::Block,
             ack_propagation_mode_default: TopicAckPropagationMode::Disabled,
+            load_report_sender: None,
         }
     }
 
@@ -48,6 +52,7 @@ impl<T: Send + Sync + 'static> PipelineTopicBinding<T> {
             handle: self.handle.clone(),
             queue_on_full_default: policy,
             ack_propagation_mode_default: self.ack_propagation_mode_default,
+            load_report_sender: self.load_report_sender.clone(),
         }
     }
 
@@ -58,6 +63,7 @@ impl<T: Send + Sync + 'static> PipelineTopicBinding<T> {
             handle: self.handle.clone(),
             queue_on_full_default: self.queue_on_full_default.clone(),
             ack_propagation_mode_default: mode,
+            load_report_sender: self.load_report_sender.clone(),
         }
     }
 
@@ -83,6 +89,28 @@ impl<T: Send + Sync + 'static> PipelineTopicBinding<T> {
     #[must_use]
     pub const fn default_ack_propagation_mode(&self) -> TopicAckPropagationMode {
         self.ack_propagation_mode_default
+    }
+
+    /// Return a cloned binding carrying the placement scheduler's load-report
+    /// sender for this topic. A partition-dispatch owner such as the event-time
+    /// windower pulls this to report its per-partition load to the scheduler,
+    /// closing the load feedback loop.
+    #[must_use]
+    pub fn with_load_report_sender(&self, sender: LoadReportSender) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            queue_on_full_default: self.queue_on_full_default.clone(),
+            ack_propagation_mode_default: self.ack_propagation_mode_default,
+            load_report_sender: Some(sender),
+        }
+    }
+
+    /// The placement scheduler's load-report sender for this topic, if the
+    /// controller wired one. Present for a partition-dispatch in-memory topic with
+    /// a running scheduler; owners report per-partition load through it.
+    #[must_use]
+    pub fn load_report_sender(&self) -> Option<LoadReportSender> {
+        self.load_report_sender.clone()
     }
 }
 

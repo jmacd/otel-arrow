@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::error::Error;
-use crate::topic::backend::TopicState;
+use crate::topic::backend::{PartitionRoutingSnapshot, TopicState};
 use crate::topic::load_feedback::PartitionMove;
 use crate::topic::subscription::Subscription;
 use crate::topic::types::{
@@ -129,6 +129,14 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
     /// boundary so the single-writer handoff carries no overlapping state.
     pub fn reassign_partition(&self, partition: usize, to_owner: usize) -> Result<(), Error> {
         self.inner.reassign_partition(partition, to_owner)
+    }
+
+    /// The topic's current `partition -> owner` routing, or `None` if it is not a
+    /// partition-dispatch topic. The placement scheduler uses this to align its
+    /// owner indices with the topic's real owner slots.
+    #[must_use]
+    pub fn partition_routing(&self) -> Option<PartitionRoutingSnapshot> {
+        self.inner.partition_routing()
     }
 
     /// Apply a [`PartitionMove`] emitted by a
