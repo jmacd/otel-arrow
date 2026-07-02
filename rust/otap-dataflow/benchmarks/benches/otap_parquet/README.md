@@ -54,11 +54,13 @@ rather than the deprecated Hadoop-framed `LZ4`.
 cargo bench -p benchmarks --bench otap_parquet
 ```
 
-Eight tables are printed to stdout before the timed round-trip benchmarks run:
+Ten tables are printed to stdout before the timed round-trip benchmarks run:
 serialized size, the OTAP/IPC pipeline breakdown, the Parquet pipeline breakdown,
 the OTAP-flat single columnar view study, the service-to-service transfer
 comparison, the conversion-cost matrix, the naive-versus-optimized OTAP-to-Parquet
-comparison, and the OTAP/IPC streaming amortization. The breakdown shapes are 10k,
+comparison, the OTAP/IPC streaming amortization, the lazy-versus-eager Parquet
+break-even, and the standard multi-file versus single flat file size comparison.
+The breakdown shapes are 10k,
 30k, and 60k log records. A single OTAP logs batch holds at most 65,535 records
 because the log id is a `u16`, so the shapes stay below that and larger volumes
 are streamed. The full Criterion sweep is slow; the printed tables are the main
@@ -195,7 +197,9 @@ prepare-and-write is shared:
 A companion write-up of what these ratios mean, including the streaming effect,
 is in [`ANALYSIS.md`](./ANALYSIS.md). The OTAP-flat single columnar view, the
 transfer comparison, and the natural-center conversion analysis are in
-[`OTAP_FLAT_ANALYSIS.md`](./OTAP_FLAT_ANALYSIS.md).
+[`OTAP_FLAT_ANALYSIS.md`](./OTAP_FLAT_ANALYSIS.md). The lazy-versus-eager Parquet
+break-even, which asks whether deferring the Parquet encode until the first read
+pays off, is in [`LAZY_ANALYSIS.md`](./LAZY_ANALYSIS.md).
 
 ## Takeaways
 
@@ -227,6 +231,12 @@ transfer comparison, and the natural-center conversion analysis are in
   Parquet. Producing Parquet is worth it only where the columnar file and its
   smaller `zstd` size are needed at rest, and that cost lands wherever the flatten
   and Parquet write run.
+- Deferring the Parquet encode to the first read (lazy conversion) does not pay
+  for large batches once transport and storage are counted, because warm IPC is
+  1.3 to 1.6x the Parquet file and moving those extra bytes costs more than the
+  flatten-and-write CPU it saves. Lazy only competes under CPU-only accounting,
+  and even then only when files are read fewer than about one to two times. See
+  [`LAZY_ANALYSIS.md`](./LAZY_ANALYSIS.md).
 
 ## Extending
 
@@ -251,3 +261,16 @@ prepares a flat batch for Parquet by expanding run-end columns and materializing
 the dictionary `FixedSizeBinary` `trace_id`/`span_id`, the only two encodings
 arrow-rs cannot round-trip, and the conversion-cost matrix in `main.rs` times
 every pipeline edge in isolation.
+
+The lazy-versus-eager cost model is `parquet_study::lazy`: `Components` holds the
+measured per-step CPU and byte sizes, `CostKnobs` holds the `$/CPU-ms` and `$/GB`
+prices, and `breakeven_reads` solves for `R*`. The
+`print_lazy_breakeven_table` in `main.rs` measures the components and prints `R*`
+with each priced dimension added cumulatively, plus a retention sweep. Its unit
+tests run with `cargo test -p benchmarks --lib parquet_study::lazy`.
+
+The `print_standard_multifile_table` in `main.rs` writes each OTAP payload
+(Logs, ResourceAttrs, ScopeAttrs, LogAttrs) as its own Parquet file, the way the
+production `parquet_exporter` does, and compares the summed size against the
+single flattened file, showing the fixed-overhead cost of the normalized
+multi-file layout across payload sizes.

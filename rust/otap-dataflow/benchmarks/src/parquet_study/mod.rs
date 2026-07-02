@@ -19,6 +19,7 @@ pub mod attrs;
 pub mod datagen;
 pub mod ipc;
 pub mod ipc_flat;
+pub mod lazy;
 pub mod map;
 pub mod nested;
 pub mod otap_flat;

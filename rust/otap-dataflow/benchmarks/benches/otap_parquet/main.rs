@@ -35,6 +35,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use benchmarks::parquet_study::datagen::{LogsGenParams, gen_logs_otap};
+use benchmarks::parquet_study::lazy::{self, Components, CostKnobs};
 use benchmarks::parquet_study::otap_flat::{self, Layout};
 use benchmarks::parquet_study::parquet_io::{read_parquet, to_parquet_ready, write_parquet};
 use benchmarks::parquet_study::{Compressor, Scheme, ipc, ipc_flat};
@@ -704,6 +705,293 @@ fn print_streaming_table(shapes: &[LogsGenParams]) {
     println!();
 }
 
+/// Measure the per-file cost components (CPU per step, warm IPC bytes, Parquet
+/// bytes) and report the lazy-versus-eager break-even read rate `R*` under a
+/// full total-cost-of-ownership model.
+///
+/// The premise this tests: a vendor accepts Parquet, so the gateway encodes it
+/// eagerly, paying `flatten + pq-write` on every file to make it query-ready. The
+/// alternative is to write Arrow IPC to disk and convert to Parquet lazily on the
+/// first read, so files never read never pay the conversion. `R*` is where eager
+/// becomes cheaper than lazy.
+///
+/// This is the **large-batch** regime, so warm IPC is larger than the Parquet
+/// file (see the streaming table). That makes lazy pay more for transport and
+/// storage-at-rest, which works against it. The table shows `R*` for each priced
+/// dimension added cumulatively, then a retention sweep, so it is visible which
+/// resource decides the outcome. The per-read cost is identical for both
+/// strategies and cancels, so `R*` is set by the write-path CPU saved versus the
+/// conversion CPU plus the IPC-vs-Parquet size penalty.
+///
+/// The cost knobs are illustrative (see [`CostKnobs::default`]); the interesting
+/// output is `R*` and how the byte-priced dimensions move it, not an absolute
+/// dollar figure.
+fn print_lazy_breakeven_table(shapes: &[LogsGenParams]) {
+    // Search reads out to this many per file; beyond it we report "> N".
+    const MAX_R: f64 = 1000.0;
+
+    // Format a break-even into R*, or which strategy dominates the whole range.
+    // `breakeven_reads` returns None when one strategy wins everywhere; the sign
+    // at r=0 says which: lazy cheaper at 0 and no crossing => lazy wins out to
+    // MAX_R; otherwise eager wins outright.
+    fn fmt_breakeven(c: &Components, k: &CostKnobs) -> String {
+        match lazy::breakeven_reads(c, k, MAX_R) {
+            Some(r) => format!("{r:.3}"),
+            None => {
+                if lazy::lazy_cost(c, k, 0.0) < lazy::eager_cost(c, k, 0.0) {
+                    format!("> {MAX_R:.0} (lazy)")
+                } else {
+                    "eager".to_string()
+                }
+            }
+        }
+    }
+
+    // Measure the components for one shape and IPC compressor. Parquet uses the
+    // same compressor; the nested flatten is the write-path index. IPC bytes are
+    // the steady-state (warm) size, since large volumes are streamed.
+    fn measure(shape: &LogsGenParams, comp: Compressor) -> Components {
+        let (otap, _) = gen_logs_otap(shape);
+        let flat = Scheme::Nested.flatten(&otap).expect("nested flatten");
+
+        let ipc_encode_ms = median_ms(|| {
+            let _ = ipc::encode_to_bytes(otap.clone(), comp).expect("encode");
+        });
+        let ipc_bytes_wire = ipc::encode_to_bytes(otap.clone(), comp).expect("encode");
+        let optimized = ipc::deserialize(&ipc_bytes_wire).expect("deserialize");
+        let ipc_decode_ms = median_ms(|| {
+            let mut o = optimized.clone();
+            ipc::transport_decode(&mut o).expect("transport decode");
+        }) + median_ms(|| {
+            let _ = ipc::deserialize(&ipc_bytes_wire).expect("deserialize");
+        });
+
+        let flatten_ms = median_ms(|| {
+            let _ = Scheme::Nested.flatten(&otap).expect("flatten");
+        });
+        let pq_bytes_vec = write_parquet(&flat, comp.parquet()).expect("write");
+        let pq_write_ms = median_ms(|| {
+            let _ = write_parquet(&flat, comp.parquet()).expect("write");
+        });
+        let pq_read_ms = median_ms(|| {
+            let _ = read_parquet(&pq_bytes_vec).expect("read");
+        });
+
+        // Warm (steady-state) IPC size: the fixed schema/dictionary cost is
+        // amortized after the first batch, which is the realistic streaming size.
+        let warm_ipc = *ipc::stream_batch_sizes(&otap, comp, 6)
+            .expect("stream sizes")
+            .last()
+            .expect("non-empty");
+
+        Components {
+            ipc_encode_ms,
+            ipc_decode_ms,
+            flatten_ms,
+            pq_write_ms,
+            pq_read_ms,
+            ipc_bytes: warm_ipc as f64,
+            pq_bytes: pq_bytes_vec.len() as f64,
+        }
+    }
+
+    let base = CostKnobs::default();
+    // Cumulative knob sets: CPU only, then add storage, transport, and I/O.
+    let cpu_only = base.cpu_only();
+    let plus_store = cpu_only.with_storage(base.store_per_gb);
+    let plus_net = plus_store.with_network(base.net_per_gb);
+    let all_in = plus_net.with_io(base.io_per_gb);
+
+    println!("\n=== Lazy vs eager Parquet: break-even read rate R* (large batches) ===");
+    println!("Eager = flatten+pq-write on every file. Lazy = write IPC, convert on first read.");
+    println!(
+        "R* = reads/file where eager gets cheaper; below R* lazy wins. Reads cancel (both read Parquet)."
+    );
+    println!(
+        "Knobs: cpu=${:.2}/vCPU-hr, net=${}/GB, io=${}/GB, store=${}/GB over retention.",
+        base.cpu_per_ms * 3_600_000.0,
+        base.net_per_gb,
+        base.io_per_gb,
+        base.store_per_gb
+    );
+    println!("IPC bytes are warm (steady-state). Columns add each priced dimension cumulatively.");
+
+    for shape in shapes {
+        println!("-- shape {} log records --", shape.total_logs());
+        println!(
+            "{:<6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>16} {:>16} {:>16} {:>16}",
+            "comp",
+            "ipc-enc",
+            "convert",
+            "eager-wr",
+            "ipc-B",
+            "pq-B",
+            "R*(cpu)",
+            "R*(+store)",
+            "R*(+net)",
+            "R*(+io=all)"
+        );
+        for &comp in Scheme::Ipc.compressors() {
+            let c = measure(shape, comp);
+            println!(
+                "{:<6} {:>10.2} {:>10.2} {:>10.2} {:>10.0} {:>10.0} {:>16} {:>16} {:>16} {:>16}",
+                comp.label(),
+                c.ipc_encode_ms,
+                c.convert_ms(),
+                c.eager_write_ms(),
+                c.ipc_bytes,
+                c.pq_bytes,
+                fmt_breakeven(&c, &cpu_only),
+                fmt_breakeven(&c, &plus_store),
+                fmt_breakeven(&c, &plus_net),
+                fmt_breakeven(&c, &all_in),
+            );
+        }
+        println!();
+    }
+
+    // Retention sweep at the largest shape with zstd: storage scales with the
+    // retention window, and in this regime it is the dimension that decides
+    // whether any break-even in reads exists at all.
+    let shape = shapes.last().expect("at least one shape");
+    let c = measure(shape, Compressor::Zstd);
+    println!(
+        "Retention sweep (zstd, {} logs, network+I/O on): how storage duration moves R*.",
+        shape.total_logs()
+    );
+    println!("{:<20} {:>16}", "retention", "R* (all-in)");
+    for months in [0.0f64, 0.25, 1.0, 3.0, 12.0] {
+        let k = all_in.with_retention_months(0.023, months);
+        let label = if months == 0.0 {
+            "none".to_string()
+        } else {
+            format!("{months} month(s)")
+        };
+        println!("{:<20} {:>16}", label, fmt_breakeven(&c, &k));
+    }
+    println!();
+}
+
+/// Standard multi-file Parquet: what the production `parquet_exporter` actually
+/// writes, one Parquet file per OTAP payload type (Logs, ResourceAttrs,
+/// ScopeAttrs, LogAttrs) in the normalized layout, contrasted with the study's
+/// single flattened file.
+///
+/// The multi-file layout keeps attributes normalized, so it never denormalizes a
+/// resource/scope attribute across the log rows that share it, but it pays the
+/// Parquet fixed overhead, footer plus schema plus dictionary pages, once per
+/// file and cannot co-compress across files. So its fixed cost is higher and
+/// amortizes only at large payloads, while the single flat file pays that
+/// overhead once but repeats shared attributes inline.
+///
+/// This is the same size ladder as OTLP -> OTAP -> Parquet, one level further:
+/// more files means more fixed overhead, so multi-file standard is worst for
+/// small payloads and closes the gap as the payload grows.
+fn print_standard_multifile_table() {
+    use benchmarks::parquet_study::datagen::{RichGenParams, gen_logs_otap_rich};
+    use otap_df_pdata::otap::OtapArrowRecords;
+    use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+
+    // Sum the Parquet size of each present OTAP payload written as its own file,
+    // the way the parquet_exporter does. Returns (total, file count).
+    fn multifile_bytes(otap: &OtapArrowRecords, comp: Compressor) -> (usize, usize) {
+        let payloads = [
+            ArrowPayloadType::Logs,
+            ArrowPayloadType::ResourceAttrs,
+            ArrowPayloadType::ScopeAttrs,
+            ArrowPayloadType::LogAttrs,
+        ];
+        let mut total = 0usize;
+        let mut files = 0usize;
+        for pt in payloads {
+            if let Some(batch) = otap.get(pt) {
+                let ready = to_parquet_ready(batch).expect("parquet-ready");
+                total += write_parquet(&ready, comp.parquet()).expect("write").len();
+                files += 1;
+            }
+        }
+        (total, files)
+    }
+
+    // Small to large, plus a resource-heavy shape where denormalizing the shared
+    // resource attributes into the single flat file is most wasteful.
+    let scenarios = [
+        RichGenParams {
+            label: "small",
+            num_resources: 1,
+            num_scopes: 1,
+            num_logs: 100,
+            num_resource_attrs: 1,
+            num_scope_attrs: 2,
+            num_log_attrs: 9,
+        },
+        RichGenParams {
+            label: "medium",
+            num_resources: 1,
+            num_scopes: 1,
+            num_logs: 10_000,
+            num_resource_attrs: 1,
+            num_scope_attrs: 2,
+            num_log_attrs: 9,
+        },
+        RichGenParams {
+            label: "log-heavy-60k",
+            num_resources: 1,
+            num_scopes: 1,
+            num_logs: 60_000,
+            num_resource_attrs: 1,
+            num_scope_attrs: 2,
+            num_log_attrs: 9,
+        },
+        RichGenParams {
+            label: "resource-heavy",
+            num_resources: 600,
+            num_scopes: 1,
+            num_logs: 100,
+            num_resource_attrs: 20,
+            num_scope_attrs: 5,
+            num_log_attrs: 2,
+        },
+    ];
+
+    println!("\n=== Standard multi-file Parquet vs single flat file (bytes) ===");
+    println!("multi-file = one Parquet file per OTAP payload (what parquet_exporter writes).");
+    println!("nested/wide = the study's single flattened file. ratio = multi-file / nested.");
+    println!(
+        "{:<16} {:<6} {:>12} {:>12} {:>12} {:>6} {:>10}",
+        "scenario", "comp", "nested-1f", "wide-1f", "multi-file", "files", "multi/nest"
+    );
+    for s in &scenarios {
+        let otap = gen_logs_otap_rich(s);
+        for comp in [Compressor::Zstd, Compressor::Lz4] {
+            let nested = write_parquet(
+                &to_parquet_ready(&Scheme::Nested.flatten(&otap).expect("nested")).expect("ready"),
+                comp.parquet(),
+            )
+            .expect("write")
+            .len();
+            let wide = write_parquet(
+                &to_parquet_ready(&Scheme::Wide.flatten(&otap).expect("wide")).expect("ready"),
+                comp.parquet(),
+            )
+            .expect("write")
+            .len();
+            let (multi, files) = multifile_bytes(&otap, comp);
+            println!(
+                "{:<16} {:<6} {:>12} {:>12} {:>12} {:>6} {:>9.2}x",
+                s.label,
+                comp.label(),
+                nested,
+                wide,
+                multi,
+                files,
+                multi as f64 / nested as f64,
+            );
+        }
+    }
+    println!();
+}
+
 fn bench_round_trip(c: &mut Criterion) {
     let shapes = input_shapes();
     print_size_table(&shapes);
@@ -714,6 +1002,8 @@ fn bench_round_trip(c: &mut Criterion) {
     print_conversion_matrix();
     print_parquet_fastpath();
     print_streaming_table(&streaming_shapes());
+    print_lazy_breakeven_table(&shapes);
+    print_standard_multifile_table();
 
     let mut write_group = c.benchmark_group("parquet_study/write");
     let _ = write_group.sample_size(10);
