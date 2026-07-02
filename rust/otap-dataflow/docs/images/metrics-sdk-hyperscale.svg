@@ -1,0 +1,208 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="828" viewBox="0 0 1360 828" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <style>
+    .t      { fill:#2f3640; }
+    .title  { font-size:23px; font-weight:700; }
+    .sub    { font-size:13px; fill:#5b636e; }
+    .scope  { font-size:11px; fill:#6b7785; }
+    .h      { font-size:13px; font-weight:700; }
+    .h2     { font-size:12px; font-weight:700; }
+    .s      { font-size:11px; }
+    .xs     { font-size:10px; fill:#5b636e; }
+    .mono   { font-family:Consolas, "SF Mono", Menlo, monospace; font-size:10.5px; fill:#2f3640; }
+    .monos  { font-family:Consolas, "SF Mono", Menlo, monospace; font-size:9.5px; fill:#5b636e; }
+    .box    { stroke:#3a414a; stroke-width:1.5; }
+    .lbl    { font-size:9.5px; fill:#5b636e; }
+  </style>
+
+  <rect x="0" y="0" width="1360" height="828" fill="#ffffff"/>
+
+  <!-- ===== Title ===== -->
+  <text class="t title" x="40" y="42">OTAP metrics on one Linux node — three per-core receivers, one shared aggregation core</text>
+  <text class="t sub"   x="40" y="64">Thread-per-core, share-nothing ingest: every core runs its own internal-telemetry, StatsD, and user_events receivers. Data stays on the core that produced it.</text>
+  <text class="t scope" x="40" y="82">Branch jmacd/self_tracing_sdk · sharing begins at the aggregation core and OTAP encoder, not at ingest. The small-scale form of the durable metrics appliance. See integrated-metrics-sdk.md.</text>
+  <line x1="40" y1="90" x2="1336" y2="90" stroke="#d3d8de" stroke-width="1"/>
+
+  <!-- ===== Arrow markers ===== -->
+  <defs>
+    <marker id="ad" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#2c6e9b"/></marker>
+    <marker id="an" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3a414a"/></marker>
+    <marker id="ac" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#c46a1b"/></marker>
+    <marker id="ag" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#6b7785"/></marker>
+    <marker id="ap" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#6f5499"/></marker>
+  </defs>
+
+  <!-- ===== NUMA region: thread-per-core ===== -->
+  <rect class="box" x="40" y="104" width="864" height="300" rx="8" fill="#f7f8f9"/>
+  <rect x="40" y="104" width="864" height="30" rx="8" fill="#dfe3e8"/>
+  <rect x="40" y="120" width="864" height="14" fill="#dfe3e8"/>
+  <text class="t h2" x="54"  y="124">NUMA region · thread-per-core</text>
+  <text class="t xs" x="890" y="124" text-anchor="end">× R regions · share-nothing at the receiver end</text>
+
+  <!-- Core 0 -->
+  <rect x="52" y="144" width="410" height="150" rx="6" fill="#f4f6f8" stroke="#3a414a" stroke-width="1.3"/>
+  <text class="t h2" x="62"  y="164">Core 0</text>
+  <text class="t xs" x="452" y="164" text-anchor="end">data stays on this core</text>
+
+  <rect x="62" y="176" width="126" height="94" rx="5" fill="#e9f2f9" stroke="#2c6e9b" stroke-width="1.2"/>
+  <text class="t h2"   x="72" y="196">internal</text>
+  <text class="t s"    x="72" y="212">telemetry</text>
+  <text class="t mono" x="72" y="230">#[metric_set]</text>
+  <text class="t xs"   x="72" y="248">non-atomic</text>
+  <text class="t xs"   x="72" y="262">slots</text>
+
+  <rect x="194" y="176" width="126" height="94" rx="5" fill="#e6f3f1" stroke="#2f8f83" stroke-width="1.2"/>
+  <text class="t h2" x="204" y="196">StatsD</text>
+  <text class="t s"  x="204" y="212">receiver</text>
+  <text class="t xs" x="204" y="230">metric-lines</text>
+  <text class="t xs" x="204" y="248">UDP / UDS</text>
+  <text class="t xs" x="204" y="262">per-core socket</text>
+
+  <rect x="326" y="176" width="126" height="94" rx="5" fill="#e6f3f1" stroke="#2f8f83" stroke-width="1.2"/>
+  <text class="t h2" x="336" y="196">user_events</text>
+  <text class="t s"  x="336" y="212">receiver</text>
+  <text class="t xs" x="336" y="230">tracepoints</text>
+  <text class="t xs" x="336" y="248">per-core</text>
+  <text class="t xs" x="336" y="262">consumer</text>
+
+  <text class="t xs" x="62" y="286">record locally → per-core deltas</text>
+
+  <!-- Core 1 -->
+  <rect x="472" y="144" width="410" height="150" rx="6" fill="#f4f6f8" stroke="#3a414a" stroke-width="1.3"/>
+  <text class="t h2" x="482" y="164">Core 1</text>
+  <text class="t xs" x="872" y="164" text-anchor="end">data stays on this core</text>
+
+  <rect x="482" y="176" width="126" height="94" rx="5" fill="#e9f2f9" stroke="#2c6e9b" stroke-width="1.2"/>
+  <text class="t h2"   x="492" y="196">internal</text>
+  <text class="t s"    x="492" y="212">telemetry</text>
+  <text class="t mono" x="492" y="230">#[metric_set]</text>
+  <text class="t xs"   x="492" y="248">non-atomic</text>
+  <text class="t xs"   x="492" y="262">slots</text>
+
+  <rect x="614" y="176" width="126" height="94" rx="5" fill="#e6f3f1" stroke="#2f8f83" stroke-width="1.2"/>
+  <text class="t h2" x="624" y="196">StatsD</text>
+  <text class="t s"  x="624" y="212">receiver</text>
+  <text class="t xs" x="624" y="230">metric-lines</text>
+  <text class="t xs" x="624" y="248">UDP / UDS</text>
+  <text class="t xs" x="624" y="262">per-core socket</text>
+
+  <rect x="746" y="176" width="126" height="94" rx="5" fill="#e6f3f1" stroke="#2f8f83" stroke-width="1.2"/>
+  <text class="t h2" x="756" y="196">user_events</text>
+  <text class="t s"  x="756" y="212">receiver</text>
+  <text class="t xs" x="756" y="230">tracepoints</text>
+  <text class="t xs" x="756" y="248">per-core</text>
+  <text class="t xs" x="756" y="262">consumer</text>
+
+  <text class="t xs" x="482" y="286">record locally → per-core deltas</text>
+
+  <path d="M257,296 L257,306" stroke="#3a414a" stroke-width="1.6" fill="none" marker-end="url(#an)"/>
+  <path d="M677,296 L677,306" stroke="#3a414a" stroke-width="1.6" fill="none" marker-end="url(#an)"/>
+
+  <!-- NUMA-regional aggregator -->
+  <rect x="52" y="308" width="830" height="84" rx="6" fill="#e8f1e8" stroke="#4f7d54" stroke-width="1.3"/>
+  <text class="t h2" x="62" y="328">NUMA-regional aggregator · Tier 2</text>
+  <text class="t xs" x="62" y="346">sum per-core deltas additively · partials only, no cumulative state</text>
+  <text class="t xs" x="62" y="362">stays NUMA-local · only compact partials cross a socket</text>
+  <text class="t xs" x="62" y="378">one region shown · × R NUMA regions</text>
+
+  <path d="M467,392 L467,414" stroke="#3a414a" stroke-width="1.7" fill="none" marker-end="url(#an)"/>
+  <text class="t lbl" x="475" y="408">regional partials</text>
+
+  <!-- ===== Shared aggregation core (Tier 3) ===== -->
+  <rect class="box" x="40" y="416" width="864" height="66" rx="8" fill="#e8f1e8" stroke="#4f7d54"/>
+  <text class="t h"  x="56" y="438">Temporal aggregation processor — single writer per identity · sharing begins here · hosted by the ITR (Tier 3)</text>
+  <text class="t xs" x="56" y="456">ingest shares nothing; per-core partials meet here, keyed by identity · cumulative anchors · reset / gap / overlap</text>
+  <text class="t xs" x="56" y="472">shuffle by name to one owner, the appliance's L1 · host-origin points carry event time, windowed with watermarks, its L2</text>
+
+  <path d="M382,482 L382,490" stroke="#3a414a" stroke-width="1.7" fill="none" marker-end="url(#an)"/>
+
+  <!-- ===== OTAP-direct encoder ===== -->
+  <rect class="box" x="40" y="492" width="684" height="76" rx="8" fill="#eef1f4"/>
+  <text class="t h"    x="56"  y="514">OTAP-direct encoder — minimum cost</text>
+  <text class="t mono" x="712" y="514" text-anchor="end">→ OtapArrowRecords::Metrics</text>
+  <text class="t xs"   x="56"  y="532">built once: UnivariateMetrics · ScopeAttrs · NumberDPAttrs — dictionary-encoded, Arc-shared</text>
+  <text class="t xs"   x="56"  y="550">per tick: NumberDataPoint · Histogram / EDP columns, straight from the aggregated values</text>
+
+  <!-- schema codegen -->
+  <rect x="740" y="492" width="164" height="76" rx="8" fill="#ffffff" stroke="#6f5499" stroke-width="1.4"/>
+  <text class="t h2"    x="750" y="512">Schema codegen</text>
+  <text class="t monos" x="750" y="528">cargo xtask generate-metrics</text>
+  <text class="t xs"    x="750" y="544">schema + semconv →</text>
+  <text class="t xs"    x="750" y="560">structs + encoder</text>
+  <path d="M740,531 L726,531" stroke="#6f5499" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#ap)"/>
+
+  <path d="M382,568 L382,576" stroke="#3a414a" stroke-width="1.7" fill="none" marker-end="url(#an)"/>
+
+  <!-- ===== Output ===== -->
+  <rect class="box" x="40" y="578" width="864" height="60" rx="8" fill="#f2f3f5"/>
+  <text class="t h"  x="56" y="600">Internal observability pipeline</text>
+  <text class="t xs" x="56" y="618">ITR → batch processor → OTLP / OTAP exporter · a separate pipeline, isolated from the main engine</text>
+  <text class="t xs" x="56" y="634">MetricsTap serves Prometheus / console directly, with or without a full pipeline</text>
+
+  <!-- ===== Feedback control plane ===== -->
+  <rect x="952" y="104" width="384" height="534" rx="10" fill="#ffffff" stroke="#c46a1b" stroke-width="1.6"/>
+  <rect x="952" y="104" width="384" height="30" rx="10" fill="#fbeede"/>
+  <rect x="952" y="120" width="384" height="14" fill="#fbeede"/>
+  <text class="t h" x="968" y="124" fill="#9a5314">Feedback control plane · ArcSwap registry</text>
+
+  <text class="t xs" x="968" y="152">Tables published each window; every core reads them</text>
+  <text class="t xs" x="968" y="166">wait-free on the hot path, all three receivers alike.</text>
+
+  <!-- table 1 -->
+  <rect x="968" y="178" width="352" height="80" rx="6" fill="#fdf4e8" stroke="#c46a1b" stroke-width="1.2"/>
+  <text class="t h2" x="980" y="198">1 · Schema &amp; metric level</text>
+  <text class="t xs" x="980" y="216">Basic / Normal / Detailed per config</text>
+  <text class="t xs" x="980" y="232">granular name or agnostic signal attr</text>
+  <text class="t xs" x="980" y="248">resolved at registration · descriptor static</text>
+
+  <!-- table 2 -->
+  <rect x="968" y="270" width="352" height="66" rx="6" fill="#fdf4e8" stroke="#c46a1b" stroke-width="1.2"/>
+  <text class="t h2" x="980" y="290">2 · Cardinality budget</text>
+  <text class="t xs" x="980" y="308">bound active identities per core</text>
+  <text class="t xs" x="980" y="324">sparse enumeration · drop-and-count overflow</text>
+
+  <!-- table 3 -->
+  <rect x="968" y="348" width="352" height="104" rx="6" fill="#fdf4e8" stroke="#c46a1b" stroke-width="1.2"/>
+  <text class="t h2" x="980" y="368">3 · Ownership assignment (optional)</text>
+  <text class="t xs" x="980" y="386">identity → aggregation slot</text>
+  <text class="t xs" x="980" y="402">Slicer / Centrifuge-style key balancing</text>
+  <text class="t xs" x="980" y="418">applied at a window boundary</text>
+  <text class="t xs" x="980" y="434">a moved key carries no partial state</text>
+
+  <text class="t xs" x="968" y="472">Absent table is a fail-safe no-op until the</text>
+  <text class="t xs" x="968" y="486">aggregator first publishes.</text>
+
+  <text class="t xs" x="968" y="512" fill="#9a5314">Static hash assignment suffices for bounded SDK</text>
+  <text class="t xs" x="968" y="526" fill="#9a5314">metrics; most series stay on their origin core,</text>
+  <text class="t xs" x="968" y="540" fill="#9a5314">balancing moves only a hot identity.</text>
+
+  <!-- measure: owners -> control plane -->
+  <path d="M906,420 L950,420" stroke="#6b7785" stroke-width="1.4" fill="none" stroke-dasharray="5 3" marker-end="url(#ag)"/>
+  <text class="t lbl" x="910" y="414">owner load</text>
+
+  <!-- publish: control plane -> cores -->
+  <path d="M950,240 L906,240" stroke="#c46a1b" stroke-width="1.6" fill="none" marker-end="url(#ac)"/>
+  <text class="t lbl" x="946" y="234" text-anchor="end" fill="#9a5314">publish tables</text>
+
+  <!-- ===== Legend ===== -->
+  <rect x="40" y="660" width="1296" height="152" rx="8" fill="#fbfcfd" stroke="#d3d8de" stroke-width="1"/>
+  <text class="t h2" x="56" y="682">Legend · three share-nothing receivers per core</text>
+
+  <rect x="56"  y="692" width="16" height="12" fill="#e9f2f9" stroke="#2c6e9b"/><text class="t s" x="78"  y="702">internal telemetry receiver · engine self-metrics</text>
+  <rect x="430" y="692" width="16" height="12" fill="#e6f3f1" stroke="#2f8f83"/><text class="t s" x="452" y="702">StatsD receiver · metric-lines</text>
+  <rect x="720" y="692" width="16" height="12" fill="#e6f3f1" stroke="#2f8f83"/><text class="t s" x="742" y="702">user_events receiver · tracepoints</text>
+
+  <rect x="56"  y="714" width="16" height="12" fill="#e8f1e8" stroke="#4f7d54"/><text class="t s" x="78"  y="724">shared aggregation · single writer</text>
+  <rect x="430" y="714" width="16" height="12" fill="#eef1f4" stroke="#3a414a"/><text class="t s" x="452" y="724">OTAP encoding / output</text>
+  <rect x="720" y="714" width="16" height="12" fill="#fdf4e8" stroke="#c46a1b"/><text class="t s" x="742" y="724">feedback tables</text>
+  <rect x="980" y="714" width="16" height="12" fill="#ffffff" stroke="#6f5499"/><text class="t s" x="1002" y="724">schema codegen · build time</text>
+
+  <path d="M56,742 L92,742" stroke="#3a414a" stroke-width="1.8" fill="none" marker-end="url(#an)"/>
+  <text class="t s" x="100" y="746">per-core → NUMA-regional → global → OTAP</text>
+  <path d="M430,742 L466,742" stroke="#6b7785" stroke-width="1.6" fill="none" stroke-dasharray="5 3" marker-end="url(#ag)"/>
+  <text class="t s" x="474" y="746">measurement · owner to controller</text>
+  <path d="M720,742 L756,742" stroke="#c46a1b" stroke-width="1.8" fill="none" marker-end="url(#ac)"/>
+  <text class="t s" x="764" y="746">feedback control plane · ArcSwap tables</text>
+
+  <text class="t xs" x="56" y="772">Share-nothing at the receiver end: each core owns all three receivers and keeps its data local; sharing begins at the aggregation core and OTAP encoder.</text>
+  <text class="t xs" x="56" y="788">This is the small-scale form of the durable metrics appliance: per-core capture, single-writer aggregation by name, then OTAP.</text>
+</svg>
