@@ -1,0 +1,33 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: enhancement
+
+# The name of the component, or a single word describing the area of concern, (e.g. engine, otap).
+# Must be one of the components listed in rust/otap-dataflow/.chloggen/config.yaml.
+component: engine
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Balance the durable partition-dispatch scheduler across subscribers (windowers) rather than quiver stores, via a subscriber-level reassign entry point (durable-dispatch I4).
+
+# Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
+issues: [3359]
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries.
+subtext: |
+  A durable topic's owners are its per-owner quiver stores, and a subscriber may
+  drain several stores, so balancing stores does not balance the aggregating
+  windowers (at the default one-store-per-partition layout a store-level
+  coordinator cannot rebalance at all). The placement scheduler now balances at
+  subscriber granularity for both backends: `TopicState` gains
+  `subscriber_routing` (partition to subscriber) and
+  `reassign_partition_to_subscriber`, defaulting to the existing owner-level
+  methods for the in-memory backend. The durable topic maps each subscriber to
+  the stores it drains: `subscriber_routing` resolves a partition's store to its
+  claiming subscriber, and `reassign_partition_to_subscriber` routes a partition
+  into one of the target subscriber's stores, delivering it through the existing
+  whole-store drain and fence-and-forward with no owned-set change or
+  per-subscriber notification. The controller sizes the scheduler to the
+  partition-dispatch receiver count for both backends.

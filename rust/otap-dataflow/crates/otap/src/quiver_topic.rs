@@ -79,8 +79,8 @@ use quiver::{
 use otap_df_engine::error::Error;
 use otap_df_engine::topic::{
     Delivery, DeliveryBackend, DurableDispatchConfig, DurableDispatchPayload,
-    DurableRetentionPolicy, Envelope, PartitionPlacement, PublishFuture, PublishOutcome,
-    PublishTrackedFuture, RecvDelivery, SubscriberOptions, SubscriptionBackend,
+    DurableRetentionPolicy, Envelope, PartitionPlacement, PartitionRoutingSnapshot, PublishFuture,
+    PublishOutcome, PublishTrackedFuture, RecvDelivery, SubscriberOptions, SubscriptionBackend,
     SubscriptionGroupName, TopicBroadcastOnLagPolicy, TopicName, TopicState, TrackedPublishOutcome,
     TrackedPublishPermit, TrackedPublishTracker, TrackedTryPublishOutcome,
 };
@@ -860,6 +860,71 @@ impl TopicState<OtapPdata> for QuiverPartitionDispatchTopic {
         Ok(())
     }
 
+    /// The current `partition -> owner store` routing, so a caller can inspect the
+    /// durable topic's physical store layout. Unlike the in-memory backend, every
+    /// partition always has a store owner under the static `balanced` placement as
+    /// updated by `reassign_partition`, so no entry is `None`, and `num_owners` is
+    /// the number of per-owner quiver stores. The placement scheduler instead uses
+    /// `subscriber_routing`, which maps these stores to their draining subscribers.
+    fn partition_routing(&self) -> Option<PartitionRoutingSnapshot> {
+        let routing = self.shared.routing.load();
+        Some(PartitionRoutingSnapshot {
+            owner_of: routing.partition_owner.iter().copied().map(Some).collect(),
+            num_owners: self.shared.engines.len(),
+        })
+    }
+
+    /// The current `partition -> subscriber` routing the placement scheduler
+    /// balances. A durable owner is a quiver store, and a subscriber may drain
+    /// several stores, so the schedulable owner is the *subscriber*, not the
+    /// store: map each partition's current store to the subscriber that claimed
+    /// it (`engine_claimed`). `num_owners` is the number of subscribers that have
+    /// subscribed, so the scheduler waits for the full set before rebalancing. A
+    /// partition whose store is not yet claimed maps to `None`.
+    fn subscriber_routing(&self) -> Option<PartitionRoutingSnapshot> {
+        let routing = self.shared.routing.load();
+        let claims = self.shared.claims.lock();
+        let owner_of = routing
+            .partition_owner
+            .iter()
+            .map(|&store| claims.engine_claimed[store])
+            .collect();
+        Some(PartitionRoutingSnapshot {
+            owner_of,
+            num_owners: claims.next_sub_idx,
+        })
+    }
+
+    /// Reassign `partition` to the subscriber `to_subscriber` by routing it into
+    /// one of the owner stores that subscriber drains, then reusing the
+    /// store-level `reassign_partition`. The subscriber receives the partition's
+    /// data through its whole-store drain plus the fence-and-forward of residual,
+    /// so no owned-set change or per-subscriber notification is needed. The lowest
+    /// store the subscriber claimed is chosen deterministically; any store it
+    /// drains would deliver the partition.
+    fn reassign_partition_to_subscriber(
+        &self,
+        partition: usize,
+        to_subscriber: usize,
+    ) -> Result<(), Error> {
+        let store = {
+            let claims = self.shared.claims.lock();
+            claims
+                .engine_claimed
+                .iter()
+                .position(|&owner| owner == Some(to_subscriber))
+        };
+        let Some(store) = store else {
+            // The scheduler should only target subscribed owners; a subscriber
+            // with no claimed store is out of range for a durable reassignment.
+            return Err(Error::OwnerOutOfRange {
+                owner: to_subscriber,
+                num_owners: self.shared.claims.lock().next_sub_idx,
+            });
+        };
+        self.reassign_partition(partition, store)
+    }
+
     fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy {
         TopicBroadcastOnLagPolicy::DropOldest
     }
@@ -1191,9 +1256,13 @@ impl DurableDispatchPayload for OtapPdata {
 mod tests {
     use super::*;
     use crate::pdata::{Context, OtapPdata};
-    use otap_df_engine::topic::{RecvDelivery, Subscription, SubscriptionMode, TopicBroker};
+    use otap_df_engine::topic::{
+        LoadWeights, PartitionLoad, PlacementScheduler, RecvDelivery, Subscription,
+        SubscriptionMode, TopicBroker,
+    };
     use otap_df_pdata::otap::{OtapArrowRecords, OtapBatchStore};
     use otap_df_pdata::{logs, record_batch};
+    use std::num::NonZeroUsize;
     use tempfile::TempDir;
 
     /// Build a single-batch logs `OtapPdata` tagged with `partition`.
@@ -1202,6 +1271,15 @@ mod tests {
         let mut pdata = OtapPdata::new(Context::default(), OtapPayload::OtapArrowRecords(records));
         pdata.set_partition(partition);
         pdata
+    }
+
+    /// A `PartitionLoad` with `n` active series and no interval points, for
+    /// seeding a `PlacementScheduler` in placement tests.
+    fn series(n: u64) -> PartitionLoad {
+        PartitionLoad {
+            active_series: n,
+            points: 0,
+        }
     }
 
     fn config(dir: &TempDir, num_partitions: usize) -> DurableDispatchConfig {
@@ -1373,6 +1451,39 @@ mod tests {
         assert_eq!(got, vec![0]);
     }
 
+    // partition_routing exposes the durable topic's `partition -> owner store`
+    // map immediately at open (no subscriber needed) and reflects reassignments,
+    // so the placement scheduler can reconcile against it (durable-dispatch I4).
+    #[tokio::test]
+    async fn durable_partition_routing_reflects_placement() {
+        let dir = TempDir::new().unwrap();
+        let name: TopicName = "durable-partition-routing".into();
+        // 4 partitions across 2 owners: owner0={0,1}, owner1={2,3}.
+        let state =
+            QuiverPartitionDispatchTopic::open(name.clone(), config_with_owners(&dir, 4, 2))
+                .unwrap();
+        let broker = TopicBroker::<OtapPdata>::new();
+        let handle = broker.create_topic_with_state(name, state).unwrap();
+
+        let routing = handle
+            .partition_routing()
+            .expect("durable topic exposes routing");
+        assert_eq!(routing.num_owners, 2);
+        assert_eq!(
+            routing.owner_of,
+            vec![Some(0), Some(0), Some(1), Some(1)],
+            "static balanced(4, 2) placement"
+        );
+
+        // A reassignment repoints partition 0 to owner1 and is visible in routing.
+        handle.reassign_partition(0, 1).unwrap();
+        let routing = handle
+            .partition_routing()
+            .expect("routing after reassignment");
+        assert_eq!(routing.owner_of, vec![Some(1), Some(0), Some(1), Some(1)]);
+        assert_eq!(routing.num_owners, 2);
+    }
+
     // Data already persisted for a partition in its former owner's store is
     // migrated to the new owner's store by drain-and-forward: the former owner
     // recognizes the residual is no longer its own and forwards it, so the new
@@ -1523,6 +1634,169 @@ mod tests {
                 "partition 0 moved to owner1 and survived restart"
             );
         }
+    }
+
+    // A PlacementScheduler created against a durable topic reopened after a
+    // reassignment reconciles its coordinator to the restored placement.v1
+    // overlay on the first tick, so the scheduler's owner view agrees with the
+    // topic after a restart (durable-dispatch I4, folded snapshot reconciliation).
+    #[tokio::test]
+    async fn durable_scheduler_reconciles_to_restored_placement() {
+        let dir = TempDir::new().unwrap();
+        let name: TopicName = "durable-scheduler-reconcile".into();
+        // M=2 stores, static layout store0={0,1}, store1={2,3}; two subscribers
+        // each drain one store, so subscriber index == store index here.
+        let cfg = config_with_owners(&dir, 4, 2);
+
+        // Run 1: move partition 2 into store 0, persisting the overlay.
+        {
+            let state = QuiverPartitionDispatchTopic::open(name.clone(), cfg.clone()).unwrap();
+            let broker = TopicBroker::<OtapPdata>::new();
+            let handle = broker.create_topic_with_state(name.clone(), state).unwrap();
+            handle.reassign_partition(2, 0).unwrap();
+            handle.close();
+        }
+
+        // Run 2: reopen with both subscribers so subscriber_routing resolves. The
+        // scheduler's coordinator starts from the static balanced map (partition 2
+        // -> subscriber 1) but must reconcile to the restored overlay (partition 2
+        // -> subscriber 0) on tick. With no load reported the rebalance is a no-op,
+        // so the placement is exactly the restored overlay.
+        let state = QuiverPartitionDispatchTopic::open(name.clone(), cfg).unwrap();
+        let broker = TopicBroker::<OtapPdata>::new();
+        let handle = broker.create_topic_with_state(name, state).unwrap();
+        let _sub0 = handle
+            .subscribe(pd_mode(vec![0, 1]), SubscriberOptions::default())
+            .unwrap();
+        let _sub1 = handle
+            .subscribe(pd_mode(vec![2, 3]), SubscriberOptions::default())
+            .unwrap();
+
+        let mut scheduler = PlacementScheduler::new(
+            handle.clone(),
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            LoadWeights::default(),
+            1.2,
+        );
+        let moves = scheduler.tick().unwrap();
+        assert!(moves.is_empty(), "no load reported, so no rebalance moves");
+
+        let placement = scheduler.coordinator().placement();
+        assert_eq!(placement.owner_of(0), 0);
+        assert_eq!(placement.owner_of(1), 0);
+        assert_eq!(
+            placement.owner_of(2),
+            0,
+            "reconciled to the restored overlay, not the static balanced subscriber 1"
+        );
+        assert_eq!(placement.owner_of(3), 1);
+    }
+
+    // subscriber_routing maps each partition's owner *store* to the *subscriber*
+    // draining it, and reassign_partition_to_subscriber routes a partition into a
+    // store the target subscriber drains -- the subscriber granularity the
+    // placement scheduler balances when a subscriber drains several stores
+    // (durable-dispatch I4).
+    #[tokio::test]
+    async fn durable_subscriber_routing_and_reassign_to_subscriber() {
+        let dir = TempDir::new().unwrap();
+        let name: TopicName = "durable-subscriber-routing".into();
+        // Default one store per partition (M=N=4). Two subscribers each drain two
+        // single-partition stores: sub0 drains stores {0,1}, sub1 drains {2,3}.
+        let state = QuiverPartitionDispatchTopic::open(name.clone(), config(&dir, 4)).unwrap();
+        let broker = TopicBroker::<OtapPdata>::new();
+        let handle = broker.create_topic_with_state(name, state).unwrap();
+
+        let _sub0 = handle
+            .subscribe(pd_mode(vec![0, 1]), SubscriberOptions::default())
+            .unwrap();
+        let mut sub1 = handle
+            .subscribe(pd_mode(vec![2, 3]), SubscriberOptions::default())
+            .unwrap();
+
+        // Each partition maps to the subscriber draining its store, not the store
+        // index: partitions 0,1 -> subscriber 0; partitions 2,3 -> subscriber 1.
+        let routing = handle.subscriber_routing().expect("subscriber routing");
+        assert_eq!(routing.num_owners, 2, "two subscribers");
+        assert_eq!(
+            routing.owner_of,
+            vec![Some(0), Some(0), Some(1), Some(1)],
+            "stores mapped to their draining subscribers"
+        );
+
+        // Move partition 0 to subscriber 1. Its lowest claimed store is 2, so the
+        // partition routes there and subscriber 1 now owns it.
+        handle.reassign_partition_to_subscriber(0, 1).unwrap();
+        let routing = handle
+            .subscriber_routing()
+            .expect("subscriber routing after reassign");
+        assert_eq!(routing.owner_of, vec![Some(1), Some(0), Some(1), Some(1)]);
+
+        // Delivery follows: a partition-0 publish now reaches subscriber 1, which
+        // drains the store the partition was routed into.
+        handle.publish(Arc::new(tagged_logs(0))).await.unwrap();
+        let got = drain_n(&mut sub1, 1).await;
+        assert_eq!(
+            got,
+            vec![0],
+            "subscriber 1 receives the reassigned partition"
+        );
+    }
+
+    // End to end: a scheduler over a durable topic whose subscribers each drain
+    // several stores rebalances at *subscriber* granularity -- it sheds a hot
+    // partition from the overloaded subscriber to the idle one, applying the move
+    // through reassign_partition_to_subscriber (durable-dispatch I4, Option A).
+    #[tokio::test]
+    async fn durable_scheduler_rebalances_across_subscribers() {
+        let dir = TempDir::new().unwrap();
+        let name: TopicName = "durable-subscriber-rebalance".into();
+        // M=N=4 stores, two subscribers draining two stores each.
+        let state = QuiverPartitionDispatchTopic::open(name.clone(), config(&dir, 4)).unwrap();
+        let broker = TopicBroker::<OtapPdata>::new();
+        let handle = broker.create_topic_with_state(name, state).unwrap();
+
+        let _sub0 = handle
+            .subscribe(pd_mode(vec![0, 1]), SubscriberOptions::default())
+            .unwrap();
+        let _sub1 = handle
+            .subscribe(pd_mode(vec![2, 3]), SubscriberOptions::default())
+            .unwrap();
+
+        // Two subscribers, so the scheduler's owner space is 2 (not the 4 stores).
+        let mut scheduler = PlacementScheduler::new(
+            handle.clone(),
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            LoadWeights::default(),
+            1.2,
+        );
+        // Pile load on partitions 0 and 1 (subscriber 0); subscriber 1 is idle.
+        scheduler.report(&[
+            (0, series(50)),
+            (1, series(50)),
+            (2, series(1)),
+            (3, series(1)),
+        ]);
+        let moves = scheduler.tick().expect("tick");
+
+        assert!(
+            !moves.is_empty(),
+            "skew across subscribers must move a partition"
+        );
+        assert!(
+            moves.iter().all(|m| m.from == 0 && m.to == 1),
+            "sheds from the hot subscriber 0 onto the idle subscriber 1: {moves:?}"
+        );
+        assert!(
+            moves.iter().all(|m| m.partition == 0 || m.partition == 1),
+            "moves one of subscriber 0's hot partitions: {moves:?}"
+        );
+        // The move was applied through reassign_partition_to_subscriber, so the
+        // moved partition now maps to subscriber 1.
+        let routing = handle.subscriber_routing().expect("subscriber routing");
+        assert_eq!(routing.owner_of[moves[0].partition], Some(1));
     }
 
     // With fewer owners than partitions, multiple partitions share one owner

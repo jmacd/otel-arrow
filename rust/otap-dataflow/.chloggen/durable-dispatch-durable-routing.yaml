@@ -1,0 +1,28 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: enhancement
+
+# The name of the component, or a single word describing the area of concern, (e.g. engine, otap).
+# Must be one of the components listed in rust/otap-dataflow/.chloggen/config.yaml.
+component: engine
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Expose partition_routing on the durable partition-dispatch topic so the placement scheduler can reconcile against it (durable-dispatch I4).
+
+# Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
+issues: [3359]
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries.
+subtext: |
+  The durable `QuiverPartitionDispatchTopic` now implements
+  `TopicState::partition_routing`, returning its current `partition -> owner
+  store` map from the routing overlay. Unlike the in-memory backend, every
+  partition always has a store owner under the static `balanced` placement, so
+  no entry is `None`, and the map reflects `reassign_partition`. This is the
+  named prerequisite for running the load-feedback placement scheduler against a
+  durable topic; ungating the scheduler, reconciling the controller's initial
+  placement with the restored `placement.v1` snapshot, and an explicit
+  subscription-level reassign entry point remain the next slices.

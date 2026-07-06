@@ -369,11 +369,12 @@ impl<T: Send + Sync + 'static> PlacementScheduler<T> {
     /// Returns the first error from applying a move (for example if the
     /// coordinator and topic disagree on the owner set).
     pub fn tick(&mut self) -> Result<Vec<PartitionMove>, Error> {
-        // Reconcile to the topic's real owner slots before deciding, so the owner
-        // indices in emitted moves address the right owners even when subscription
-        // order does not match the initial placement order. If not every owner has
-        // subscribed yet, wait for the full set rather than rebalance a partial one.
-        if let Some(routing) = self.topic.partition_routing() {
+        // Reconcile to the topic's real subscriber slots before deciding, so the
+        // owner indices in emitted moves address the right subscribers even when
+        // subscription order does not match the initial placement order. If not
+        // every subscriber has subscribed yet, wait for the full set rather than
+        // rebalance a partial one.
+        if let Some(routing) = self.topic.subscriber_routing() {
             if routing.num_owners < self.coordinator.num_owners() {
                 return Ok(Vec::new());
             }

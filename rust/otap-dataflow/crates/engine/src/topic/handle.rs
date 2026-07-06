@@ -131,6 +131,20 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
         self.inner.reassign_partition(partition, to_owner)
     }
 
+    /// Reassign `partition` to the subscriber `to_subscriber`, the granularity the
+    /// placement scheduler balances (see
+    /// [`TopicState::reassign_partition_to_subscriber`](crate::topic::TopicState::reassign_partition_to_subscriber)).
+    /// Apply this at an aggregation window boundary so the single-writer handoff
+    /// carries no overlapping state.
+    pub fn reassign_partition_to_subscriber(
+        &self,
+        partition: usize,
+        to_subscriber: usize,
+    ) -> Result<(), Error> {
+        self.inner
+            .reassign_partition_to_subscriber(partition, to_subscriber)
+    }
+
     /// The topic's current `partition -> owner` routing, or `None` if it is not a
     /// partition-dispatch topic. The placement scheduler uses this to align its
     /// owner indices with the topic's real owner slots.
@@ -139,11 +153,20 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
         self.inner.partition_routing()
     }
 
+    /// The topic's current `partition -> subscriber` routing, the granularity the
+    /// placement scheduler balances (see
+    /// [`TopicState::subscriber_routing`](crate::topic::TopicState::subscriber_routing)).
+    #[must_use]
+    pub fn subscriber_routing(&self) -> Option<PartitionRoutingSnapshot> {
+        self.inner.subscriber_routing()
+    }
+
     /// Apply a [`PartitionMove`] emitted by a
     /// [`PlacementCoordinator`](crate::topic::PlacementCoordinator), reassigning
-    /// the partition to the move's target owner.
+    /// the partition to the move's target subscriber.
     pub fn apply_move(&self, mv: PartitionMove) -> Result<(), Error> {
-        self.inner.reassign_partition(mv.partition, mv.to)
+        self.inner
+            .reassign_partition_to_subscriber(mv.partition, mv.to)
     }
 
     /// Get the topic name.

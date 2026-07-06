@@ -154,6 +154,30 @@ pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
     fn partition_routing(&self) -> Option<PartitionRoutingSnapshot> {
         None
     }
+    /// The current `partition -> subscriber` routing the placement scheduler
+    /// balances: the subscribing owner (windower) that currently receives each
+    /// partition, and the number of subscribers. For most backends the
+    /// schedulable owner *is* the subscriber, so this defaults to
+    /// [`partition_routing`](Self::partition_routing). A backend whose internal
+    /// owner is not the subscriber -- the durable topic, whose owners are quiver
+    /// stores that a subscriber may drain several of -- overrides this to report
+    /// subscribers so the scheduler balances load across windowers, not stores.
+    fn subscriber_routing(&self) -> Option<PartitionRoutingSnapshot> {
+        self.partition_routing()
+    }
+    /// Reassign `partition` to the subscriber `to_subscriber`, the granularity the
+    /// placement scheduler balances. For most backends the subscriber is the
+    /// owner, so this defaults to [`reassign_partition`](Self::reassign_partition).
+    /// The durable topic overrides it to route the partition into one of that
+    /// subscriber's stores, handing the partition's data to that subscriber via
+    /// the whole-store drain and fence-and-forward.
+    fn reassign_partition_to_subscriber(
+        &self,
+        partition: usize,
+        to_subscriber: usize,
+    ) -> Result<(), Error> {
+        self.reassign_partition(partition, to_subscriber)
+    }
     /// Effective broadcast lag policy for this topic.
     fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy;
     /// Close the topic. Existing subscriptions eventually observe closure.

@@ -1695,10 +1695,10 @@ impl<
         counts
     }
 
-    /// Create a placement scheduler for each in-memory partition-dispatch topic and
-    /// spawn the thread that ticks them (durable-dispatch I4, half 2). Returns the
-    /// per-topic load-report senders to attach to topic bindings, and the thread's
-    /// lifecycle handle. Durable partition-dispatch topics are deferred.
+    /// Create a placement scheduler for each partition-dispatch topic (in-memory
+    /// or durable) and spawn the thread that ticks them (durable-dispatch I4,
+    /// half 2). Returns the per-topic load-report senders to attach to topic
+    /// bindings, and the thread's lifecycle handle.
     fn spawn_placement_schedulers(
         config: &OtelDataflowSpec,
         declared: &DeclaredTopics<PData>,
@@ -1746,8 +1746,9 @@ impl<
         Ok((senders, PlacementSchedulerRuntime::spawn(schedulers)))
     }
 
-    /// Create a scheduler for one topic when it is an in-memory partition-dispatch
-    /// topic with at least one owner, recording its load-report sender.
+    /// Create a scheduler for one topic when it is a partition-dispatch topic
+    /// (in-memory or durable) with at least one owner, recording its load-report
+    /// sender.
     fn try_make_scheduler(
         declared: &DeclaredTopics<PData>,
         declared_name: &TopicName,
@@ -1756,13 +1757,22 @@ impl<
         senders: &mut HashMap<TopicName, LoadReportSender>,
         schedulers: &mut Vec<PlacementScheduler<PData>>,
     ) -> Result<(), Error> {
-        // In-memory partition-dispatch only; durable placement is deferred.
-        if spec.backend != TopicBackendKind::InMemory {
+        // Partition-dispatch schedulers run over the in-memory and durable
+        // (quiver) backends; any other backend has no placement to balance.
+        if !matches!(
+            spec.backend,
+            TopicBackendKind::InMemory | TopicBackendKind::Quiver
+        ) {
             return Ok(());
         }
         let Some(num_partitions) = spec.num_partitions else {
             return Ok(());
         };
+        // The scheduler balances load across the subscribing owners (windowers),
+        // so its owner space is the partition-dispatch receiver count for both
+        // backends. A durable topic maps each subscriber to the quiver stores it
+        // drains internally (see `reassign_partition_to_subscriber`), so the
+        // store count (`num_owners`) is not the scheduler's owner space.
         let Some(num_owners) = owner_counts
             .get(declared_name)
             .copied()
