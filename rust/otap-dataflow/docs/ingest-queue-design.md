@@ -114,7 +114,7 @@ lossless mode.
 | Local control plane / placement | controller (core allocation, lifecycle, leases)                             | in-memory placement + rebalancing (Layer C) done    |
 | Validation compute              | query engine / DataFusion over OTAP Arrow                                   | exists                                              |
 | Admission + manifest (Phase 0)  | `processor:metrics_admission` (time-window gate, per-core type registry)    | exists (Phase 0)                                    |
-| Auto-sharder                    | placement map + partition-dispatch (Layer C)                                | in-memory done; durable sharding TODO               |
+| Auto-sharder                    | placement map + partition-dispatch (Layer C)                                | in-memory done; durable backend built; I4 TODO      |
 
 The durable-queue question is largely answered by `quiver` already. Phase 0
 landed the admission front-end (the `metrics_admission` processor and its
@@ -344,9 +344,10 @@ retention window. No transactional broker is required.
   on the partition-dispatch topic's in-memory backend. The registry is relearned
   on restart, which is safe because conflicts are warnings rather than rejections,
   per D2 and D7. Tests cover the name-keyed shuffle and conflict-flagging. Registry
-  durability is deferred with the Quiver backend, durable-dispatch Layer B and
-  decisions D21 and D28: switching the registry's topic to that backend persists
-  it as a snapshot plus log replayed on startup and adds restart-replay tests.
+  durability is still deferred, though the Quiver backend it needs
+  (durable-dispatch Layer B, D21/D28) now exists: switching the registry's
+  topic to that backend persists it as a snapshot plus log replayed on startup
+  and adds restart-replay tests.
 - **Phase 2 -- auto-sharder and per-bucket durability:** shuffle by signal key
   into N buckets; a placement map in the controller (`bucket -> core`); one
   `quiver` per core with per-bucket Arrow IPC streams (D5); balanced-topic
@@ -632,8 +633,9 @@ with D7.
 ### D9. Tenancy
 
 **Decided:** the queue does not define its own tenant concept; it consumes the
-engine's tenant model (see `agent-multitenancy-design.md`). Tenant is a
-multi-dimensional **descriptor** resolved at the edge by descriptor actions
+engine's tenant model (see `agent-multitenancy-design.md` in the
+Telemetry-Collection-Spec repo). Tenant is a multi-dimensional **descriptor**
+resolved at the edge by descriptor actions
 (`request_header`, `remote_address`, `generic_key`, and -- in single-resource
 contexts -- `resource_key`). The tenant that scopes type identity and sharding
 is a configured **projection** of that descriptor onto one or more coarse keys
@@ -682,8 +684,8 @@ this ingest queue as **L1** of a durable, disconnection-tolerant metrics
 appliance and adds: **L2** event-time windowing and watermarks over the
 shuffled streams (extending the `temporal_reaggregation` processor from
 processing-time to event-time), **L3** a stage-2 store of complete aggregated
-batches keyed by `(metric_name, resolution, window_index)` (Vortex columnar
-files behind a store seam, Parquet for archival), **L4** a DataFusion
+batches keyed by `(metric_name, resolution, window_index)` (columnar files
+behind a store seam), **L4** a DataFusion
 `TableProvider` + Grafana query interface, and **L5** store-and-forward to a
 central platform.
 
@@ -705,17 +707,21 @@ which the downstream watermark operates.
   churn-minimizing rebalancing with its owner-to-controller feedback loop -- are
   implemented in the partition-dispatch effort (see
   [`durable-dispatch-topic-design.md`](./durable-dispatch-topic-design.md)),
-  driven end to end by the L2 event-time windower as a real owner. Their durable
-  aspects and Phase 4 are not yet implemented.
+  driven end to end by the L2 event-time windower as a real owner. The durable
+  topic backend also exists (dispatch Layer B); the ingest queue's own durable
+  aspects -- registry durability and controller placement wiring (I4) -- and
+  Phase 4 are not yet implemented.
 - The durable buffer substrate (`quiver`) exists (experimental). The broadcast
   and balanced topics, the controller, and DataFusion query support exist. The
   `durable_buffer_processor` already wraps `quiver` as a pipeline node.
-- Registry durability, per-bucket Quiver durability, M3-style streaming handoff,
-  replication, and distributed `bucket -> node` placement do not yet exist.
+- Registry durability, replication, and distributed `bucket -> node` placement
+  (Phase 4) do not yet exist. Per-owner Quiver durability and its
+  drain-and-forward handoff exist in dispatch Layer B but are not yet driven by
+  the ingest queue's controller placement (I4).
 - All decisions D1 through D9 are ratified. The two-plane collapse (metrics
   shuffle by `metric_name`) is adopted.
 
-> **Paused (Phase 1 blocked on a foundation gap).** Starting Phase 1 surfaced
+> **Resolved: the foundation gap is now built.** Starting Phase 1 surfaced
 > that the engine has no key-deterministic cross-core dispatch (the topic broker
 > offers only broadcast and round-robin *balanced* delivery), and no durable
 > topic backend (the bespoke `durable_buffer_processor` wraps `quiver` outside
@@ -729,8 +735,8 @@ which the downstream watermark operates.
 >   *descriptor condition*; our shard key (`hash(metric_name)`; low-56-bit
 >   `trace_id`) is another routing dimension on that same descriptor substrate.
 >
-> Phase 1 is therefore paused pending a **partition-dispatch topic with optional
-> durability**, now designed in
+> Phase 1's prerequisite was a **partition-dispatch topic with optional
+> durability**, now designed and implemented in
 > [`durable-dispatch-topic-design.md`](./durable-dispatch-topic-design.md)
 > (decisions D18-D28). Durability is an **orthogonal axis** (D27): the
 > shuffle/aggregate/load-balance path runs in memory (a large-scale aggregating
@@ -748,13 +754,13 @@ which the downstream watermark operates.
 > 3. **Quiver topic backend** (Layer B), the **optional** durability plug-in: the
 >    reserved `TopicBackendKind::Quiver`, the *same* dispatch made durable, also
 >    backing registry durability. Replaces `durable_buffer_processor`.
->    **Deferred this effort (design doc D28)** -- added later as a backend swap.
+>    **Now implemented** -- added as the backend swap, one quiver per owner.
 >
 > The shard key is a **sub-tenant identifier** (data-sourced from OTAP columns,
 > per row; see D3 and the multitenancy design's "Split-by-key and sub-tenant
 > identifiers"). No hand-rolled WAL is needed.
 
-**To resume in a new session (in-memory core only, design doc D28):**
+**To resume (dispatch infrastructure is built; integration remains):**
 
 1. **Layers A and C are implemented** -- the in-memory shuffle is runnable. Layer
    A is the `partition` processor node (`urn:otel:processor:partition`) over the
@@ -764,7 +770,8 @@ which the downstream watermark operates.
    `PartitionDispatchBackend`, and the `PartitionPlacement` map in
    `crates/engine/src/topic/`), wired through the topic exporter, receiver,
    config (`TopicSpec.num_partitions`), and controller. **Layer B (Quiver
-   durability) is deferred.** See `durable-dispatch-topic-design.md`.
+   durability) is now also implemented** -- one quiver per owner, dispatch
+   D21/D24. See `durable-dispatch-topic-design.md`.
 2. Phase 1 shuffle = the `partition` node splits by the **per-signal
    partitioner** (D3 refinement) -- `hash(name)` for metrics, low-56-bit slice of
    `trace_id` for traces/correlated-logs -- and `metrics_admission` subscribes to
@@ -772,13 +779,13 @@ which the downstream watermark operates.
    each owner's `TypeRegistry` is the sole authority for its keys.
 3. Phase 1 registry stays **in-memory**, relearned on restart. Relearning is safe
    because conflicts are warnings rather than rejections, per D2 and D7; D8 records
-   the same relearn safety for eviction. Durable registry is deferred with Layer
-   B: switch the registry's topic to the Quiver backend, replayed on startup. The
+   the same relearn safety for eviction. The durable registry is deferred:
+   switch its topic to the now-built Quiver backend, replayed on startup. The
    `TypeDescriptor`/`observe` API is already in
    `metrics_admission_processor/registry.rs`.
 4. Conflict-flagging tests exist for admission; the split-by-key node has
-   cascade, determinism, and conservation tests. (Restart-replay tests arrive
-   with Layer B.)
+   cascade, determinism, and conservation tests. (Restart-replay tests for the
+   durable topic landed with Layer B; the durable registry's are future work.)
 
 **Related engine docs:** `design-principles.md`, `topic-architecture.md`,
 `load-balancing.md`, `memory-limiter-phase1.md`, and the `quiver` crate README.
@@ -806,7 +813,9 @@ which the downstream watermark operates.
   point attributes (scope excluded as non-identifying); the effective-once dedup
   key (not the shard key).
 - **Bucket (logical shard)**: one of N fixed hash buckets over the signal key;
-  the unit of placement and rebalancing.
+  the unit of placement and rebalancing. The partition-dispatch design
+  (`durable-dispatch-topic-design.md`) calls this a **partition**; the two
+  terms name the same logical shard.
 - **Lease and generation**: the per-shard ownership token and its monotonic
   counter, used to fence a deposed owner's writes.
 - **Name conflict**: a name carrying more than one distinct descriptor; both

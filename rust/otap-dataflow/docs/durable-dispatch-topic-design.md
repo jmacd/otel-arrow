@@ -46,15 +46,18 @@ bespoke parts.
 > drains-and-forwards the partition's residual to the new owner's store; and (3)
 > **reassignments survive restart**: the routing overlay (owners + generations)
 > is persisted as an atomically-rewritten snapshot and restored on `open()`.
-> **Phase 3 progress (I4): the in-memory load-balancing loop is closed.** The
-> controller computes the static `balanced(N, M)` map and assigns each
+> **Phase 3 progress (I4): the load-balancing loop is closed for both backends.**
+> The controller computes the static `balanced(N, M)` map and assigns each
 > partition-dispatch receiver its owned partitions, so `owned_partitions` is
-> optional (half 1). For an in-memory topic it also runs a `PlacementScheduler`
-> on a background thread: owners report load through the topic binding, and the
-> scheduler reconciles to the topic's real routing and rebalances by moving whole
-> partitions off overloaded owners (half 2). **Open follow-up:** the durable
-> backend's scheduler and snapshot reconciliation, and an explicit
-> subscription-level reassign entry point.
+> optional (half 1). It runs a `PlacementScheduler` on a background thread for
+> in-memory and durable (quiver) topics alike: owners report load through the
+> topic binding, and the scheduler reconciles to the topic's real routing --
+> including a durable topic's restored `placement.v1` overlay -- then rebalances
+> by moving whole partitions off overloaded owners (half 2). The scheduler
+> balances *subscribers*, not quiver stores: the durable topic maps a subscriber
+> to the stores it drains via `subscriber_routing` and
+> `reassign_partition_to_subscriber`. I4 is complete; the remaining
+> durable-dispatch work is off I4 (the durable registry and the D26 logs key).
 
 ## Motivation
 
@@ -152,7 +155,8 @@ the load-balancing feedback loop designed here.
 
 **Goal.** Given an OTAP batch and a configured key, partition the batch into
 sub-batches such that all rows sharing a key value land in the same sub-batch,
-tagged with a partition index.
+tagged with a partition index. This partition is the ingest queue's **bucket**
+(`ingest-queue-design.md` D5); the two terms name the same logical shard.
 
 **Mechanism: selection-mask radix cascade, not range split.** The existing
 `transform::split` produces *contiguous* row ranges over a parent/id-sorted
@@ -213,7 +217,7 @@ one traversal is the obvious optimization once the path is proven.
 > topic receiver subscribes with its owned partitions
 > (`TopicSubscriptionConfig::PartitionDispatch`), and the controller creates a
 > partition-dispatch topic from `TopicSpec.num_partitions`. The durable backend
-> (Layer B) is the remaining work.
+> (Layer B) has since been built behind this same interface, described below.
 
 **Goal.** Deliver each partition deterministically to a stable, *exclusive*
 owner, so the owner's per-core state is the single writer for that partition's
@@ -300,9 +304,12 @@ Two structural points make this work in memory:
 - **Rebalance at window boundaries.** Moving a partition mid-window would migrate
   live aggregator state. A reassignment instead takes effect at a window close:
   the old owner flushes the closed window and the new owner opens the next one,
-  so the handoff carries no state. Aggregation windows are natural, state-free
-  rebalance points; the durable backend later upgrades this to the lease and
-  generation handoff above.
+  so the handoff carries no open-window aggregate. It does carry the per-stream
+  cumulative anchor, which the gaining owner takes in memory here or restores from
+  the durable completeness checkpoint on the quiver backend, so the move injects
+  no reset into a cumulative series; see the appliance design's D29. Aggregation
+  windows are the natural rebalance points; the durable backend later upgrades
+  this to the lease and generation handoff above.
 
 **The load feedback loop.** The signal above is closed into a loop by
 `PlacementCoordinator` (`crates/engine/src/topic/load_feedback.rs`):
@@ -357,21 +364,21 @@ today's hand-specified owned partitions in receiver config. A replica's owner
 identity is its subscriber slot, and the controller keeps the replica-to-owner
 mapping so a later move addresses the right subscribers.
 
-**Dynamic owned-set propagation.** A `PartitionMove` must reach the two affected
-replicas, not only the topic's routing table. Applying a move does two things at
-an aggregation window boundary. First, `TopicHandle::apply_move` repoints the
-backend's partition-to-owner routing so future publishes enqueue to the new
-owner, which
-already exists. Second, a control notification updates the live owned set on each
-side: the losing replica drains and releases the partition's queue, and the gaining
-replica begins draining it and opens the partition's next window. The subscription
-fixes its owned set at subscribe time today, so this notification and a
-subscription-level reassign entry point are the remaining piece. Sequencing the
-change at a window boundary means the handoff carries no live per-series state,
-because the old owner has flushed the closed window and the new owner opens the
-next one.
+**Dynamic owned-set propagation.** A `PartitionMove` reaches the affected owners
+through the routing repoint, not a separate owned-set edit. Applying a move at an
+aggregation window boundary repoints the backend's partition-to-owner routing so
+future publishes go to the new owner. For the in-memory backend the gaining
+subscriber then reads its own per-owner queue and the losing one stops receiving
+the partition, so no owned-set mutation or notification is needed. For the durable
+backend `reassign_partition_to_subscriber` routes the partition into a store the
+gaining subscriber drains, which delivers it through the whole-store drain and
+fence-and-forward. Sequencing the change at a window boundary means the handoff
+carries no open-window aggregate, because the old owner has flushed the closed
+window and the new owner opens the next one; the per-stream cumulative anchor
+travels with the partition through the completeness checkpoint of the appliance
+design's D29, so the move injects no reset.
 
-For the durable backend of Layer B, deferred, the same apply step stamps the lease
+For the durable backend of Layer B, the same apply step stamps the lease
 generation so a deposed owner's late writes are fenced. The in-memory path
 reassigns directly and treats any unflushed data as best-effort, per decision D27.
 
@@ -446,9 +453,10 @@ can rebalance under load.
 **Status: implemented** (increments I1-I3 plus placement persistence): the WAL
 `user_meta` stamping (below), a dynamic per-partition routing overlay with lease
 generations, the drain-and-forward handoff, and a persisted placement snapshot so
-reassignments survive restart. **Deferred (next increment):** wiring the
-controller so it computes the initial placement and drives reassignment from the
-load-feedback scheduler (`apply_move`, I4).
+reassignments survive restart. **Controller wiring (I4) is now complete for both
+backends** -- initial placement and the scheduler loop, including the durable
+topic reconciling to its restored overlay and balancing at subscriber
+granularity through `reassign_partition_to_subscriber`.
 
 ### Current substrate (what Phases 1 and 2 already provide)
 
@@ -561,12 +569,13 @@ topic logic.
   in `QuiverDispatchSub::poll_recv_delivery` / `forward_fenced_bundle`.
 - **Placement persistence (done):** the overlay is persisted as a snapshot and
   restored on `open()` (above), so a reassignment survives restart.
-- **I4 -- controller wiring (next):** the controller computes the initial
+- **I4 -- controller wiring (done):** the controller computes the initial
   placement and assigns each receiver replica its stores (replacing the
   hand-specified config), and drives reassignment from
   `crates/engine/src/topic/load_feedback.rs` (`PartitionMove`,
   `PlacementCoordinator`, `PlacementScheduler` -> `apply_move`), which the durable
-  backend now honors through `reassign_partition`.
+  backend honors through `reassign_partition`. The scheduler runs for durable
+  topics too, sized to the store count and reconciled to the restored overlay.
 
 ### Open questions -- resolved
 
@@ -595,8 +604,9 @@ topic logic.
   per-partition Arrow-IPC streams (ingest-queue D5); the controller placement
   map; leases + generation fencing. The durable-dispatch infrastructure this
   needs is now built: one quiver per owner (D24), the persisted routing overlay,
-  and lease-generation reassignment with drain-and-forward. What the ingest queue
-  still needs on top is the controller placement wiring (I4).
+  lease-generation reassignment with drain-and-forward, and the controller
+  placement/scheduler wiring (I4). What the ingest queue adds on top is
+  subscribing its admission owners to that topic.
 - **Raw buffer (L1) and stage-2 feed (L3 of the appliance).** Topics whose
   backend is chosen per location (D27): in-memory for the SDK profile, quiver for
   the durable appliance.
@@ -607,7 +617,9 @@ Continuing the shared decision ledger of the ingest-queue and appliance designs
 (D1-D17). Status is per-decision: **ratified**, decided and ready to build, or
 **implemented**, built and tested. The durable backend (D21/D24), previously
 deferred, is now implemented (one quiver per owner) with live, restart-durable
-reassignment; the remaining Phase 3 work is the controller/scheduler wiring (I4).
+reassignment and controller/scheduler wiring (I4) for both backends, balancing at
+subscriber granularity. The remaining durable-dispatch work is off I4: the
+durable registry (ingest-queue Phase 1) and the standalone-logs key (D26).
 
 | ID  | Decision                            | Recommendation                                      | Status            |
 | --- | ----------------------------------- | --------------------------------------------------- | ----------------- |
@@ -711,7 +723,7 @@ processor's existing outbound-slot tracking.
 static `partition -> core` first; load-aware, churn-minimizing rebalancing and
 `partition -> node` later (ingest-queue Phases 2-4). For this effort only the
 **static in-memory map** is needed; leases with generation fencing and the M3
-`Initializing`/`Leaving` durable handoff are deferred with Layer B, where they
+`Initializing`/`Leaving` durable handoff arrive with Layer B, where they
 stamp quiver bundle metadata and replay durable streams. **Why:** the two-level
 `key -> partition -> owner` indirection bounds churn and makes rebalancing
 possible without rehashing keys (ingest-queue D3 / Auto-sharding).
@@ -721,10 +733,11 @@ controller's lease and key-ownership primitive arrives with durability.
 **Status update (Phase 3):** the durable backend's placement is now **dynamic and
 restart-durable** at the topic level: `reassign_partition` repoints a per-partition
 routing overlay (owner + lease generation), migrates residual by drain-and-forward,
-and persists the overlay as a snapshot restored on `open()`. What remains (I4) is
-the **controller half** of this decision: computing the initial placement map,
-assigning each receiver replica its stores, and driving reassignment from the
-load-feedback scheduler.
+and persists the overlay as a snapshot restored on `open()`. The **controller half**
+of this decision is now also done: the controller computes the initial placement
+map, assigns each receiver replica its stores, and drives reassignment from the
+load-feedback scheduler for both backends, balancing at subscriber granularity via
+`reassign_partition_to_subscriber`.
 
 ### D24. Quiver backend granularity -- implemented (one quiver per owner)
 
@@ -783,7 +796,7 @@ topology.
 `crates/core-nodes/src/processors/partition_processor/`) over the
 `partition_otap_batch` primitive
 (`crates/pdata/src/otap/partition.rs`); the integer tag rides `Context::partition`.
-The partition-dispatch delivery mode (Layer C) is the remaining half.
+The partition-dispatch delivery mode (Layer C) is the other half, now built.
 
 ### D26. Standalone logs key
 
@@ -820,8 +833,8 @@ all in memory); others want the disconnection-tolerant appliance. These are the
 same design with the backend swapped. **Per-location:** the appliance has two
 durability locations, each chosen independently -- **stage-1** (L1 ingest/shuffle)
 via the **topic backend** (in-memory/quiver), and **stage-2** (L3 aggregated
-store) via the **store seam** (in-memory/queryable-from-RAM vs Vortex files,
-appliance D13/D16). A third durability-optional state is the per-owner registry
+store) via the **store seam** (in-memory/queryable-from-RAM vs durable columnar
+files, appliance D13). A third durability-optional state is the per-owner registry
 (off = relearned on restart, which ingest-queue D8 already makes safe).
 **Implication:** build the in-memory path first (D18); durability is an additive
 backend per location; honors the engine's configurable-QoS posture
@@ -838,10 +851,11 @@ durability adds as a pure backend swap with no redesign. **Update:** Layer B (th
 Quiver durable backend, D21/D24) has since been built behind that same interface,
 one quiver per owner, so it is no longer deferred; the durable-registry half of
 Phase 1 remains future work. D23's placement is now **dynamic and restart-durable**
-(reassignment repoints a persisted routing overlay), with the controller-driven
-placement lifecycle (I4) still to follow; the registry stays in-memory and is
-relearned on restart, which is safe because conflicts are warnings rather than
-rejections, per ingest-queue D2 and D7.
+(reassignment repoints a persisted routing overlay), and the controller-driven
+placement lifecycle (I4) is now complete for both backends, balancing at
+subscriber granularity; the registry stays in-memory
+and is relearned on restart, which is safe because conflicts are warnings
+rather than rejections, per ingest-queue D2 and D7.
 
 ## Implementation order
 
@@ -873,8 +887,9 @@ Added later as an additive backend swap (D28/D21):
   Restart replay and partition recovery from `user_meta` are tested. Adds a path
   to replace `durable_buffer_processor`. **Phase 3 (done):** live, restart-durable
   reassignment (lease-generation routing overlay + drain-and-forward handoff +
-  persisted placement snapshot). The durable registry of Phase 1 and the
-  controller/scheduler wiring (I4) remain future work.
+  persisted placement snapshot) and the controller/scheduler wiring (I4) for both
+  backends, balancing at subscriber granularity. The durable registry of Phase 1
+  remains future work.
 
 ## Status and next steps
 
@@ -923,10 +938,11 @@ Added later as an additive backend swap (D28/D21):
 ### I4 -- controller/scheduler wiring
 
 Layers A/C, Layer B, and Phase 3 I1-I3 plus placement persistence are implemented
-and tested. **I4 half 1 (initial placement) and the in-memory half of the
-scheduler loop are now done.** The remaining work is the durable backend's
-scheduler and snapshot reconciliation, plus an explicit subscription-level
-reassign entry point.
+and tested. **I4 is complete: half 1 (initial placement) and the scheduler loop
+for both the in-memory and durable backends**, including a durable topic
+reconciling to its restored `placement.v1` overlay and balancing at subscriber
+granularity. The remaining durable-dispatch work is off I4: the durable registry
+(ingest-queue Phase 1) and the standalone-logs key (D26).
 
 I4 has two halves:
 
@@ -938,43 +954,46 @@ I4 has two halves:
    config before the spec is resolved, in
    `Controller::assign_partition_dispatch_placement` called from `run_with_mode`.
    An explicit set is honored as an override, and a topic must not mix explicit
-   and auto receivers. **Still open for the durable backend:** reconciling this
-   initial map with the persisted `placement.v1` snapshot the topic restores on
-   `open()`, so the controller's view and the topic's restored overlay agree
-   after a restart. Open question: does the controller read the snapshot, or does
-   the topic stay the source of truth and hand the controller the restored
-   owned-partition sets?
-2. **Scheduler-driven moves -- in-memory done, durable remaining.** For an
-   in-memory topic the controller creates a `PlacementScheduler` per topic and
-   ticks it on a background thread (`spawn_placement_schedulers` in
-   `crates/controller/`). Owners report load through the topic binding's
-   load-report sender, which the event-time windower pulls when its
-   `report_load_to` names the topic; each tick reconciles the coordinator to the
-   topic's real `partition -> owner` routing via `TopicHandle::partition_routing`,
-   so owner indices match the actual owner slots regardless of subscription order,
-   and then rebalances. The in-memory owner-queue routing carries the handoff, so
-   no per-move receiver notification is needed. **Remaining:** the durable
-   backend's scheduler is deferred until the durable topic exposes its routing
-   and the controller reconciles the persisted snapshot; a durable move that
-   shifts a partition between owner *stores* also needs an explicit
-   subscription-level reassign entry point, since a durable subscriber claims
-   whole owner blocks at subscribe time.
+   and auto receivers. **Durable-backend reconciliation -- resolved: the topic
+   is the source of truth.** The injected `balanced(N, M)` set feeds subscribe,
+   which maps through the durable topic's *static* store layout and so agrees
+   with the injection regardless of reassignments; the *dynamic* routing
+   (post-reassignment, restored from `placement.v1` on `open()`) is read back by
+   the scheduler through `partition_routing` and reconciled on each tick, so the
+   controller never re-reads the snapshot.
+2. **Scheduler-driven moves -- done for both backends.** The controller creates
+   a `PlacementScheduler` per partition-dispatch topic and ticks it on a background
+   thread (`spawn_placement_schedulers` in `crates/controller/`). Owners report
+   load through the topic binding's load-report sender, which the event-time
+   windower pulls when its `report_load_to` names the topic; each tick reconciles
+   the coordinator to the topic's real `partition -> owner` routing via
+   `TopicHandle::partition_routing`, so owner indices match the actual owner slots
+   regardless of subscription order, and then rebalances. **Subscriber
+   granularity (done).** A durable topic's owners are quiver stores, and a
+   subscriber may drain several, so the scheduler balances *subscribers*, not
+   stores: the topic implements `subscriber_routing` (mapping each partition's
+   store to its claiming subscriber) and `reassign_partition_to_subscriber`
+   (routing a partition into one of the target subscriber's stores), which
+   default to the owner-level methods for the in-memory backend. A move reaches
+   the gaining subscriber through the whole-store drain and fence-and-forward, so
+   no owned-set change or per-subscriber notification is needed. The controller
+   sizes the scheduler to the receiver count for both backends.
 
 **Key files/seams for I4:**
 
 - `crates/engine/src/topic/load_feedback.rs` -- `PlacementScheduler`,
   `PlacementCoordinator`, `PartitionMove`; the brain is built and unit-tested.
 - `crates/engine/src/topic/handle.rs` -- `TopicHandle::apply_move` /
-  `reassign_partition` (the seam both backends honor).
-- `crates/otap/src/quiver_topic.rs` -- `reassign_partition` (durable, persists +
-  drain-and-forward) and `persist_placement` / `load_placement` (the placement
-  snapshot); reconcile the controller's initial map with the restored overlay.
+  `reassign_partition_to_subscriber` (the seam both backends honor).
+- `crates/otap/src/quiver_topic.rs` -- `subscriber_routing` and
+  `reassign_partition_to_subscriber` (the subscriber granularity the scheduler
+  uses), plus `partition_routing` and `reassign_partition` (store-level, for
+  inspection and the drain-and-forward handoff).
 - `crates/controller/` -- `assign_partition_dispatch_placement` computes the
   initial placement (half 1), and `spawn_placement_schedulers` runs a scheduler
-  per in-memory partition-dispatch topic (half 2, in-memory). `owned_partitions`
-  in the topic receiver is optional, and the windower's `report_load_to` wires an
-  owner's load reports. The durable scheduler and snapshot reconciliation land
-  here next.
+  per partition-dispatch topic, in-memory or durable (half 2), sized to the
+  receiver count. `owned_partitions` in the topic receiver is optional, and the
+  windower's `report_load_to` wires an owner's load reports.
 
 **Out of scope / separate:** the durable registry half of ingest-queue Phase 1,
 and the standalone-logs key (D26, decided but waits until logs are addressed).

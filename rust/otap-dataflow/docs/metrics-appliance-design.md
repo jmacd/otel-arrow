@@ -11,8 +11,10 @@ queries) while disconnected from a central observability platform.
 > designed separately in [`ingest-queue-design.md`](./ingest-queue-design.md)
 > with ratified decisions D1-D9; its **phase 0 (admission + per-core type
 > registry) is implemented** as the `metrics_admission` processor. This document
-> covers the layers above it (L2-L5). Its decisions (D10-D17) are **ratified**
-> (see "Decisions"). Implementation has started: the **L2 event-time windowing
+> covers the layers above it (L2-L5). Its decisions (D10-D17, plus the exactly-once
+> checkpoint D29) are **ratified** except the store file format, deferred to separate
+> work (see "Decisions").
+> Implementation has started: the **L2 event-time windowing
 > core (phase A0)** -- epoch-aligned tumbling windows and per-stream watermarks
 > with the on-time and lateness triggers -- is implemented in
 > `crates/pdata/src/otap/windowing.rs`, and a **proof-of-concept
@@ -40,17 +42,17 @@ The result is a self-contained metrics appliance:
 
 This is deliberately *not* a new time-series database project, and it does not
 build or depend on a database. It is a thin, vertically-integrated assembly of
-primitives the engine already has, plus two foundation-governed columnar file
-formats: `quiver` for durable ingest, the `temporal_reaggregation` processor
-for metric aggregation, the [Vortex](https://vortex.dev) format with DataFusion
-for the queryable aggregated store, Parquet for archival interop, and the
-existing exporters for forwarding. The engine *owns* the L1 ingest queue; it
-*rents* the L3 store from neutral file formats (Vortex, Parquet).
+primitives the engine already has: the `quiver` durable buffer for ingest, the
+`temporal_reaggregation` processor for metric aggregation, a DataFusion-queried
+columnar store for the aggregated timeseries, and the existing exporters for
+forwarding. The engine *owns* the L1 ingest queue and *rents* the L3 store from
+a neutral columnar file format behind a configurable seam.
 
 **Durability is optional and per-location.** The shuffle/aggregate/load-balance
 path runs with or without durable storage; durability is a backend choice at
 each of two locations -- **stage-1** (L1, via the topic backend: in-memory or
-`quiver`) and **stage-2** (L3, via the store seam: in-memory or Vortex). With
+`quiver`) and **stage-2** (L3, via the store seam: in-memory or a durable file
+backend). With
 durability off at both, the appliance is a large-scale aggregating telemetry SDK
 (in-memory shuffle, aggregation, load-balancing, and queries); with it on, the
 disconnection-tolerant appliance described here. This orthogonality is designed
@@ -80,20 +82,18 @@ The layered view in text:
  | Ingest |-->| Event-    |-->| Aggregated  |-->| Pull    |   | Forwarding  |
  | queue  |   | time      |   | TS store    |   | query   |   | (push OTAP, |
  | (shuf- |   | windowing |   | (stage-2    |   | (OPL -> |   |  store-and- |
- |  fle)  |   | + water-  |   |  store:     |   |  OTAP)  |   |  forward)   |
- |        |   | marks     |   |  Vortex)    |   |         |   |             |
+ |  fle)  |   | + water-  |   |  store      |   |  OTAP)  |   |  forward)   |
+ |        |   | marks     |   |  seam)      |   |         |   |             |
  +--------+   +-----------+   +------+------+   +----+----+   +------+------+
- stage-1                            |                |               |
- quiver                             +----------------+---------------+
-                                    |   (also) Parquet export -> object store
-                                    v   for interop / archival (sibling path)
+ stage-1                            |
+ quiver                             +-> stage-2 store, feeding L4 and L5
 ```
 
 | Layer               | Role                                                        | Substrate / status                               |
 | ------------------- | ----------------------------------------------------------- | ------------------------------------------------ |
 | L1 Ingest queue     | Admit, shuffle by name, durable raw OTAP buffer             | ingest-queue-design.md; stage-1 `quiver`         |
 | L2 Aggregation      | Event-time windowing + watermarks over shuffled streams     | `temporal_reaggregation` (processing-time today) |
-| L3 Aggregated store | Complete windowed batches, keyed (name, resolution, window) | stage-2 store seam; Vortex (Parquet archival)    |
+| L3 Aggregated store | Complete windowed batches, keyed (name, resolution, window) | stage-2 store seam; columnar files; greenfield   |
 | L4 Query (pull)     | Pull-based retrieval; metrics + sample queries (spans/logs) | DataFusion `TableProvider`; OTAP out; greenfield |
 | L5 Forwarding       | Push egress to a central observability platform             | OTAP exporters (exist)                           |
 
@@ -267,9 +267,11 @@ time. The watermark policy already raises an idle stream's watermark to its
 `processing_time - max_lag` floor, so a tick alone closes any window whose
 completion time has passed. The proof of concept closes windows only when a batch
 arrives; the production node adds this timer so idle streams flush. This drain
-cadence is also the natural rebalance point, because a reassignment applied at a
-window boundary carries no live aggregator state, as the dispatch design's load
-feedback loop describes.
+cadence is also the natural rebalance point: a reassignment applied at a window
+boundary carries no open-window aggregate. It does carry the per-stream cumulative
+anchor, which the gaining owner restores from the completeness checkpoint of D29,
+so the handoff injects no reset, as the dispatch design's load feedback loop
+describes.
 
 **Bounded per-stream state.** Within the lateness horizon a stream keeps at most
 `ceil(allowed_lateness / window_size) + 1` open windows, since an older window has
@@ -289,7 +291,13 @@ can still arrive for the stream, and its watermark and anchor can be dropped. A
 later point for the same identity then starts a fresh segment, which a cumulative
 producer expresses as an unknown-start reset, so no value is corrupted. This needs
 a small eviction entry point on the windowing core, which today exposes only admit
-and drain.
+and drain. A restart or a reassignment, unlike eviction, does not drop the anchor:
+the completeness checkpoint of D29 preserves the anchor of every still-active
+stream, so only a genuine post-eviction return begins a fresh segment. This section
+also couples to that checkpoint, because an idle stream whose trailing window
+closes only at the `max_lag` floor holds back the completeness low-watermark and
+with it L1 retention, so the idle-close interval wants to be far shorter than
+`max_lag` even though anchor eviction stays at `max_lag`.
 
 ### Accumulation and the OTel temporality interplay
 
@@ -355,7 +363,11 @@ of the last point folded in. The anchor persists across windows, while
 the windower's per-window aggregate accumulates only within a window. The shuffle
 by metric name makes the owner core the single writer for a stream, so the anchor
 advances without a lock or a cross-core race, which is the single-writer
-destination the data model requires for delta-to-cumulative conversion.
+destination the data model requires for delta-to-cumulative conversion. The anchor
+is durable state: the completeness checkpoint of D29 captures each active stream's
+anchor as of the low-watermark `LW`, so an appliance restart or a partition
+reassignment restores it and continues the same cumulative segment rather than
+restarting the series, and neither event injects a reset.
 
 **Delta inputs.** A delta point carries the increment for its `[start, time]`
 interval, and within a window the aggregate sums these increments. When the
@@ -396,11 +408,13 @@ rules.
 all streams, so the processor groups them by stream and applies them in
 ascending window-index order so the anchor advances monotonically. The windower
 already drains a stream's windows ascending, and event time advances the
-watermark monotonically, so a closed window is never applied out of order. A
-stream's anchor is freed when the stream is aged out, as described under
-"Draining idle streams and bounding state"; after a stream is freed a later
-point starts a fresh segment, which a cumulative producer expresses as an
-unknown-start reset, so eviction is safe.
+watermark monotonically, so a closed window is never applied out of order. While
+a stream is active its anchor is checkpointed with the window state (D29), so a
+restart or a reassignment restores it and continues the same segment. The anchor
+is freed only when the stream is aged out, as described under "Draining idle
+streams and bounding state"; a later point for a freed stream starts a fresh
+segment, which a cumulative producer expresses as an unknown-start reset, so
+eviction is safe.
 
 ### Output to L3
 
@@ -421,30 +435,120 @@ as immutable columnar files behind a small **store seam** (a writer plus a
 DataFusion `TableProvider`), so the backend is a configuration choice the way
 the ingest queue's storage backend is (ingest-queue D4).
 
-- **Backend: Vortex (default), behind the store seam (D13/D16).** Closed windows
-  are written as [Vortex](https://vortex.dev) files. Vortex is a
-  Linux-Foundation-governed, Apache-2.0 columnar format with a file format
-  stable since 0.36.0; it is Arrow-native (zero-copy to/from `RecordBatch`),
-  Rust-native, object-store optimized, and offers ~100-200x faster random access
-  than Parquet -- the property a per-series Grafana lookup needs. It is a
-  *format plus a library*, not a server, so it adds no service dependency and
-  preserves the Arrow-native, vendor-neutral posture. Parquet remains the
-  archival/interop sibling (see "The live store and the archival sibling").
+- **Backend behind the store seam (D13).** The store needs Arrow-native,
+  zero-copy columnar files with fast random access by key, for the recent-range,
+  per-series lookup a dashboard issues; the concrete format is chosen in separate
+  work and is out of scope here (D16).
 - **Key `(metric_name, resolution, window_index)`.** Range scans for a name over
   a time range are partition/min-max prunable. `resolution` is constant in v1;
   reserving it now is what lets rollup/downsampling add coarser levels later
   without a migration (D10).
-- **Corrections (phase 2).** A restated window is written as a new file for the
-  same key rather than rewriting the prior one (columnar files are immutable);
-  the read path resolves the live value by the configured policy
-  (last-writer-wins by default, or retraction-aware). v1 emits a single primary
-  per window, so this path is dormant until late-restatement lands.
+- **Idempotent writes and corrections.** Each window is addressed by its key, and
+  the read path resolves a key to one live value by the configured policy, either
+  last-writer-wins by default or retraction-aware. This resolution is a v1
+  invariant, not a dormant path: the completeness checkpoint of D29 lets a crash
+  replay re-emit an identical window for a key, and last-writer-wins by key absorbs
+  that duplicate. Because the columnar files are immutable, a re-emission or a
+  phase-2 restatement is written as a new file for the same key rather than
+  rewriting the prior one; v1 emits one primary per window and the resolution
+  collapses identical duplicates, while phase-2 restatement layers genuine
+  corrections onto the same mechanism.
 - **Retention: fixed window, drop-oldest (v1).** A fixed time/size budget; when
   it is reached the oldest files are dropped (D15/QoS). The aggregated form is
   far smaller than raw ingest, so the local horizon is long. Rollup later sheds
   fine resolution first and keeps coarse longer.
 - **Queryable.** The stage-2 files are the substrate for L4 via a DataFusion
   `TableProvider` (see L4).
+
+## Exactly-once into the store: the completeness low-watermark
+
+L2 is an at-least-once subscriber of L1, and no atomic commit spans "a window is
+durable in L3" and "L2's L1 progress has advanced past that window's input." A
+crash between those two steps replays the input, re-closes the same windows, and
+re-emits them to L3. Because a window is addressed by the immutable key
+`(metric_name, resolution, window_index, stream)`, a re-emission with no
+resolution rule is a second contribution for that key and a query double-counts.
+The identical key is also produced by an HA replica and by two appliances that
+aggregate the same series, so the store, the forwarder, and the central platform
+face the same duplication.
+
+The resolution rests on one observation: the window identity is a natural
+idempotency key. In v1 each `(stream, window)` has exactly one correct final
+value, so a re-emission must resolve to that value rather than accumulate. Turning
+an at-least-once source into a deterministically exactly-once keyed store takes
+three ingredients, and this design already supplies two. Ordered single-writer
+replay comes from the shuffle by metric name, which pins a stream to one owner and
+replays its input in log order, so the fold is reproducible and only the stateless
+stages work-steal. The idempotent keyed sink is the window identity. The missing
+ingredient is a record, kept in the sink, of the input position the sink reflects.
+This carries the effective-once posture of the ingest design to the aggregated
+result: at-least-once delivery, idempotent keyed writes, an exactly-once stored
+value.
+
+**The completeness low-watermark `LW`.** `LW` is a durable, monotonic event-time
+marker per owner: every window with `window_end <= LW` across all of the owner's
+streams is durably stored in L3. Alongside it the owner records `O(LW)`, the L1
+subscriber offset below which no point with `event_time >= LW` remains, and the
+per-stream cumulative anchors as of `LW`. These form one small checkpoint, the
+same snapshot-plus-log shape the type registry uses for its own durability.
+
+**Commit ordering.** A flush follows a fixed order so any crash leaves a
+recoverable state. The closed windows are written durably to L3 first. The
+checkpoint is committed next, advancing `LW` and recording `O(LW)` and the
+anchors. L1 progress is advanced to `O(LW)` last. Advancing progress to `O(LW)`
+rather than to the position actually consumed is what keeps L1 holding every point
+that still feeds an open window, and it is the previously unstated rule for when
+L2 releases L1 input relative to L3 durability.
+
+**Restart.** The owner restores the anchors, resumes its L1 subscription at
+`O(LW)`, and seeds each stream's watermark to `LW`. A replayed point whose window
+ends at or below `LW` is discarded by the ordinary late-arrival rule, so no
+already-stored window is re-derived and no anchor advances twice. Points beyond
+`LW` rebuild the open windows and flush normally. Suppression of the
+already-committed windows therefore falls out of the late-drop path L2 already
+runs, with no separate index of stored windows. Because `O(LW)` trails the
+consumed position only by the open-window horizon, the replay is short and L1
+retention behind `O(LW)` is bounded by that same horizon.
+
+**Residual duplicates.** One case still produces a duplicate: a crash after the
+L3 write and the `LW` advance but before L1 progress advances. On restart the
+older `LW` is in force, the affected windows re-derive from the same replayed
+points, and because that replay is complete and ordered the re-emitted values
+are identical. Last-writer-wins by the window key absorbs them, which is why
+L3's read-time resolution is a v1 invariant rather than a phase-2 refinement.
+
+**The anchor rides the checkpoint.** Because the anchor is captured as of `LW` and
+restored on restart, an appliance restart no longer restarts every cumulative
+series from zero. A reassignment carries the anchor the same way: the gaining
+owner takes the anchor as of the last window boundary, in memory on an in-memory
+move or from the checkpoint on the durable backend, so the handoff injects no
+reset. The window boundary carries no open-window aggregate, but it does carry the
+anchor, and that is the amendment the rebalance and restart claims elsewhere need.
+
+**Granularity and idle streams.** `LW` is per-stream in the manner of the D11
+watermark rather than a single per-bucket value, so a slow or idle stream does not
+hold back completeness for the rest. This couples `LW` to idle handling: a stream
+whose trailing window closes only at the `max_lag` idle floor pins both `LW` and
+`O(LW)`, and with them L1 retention, near that stream's last event, so the idle
+drain wants an idle-close interval far shorter than `max_lag` even while the anchor
+eviction TTL stays at `max_lag`. `O(LW)` reduces to the minimum offset across the
+owner's open windows, so it is maintained incrementally as windows open and close.
+
+**A shared completeness horizon.** The same marker serves the layers above. L4
+answers a query against a snapshot at or below `LW`, which bounds query freshness
+to one window plus the allowed lateness instead of exposing half-flushed windows.
+L5 forwards windows at or below `LW`, resolved by key, so a replica or a peer
+appliance that forwards the same window key merges at the central platform by the
+same idempotency. `LW` is thus at once the restart position, the query-consistency
+horizon, and the forwarding progress marker.
+
+**Source-model assumption.** L2 consumes its L1 subscription as a forward-only
+cursor whose committed progress it advances lazily to `O(LW)`, so steady-state
+operation never redelivers already-folded input and duplicates arise only from
+crash replay. `quiver` already provides durable subscriber progress; the
+requirement this places on the subscription is that consuming a bundle does not
+force its acknowledgement, so committed progress can trail the read position by
+the open-window horizon.
 
 ## L4: Query and serving (pull-based retrieval)
 
@@ -477,6 +581,10 @@ protocol.
   separate server protocol.
 - **Disconnected operation**: because L1-L3 have no central dependency, L4
   serves from local storage regardless of upstream connectivity.
+- **Read consistency**: a query reads a snapshot of the store at or below the
+  completeness low-watermark `LW`, described under "Exactly-once into the store",
+  so it never observes a half-flushed checkpoint and its freshness is bounded by
+  one window plus the allowed lateness.
 
 ## L5: Forwarding
 
@@ -494,37 +602,19 @@ needed.)
   progress, so an outage simply delays delivery and progress resumes on
   reconnect. Under a *sustained* outage the stage hits its retention budget and
   sheds oldest-first (D15/QoS, the same drop-oldest policy as local retention),
-  so a disconnected appliance degrades gracefully instead of blocking ingest.
+  so a disconnected appliance degrades gracefully instead of blocking ingest. For
+  the aggregated stream, forwarding advances with the completeness low-watermark
+  `LW`, emitting windows at or below it with values resolved by key, so a replica
+  or a peer appliance forwarding the same window key merges idempotently at the
+  central platform, as described under "Exactly-once into the store".
 - **No new dependency**: forwarding is an OTAP exporter on the balanced topic,
   the same mechanism the pipeline already uses.
 
-## The live store and the archival sibling
-
-The live store (Vortex) and the archival format (Parquet) play different roles,
-and both sit behind configurable seams (per the engine's modularity posture):
-
-- **Vortex in the stage-2 store (L3): the live, query-served store.** It is
-  Arrow-native (zero-copy), Rust-native, and gives ~100-200x faster random
-  access than Parquet -- exactly the recent-range, per-series lookup a Grafana
-  dashboard issues. Late corrections are handled by writing a new file for the
-  same key (immutable files, resolved at read), not by rewriting, so there is no
-  row-group write amplification. Because windows close on the watermark, the
-  encode happens off the hot path.
-- **Parquet via the exporter (sibling of L2/L3): cold, widely-readable archival
-  and interop.** Parquet's universal readability is what the *hand-off* to a
-  lakehouse or the central platform needs, and the existing `parquet_exporter`
-  already writes Arrow to an `object_store` backend (local or `s3://`),
-  partitioned by date bucket and metric name.
-
-The earlier objection to Parquet *as the live store* (mutation cost, per-series
-query shape) is what makes Vortex the live store; the objection does not apply to
-Parquet's archival role, where files are written once and read by broad
-analytical scans. Both are foundation-governed columnar formats plus a library --
-no database, no server, no vendor backend.
-
 ## Decisions
 
-These gate the detail above. **All are ratified** (D10-D17). v1 scope is called
+These gate the detail above. D10-D17 and D29 are **ratified**, except the store
+file format (D16), which is deferred to separate work. D29 continues the shared
+decision ledger and postdates the dispatch design's D18-D28. v1 scope is called
 out where a decision defers part of itself to appliance phase 2.
 
 | ID  | Decision                    | Decided                                               | Status  |
@@ -532,11 +622,12 @@ out where a decision defers part of itself to appliance phase 2.
 | D10 | Window model                | tumbling, event-time, epoch-aligned; single-res v1    | decided |
 | D11 | Watermark policy            | per-stream heuristic + idle floor; bounded by max_lag | decided |
 | D12 | Late/early + accumulation   | v1 one on-time firing, late=drop-and-count            | decided |
-| D13 | Stage-2 layout              | store seam; Vortex default; (name, res, window) key   | decided |
+| D13 | Stage-2 layout              | store seam; (name, res, window) key; drop-oldest      | decided |
 | D14 | Query/serving protocol      | DataFusion `TableProvider`; OPL/OTTL in, OTAP out     | decided |
 | D15 | Forwarding granularity      | push OTAP; aggregated default; drop-oldest on outage  | decided |
-| D16 | Store formats               | Vortex live store; Parquet archival sibling           | decided |
+| D16 | Store file format           | deferred; concrete format chosen in separate work     | pending |
 | D17 | Temporality + reaggregation | mixed in; store cumulative; output configurable       | decided |
+| D29 | Exactly-once into the store | completeness low-watermark checkpoint; v1 LWW-by-key  | decided |
 
 ### D10. Window model
 
@@ -574,8 +665,9 @@ last-writer-wins at L3). Bounded by `max_lag` throughout.
 
 **Decided:** aggregated windows are written as immutable columnar files behind a
 **store seam** (writer + DataFusion `TableProvider`), keyed `(metric_name,
-resolution, window_index)`. The default backend is **Vortex** (D16). Late
-restatements are written as new files for the same key and resolved at read time
+resolution, window_index)`. The seam keeps the on-disk format a configuration
+choice; the concrete format is chosen in separate work (D16). Late restatements
+are written as new files for the same key and resolved at read time
 by the accumulation policy (phase 2). Retention is a fixed time/size budget with
 drop-oldest (D15). This revises the earlier Arrow-IPC-in-`quiver` idea: `quiver`
 stays the L1 *queue*; L3 is a *queryable store* of columnar files, a different
@@ -603,16 +695,15 @@ outage the stage sheds **oldest-first** at its retention budget rather than
 blocking ingest (the same drop-oldest QoS as local retention; lossless mode
 remains available per ingest-queue D6).
 
-### D16. Store formats: Vortex live, Parquet archival
+### D16. Store file format
 
-**Decided:** the live, query-served stage-2 store is **Vortex** -- a
-Linux-Foundation-governed, Apache-2.0, Arrow-native columnar format, file-format
-stable since 0.36.0, with ~100-200x faster random access than Parquet (the
-Grafana per-series lookup pattern). **Parquet** is retained as the cold,
-widely-readable archival/interop sibling (the existing `parquet_exporter` to an
-`object_store` backend). Both are *format + library*, not a server or database:
-this keeps the minimum-dependency, vendor-neutral, Arrow-native posture while
-letting the engine *rent* rather than *own* the store. ClickHouse and other
+**Deferred.** The store seam (D13) keeps the on-disk columnar file format a
+configuration choice, so the appliance design does not depend on a specific one.
+The format must provide Arrow-native, zero-copy columnar files with fast random
+access by key, and a *format-and-library* posture with no server or external
+database, to preserve the minimum-dependency, vendor-neutral, Arrow-native
+stance. The concrete format, and any archival or interop export alongside it, are
+being decided in separate work and are out of scope here. ClickHouse and other
 external databases were considered and rejected as required dependencies for
 this reason.
 
@@ -634,6 +725,46 @@ provides for free. **Metric attribute reduction** (dropping attributes and
 re-aggregating across the now-equivalent series) is a designed-for, deferred
 capability done at stage-2 on an additive basis then projected to the chosen
 output temporality, reset-aware -- hence temporality-agnostic.
+
+### D29. Exactly-once into the aggregated store
+
+**Decided:** achieve deterministic exactly-once from the at-least-once L1 into L3
+with a durable completeness low-watermark. The owner keeps `LW`, the event-time
+bound below which every window is durably stored; `O(LW)`, the L1 offset below
+which no point with `event_time >= LW` remains; and the per-stream cumulative
+anchors as of `LW`. A flush writes L3, commits the checkpoint, then advances L1
+progress to `O(LW)`, in that order. On restart the owner restores the anchors,
+resumes L1 at `O(LW)`, seeds watermarks to `LW`, and lets the late-arrival rule
+discard already-stored windows. Read-time last-writer-wins by the window key is
+a v1 invariant that absorbs the one deterministic duplicate band at the
+checkpoint boundary, and phase-2 restatement layers genuine corrections onto the
+same resolution.
+
+**Why it matters:** without it an appliance restart or a partition reassignment
+either double-counts windows in L3 or restarts every cumulative series from zero,
+so the durable, disconnection-tolerant claim fails for the very events the
+appliance exists to survive.
+
+**Rationale:** the window identity is a natural idempotency key, and the shuffle
+by metric name already gives ordered single-writer replay, so the only missing
+ingredient for exactly-once is recording the input position in the sink. Seeding
+the restart watermark to `LW` reuses the existing late-drop path as the
+already-committed suppressor, so no separate index of stored windows is needed.
+The anchor travels in the same checkpoint, so restart and reassignment inject no
+reset, which is what lets the window-boundary handoff stay state-free apart from
+the anchor it explicitly carries.
+
+**Implications:** L2 gains a durable checkpoint and the ack discipline of
+advancing L1 progress to `O(LW)` rather than the consumed position; L3 makes
+last-writer-wins by key non-optional in v1; L4 reads at a snapshot at or below
+`LW` and so has a bounded freshness of one window plus the allowed lateness; L5
+forwards at or below `LW` and relies on the same key idempotency for replica and
+multi-appliance merge; `LW` is per-stream so an idle stream cannot pin
+completeness, which asks the idle drain to close and checkpoint on an interval far
+shorter than `max_lag`. Couples to D11, D12, D13, D17, ingest-queue D6, and the
+dispatch design's reassignment handoff. A deferred sub-choice is whether `O(LW)`
+and the anchors live in L3's manifest or in a small `quiver`-backed checkpoint
+stream like the registry; the store seam keeps that a later, local decision.
 
 ## Implementation phases
 
@@ -671,16 +802,16 @@ The appliance builds on the ingest queue (L1, whose own phases 0-4 are in
   "Folding the proof of concept into `temporal_reaggregation`". Histograms remain
   after the number path.
 - **A1 -- stage-2 store (L3 core).** The store seam (writer + `TableProvider`)
-  with the Vortex backend, keyed `(metric_name, resolution, window_index)`;
-  fixed-window drop-oldest retention (D13, D15, D16). Can be prototyped in
-  parallel against a fixed windowed-batch schema, then integrated with A0.
+  over a columnar file backend, keyed `(metric_name, resolution, window_index)`;
+  fixed-window drop-oldest retention (D13, D15). The concrete store format is
+  chosen in separate work (D16). Can be prototyped in parallel against a fixed
+  windowed-batch schema, then integrated with A0.
 - **A2 -- query/serving (L4 core).** DataFusion `TableProvider` over the store
   plus the HTTP query endpoint (OPL/OTTL in, Arrow/OTAP out), range and instant
   queries (D14). Depends on A1.
 - **A3 -- forwarding (L5).** Store-and-forward OTAP exporter as a durable-stage
   subscriber; aggregated default, raw passthrough; drop-oldest under outage
-  (D15). Parquet archival sibling reuses `parquet_exporter` (D16). Depends on L1
-  (raw) and/or A1 (aggregated).
+  (D15). Depends on L1 (raw) and/or A1 (aggregated).
 - **A4 -- appliance phase 2.** Late restatement + L3 correction files, early/late
   firings and accumulation modes (D12), rollup/downsampling resolutions (D10),
   metric attribute reduction (D17), Grafana datasource adapter, spans/logs sample
@@ -746,10 +877,9 @@ becomes that owner and reports per-partition load on each telemetry collection.
   Decisions D10-D17 are ratified.
 - L2's seed exists -- the `temporal_reaggregation` processor -- but is
   processing-time, not event-time; L2 (phase A0) is the extension described here.
-- `quiver` (L1 substrate), the `parquet_exporter` (object-store Parquet, L5
-  archival), the OTAP exporters (L5), and the query engine with its OPL/OTTL
-  languages exist. The Vortex-backed stage-2 store (L3) and the `TableProvider`
-  query path over it (L4) are the new assembly.
+- `quiver` (L1 substrate), the OTAP exporters (L5), and the query engine with its
+  OPL/OTTL languages exist. The stage-2 store (L3) and the `TableProvider` query
+  path over it (L4) are the new assembly.
 
 **To resume, start at phase A0:**
 
@@ -761,8 +891,8 @@ becomes that owner and reports per-partition load on each telemetry collection.
    the reset/gap/overlap and cumulative-conversion rules (D17), histograms, and
    a timer-driven drain -- folding it into `temporal_reaggregation` rather than
    keeping a duplicate processor.
-3. In parallel, prototype the A1 store seam + Vortex writer against the windowed
-   batch schema.
+3. In parallel, prototype the A1 store seam and columnar file writer against the
+   windowed batch schema.
 4. File tracking issues per phase.
 
 **Related docs:** [`ingest-queue-design.md`](./ingest-queue-design.md),
@@ -779,6 +909,10 @@ ARCHITECTURE, and the `temporal_reaggregation` processor README.
   event time; the unit of aggregation.
 - **Watermark**: an estimate of event-time completeness for a stream; when it
   passes a window's end, the window may fire.
+- **Completeness low-watermark (`LW`)**: the durable, monotonic event-time bound
+  below which every window is stored in L3; with the L1 offset `O(LW)` and the
+  per-stream anchors it forms the exactly-once checkpoint of D29, and it also
+  bounds query freshness at L4 and forwarding progress at L5.
 - **Trigger**: the rule that decides when a window emits (on-time, early, late).
 - **Allowed lateness**: how far past a window's end late data is still
   incorporated; bounded by the ingest queue's `max_lag`.
@@ -787,13 +921,10 @@ ARCHITECTURE, and the `temporal_reaggregation` processor README.
 - **Restatement / correction record**: a re-emitted window result for late data
   (appliance phase 2), stored as a new stage-2 file resolved at query time.
 - **Stage-1 quiver / stage-2 store**: the raw durable ingest buffer (L1, a
-  `quiver` queue) and the aggregated durable timeseries store (L3, Vortex files
+  `quiver` queue) and the aggregated durable timeseries store (L3, columnar files
   behind a store seam).
-- **Vortex**: a Linux-Foundation-governed, Apache-2.0, Arrow-native columnar
-  file format (stable file format since 0.36.0) used as the L3 live store; fast
-  random access and zero-copy to Arrow.
 - **Store seam**: the L3 abstraction (writer + DataFusion `TableProvider`) that
-  makes the stage-2 backend a configuration choice (Vortex default).
+  makes the stage-2 backend a configuration choice.
 - **Resolution**: the window granularity of a stored aggregate; constant in v1,
   the key component reserved for later rollup/downsampling.
 - **Reset / gap / overlap**: OTel data-model conditions on a stream -- a counter
