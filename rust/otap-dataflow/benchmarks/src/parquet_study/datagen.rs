@@ -277,6 +277,19 @@ fn log_attrs_for(idx: u64, n: usize) -> Vec<KeyValue> {
 /// measure resource-heavy versus log-heavy telemetry without identical rows.
 #[must_use]
 pub fn create_logs_data_rich(params: &RichGenParams) -> LogsData {
+    create_logs_data_rich_with_base(params, 0)
+}
+
+/// Like [`create_logs_data_rich`] but offsets every record's global index by
+/// `base_idx`. Because the per-record `trace_id`, `span_id`, timestamps, body,
+/// and high-cardinality attributes are all derived from that global index, two
+/// calls with different `base_idx` produce batches with distinct per-record
+/// content, while the resource/scope attributes (keyed only by resource/scope
+/// position) stay identical. This models a realistic stream: the same services
+/// keep reporting, but every batch carries fresh records rather than the
+/// byte-for-byte duplicates the identical-batch best case uses.
+#[must_use]
+pub fn create_logs_data_rich_with_base(params: &RichGenParams, base_idx: u64) -> LogsData {
     let base_time = 1_700_000_000_000_000_000u64;
     LogsData::new(
         (0..params.num_resources)
@@ -299,7 +312,8 @@ pub fn create_logs_data_rich(params: &RichGenParams) -> LogsData {
                                         let idx = ((res_idx * params.num_scopes + scope_idx)
                                             * params.num_logs
                                             + log_idx)
-                                            as u64;
+                                            as u64
+                                            + base_idx;
                                         LogRecord::build()
                                             .time_unix_nano(base_time + idx * 1_000_000)
                                             .observed_time_unix_nano(
@@ -336,6 +350,32 @@ pub fn gen_logs_otap_rich(params: &RichGenParams) -> OtapArrowRecords {
         .expect("can encode OTLP proto bytes");
     let view = RawLogsData::new(proto_bytes.as_ref());
     encode_logs_otap_batch(&view).expect("can encode OTAP logs batch")
+}
+
+/// Generate `num_batches` *distinct* realistic OTAP logs batches that model a
+/// stream from the same set of services. Each batch offsets its global record
+/// index by `batch * total_logs`, so per-record content (trace/span ids,
+/// timestamps, body, high-cardinality attributes) differs batch to batch while
+/// the shared resource/scope attributes stay stable. This is the realistic
+/// counterpart to cloning one identical batch, which is the cross-batch
+/// best case.
+#[must_use]
+pub fn gen_logs_otap_rich_stream(
+    params: &RichGenParams,
+    num_batches: usize,
+) -> Vec<OtapArrowRecords> {
+    let per_batch = params.total_logs() as u64;
+    (0..num_batches)
+        .map(|b| {
+            let logs_data = create_logs_data_rich_with_base(params, b as u64 * per_batch);
+            let mut proto_bytes = Vec::new();
+            logs_data
+                .encode(&mut proto_bytes)
+                .expect("can encode OTLP proto bytes");
+            let view = RawLogsData::new(proto_bytes.as_ref());
+            encode_logs_otap_batch(&view).expect("can encode OTAP logs batch")
+        })
+        .collect()
 }
 
 #[cfg(test)]
