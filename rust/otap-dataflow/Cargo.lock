@@ -6827,6 +6827,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "criterion",
  "flume",
  "opentelemetry",
  "opentelemetry-otlp",

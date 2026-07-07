@@ -335,6 +335,77 @@ impl SpanStartValues {
     }
 }
 
+/// Test- and benchmark-only access to the crate-internal [`SpanStartValues`]
+/// accumulator.
+///
+/// This exposes the window-boundary derivation of local-root span-start
+/// probabilities, the `update_log_surprisals` surprisal recompute and the
+/// `build_table` table build, so it can be exercised and measured in isolation
+/// without widening the crate's real public surface. It is compiled only under
+/// `test` or the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
+pub mod bench_support {
+    use std::collections::HashMap;
+
+    use super::super::super::span::Threshold;
+    use super::{SpanStartTable, SpanStartValues};
+
+    /// A public wrapper over the crate-internal span-start value accumulator.
+    ///
+    /// The methods forward directly to [`SpanStartValues`] so a benchmark
+    /// measures the production code path, not a re-implementation.
+    pub struct SpanStartValuesHarness(SpanStartValues);
+
+    impl Default for SpanStartValuesHarness {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl SpanStartValuesHarness {
+        /// Create an empty accumulator with no surprisal scale.
+        #[must_use]
+        pub fn new() -> Self {
+            Self(SpanStartValues::new())
+        }
+
+        /// Accumulate one in-span record under its span-start callsite.
+        pub fn observe_in_span(&mut self, start_callsite: u64, log_callsite: u64) {
+            self.0.observe_in_span(start_callsite, log_callsite);
+        }
+
+        /// Add an estimated span-start volume under its start callsite.
+        pub fn add_start(&mut self, start_callsite: u64, adjusted_count: f64) {
+            self.0.add_start(start_callsite, adjusted_count);
+        }
+
+        /// Recompute the per-log-callsite surprisal scale for the next window
+        /// from criterion one's estimated counts.
+        pub fn update_log_surprisals(&mut self, estimates: &HashMap<u64, f64>) {
+            self.0.update_log_surprisals(estimates);
+        }
+
+        /// Build the next window's span-start threshold table, deriving one
+        /// admission probability per local-root kind.
+        #[must_use]
+        pub fn build_table(
+            &self,
+            target: f64,
+            enable_value_weighting: bool,
+            shrinkage: f64,
+            fallback_default: Threshold,
+        ) -> SpanStartTable {
+            self.0
+                .build_table(target, enable_value_weighting, shrinkage, fallback_default)
+        }
+
+        /// Clear the per-window accumulators; the surprisal scale carries over.
+        pub fn reset_window(&mut self) {
+            self.0.reset_window();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

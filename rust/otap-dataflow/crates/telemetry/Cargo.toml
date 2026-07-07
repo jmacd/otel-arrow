@@ -51,6 +51,12 @@ tracing-subscriber = { workspace = true, features = ["env-filter","registry", "s
 [dev-dependencies]
 tower = { workspace = true }
 tempfile = { workspace = true }
+criterion = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 otap-df-pdata = { workspace = true, features = ["testing"] }
 rustls = { workspace = true, features = ["ring"] }
+
+[[bench]]
+name = "span_start_probabilities"
+harness = false
+required-features = ["testing"]
