@@ -17,6 +17,7 @@
 //!   registry confirms some token actually declared that header name.
 
 use otap_df_config::tenant::compiled::{HeaderValue, TenantTokenRegistry, TokenInputs};
+use otap_df_telemetry::otel_warn;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -44,13 +45,47 @@ impl HeaderValue for LazyMetadataValue<'_> {
     fn bytes(&self) -> Cow<'_, [u8]> {
         match self {
             Self::Ascii(value) => Cow::Borrowed(value.as_bytes()),
-            // A malformed base64 value resolves as empty rather than as the
-            // raw encoded bytes: admitting the encoded form would let a
-            // corrupt header masquerade as a legitimate token value.
-            Self::Binary(value) => value.to_bytes().map_or(Cow::Borrowed(&[][..]), |decoded| {
-                Cow::Owned(decoded.to_vec())
-            }),
+            // gRPC allows repeated `-bin` headers to arrive already joined
+            // with commas, and requires a reader to split on the comma before
+            // decoding. tonic decodes the value whole, which fails outright on
+            // a joined one, so the segments are separated here first. Only the
+            // leading segment can be represented, because decoded bytes cannot
+            // be rejoined into one value unambiguously.
+            //
+            // A malformed value resolves as empty rather than as the raw
+            // encoded bytes: admitting the encoded form would let a corrupt
+            // header masquerade as a legitimate token value.
+            Self::Binary(value) => {
+                let encoded = value.as_encoded_bytes();
+                let first = encoded.split(|b| *b == b',').next().unwrap_or(encoded);
+                tonic::metadata::MetadataValue::from_bytes(first)
+                    .to_bytes()
+                    .map_or(Cow::Borrowed(&[][..]), |decoded| {
+                        Cow::Owned(decoded.to_vec())
+                    })
+            }
         }
+    }
+}
+
+/// Reports retained values the pack could not carry.
+///
+/// Values dropped for size are omitted whole, so the context stays well formed
+/// and the affected keys read as absent; a binary header repeated on one
+/// request keeps only its first occurrence. The warnings are what keep those
+/// losses visible to an operator.
+fn warn_if_dropped(scratch: &otap_df_config::tenant::compiled::TokenScratch) {
+    let dropped = scratch.dropped_values();
+    if dropped > 0 {
+        otel_warn!(
+            "tenant.context.values_dropped",
+            dropped = dropped,
+            limit = otap_df_config::tenant::compiled::MAX_VALUE_BYTES,
+        );
+    }
+    let duplicates = scratch.dropped_duplicates();
+    if duplicates > 0 {
+        otel_warn!("tenant.context.duplicates_dropped", dropped = duplicates,);
     }
 }
 
@@ -73,10 +108,10 @@ where
         return None;
     }
     SCRATCH.with(|scratch| {
-        registry.resolve(
-            &mut scratch.borrow_mut(),
-            TokenInputs::new(headers).with_peer_addr(peer_addr),
-        )
+        let scratch = &mut *scratch.borrow_mut();
+        let packed = registry.resolve(scratch, TokenInputs::new(headers).with_peer_addr(peer_addr));
+        warn_if_dropped(scratch);
+        packed
     })
 }
 
@@ -98,9 +133,9 @@ pub fn resolve_grpc(
         KeyAndValueRef::Binary(key, value) => (key.as_str(), LazyMetadataValue::Binary(value)),
     });
     SCRATCH.with(|scratch| {
-        registry.resolve(
-            &mut scratch.borrow_mut(),
-            TokenInputs::new(headers).with_peer_addr(peer_addr),
-        )
+        let scratch = &mut *scratch.borrow_mut();
+        let packed = registry.resolve(scratch, TokenInputs::new(headers).with_peer_addr(peer_addr));
+        warn_if_dropped(scratch);
+        packed
     })
 }

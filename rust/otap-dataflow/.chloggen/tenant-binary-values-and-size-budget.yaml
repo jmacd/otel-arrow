@@ -1,0 +1,25 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: bug_fix
+
+# The name of the component, or a single word describing the area of concern, (e.g. engine, otap).
+# Must be one of the components listed in rust/otap-dataflow/.chloggen/config.yaml.
+component: engine
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Retained tenant token values keep binary encoding and stay within a per-request size budget.
+
+# Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
+issues: [3636]
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries. Breaking entries must include a `Migration:`
+# section with the specific action consumers must take. Keep notes to 200
+# characters and subtext to 300 characters.
+subtext: |
+  A transport header declared with the gRPC `-bin` suffix now travels as bytes,
+  so a `bag: true` key no longer places non-UTF-8 data in a string attribute.
+  Retained values exceeding 65535 bytes per request are dropped whole and
+  reported as `tenant.context.values_dropped` instead of truncating the context.

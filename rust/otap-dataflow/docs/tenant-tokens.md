@@ -250,6 +250,23 @@ Other limits:
 
 - Header names are matched exactly, case-insensitively. Regex and glob
   patterns are not supported.
+- Retained values are budgeted at 65,535 bytes per request, counted across
+  every retained key after encoding. A value that does not fit is dropped
+  whole and reads as absent downstream; the receiver logs
+  `tenant.context.values_dropped`. Nothing is ever truncated, so the attribute
+  bag stays a well-formed OTLP field.
+- A header declared with the gRPC `-bin` suffix carries opaque bytes. Its
+  retained value is encoded as an OTLP `bytes_value`, so a `bag: true` binary
+  key can be appended to attributes without putting non-UTF-8 bytes in a
+  string field. Every other source is text.
+- A header repeated on one request is carried as a single comma-joined value,
+  which HTTP (RFC 9110 section 5.3) and gRPC both define as equivalent to the
+  repeated form. An exporter re-emits one joined header and the receiving peer
+  splits it again, so a multi-valued header round-trips. A condition declared
+  over a single value therefore stops matching when a second occurrence is
+  appended, rather than matching whichever occurrence arrived last. Repeated
+  binary headers cannot be joined unambiguously: the first is kept and the
+  rest are reported as `tenant.context.duplicates_dropped`.
 - Only OTLP gRPC, OTLP HTTP, and Kafka receivers resolve tenant tokens today.
   The OTAP receiver does not yet.
 

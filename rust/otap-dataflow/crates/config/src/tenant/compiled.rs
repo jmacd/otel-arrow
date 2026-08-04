@@ -57,6 +57,19 @@ pub const MAX_TOKENS: usize = 64;
 /// Maximum total size of the retained value bytes in one request context.
 pub const MAX_VALUE_BYTES: usize = u16::MAX as usize;
 
+/// Header-name suffix gRPC reserves for binary metadata. A header declared
+/// with this suffix carries opaque bytes, not text, and its retained value is
+/// encoded into the `AnyValue` field that can represent them.
+const BINARY_HEADER_SUFFIX: &str = "-bin";
+
+/// Delimiter joining repeated occurrences of one header name.
+///
+/// Both HTTP (RFC 9110 section 5.3) and gRPC define a comma-joined value as
+/// semantically equivalent to the same name repeated, so joining preserves a
+/// multi-valued header exactly rather than approximating it: an exporter
+/// re-emits one joined header and the receiving peer splits it back.
+const MULTI_VALUE_DELIMITER: u8 = b',';
+
 fn config_error(error: impl Into<String>) -> Error {
     Error::InvalidUserConfig {
         error: error.into(),
@@ -206,6 +219,11 @@ pub struct TenantTokenRegistry {
     /// OTLP field number the bagged run is tagged with, fixed at build time
     /// by the consumer that initialized the registry.
     bag_field: u32,
+    /// Per key id: whether the key's value is text or opaque bytes. Fixed by
+    /// the key's binding at build time, so every path that stages a value --
+    /// resolution, boundary export and rewrite -- agrees on the encoding
+    /// without having to carry the kind alongside the bytes.
+    key_kinds: Vec<ValueKind>,
     /// Reverse of `retained`, indexed by key id; [`NO_VALUE_SLOT`] for keys
     /// that are match-only.
     value_slot: Vec<u16>,
@@ -601,6 +619,46 @@ impl TenantTokenRegistryBuilder {
         let _ = self.pair_index.insert((token, signature), slot);
     }
 
+    /// Fix each key's value encoding from the source it is bound to.
+    ///
+    /// A transport header whose declared name carries the gRPC `-bin` suffix
+    /// holds opaque bytes; every other source holds text. An imported key
+    /// inherits from the upstream key it reads, so a binary value keeps its
+    /// encoding across a pipeline boundary instead of silently becoming a
+    /// string. Inheritance is iterated to a fixpoint because an imported key
+    /// may itself be read by a further import, and the chain is at most
+    /// `n_keys` long.
+    fn resolve_key_kinds(
+        n_keys: usize,
+        request_binding: &[Option<KeyBinding>],
+        import_binding: &[Option<KeyBinding>],
+    ) -> Vec<ValueKind> {
+        let mut kinds = vec![ValueKind::Text; n_keys];
+        for (key, binding) in request_binding.iter().enumerate() {
+            if let Some(KeyBinding::Header(name)) = binding
+                && name.ends_with(BINARY_HEADER_SUFFIX)
+            {
+                kinds[key] = ValueKind::Binary;
+            }
+        }
+        for _ in 0..n_keys {
+            let mut changed = false;
+            for (key, binding) in import_binding.iter().enumerate() {
+                if let Some(KeyBinding::Imported(upstream)) = binding
+                    && kinds[usize::from(*upstream)] == ValueKind::Binary
+                    && kinds[key] == ValueKind::Text
+                {
+                    kinds[key] = ValueKind::Binary;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        kinds
+    }
+
     /// Freeze the builder into an immutable registry.
     ///
     /// `generation` is the deployment generation. The stored epoch mixes it
@@ -632,6 +690,9 @@ impl TenantTokenRegistryBuilder {
         for (key, slots) in self.import_by_key {
             import_by_key[usize::from(key)] = slots;
         }
+
+        let key_kinds =
+            Self::resolve_key_kinds(n_keys, &self.request_binding, &self.import_binding);
 
         // Assign each signature a bit layout wide enough for every symbol its
         // keys can take. Injectivity is the whole point, so a layout that does
@@ -696,6 +757,7 @@ impl TenantTokenRegistryBuilder {
             retained: self.retained,
             bagged: self.bagged,
             bag_field: self.bag_field.unwrap_or(attribute_field::SCOPE),
+            key_kinds,
             value_slot,
             retain_mask,
             empty: Arc::from(Vec::new()),
@@ -767,6 +829,10 @@ pub struct TokenScratch {
     blob: Vec<u8>,
     /// Blob offset of each value slot, parallel to `slots`.
     offsets: Vec<u32>,
+    /// Values the most recent pack could not fit within [`MAX_VALUE_BYTES`].
+    dropped: u32,
+    /// Repeated occurrences that could not be joined onto an existing value.
+    duplicates_dropped: u32,
     out: Vec<u64>,
 }
 
@@ -801,7 +867,6 @@ pub enum ValueKind {
 struct ValueRef {
     off: u32,
     len: u32,
-    kind: ValueKind,
     present: bool,
 }
 
@@ -968,12 +1033,14 @@ fn pack_words<'n>(
         offsets,
         fingerprints,
         out,
+        dropped,
         ..
     } = scratch;
 
     blob.clear();
     offsets.clear();
     offsets.resize(slots.len(), EMPTY_OFFSET);
+    *dropped = 0;
 
     // Bag keys first and contiguous, so the run can be copied in one pass.
     for (slot, staged) in slots.iter().enumerate() {
@@ -988,6 +1055,15 @@ fn pack_words<'n>(
             + 1
             + varint_len(any_value_len(value.len()) as u64)
             + any_value_len(value.len());
+        // Drop the whole entry when it does not fit rather than writing a
+        // prefix of it. `bag_len` is a 16-bit field and `attributes()` hands
+        // the region out as a complete repeated field, so a partial entry
+        // would be read as a malformed one; an omitted entry is merely absent.
+        let record = varint_len((u64::from(bag_field) << 3) | 2) + varint_len(inner as u64) + inner;
+        if blob.len() + record > MAX_VALUE_BYTES {
+            *dropped = dropped.saturating_add(1);
+            continue;
+        }
         put_varint(blob, (u64::from(bag_field) << 3) | 2);
         put_varint(blob, inner as u64);
         blob.push(otlp::KEY_VALUE_KEY_TAG);
@@ -1003,6 +1079,15 @@ fn pack_words<'n>(
             continue;
         }
         let value = &arena[staged.off as usize..(staged.off + staged.len) as usize];
+        // Value-only entries are addressed individually, so an overlong one is
+        // dropped and its slot left empty. A reader sees the key as absent,
+        // which is the same outcome the old capture policy produced when a
+        // header exceeded `max_value_bytes`.
+        let record = varint_len(any_value_len(value.len()) as u64) + any_value_len(value.len());
+        if blob.len() + record > MAX_VALUE_BYTES {
+            *dropped = dropped.saturating_add(1);
+            continue;
+        }
         offsets[slot] = put_any_value(blob, value, staged.kind);
     }
 
@@ -1058,6 +1143,25 @@ impl TokenScratch {
         Self::default()
     }
 
+    /// Values the most recent pack could not fit within [`MAX_VALUE_BYTES`].
+    ///
+    /// A request whose retained values exceed the per-request budget keeps the
+    /// values that fit and omits the rest, so a caller that wants to report
+    /// the loss reads this immediately after resolving.
+    #[must_use]
+    pub fn dropped_values(&self) -> u32 {
+        self.dropped
+    }
+
+    /// Repeated header occurrences the most recent resolve could not join.
+    ///
+    /// Only binary values are ever counted here: text values join, so a
+    /// repeated text header loses nothing.
+    #[must_use]
+    pub fn dropped_duplicates(&self) -> u32 {
+        self.duplicates_dropped
+    }
+
     fn reset(&mut self, registry: &TenantTokenRegistry) {
         self.unsatisfied.clear();
         self.unsatisfied
@@ -1073,6 +1177,7 @@ impl TokenScratch {
         self.slots.clear();
         self.slots
             .resize(registry.retained.len(), StagedSlot::default());
+        self.duplicates_dropped = 0;
         self.out.clear();
     }
 
@@ -1098,9 +1203,53 @@ impl TokenScratch {
         self.values[usize::from(key)] = ValueRef {
             off,
             len: u32::try_from(value.len()).unwrap_or(u32::MAX),
-            kind: ValueKind::Text,
             present: true,
         };
+    }
+
+    /// Record one occurrence of a header, joining it onto any earlier
+    /// occurrence of the same key.
+    ///
+    /// A request may repeat a header name, and both HTTP and gRPC treat the
+    /// repetition as equivalent to a single comma-joined value. Joining is
+    /// therefore how a multi-valued header is carried without a second value
+    /// slot: the joined form is what the protocol says the request meant, it
+    /// round-trips when an exporter re-emits it, and a condition declared over
+    /// a single value stops matching a request that smuggled in a second one
+    /// rather than silently matching the last occurrence to arrive.
+    ///
+    /// Binary values are the exception. gRPC joins `-bin` headers in their
+    /// base64 form and requires a reader to split before decoding, so decoded
+    /// bytes cannot be concatenated back into one value unambiguously. The
+    /// first occurrence is kept and the rest are counted.
+    fn store_occurrence(&mut self, key: KeyId, value: &[u8], kind: ValueKind) {
+        if !self.values[usize::from(key)].present {
+            self.store(key, value);
+            return;
+        }
+        if kind == ValueKind::Binary {
+            self.duplicates_dropped = self.duplicates_dropped.saturating_add(1);
+            return;
+        }
+        let existing = self.values[usize::from(key)];
+        let off = existing.off as usize;
+        let len = existing.len as usize;
+        if off + len == self.arena.len() {
+            // The value is already the arena tail, so it grows in place.
+            self.arena.push(MULTI_VALUE_DELIMITER);
+            self.arena.extend_from_slice(value);
+        } else {
+            // Another key staged after this one, so the joined value has to be
+            // rebuilt contiguously at the tail. Values must stay contiguous
+            // because packing addresses each one as a single range.
+            let start = self.arena.len();
+            self.arena.extend_from_within(off..off + len);
+            self.arena.push(MULTI_VALUE_DELIMITER);
+            self.arena.extend_from_slice(value);
+            self.values[usize::from(key)].off = u32::try_from(start).unwrap_or(u32::MAX);
+        }
+        self.values[usize::from(key)].len =
+            u32::try_from(len + 1 + value.len()).unwrap_or(u32::MAX);
     }
 }
 
@@ -1300,7 +1449,11 @@ impl TenantTokenRegistry {
             // The name is wanted, so the value is worth materializing now.
             let bytes = value.bytes();
             for slot in &header_slot.any_value {
-                scratch.store(slot.key, bytes.as_ref());
+                scratch.store_occurrence(
+                    slot.key,
+                    bytes.as_ref(),
+                    self.key_kinds[usize::from(slot.key)],
+                );
                 scratch.unsatisfied[usize::from(slot.token)] &= !(1u64 << slot.bit);
             }
         }
@@ -1431,7 +1584,7 @@ impl TenantTokenRegistry {
                 StagedSlot {
                     off: v.off,
                     len: v.len,
-                    kind: v.kind,
+                    kind: self.key_kinds[usize::from(*key)],
                     present: v.present,
                     bagged: self.bagged[slot],
                 }
@@ -1488,7 +1641,7 @@ impl TenantTokenRegistry {
             scratch.slots[usize::from(slot)] = StagedSlot {
                 off: range.0,
                 len: range.1,
-                kind: ValueKind::Text,
+                kind: self.key_kinds[usize::from(*key)],
                 present: true,
                 bagged: self.bagged[usize::from(slot)],
             };
@@ -1553,7 +1706,7 @@ impl TenantTokenRegistry {
             scratch.slots[slot] = StagedSlot {
                 off: range.0,
                 len: range.1,
-                kind: ValueKind::Text,
+                kind: self.key_kinds[usize::from(self.retained[slot])],
                 present: true,
                 bagged: self.bagged[slot],
             };
@@ -2192,5 +2345,306 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), TENANTS.len() * ENVS.len());
+    }
+
+    /// Build a registry over one retained transport-header key.
+    fn retained_fixture(wire: &str, key: &str, bag: bool) -> TenantTokenRegistry {
+        let extractors = vec![Extractor::TransportHeader {
+            key: key.to_owned(),
+            transport_header: wire.to_owned(),
+            retain: true,
+            bag,
+        }];
+        let mut tokens = TenantTokens::default();
+        let _ = tokens.insert("gateway".to_owned(), TenantTokenSpec { extractors });
+        let mut builder = TenantTokenRegistryBuilder::new();
+        builder.add_tokens(&tokens).expect("tokens compile");
+        builder.build(1).expect("layout fits")
+    }
+
+    /// Scenario: a token retains a transport header declared with the gRPC
+    /// `-bin` suffix, and the request carries bytes that are not valid UTF-8.
+    /// Guarantees: the retained value is encoded into the `AnyValue`
+    /// `bytes_value` field rather than `string_value`, so a bagged key spliced
+    /// into OTLP attributes never presents non-UTF-8 bytes as a proto3 string,
+    /// and the bytes read back unchanged.
+    #[test]
+    fn binary_header_is_encoded_as_bytes_value() {
+        let reg = retained_fixture("x-tenant-bin", "tenant_id", true);
+        let raw: &[u8] = &[0xFF, 0x00, 0xFE, 0x80];
+        let words = resolve(&reg, &[("x-tenant-bin", raw)]);
+        let view = TenantView::new(&words);
+
+        let key = reg.key_id("tenant_id").expect("key declared");
+        let slot = reg.value_slot(key).expect("key retained");
+        assert_eq!(view.slot_value(slot), Some(raw));
+
+        // The bag is <tag> <len> KeyValue{ key, value: AnyValue }. Find the
+        // AnyValue's field tag and assert it selects bytes_value.
+        let attrs = view.attributes();
+        assert!(
+            attrs.contains(&otlp::ANY_VALUE_BYTES_TAG),
+            "bagged binary value must use the bytes_value tag, got {attrs:02x?}"
+        );
+    }
+
+    /// Scenario: a token retains an ordinary transport header whose name does
+    /// not end in `-bin`.
+    /// Guarantees: the value keeps the `string_value` encoding, so making
+    /// binary headers detectable did not reclassify ordinary text headers.
+    #[test]
+    fn text_header_is_encoded_as_string_value() {
+        let reg = retained_fixture("x-tenant-id", "tenant_id", true);
+        let words = resolve(&reg, &[("x-tenant-id", b"acme".as_slice())]);
+        let view = TenantView::new(&words);
+
+        let key = reg.key_id("tenant_id").expect("key declared");
+        let slot = reg.value_slot(key).expect("key retained");
+        assert_eq!(view.slot_value(slot), Some(b"acme".as_slice()));
+        assert!(
+            view.attributes().contains(&otlp::ANY_VALUE_STRING_TAG),
+            "bagged text value must use the string_value tag"
+        );
+    }
+
+    /// Scenario: a request carries a retained header value far larger than the
+    /// per-request budget of [`MAX_VALUE_BYTES`].
+    /// Guarantees: the oversized value is omitted whole instead of being
+    /// written as a truncated record, the packed `bag_len` therefore still
+    /// describes the region exactly, and the drop is counted so a receiver can
+    /// report it rather than losing the value silently.
+    #[test]
+    fn oversized_value_is_dropped_not_truncated() {
+        let reg = retained_fixture("x-tenant-id", "tenant_id", true);
+        let huge = vec![b'a'; MAX_VALUE_BYTES + 1024];
+
+        let mut scratch = TokenScratch::new();
+        let words = reg
+            .resolve(
+                &mut scratch,
+                TokenInputs::new([("x-tenant-id", huge.as_slice())]),
+            )
+            .expect("token still resolves on its key being present");
+
+        assert_eq!(scratch.dropped_values(), 1, "the drop must be counted");
+
+        let view = TenantView::new(&words);
+        let key = reg.key_id("tenant_id").expect("key declared");
+        let slot = reg.value_slot(key).expect("key retained");
+        assert_eq!(
+            view.slot_value(slot),
+            None,
+            "a value that does not fit reads as absent, never as a prefix"
+        );
+        assert!(
+            view.attributes().is_empty(),
+            "no partial KeyValue may appear in the attributes run"
+        );
+    }
+
+    /// Scenario: many bagged keys are retained whose encoded records together
+    /// exceed [`MAX_VALUE_BYTES`], while each one individually fits.
+    /// Guarantees: packing stops adding bag entries at the budget so `bag_len`
+    /// never wraps its 16-bit field, and every entry that was written stays a
+    /// complete, decodable `KeyValue`.
+    #[test]
+    fn bag_region_never_exceeds_the_packed_length_field() {
+        const KEYS: usize = 32;
+        let value = vec![b'v'; 4096];
+
+        let extractors: Vec<Extractor> = (0..KEYS)
+            .map(|i| Extractor::TransportHeader {
+                key: format!("key{i}"),
+                transport_header: format!("x-key-{i}"),
+                retain: true,
+                bag: true,
+            })
+            .collect();
+        let mut tokens = TenantTokens::default();
+        let _ = tokens.insert("gateway".to_owned(), TenantTokenSpec { extractors });
+        let mut builder = TenantTokenRegistryBuilder::new();
+        builder.add_tokens(&tokens).expect("tokens compile");
+        let reg = builder.build(1).expect("layout fits");
+
+        let names: Vec<String> = (0..KEYS).map(|i| format!("x-key-{i}")).collect();
+        let headers: Vec<(&str, &[u8])> = names
+            .iter()
+            .map(|n| (n.as_str(), value.as_slice()))
+            .collect();
+
+        let mut scratch = TokenScratch::new();
+        let words = reg
+            .resolve(
+                &mut scratch,
+                TokenInputs::new(headers.iter().map(|(k, v)| (*k, *v))),
+            )
+            .expect("token resolves");
+
+        let view = TenantView::new(&words);
+        let attrs = view.attributes();
+        assert!(
+            attrs.len() <= MAX_VALUE_BYTES,
+            "bag region must fit the 16-bit bag_len field, got {}",
+            attrs.len()
+        );
+        assert!(
+            scratch.dropped_values() > 0,
+            "entries beyond the budget must be reported as dropped"
+        );
+
+        // Walk the run: every record must be complete, proving nothing was
+        // cut mid-entry.
+        let mut at = 0usize;
+        let mut seen = 0usize;
+        while at < attrs.len() {
+            let (_tag, next) = get_varint(attrs, at).expect("record tag present");
+            let (len, body) = get_varint(attrs, next).expect("record length present");
+            at = body + usize::try_from(len).expect("length fits");
+            assert!(at <= attrs.len(), "record must not run past the region");
+            seen += 1;
+        }
+        assert!(seen > 0, "some entries must survive");
+    }
+
+    /// Scenario: one request repeats a retained text header, which HTTP and
+    /// gRPC both define as equivalent to a single comma-joined value.
+    /// Guarantees: every occurrence is carried in arrival order as one joined
+    /// value, so re-emitting it reproduces the multi-valued header instead of
+    /// silently keeping only the last occurrence.
+    #[test]
+    fn repeated_text_header_is_joined() {
+        let reg = retained_fixture("x-tenant-id", "tenant_id", false);
+        let words = resolve(
+            &reg,
+            &[
+                ("x-tenant-id", b"first".as_slice()),
+                ("x-tenant-id", b"second".as_slice()),
+                ("x-tenant-id", b"third".as_slice()),
+            ],
+        );
+        let view = TenantView::new(&words);
+        let key = reg.key_id("tenant_id").expect("key declared");
+        assert_eq!(
+            reg.retained_value(&view, key),
+            Some(b"first,second,third".as_slice())
+        );
+    }
+
+    /// Scenario: a repeated header is joined while another key's value is
+    /// staged in the arena between the two occurrences.
+    /// Guarantees: the joined value is relocated so it stays one contiguous
+    /// range, and the interleaved key keeps its own value intact; packing
+    /// addresses each value as a single range, so overlap would corrupt both.
+    #[test]
+    fn joining_survives_an_interleaved_key() {
+        let extractors = vec![
+            Extractor::TransportHeader {
+                key: "tenant_id".to_owned(),
+                transport_header: "x-tenant-id".to_owned(),
+                retain: true,
+                bag: false,
+            },
+            Extractor::TransportHeader {
+                key: "env".to_owned(),
+                transport_header: "x-env".to_owned(),
+                retain: true,
+                bag: false,
+            },
+        ];
+        let mut tokens = TenantTokens::default();
+        let _ = tokens.insert("gateway".to_owned(), TenantTokenSpec { extractors });
+        let mut builder = TenantTokenRegistryBuilder::new();
+        builder.add_tokens(&tokens).expect("tokens compile");
+        let reg = builder.build(1).expect("layout fits");
+
+        let words = resolve(
+            &reg,
+            &[
+                ("x-tenant-id", b"acme".as_slice()),
+                ("x-env", b"prod".as_slice()),
+                ("x-tenant-id", b"globex".as_slice()),
+            ],
+        );
+        let view = TenantView::new(&words);
+        let tenant = reg.key_id("tenant_id").expect("key declared");
+        let env = reg.key_id("env").expect("key declared");
+        assert_eq!(
+            reg.retained_value(&view, tenant),
+            Some(b"acme,globex".as_slice())
+        );
+        assert_eq!(reg.retained_value(&view, env), Some(b"prod".as_slice()));
+    }
+
+    /// Scenario: two tenants each declare a condition, a trusted hop sets the
+    /// identifying header, and a second occurrence naming the other tenant is
+    /// appended to the same request.
+    /// Guarantees: the joined value matches neither condition, so an appended
+    /// header can neither displace the trusted value nor steer the request
+    /// into the other tenant's route.
+    #[test]
+    fn injected_duplicate_cannot_steer_the_route() {
+        let conditions = [
+            condition(&[("tenant_id", "acme"), ("env", "prod")]),
+            condition(&[("tenant_id", "globex"), ("env", "prod")]),
+        ];
+        let reg = fixture(&conditions);
+        let set = reg
+            .condition_set(None, &conditions)
+            .expect("conditions compile");
+
+        let clean = resolve(
+            &reg,
+            &[
+                ("x-tenant-id", b"acme".as_slice()),
+                ("x-env", b"prod".as_slice()),
+            ],
+        );
+        assert_eq!(
+            set.first_match(&TenantView::new(&clean)),
+            Some(0),
+            "the undisturbed request still routes to its own tenant"
+        );
+
+        let injected = resolve(
+            &reg,
+            &[
+                ("x-tenant-id", b"acme".as_slice()),
+                ("x-tenant-id", b"globex".as_slice()),
+                ("x-env", b"prod".as_slice()),
+            ],
+        );
+        assert_eq!(
+            set.first_match(&TenantView::new(&injected)),
+            None,
+            "an appended occurrence must not select the other tenant's route"
+        );
+    }
+
+    /// Scenario: a binary header is repeated on one request, whose decoded
+    /// byte values cannot be concatenated back into one unambiguous value.
+    /// Guarantees: the first occurrence is kept unchanged rather than being
+    /// corrupted by a joined delimiter, and the discarded occurrence is
+    /// counted so the loss is reportable instead of silent.
+    #[test]
+    fn repeated_binary_header_keeps_the_first_and_counts_the_rest() {
+        let reg = retained_fixture("x-tenant-bin", "tenant_id", false);
+        let mut scratch = TokenScratch::new();
+        let words = reg
+            .resolve(
+                &mut scratch,
+                TokenInputs::new([
+                    ("x-tenant-bin", [0xFFu8, 0x01].as_slice()),
+                    ("x-tenant-bin", [0xFEu8, 0x02].as_slice()),
+                ]),
+            )
+            .expect("token resolves");
+
+        let view = TenantView::new(&words);
+        let key = reg.key_id("tenant_id").expect("key declared");
+        assert_eq!(
+            reg.retained_value(&view, key),
+            Some([0xFFu8, 0x01].as_slice())
+        );
+        assert_eq!(scratch.dropped_duplicates(), 1);
     }
 }
