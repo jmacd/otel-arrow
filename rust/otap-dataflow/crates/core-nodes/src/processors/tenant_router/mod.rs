@@ -37,8 +37,8 @@ use linkme::distributed_slice;
 use otap_df_config::PortName;
 use otap_df_config::error::Error as ConfigError;
 use otap_df_config::node::NodeUserConfig;
+use otap_df_config::tenant::TenantRouting;
 use otap_df_config::tenant::compiled::ConditionSet;
-use otap_df_config::tenant::{Condition, Entry};
 use otap_df_engine::config::ProcessorConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{NackCause, NackMsg, NodeControlMsg, WakeupRevision, WakeupSlot};
@@ -98,36 +98,6 @@ pub struct TenantRouterMetrics {
     pub signals_rejected_route_closed: Counter<u64>,
 }
 
-/// One route: the condition that selects it and the port it names.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TenantOutputRoute {
-    /// Entries that must all match for this route to be selected.
-    pub entries: Vec<Entry>,
-    /// Output port the message is sent to.
-    pub output: String,
-}
-
-/// The route table this node publishes for the engine to compile.
-///
-/// The field name is fixed by `otap_df_config::tenant::TENANT_ROUTING_KEY`:
-/// the controller finds every node's conditions by that key and interns them
-/// before the registry is frozen, because a condition that was not declared
-/// then cannot be looked up afterwards.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TenantRouteTable {
-    /// Tenant tokens this router binds. Empty binds every declared token.
-    #[serde(default)]
-    pub tenant_tokens: Vec<String>,
-    /// Routes evaluated first-match-wins.
-    pub routes: Vec<TenantOutputRoute>,
-    /// Port for messages matching no route. Without it, unmatched messages
-    /// are NACKed rather than delivered somewhere arbitrary.
-    #[serde(default)]
-    pub default_output: Option<String>,
-}
-
 /// Configuration for the TenantRouter processor.
 ///
 /// ```yaml
@@ -138,16 +108,21 @@ pub struct TenantRouteTable {
 ///     tenant_tokens: [edge]
 ///     routes:
 ///       - entries: [{ key: tenant_id, value: acme }]
-///         output: acme
+///         to: acme
 ///       - entries: [{ key: tenant_id, value: globex }]
-///         output: globex
-///     default_output: unmatched
+///         to: globex
+///     default_to: unmatched
 /// ```
+///
+/// `tenant_routing` is [`TenantRouting`], the same route table
+/// `exporter:topic` declares. Only the meaning of `to` differs: an output port
+/// here, a topic there. That is what lets the controller collect every node's
+/// conditions with one traversal that knows nothing about node kinds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TenantRouterConfig {
     /// Conditions and the ports they select.
-    pub tenant_routing: TenantRouteTable,
+    pub tenant_routing: TenantRouting,
     /// Policy for selected-route `Full` admission.
     #[serde(default)]
     pub admission_policy: SelectedRouteAdmissionPolicy,
@@ -169,7 +144,7 @@ impl TenantRouterConfig {
                     error: format!("tenant_routing.routes[{idx}] declares no entries"),
                 });
             }
-            if route.output.trim().is_empty() {
+            if route.to.trim().is_empty() {
                 return Err(ConfigError::InvalidUserConfig {
                     error: format!("tenant_routing.routes[{idx}] has an empty output port name"),
                 });
@@ -182,11 +157,11 @@ impl TenantRouterConfig {
                 }
             }
         }
-        if let Some(default) = &table.default_output
+        if let Some(default) = &table.default_to
             && default.trim().is_empty()
         {
             return Err(ConfigError::InvalidUserConfig {
-                error: "tenant_routing.default_output must not be empty when specified".to_owned(),
+                error: "tenant_routing.default_to must not be empty when specified".to_owned(),
             });
         }
         // Skipped when the node declares no ports, which is how pipeline-level
@@ -195,40 +170,29 @@ impl TenantRouterConfig {
             for (idx, route) in table.routes.iter().enumerate() {
                 if !declared_outputs
                     .iter()
-                    .any(|o| o.as_ref() == route.output.as_str())
+                    .any(|o| o.as_ref() == route.to.as_str())
                 {
                     return Err(ConfigError::InvalidUserConfig {
                         error: format!(
                             "tenant_routing.routes[{idx}] references undeclared output port '{}'",
-                            route.output
+                            route.to
                         ),
                     });
                 }
             }
-            if let Some(default) = &table.default_output
+            if let Some(default) = &table.default_to
                 && !declared_outputs
                     .iter()
                     .any(|o| o.as_ref() == default.as_str())
             {
                 return Err(ConfigError::InvalidUserConfig {
                     error: format!(
-                        "tenant_routing.default_output '{default}' references undeclared output port"
+                        "tenant_routing.default_to '{default}' references undeclared output port"
                     ),
                 });
             }
         }
         Ok(())
-    }
-
-    /// The route conditions, in route order, as the registry expects them.
-    fn conditions(&self) -> Vec<Condition> {
-        self.tenant_routing
-            .routes
-            .iter()
-            .map(|route| Condition {
-                entries: route.entries.clone(),
-            })
-            .collect()
     }
 }
 
@@ -271,19 +235,18 @@ impl TenantRouter {
         })?;
 
         let table = &config.tenant_routing;
-        let bound = (!table.tenant_tokens.is_empty()).then_some(table.tenant_tokens.as_slice());
-        let conditions = registry.condition_set(bound, &config.conditions())?;
+        let conditions = registry.condition_set(table.bound_tokens(), &table.conditions())?;
 
         let outputs: Box<[PortName]> = table
             .routes
             .iter()
-            .map(|route| PortName::from(route.output.clone()))
+            .map(|route| PortName::from(route.to.clone()))
             .collect();
 
         Ok(Self {
             conditions,
             outputs,
-            default_output: table.default_output.clone().map(PortName::from),
+            default_output: table.default_to.clone().map(PortName::from),
             admission: ExclusiveRouteScheduler::new(config.admission_policy),
             metrics: Some(pipeline_ctx.register_metrics::<TenantRouterMetrics>()),
         })
@@ -591,7 +554,7 @@ impl local::Processor<OtapPdata> for TenantRouter {
                             effect_handler
                                 .notify_nack(NackMsg::new_permanent(
                                     "tenant_router: no tenant condition matched and no \
-                                     default_output is configured"
+                                     default_to is configured"
                                         .to_owned(),
                                     data,
                                 ))
@@ -636,7 +599,9 @@ mod tests {
     use otap_df_config::tenant::compiled::{
         TenantTokenRegistry, TenantTokenRegistryBuilder, TokenInputs, TokenScratch,
     };
-    use otap_df_config::tenant::{Extractor, TenantTokenSpec, TenantTokens};
+    use otap_df_config::tenant::{
+        Condition, Entry, Extractor, TenantRoute, TenantTokenSpec, TenantTokens,
+    };
     use otap_df_engine::context::ControllerContext;
     use otap_df_engine::local::message::LocalSender;
     use otap_df_engine::local::processor::{EffectHandler as LocalEffectHandler, Processor as _};
@@ -679,22 +644,22 @@ mod tests {
         Arc::new(builder.build(0).expect("registry builds"))
     }
 
-    fn route(value: &str, output: &str) -> TenantOutputRoute {
-        TenantOutputRoute {
+    fn route(value: &str, to: &str) -> TenantRoute {
+        TenantRoute {
             entries: vec![Entry {
                 key: "tenant_id".to_owned(),
                 value: Some(value.to_owned()),
             }],
-            output: output.to_owned(),
+            to: to.to_owned(),
         }
     }
 
-    fn config(routes: Vec<TenantOutputRoute>, default_output: Option<&str>) -> TenantRouterConfig {
+    fn config(routes: Vec<TenantRoute>, default_to: Option<&str>) -> TenantRouterConfig {
         TenantRouterConfig {
-            tenant_routing: TenantRouteTable {
+            tenant_routing: TenantRouting {
                 tenant_tokens: Vec::new(),
                 routes,
-                default_output: default_output.map(str::to_owned),
+                default_to: default_to.map(str::to_owned),
             },
             admission_policy: SelectedRouteAdmissionPolicy::default(),
         }

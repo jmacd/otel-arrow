@@ -43,13 +43,13 @@ use otap_df_config::PortName;
 use otap_df_config::tenant::compiled::{
     TenantTokenRegistry, TenantTokenRegistryBuilder, TokenInputs, TokenScratch,
 };
-use otap_df_config::tenant::{Condition, Entry, Extractor, TenantTokenSpec, TenantTokens};
+use otap_df_config::tenant::{
+    Condition, Entry, Extractor, TenantRoute, TenantRouting, TenantTokenSpec, TenantTokens,
+};
 use otap_df_core_nodes::processors::signal_type_router::{
     PORT_LOGS, SignalTypeRouter, SignalTypeRouterConfig,
 };
-use otap_df_core_nodes::processors::tenant_router::{
-    TenantOutputRoute, TenantRouteTable, TenantRouter, TenantRouterConfig,
-};
+use otap_df_core_nodes::processors::tenant_router::{TenantRouter, TenantRouterConfig};
 use otap_df_engine::context::{ControllerContext, PipelineContext};
 use otap_df_engine::local::message::LocalSender;
 use otap_df_engine::local::processor::{EffectHandler as LocalEffectHandler, Processor as _};
@@ -131,18 +131,18 @@ fn registry(routes: usize) -> Arc<TenantTokenRegistry> {
 
 fn tenant_router(registry: Arc<TenantTokenRegistry>, routes: usize) -> TenantRouter {
     let config = TenantRouterConfig {
-        tenant_routing: TenantRouteTable {
+        tenant_routing: TenantRouting {
             tenant_tokens: Vec::new(),
             routes: (0..routes)
-                .map(|i| TenantOutputRoute {
+                .map(|i| TenantRoute {
                     entries: vec![Entry {
                         key: "tenant_id".to_owned(),
                         value: Some(tenant_value(i)),
                     }],
-                    output: port_name(i),
+                    to: port_name(i),
                 })
                 .collect(),
-            default_output: None,
+            default_to: None,
         },
         admission_policy: Default::default(),
     };

@@ -193,76 +193,37 @@ pub struct Condition {
 /// Engine-level map of tenant token definitions, shared across pipeline groups.
 pub type TenantTokens = HashMap<TenantTokenId, TenantTokenSpec>;
 
-/// Node configuration key holding a tenant route table.
+/// Node configuration key holding a [`TenantRouting`] route table.
 ///
 /// Every node that decides a destination from a tenant condition puts its
-/// route table under this key, so the controller can find the conditions
+/// route table under this key, so the controller can collect the conditions
 /// without knowing which node types exist.
 pub const TENANT_ROUTING_KEY: &str = "tenant_routing";
 
-/// One route, as the controller reads it.
+/// Node configuration key holding [`TenantContextRules`].
 ///
-/// Only `entries` is read. The destination a route selects -- an output port
-/// for `processor:tenant_router`, a topic for `exporter:topic` -- is left to
-/// the node, which is why this type does not deny unknown fields.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-pub struct DeclaredRoute {
-    /// Entries that must all match for this route to be selected.
-    #[serde(default)]
-    pub entries: Vec<Entry>,
-}
+/// Both sides of a boundary use the same key, so the allowlist that lets a
+/// value out and the allowlist that lets it back in read the same way.
+pub const TENANT_CONTEXT_KEY: &str = "tenant_context";
 
-/// The part of a node's route table the controller must read before the
-/// tenant token registry is frozen.
+/// One route: the condition that selects it and the destination it names.
 ///
-/// A condition can only be looked up after the build if it was interned
-/// before it, because the registry assigns a signature and a dense pair slot
-/// per (token, signature) at build time. Collecting conditions from every
-/// node is therefore not an optimization; it is what makes a node's own
-/// `condition_set` call resolvable at all.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-pub struct DeclaredTenantRoutes {
-    /// Tenant tokens the node binds. Empty binds every declared token.
-    #[serde(default)]
-    pub tenant_tokens: Vec<TenantTokenId>,
-    /// Routes the node evaluates, in first-match-wins order.
-    #[serde(default)]
-    pub routes: Vec<DeclaredRoute>,
-}
-
-impl DeclaredTenantRoutes {
-    /// The routes' conditions, in route order.
-    #[must_use]
-    pub fn conditions(&self) -> Vec<Condition> {
-        self.routes
-            .iter()
-            .map(|route| Condition {
-                entries: route.entries.clone(),
-            })
-            .collect()
-    }
-
-    /// The bound token names, or `None` to bind every declared token.
-    #[must_use]
-    pub fn bound_tokens(&self) -> Option<&[TenantTokenId]> {
-        (!self.tenant_tokens.is_empty()).then_some(self.tenant_tokens.as_slice())
-    }
-}
-
-/// One route of a tenant-token router: a condition plus the destination topic
-/// selected when that condition is the first match.
+/// The destination is a plain name because what it names depends on the node
+/// evaluating it -- an output port for `processor:tenant_router`, a topic for
+/// `exporter:topic`. Keeping one route type means both kinds of routing are
+/// declared, collected and validated by the same code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TenantRoute {
     /// Entries that must all match for this route to be selected.
     pub entries: Vec<Entry>,
-    /// Destination topic name.
-    pub topic: String,
+    /// Destination this route selects, interpreted by the node.
+    pub to: String,
 }
 
-/// Tenant-token routing configuration shared by the controller (which must
-/// know every declared condition before nodes are built) and the routing node
-/// itself.
+/// Tenant-token routing configuration, shared by the controller -- which must
+/// know every declared condition before nodes are built -- and by each routing
+/// node itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TenantRouting {
@@ -271,12 +232,10 @@ pub struct TenantRouting {
     pub tenant_tokens: Vec<TenantTokenId>,
     /// Routes evaluated first-match-wins.
     pub routes: Vec<TenantRoute>,
-    /// Keys allowed to cross the topic boundary with the published data.
-    #[serde(default)]
-    pub export: TenantBoundaryPolicy,
-    /// Topic used when no route matches. Without it, unmatched data is nacked.
+    /// Destination used when no route matches. Without it, unmatched data is
+    /// nacked rather than delivered somewhere arbitrary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_topic: Option<String>,
+    pub default_to: Option<String>,
 }
 
 /// Names an outbound header and the token key whose retained value fills it.
@@ -319,7 +278,13 @@ impl TenantBoundaryPolicy {
     }
 }
 
-/// Rules a boundary-crossing receiver uses to build a fresh request context.
+/// What tenant material may cross one boundary, in both directions.
+///
+/// A boundary is the only place tenant material can leak between tenants, so
+/// each side names an explicit allowlist and everything unnamed is dropped.
+/// One type serves both sides: an egress node reads `export`, an ingress node
+/// reads `import` and `tenant_tokens`, and a node that is both reads all
+/// three.
 ///
 /// The inbound context from the upstream pipeline is never adopted as-is. The
 /// receiver admits the keys its `import` policy names, then resolves its own
@@ -329,19 +294,25 @@ impl TenantBoundaryPolicy {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TenantContextRules {
-    /// Keys admitted from the inbound cross-boundary context.
+    /// Keys admitted from the inbound cross-boundary context. Read by the
+    /// ingress side of a boundary.
     #[serde(default)]
     pub import: TenantBoundaryPolicy,
+    /// Keys allowed to leave with the published data. Read by the egress side
+    /// of a boundary, and independent of whether that side also routes: a node
+    /// publishing to one fixed destination still has a boundary to police.
+    #[serde(default)]
+    pub export: TenantBoundaryPolicy,
     /// Tokens resolved after import. Empty resolves every declared token.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tokens: Vec<TenantTokenId>,
+    pub tenant_tokens: Vec<TenantTokenId>,
 }
 
 impl TenantContextRules {
     /// The bound token names, or `None` to bind every declared token.
     #[must_use]
     pub fn bound_tokens(&self) -> Option<&[TenantTokenId]> {
-        (!self.tokens.is_empty()).then_some(self.tokens.as_slice())
+        (!self.tenant_tokens.is_empty()).then_some(self.tenant_tokens.as_slice())
     }
 }
 

@@ -59,7 +59,7 @@ use otap_df_config::policy::{
     TelemetryPolicy,
 };
 use otap_df_config::tenant::compiled::{TenantTokenRegistry, TenantTokenRegistryBuilder};
-use otap_df_config::tenant::{DeclaredTenantRoutes, TENANT_ROUTING_KEY};
+use otap_df_config::tenant::{TENANT_ROUTING_KEY, TenantRouting};
 use otap_df_config::topic::{
     TopicAckPropagationMode, TopicBackendKind, TopicBroadcastAckMode, TopicBroadcastOnLagPolicy,
     TopicImplSelectionPolicy, TopicSpec,
@@ -1112,7 +1112,7 @@ impl<
     /// Order is fixed because pair slots are assigned in declaration order and
     /// every packed context is addressed by them; iterating the config's maps
     /// directly would renumber the slots from run to run.
-    fn declared_tenant_routes(config: &OtelDataflowSpec) -> Vec<(String, DeclaredTenantRoutes)> {
+    fn declared_tenant_routes(config: &OtelDataflowSpec) -> Vec<(String, TenantRouting)> {
         let mut found = Vec::new();
         let mut group_ids: Vec<&PipelineGroupId> = config.groups.keys().collect();
         group_ids.sort();
@@ -1132,8 +1132,7 @@ impl<
                     // full shape and reports it against its own field names.
                     // Skipping it here only leaves its conditions uninterned,
                     // and the node fails to build on the same input anyway.
-                    let Ok(declared) = serde_json::from_value::<DeclaredTenantRoutes>(raw.clone())
-                    else {
+                    let Ok(declared) = serde_json::from_value::<TenantRouting>(raw.clone()) else {
                         continue;
                     };
                     if declared.routes.is_empty() {
@@ -4296,7 +4295,7 @@ groups:
                   - entries:
                       - key: tenant_id
                         value: acme
-                    output: acme_port
+                    to: acme_port
 "#,
         );
 
