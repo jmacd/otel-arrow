@@ -400,6 +400,15 @@ impl Context {
         self.tenant = Some(tenant);
     }
 
+    /// Drop the packed tenant context.
+    ///
+    /// Used at a boundary that admits nothing: the packed buffer is shared and
+    /// immutable, so a value can only be withheld by not handing the buffer
+    /// on, never by editing it.
+    pub fn clear_tenant(&mut self) {
+        self.tenant = None;
+    }
+
     /// Returns the peer address observed by the receiving socket, if any.
     #[must_use]
     pub fn peer_addr(&self) -> Option<SocketAddr> {
@@ -805,6 +814,11 @@ impl OtapPdata {
     /// Set the packed tenant context.
     pub fn set_tenant(&mut self, tenant: Arc<[u64]>) {
         self.context.set_tenant(tenant);
+    }
+
+    /// Drop the packed tenant context.
+    pub fn clear_tenant(&mut self) {
+        self.context.clear_tenant();
     }
 
     /// Returns the peer address observed by the receiving socket, if any.

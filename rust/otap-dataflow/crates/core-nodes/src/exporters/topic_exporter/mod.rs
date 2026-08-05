@@ -9,6 +9,8 @@ use linkme::distributed_slice;
 use otap_df_config::TopicName;
 use otap_df_config::error::Error as ConfigError;
 use otap_df_config::node::NodeUserConfig;
+use otap_df_config::tenant::compiled::{ConditionSet, KeyId, TenantTokenRegistry, TokenScratch};
+use otap_df_config::tenant::{TenantContextRules, TenantRouting};
 use otap_df_config::topic::{TopicAckPropagationMode, TopicQueueOnFullPolicy};
 use otap_df_engine::config::ExporterConfig;
 use otap_df_engine::context::PipelineContext;
@@ -74,25 +76,161 @@ pub struct TopicExporterMetrics {
     /// Number of pending end-to-end messages nacked during shutdown.
     #[metric(unit = "{item}")]
     pub shutdown_nacks: Counter<u64>,
+    /// Number of messages nacked because no tenant condition selected a topic
+    /// and no default was configured.
+    #[metric(unit = "{item}")]
+    pub unroutable_messages: Counter<u64>,
 }
 
 /// Topic exporter configuration.
+///
+/// Publishes to one fixed topic, or selects the topic from the request's
+/// tenant context:
+///
+/// ```yaml
+/// type: exporter:topic
+/// config:
+///   tenant_routing:
+///     routes:
+///       - entries: [{ key: tenant_id, value: acme }]
+///         to: acme_topic
+///     default_to: unmatched_topic
+///   tenant_context:
+///     export:
+///       allow_keys: [tenant_id]
+/// ```
+///
+/// `tenant_routing` is the same [`TenantRouting`] a `processor:tenant_router`
+/// declares; only the meaning of `to` differs, a topic here rather than an
+/// output port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TopicExporterConfig {
-    /// Topic name to publish to.
-    pub topic: TopicName,
+    /// Topic name to publish to. Required unless `tenant_routing` selects one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<TopicName>,
     /// Optional local override for publish behavior when topic queue is full.
     /// If omitted, runtime falls back to the topic declaration policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_on_full: Option<TopicQueueOnFullPolicy>,
+    /// Conditions selecting the destination topic, first match wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_routing: Option<TenantRouting>,
+    /// What tenant material may leave with the published data.
+    #[serde(default)]
+    pub tenant_context: TenantContextRules,
+}
+
+impl TopicExporterConfig {
+    /// Every topic this exporter can publish to, in destination order.
+    ///
+    /// A topic named by several routes appears once: two handles to one topic
+    /// would mean two tracked publishers, and an end-to-end outcome would have
+    /// to be matched against whichever of them happened to publish.
+    fn destination_names(&self) -> Result<Vec<TopicName>, ConfigError> {
+        let mut names: Vec<TopicName> = Vec::new();
+        let push = |name: TopicName, names: &mut Vec<TopicName>| {
+            if !names.iter().any(|n| n == &name) {
+                names.push(name);
+            }
+        };
+        if let Some(topic) = &self.topic {
+            push(topic.clone(), &mut names);
+        }
+        if let Some(routing) = &self.tenant_routing {
+            for route in &routing.routes {
+                push(Self::parse_topic(&route.to)?, &mut names);
+            }
+            if let Some(default) = &routing.default_to {
+                push(Self::parse_topic(default)?, &mut names);
+            }
+        }
+        Ok(names)
+    }
+
+    fn parse_topic(raw: &str) -> Result<TopicName, ConfigError> {
+        TopicName::parse(raw).map_err(|e| ConfigError::InvalidUserConfig {
+            error: format!("invalid topic name `{raw}` in topic exporter routing: {e}"),
+        })
+    }
+
+    /// Rejects configurations whose destination could not be decided.
+    fn validate(&self) -> Result<(), ConfigError> {
+        match (&self.topic, &self.tenant_routing) {
+            (None, None) => Err(ConfigError::InvalidUserConfig {
+                error: "topic exporter needs either `topic` or `tenant_routing`".to_owned(),
+            }),
+            // Two fallbacks for one decision, and nothing says which wins.
+            // `tenant_routing.default_to` is the one that belongs to routing.
+            (Some(_), Some(_)) => Err(ConfigError::InvalidUserConfig {
+                error: "topic exporter declares both `topic` and `tenant_routing`; \
+                        name the fallback as `tenant_routing.default_to` instead"
+                    .to_owned(),
+            }),
+            _ => Ok(()),
+        }?;
+        if let Some(routing) = &self.tenant_routing {
+            if routing.routes.is_empty() {
+                return Err(ConfigError::InvalidUserConfig {
+                    error: "tenant_routing.routes must not be empty".to_owned(),
+                });
+            }
+            for (idx, route) in routing.routes.iter().enumerate() {
+                if route.entries.is_empty() {
+                    return Err(ConfigError::InvalidUserConfig {
+                        error: format!("tenant_routing.routes[{idx}] declares no entries"),
+                    });
+                }
+                let _ = Self::parse_topic(&route.to)?;
+            }
+            if let Some(default) = &routing.default_to {
+                let _ = Self::parse_topic(default)?;
+            }
+        }
+        let _ = self.destination_names()?;
+        Ok(())
+    }
+}
+
+/// One topic this exporter can publish to, with the policies that topic's own
+/// declaration settled.
+///
+/// Policies are per destination rather than per node because they come from
+/// the topic being published to: two tenants' topics may disagree about
+/// queue-full handling and ack propagation, and a routing exporter must honor
+/// whichever one it selected.
+struct Destination {
+    topic: TopicHandle<OtapPdata>,
+    queue_on_full: TopicQueueOnFullPolicy,
+    ack_propagation_mode: TopicAckPropagationMode,
+}
+
+/// How a message's destination is decided.
+enum TopicSelector {
+    /// Every message goes to the single declared topic.
+    Fixed,
+    /// The request's tenant context selects the topic, first match wins.
+    Tenant {
+        /// Compiled probe tables for the declared conditions.
+        conditions: ConditionSet,
+        /// Destination index per condition index, in route order.
+        routes: Box<[usize]>,
+    },
 }
 
 /// Exporter for topic publishing.
 pub struct TopicExporter {
-    topic: TopicHandle<OtapPdata>,
-    queue_on_full: TopicQueueOnFullPolicy,
-    ack_propagation_mode: TopicAckPropagationMode,
+    /// Topics this exporter may publish to; index 0 is the fixed topic when
+    /// the exporter does not route.
+    destinations: Box<[Destination]>,
+    selector: TopicSelector,
+    /// Destination for data matching no route. Without it, unmatched data is
+    /// nacked rather than published to a topic belonging to another tenant.
+    default_destination: Option<usize>,
+    /// Keys allowed to cross this boundary with the published data.
+    export: Box<[KeyId]>,
+    /// Registry backing the boundary repack, when any key is allowed out.
+    registry: Option<Arc<TenantTokenRegistry>>,
     metrics: MetricSet<TopicExporterMetrics>,
 }
 
@@ -126,30 +264,84 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
                 .ok_or_else(|| ConfigError::InvalidUserConfig {
                     error: "Topic set is not available in pipeline context".to_owned(),
                 })?;
-        let topic_binding =
-            topic_set
-                .get_required(&config.topic)
-                .map_err(|_| ConfigError::InvalidUserConfig {
-                    error: format!(
-                        "Unknown topic `{}` for topic exporter (pipeline `{}`/`{}`)",
-                        config.topic,
-                        pipeline.pipeline_group_id(),
-                        pipeline.pipeline_id(),
-                    ),
-                })?;
-        let queue_on_full = config
-            .queue_on_full
-            .clone()
-            .unwrap_or_else(|| topic_binding.default_queue_on_full());
-        let ack_propagation_mode = topic_binding.default_ack_propagation_mode();
-        let metrics = pipeline
-            .register_metrics_with_topic::<TopicExporterMetrics>(topic_binding.name().into());
-        let topic = topic_binding.into_handle();
-        Ok(ExporterWrapper::local(
-            TopicExporter {
-                topic,
+
+        let names = config.destination_names()?;
+        let mut destinations = Vec::with_capacity(names.len());
+        for name in &names {
+            let binding =
+                topic_set
+                    .get_required(name)
+                    .map_err(|_| ConfigError::InvalidUserConfig {
+                        error: format!(
+                            "Unknown topic `{}` for topic exporter (pipeline `{}`/`{}`)",
+                            name,
+                            pipeline.pipeline_group_id(),
+                            pipeline.pipeline_id(),
+                        ),
+                    })?;
+            let queue_on_full = config
+                .queue_on_full
+                .clone()
+                .unwrap_or_else(|| binding.default_queue_on_full());
+            let ack_propagation_mode = binding.default_ack_propagation_mode();
+            destinations.push(Destination {
                 queue_on_full,
                 ack_propagation_mode,
+                topic: binding.into_handle(),
+            });
+        }
+        let index_of = |raw: &str| -> usize {
+            let parsed = TopicExporterConfig::parse_topic(raw).expect("validated above");
+            names
+                .iter()
+                .position(|n| n == &parsed)
+                .expect("every route topic was collected")
+        };
+
+        let (selector, default_destination) = match &config.tenant_routing {
+            None => (TopicSelector::Fixed, Some(0usize)),
+            Some(routing) => {
+                let registry = pipeline.tenant_registry().cloned().ok_or_else(|| {
+                    ConfigError::InvalidUserConfig {
+                        error: "topic exporter routes on tenant conditions, but this \
+                                engine declares no `tenant_tokens`"
+                            .to_owned(),
+                    }
+                })?;
+                let conditions =
+                    registry.condition_set(routing.bound_tokens(), &routing.conditions())?;
+                let routes: Box<[usize]> = routing.routes.iter().map(|r| index_of(&r.to)).collect();
+                (
+                    TopicSelector::Tenant { conditions, routes },
+                    routing.default_to.as_deref().map(index_of),
+                )
+            }
+        };
+
+        // A metric is attributed to a topic only when the node has exactly
+        // one. A routing exporter spans several, and labelling its counters
+        // with whichever one happened to be listed first would misreport
+        // every other tenant's traffic as belonging to that topic.
+        let metrics = match (&config.tenant_routing, names.first()) {
+            (None, Some(name)) => {
+                pipeline.register_metrics_with_topic::<TopicExporterMetrics>(name.into())
+            }
+            _ => pipeline.register_metrics::<TopicExporterMetrics>(),
+        };
+
+        let registry = pipeline.tenant_registry().cloned();
+        let export = match (&registry, config.tenant_context.export.is_empty()) {
+            (Some(registry), false) => registry.compile_policy(&config.tenant_context.export),
+            _ => Box::from([]),
+        };
+
+        Ok(ExporterWrapper::local(
+            TopicExporter {
+                destinations: destinations.into_boxed_slice(),
+                selector,
+                default_destination,
+                export,
+                registry,
                 metrics,
             },
             node,
@@ -164,9 +356,61 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
 impl TopicExporter {
     /// Parses and validates topic exporter configuration.
     pub fn parse_config(config: &Value) -> Result<TopicExporterConfig, ConfigError> {
-        serde_json::from_value(config.clone()).map_err(|e| ConfigError::InvalidUserConfig {
-            error: format!("Failed to parse topic exporter config: {e}"),
-        })
+        let config: TopicExporterConfig =
+            serde_json::from_value(config.clone()).map_err(|e| ConfigError::InvalidUserConfig {
+                error: format!("Failed to parse topic exporter config: {e}"),
+            })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// The destination for one message, or `None` when nothing selects it.
+    ///
+    /// Falling back to some other tenant's topic is the one outcome this must
+    /// never produce, so an unmatched message resolves to the declared default
+    /// or to nothing at all.
+    fn select(
+        selector: &TopicSelector,
+        default_destination: Option<usize>,
+        data: &OtapPdata,
+    ) -> Option<usize> {
+        match selector {
+            TopicSelector::Fixed => Some(0),
+            TopicSelector::Tenant { conditions, routes } => data
+                .tenant_view()
+                .and_then(|view| conditions.first_match(&view))
+                .and_then(|idx| routes.get(usize::from(idx)).copied())
+                .or(default_destination),
+        }
+    }
+
+    /// Repack the tenant context into what this boundary's allowlist admits.
+    ///
+    /// The published message is a fresh clone, so replacing its context here
+    /// is what actually stops unlisted keys from crossing: the packed buffer
+    /// is shared and immutable, and any byte left in it stays readable by the
+    /// pipeline on the far side.
+    fn apply_export_policy(
+        registry: Option<&Arc<TenantTokenRegistry>>,
+        export: &[KeyId],
+        data: &mut OtapPdata,
+        scratch: &mut TokenScratch,
+    ) {
+        let Some(registry) = registry else {
+            data.clear_tenant();
+            return;
+        };
+        if export.is_empty() {
+            data.clear_tenant();
+            return;
+        }
+        let repacked = data
+            .tenant_view()
+            .and_then(|view| registry.export_boundary(scratch, &view, export));
+        match repacked {
+            Some(words) => data.set_tenant(words),
+            None => data.clear_tenant(),
+        }
     }
 
     /// Convert one admitted tracked publish receipt into the exporter-owned
@@ -220,10 +464,10 @@ impl TopicExporter {
     /// path has already reported backpressure.
     fn start_blocked_publish(
         data: OtapPdata,
+        published: Arc<OtapPdata>,
         tracked_publisher: Option<&otap_df_engine::topic::TrackedTopicPublisher<OtapPdata>>,
         topic: &TopicHandle<OtapPdata>,
     ) -> BlockedPublish {
-        let published = Arc::new(data.clone_without_context());
         let future: Pin<Box<dyn Future<Output = Result<BlockedPublishCompletion, Error>>>> =
             if let Some(tracked_publisher) = tracked_publisher.cloned() {
                 Box::pin(async move {
@@ -247,6 +491,7 @@ impl TopicExporter {
     /// wait inside the topic runtime.
     async fn handle_pdata_message(
         data: OtapPdata,
+        published: Arc<OtapPdata>,
         queue_on_full: &TopicQueueOnFullPolicy,
         ack_propagation_mode: TopicAckPropagationMode,
         topic: &TopicHandle<OtapPdata>,
@@ -263,13 +508,12 @@ impl TopicExporter {
 
         match queue_on_full {
             TopicQueueOnFullPolicy::Block => {
-                let published = Arc::new(data.clone_without_context());
                 // Preserve a cheap uncontended fast path: only retain a blocked
                 // publish when the topic runtime reports real backpressure.
                 if should_track_end_to_end {
                     let tracked_publisher = tracked_publisher
                         .expect("tracked publisher should exist when ack propagation is auto");
-                    match tracked_publisher.try_publish(published)? {
+                    match tracked_publisher.try_publish(published.clone())? {
                         TrackedTryPublishOutcome::Published(receipt) => {
                             Self::record_tracked_publish(
                                 receipt,
@@ -281,25 +525,29 @@ impl TopicExporter {
                             Ok(None)
                         }
                         TrackedTryPublishOutcome::DroppedOnFull
-                        | TrackedTryPublishOutcome::MaxInFlightReached => Ok(Some(
-                            Self::start_blocked_publish(data, Some(tracked_publisher), topic),
-                        )),
+                        | TrackedTryPublishOutcome::MaxInFlightReached => {
+                            Ok(Some(Self::start_blocked_publish(
+                                data,
+                                published,
+                                Some(tracked_publisher),
+                                topic,
+                            )))
+                        }
                     }
                 } else {
-                    match topic.try_publish(published)? {
+                    match topic.try_publish(published.clone())? {
                         PublishOutcome::Published => {
                             metrics.published_messages.add(1);
                             effect_handler.notify_ack(AckMsg::new(data)).await?;
                             Ok(None)
                         }
-                        PublishOutcome::DroppedOnFull => {
-                            Ok(Some(Self::start_blocked_publish(data, None, topic)))
-                        }
+                        PublishOutcome::DroppedOnFull => Ok(Some(Self::start_blocked_publish(
+                            data, published, None, topic,
+                        ))),
                     }
                 }
             }
             TopicQueueOnFullPolicy::DropNewest => {
-                let published = Arc::new(data.clone_without_context());
                 if should_track_end_to_end {
                     let tracked_publisher = tracked_publisher
                         .expect("tracked publisher should exist when ack propagation is auto");
@@ -378,11 +626,15 @@ impl Exporter<OtapPdata> for TopicExporter {
         effect_handler: EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
         let TopicExporter {
-            topic,
-            queue_on_full,
-            ack_propagation_mode,
+            destinations,
+            selector,
+            default_destination,
+            export,
+            registry,
             mut metrics,
         } = *self;
+        let destinations = &destinations;
+        let mut scratch = TokenScratch::new();
 
         let mut pending_messages: HashMap<u64, OtapPdata> = HashMap::new();
         let mut pending_outcomes: FuturesUnordered<
@@ -393,16 +645,29 @@ impl Exporter<OtapPdata> for TopicExporter {
         // control-only reads so shutdown stays responsive and ownership of the
         // blocked pdata remains unambiguous.
         let mut blocked_publish: Option<BlockedPublish> = None;
-        let tracked_publisher = (ack_propagation_mode == TopicAckPropagationMode::Auto)
-            .then(|| topic.tracked_publisher());
+        // One tracked publisher per destination: an end-to-end outcome is
+        // matched against the publisher that produced it, so a routing
+        // exporter cannot share one across topics.
+        let tracked_publishers: Vec<
+            Option<otap_df_engine::topic::TrackedTopicPublisher<OtapPdata>>,
+        > = destinations
+            .iter()
+            .map(|d| {
+                (d.ack_propagation_mode == TopicAckPropagationMode::Auto)
+                    .then(|| d.topic.tracked_publisher())
+            })
+            .collect();
 
         let exporter_id = effect_handler.exporter_id();
+        let topic_names: Vec<&str> = destinations
+            .iter()
+            .map(|d| d.topic.name().as_ref())
+            .collect();
         otel_info!(
             "topic_exporter.start",
             node = exporter_id.name.as_ref(),
-            topic = topic.name().as_ref(),
-            queue_on_full = format!("{queue_on_full:?}"),
-            ack_propagation = format!("{ack_propagation_mode:?}"),
+            topic = topic_names.join(","),
+            routed = matches!(selector, TopicSelector::Tenant { .. }),
             message = "Topic exporter started"
         );
 
@@ -557,19 +822,46 @@ impl Exporter<OtapPdata> for TopicExporter {
                                 .await?;
                                 break;
                             }
-                            Message::PData(data) => {
-                                blocked_publish = Self::handle_pdata_message(
-                                    data,
-                                    &queue_on_full,
-                                    ack_propagation_mode,
-                                    &topic,
-                                    tracked_publisher.as_ref(),
-                                    &effect_handler,
-                                    &mut metrics,
-                                    &mut pending_messages,
-                                    &mut pending_outcomes,
-                                )
-                                .await?;
+                            Message::PData(mut data) => {
+                                // Selecting first means an unroutable message
+                                // is refused before anything is published, so
+                                // it can never reach another tenant's topic.
+                                match Self::select(&selector, default_destination, &data) {
+                                    Some(idx) => {
+                                        let mut published = data.clone_without_context();
+                                        Self::apply_export_policy(
+                                            registry.as_ref(),
+                                            &export,
+                                            &mut published,
+                                            &mut scratch,
+                                        );
+                                        let destination = &destinations[idx];
+                                        blocked_publish = Self::handle_pdata_message(
+                                            data,
+                                            Arc::new(published),
+                                            &destination.queue_on_full,
+                                            destination.ack_propagation_mode,
+                                            &destination.topic,
+                                            tracked_publishers[idx].as_ref(),
+                                            &effect_handler,
+                                            &mut metrics,
+                                            &mut pending_messages,
+                                            &mut pending_outcomes,
+                                        )
+                                        .await?;
+                                    }
+                                    None => {
+                                        data.clear_tenant();
+                                        metrics.unroutable_messages.add(1);
+                                        effect_handler
+                                            .notify_nack(NackMsg::new_permanent(
+                                                "topic exporter: no tenant condition matched \
+                                                 and no default_to is configured",
+                                                data,
+                                            ))
+                                            .await?;
+                                    }
+                                }
                                 tokio::task::consume_budget().await;
                             }
                             Message::Control(_) => {}
@@ -616,7 +908,7 @@ mod tests {
     #[test]
     fn parse_config_accepts_minimal_topic() {
         let cfg = TopicExporter::parse_config(&json!({"topic": "raw"})).expect("valid config");
-        assert_eq!(cfg.topic.as_ref(), "raw");
+        assert_eq!(cfg.topic.expect("topic parsed").as_ref(), "raw");
         assert!(cfg.queue_on_full.is_none());
     }
 
@@ -627,7 +919,7 @@ mod tests {
             "queue_on_full": "drop_newest"
         }))
         .expect("valid config");
-        assert_eq!(cfg.topic.as_ref(), "raw");
+        assert_eq!(cfg.topic.expect("topic parsed").as_ref(), "raw");
         assert_eq!(cfg.queue_on_full, Some(TopicQueueOnFullPolicy::DropNewest));
     }
 
@@ -646,6 +938,103 @@ mod tests {
         let err = TopicExporter::parse_config(&json!({"topic": "   "}))
             .expect_err("empty topic should fail");
         assert!(err.to_string().contains("topic name must be non-empty"));
+    }
+
+    /// Scenario: a topic exporter declares neither a fixed `topic` nor a
+    /// `tenant_routing` table, so nothing decides where its data goes.
+    /// Guarantees: the configuration is rejected at parse time rather than
+    /// producing an exporter that cannot name a destination for any message.
+    #[test]
+    fn parse_config_rejects_a_destination_that_is_never_decided() {
+        let err = TopicExporter::parse_config(&json!({}))
+            .expect_err("a config with no destination should fail");
+        assert!(
+            err.to_string()
+                .contains("either `topic` or `tenant_routing`")
+        );
+    }
+
+    /// Scenario: a topic exporter declares both a fixed `topic` and a
+    /// `tenant_routing` table, which offer two different fallbacks for one
+    /// decision.
+    /// Guarantees: the ambiguity is refused and the operator is pointed at
+    /// `tenant_routing.default_to`, so unmatched data can never silently take
+    /// whichever fallback happened to win.
+    #[test]
+    fn parse_config_rejects_both_a_fixed_topic_and_routing() {
+        let err = TopicExporter::parse_config(&json!({
+            "topic": "raw",
+            "tenant_routing": {
+                "routes": [{"entries": [{"key": "tenant_id", "value": "acme"}], "to": "acme"}]
+            }
+        }))
+        .expect_err("declaring both should fail");
+        assert!(err.to_string().contains("default_to"));
+    }
+
+    /// Scenario: a routing table names the same topic from two routes, and
+    /// also as the default.
+    /// Guarantees: the topic is bound once. A second handle would mean a
+    /// second tracked publisher for one topic, and an end-to-end outcome
+    /// could then be matched against a publisher that did not send it.
+    #[test]
+    fn one_topic_named_twice_is_bound_once() {
+        let cfg = TopicExporter::parse_config(&json!({
+            "tenant_routing": {
+                "routes": [
+                    {"entries": [{"key": "tenant_id", "value": "acme"}], "to": "shared"},
+                    {"entries": [{"key": "tenant_id", "value": "globex"}], "to": "shared"}
+                ],
+                "default_to": "shared"
+            }
+        }))
+        .expect("valid config");
+        let names = cfg.destination_names().expect("topics parse");
+        assert_eq!(
+            names.len(),
+            1,
+            "one topic should be bound once, got {names:?}"
+        );
+    }
+
+    /// Scenario: a routing table lists its routes and a distinct default.
+    /// Guarantees: destinations are collected in route order with the default
+    /// last, because a route's index into that list is what the compiled
+    /// condition set resolves to at runtime.
+    #[test]
+    fn destinations_follow_route_order() {
+        let cfg = TopicExporter::parse_config(&json!({
+            "tenant_routing": {
+                "routes": [
+                    {"entries": [{"key": "tenant_id", "value": "acme"}], "to": "acme_topic"},
+                    {"entries": [{"key": "tenant_id", "value": "globex"}], "to": "globex_topic"}
+                ],
+                "default_to": "unmatched"
+            }
+        }))
+        .expect("valid config");
+        let names: Vec<String> = cfg
+            .destination_names()
+            .expect("topics parse")
+            .iter()
+            .map(|n| n.as_ref().to_owned())
+            .collect();
+        assert_eq!(names, vec!["acme_topic", "globex_topic", "unmatched"]);
+    }
+
+    /// Scenario: an exporter publishing to one fixed topic declares an export
+    /// allowlist.
+    /// Guarantees: the boundary policy parses without a route table. A node
+    /// with a single destination still has a boundary to police, and
+    /// requiring routes to express that would force operators to invent them.
+    #[test]
+    fn a_fixed_topic_can_still_declare_an_export_allowlist() {
+        let cfg = TopicExporter::parse_config(&json!({
+            "topic": "raw",
+            "tenant_context": {"export": {"allow_keys": ["tenant_id"]}}
+        }))
+        .expect("valid config");
+        assert_eq!(cfg.tenant_context.export.allow_keys, vec!["tenant_id"]);
     }
 
     #[test]
