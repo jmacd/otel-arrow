@@ -59,6 +59,7 @@ use otap_df_config::policy::{
     TelemetryPolicy,
 };
 use otap_df_config::tenant::compiled::{TenantTokenRegistry, TenantTokenRegistryBuilder};
+use otap_df_config::tenant::{DeclaredTenantRoutes, TENANT_ROUTING_KEY};
 use otap_df_config::topic::{
     TopicAckPropagationMode, TopicBackendKind, TopicBroadcastAckMode, TopicBroadcastOnLagPolicy,
     TopicImplSelectionPolicy, TopicSpec,
@@ -1069,6 +1070,11 @@ impl<
     /// registry assigns the key numbering that every node in the engine reads
     /// positionally. Compiling per pipeline would risk two groups disagreeing
     /// about what slot 3 means.
+    ///
+    /// Every node's conditions are declared here too, and they have to be: the
+    /// registry interns each condition's literals and assigns it a dense pair
+    /// slot at build time, so a condition a node did not declare before the
+    /// freeze cannot be looked up after it.
     fn declare_tenant_tokens(
         config: &OtelDataflowSpec,
     ) -> Result<Option<Arc<TenantTokenRegistry>>, Error> {
@@ -1083,8 +1089,61 @@ impl<
             }),
         };
         builder.add_tokens(tokens).map_err(compile_error)?;
+        for (node, declared) in Self::declared_tenant_routes(config) {
+            builder
+                .declare_conditions(declared.bound_tokens(), &declared.conditions())
+                .map_err(|e| Error::PipelineRuntimeError {
+                    source: Box::new(EngineError::InternalError {
+                        message: format!("node `{node}` declares invalid tenant routing: {e}"),
+                    }),
+                })?;
+        }
         let registry = builder.build(0).map_err(compile_error)?;
         Ok(Some(Arc::new(registry)))
+    }
+
+    /// Every node route table in the engine, in a deterministic order.
+    ///
+    /// A node that decides a destination from a tenant condition puts its
+    /// table under [`TENANT_ROUTING_KEY`], and only the conditions are read
+    /// here. The destination each route names belongs to the node, so one
+    /// traversal serves node kinds the controller knows nothing about.
+    ///
+    /// Order is fixed because pair slots are assigned in declaration order and
+    /// every packed context is addressed by them; iterating the config's maps
+    /// directly would renumber the slots from run to run.
+    fn declared_tenant_routes(config: &OtelDataflowSpec) -> Vec<(String, DeclaredTenantRoutes)> {
+        let mut found = Vec::new();
+        let mut group_ids: Vec<&PipelineGroupId> = config.groups.keys().collect();
+        group_ids.sort();
+        for group_id in group_ids {
+            let group = &config.groups[group_id];
+            let mut pipeline_ids: Vec<&PipelineId> = group.pipelines.keys().collect();
+            pipeline_ids.sort();
+            for pipeline_id in pipeline_ids {
+                let pipeline = &group.pipelines[pipeline_id];
+                let mut nodes: Vec<_> = pipeline.node_iter().collect();
+                nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
+                for (node_id, node) in nodes {
+                    let Some(raw) = node.config.get(TENANT_ROUTING_KEY) else {
+                        continue;
+                    };
+                    // A malformed table is left to the node, which owns the
+                    // full shape and reports it against its own field names.
+                    // Skipping it here only leaves its conditions uninterned,
+                    // and the node fails to build on the same input anyway.
+                    let Ok(declared) = serde_json::from_value::<DeclaredTenantRoutes>(raw.clone())
+                    else {
+                        continue;
+                    };
+                    if declared.routes.is_empty() {
+                        continue;
+                    }
+                    found.push((format!("{group_id}/{pipeline_id}/{node_id}"), declared));
+                }
+            }
+        }
+        found
     }
 
     fn declare_topics(config: &OtelDataflowSpec) -> Result<DeclaredTopics<PData>, Error> {
@@ -2405,6 +2464,8 @@ mod tests {
     use otap_df_config::engine::{ResolvedPipelineConfig, ResolvedPipelineRole};
     use otap_df_config::node::NodeUserConfig;
     use otap_df_config::policy::{CoreRange, ResolvedPolicies, ResourcesPolicy};
+    use otap_df_config::tenant::compiled::{TenantView, TokenInputs, TokenScratch};
+    use otap_df_config::tenant::{Condition, Entry};
     use otap_df_config::topic::{TopicAckPropagationMode, TopicBroadcastOnLagPolicy};
     use otap_df_engine::config::{ExporterConfig, ProcessorConfig, ReceiverConfig};
     use otap_df_engine::control::NodeControlMsg;
@@ -4191,5 +4252,112 @@ groups:
             }
         }
         assert_eq!(broadcast_messages, 1);
+    }
+    /// Builds an engine spec with one tenant token and one node that routes
+    /// on it, exercising the controller traversal rather than a hand-built
+    /// builder.
+    fn tenant_routing_spec(routing: &str) -> OtelDataflowSpec {
+        OtelDataflowSpec::from_yaml(&format!(
+            r#"
+version: otel_dataflow/v1
+engine:
+  tenant_tokens:
+    edge:
+      extractors:
+        - key: tenant_id
+          transport_header: x-tenant-id
+          retain: true
+groups:
+  default:
+    pipelines:
+      main:
+        type: otap
+        nodes:
+          router:
+            type: processor:tenant_router
+            config:
+{routing}
+"#
+        ))
+        .expect("spec parses")
+    }
+
+    /// Scenario: a node declares tenant routes under `tenant_routing`, and the
+    /// controller compiles the engine's tokens into the shared registry.
+    /// Guarantees: the declared condition is interned before the registry is
+    /// frozen, so a node's later `condition_set` call resolves it and a
+    /// request carrying the matching header selects that route -- the
+    /// end-to-end property that makes tenant routing configurable at all.
+    #[test]
+    fn controller_declares_node_conditions_into_the_registry() {
+        let spec = tenant_routing_spec(
+            r#"              tenant_routing:
+                routes:
+                  - entries:
+                      - key: tenant_id
+                        value: acme
+                    output: acme_port
+"#,
+        );
+
+        let registry = Controller::<()>::declare_tenant_tokens(&spec)
+            .expect("registry compiles")
+            .expect("tokens were declared");
+
+        let condition = Condition {
+            entries: vec![Entry {
+                key: "tenant_id".to_owned(),
+                value: Some("acme".to_owned()),
+            }],
+        };
+        let set = registry
+            .condition_set(None, std::slice::from_ref(&condition))
+            .expect("condition was declared at build time");
+
+        let mut scratch = TokenScratch::new();
+        let words = registry
+            .resolve(
+                &mut scratch,
+                TokenInputs::new([("x-tenant-id", b"acme".as_slice())]),
+            )
+            .expect("token resolves");
+        assert_eq!(set.first_match(&TenantView::new(&words)), Some(0));
+
+        let other = registry
+            .resolve(
+                &mut scratch,
+                TokenInputs::new([("x-tenant-id", b"globex".as_slice())]),
+            )
+            .expect("token resolves");
+        assert_eq!(
+            set.first_match(&TenantView::new(&other)),
+            None,
+            "an undeclared value must not match a declared route"
+        );
+    }
+
+    /// Scenario: a node declares no tenant routes, so the registry is built
+    /// from token definitions alone.
+    /// Guarantees: looking up a condition that was never declared fails
+    /// loudly instead of silently producing a set that matches nothing, which
+    /// is what would let a misconfigured router send every tenant to its
+    /// default destination.
+    #[test]
+    fn undeclared_condition_is_rejected_by_condition_set() {
+        let spec = tenant_routing_spec("              {}\n");
+        let registry = Controller::<()>::declare_tenant_tokens(&spec)
+            .expect("registry compiles")
+            .expect("tokens were declared");
+
+        let condition = Condition {
+            entries: vec![Entry {
+                key: "tenant_id".to_owned(),
+                value: Some("acme".to_owned()),
+            }],
+        };
+        assert!(
+            registry.condition_set(None, &[condition]).is_err(),
+            "a condition never declared to the builder must not resolve"
+        );
     }
 }
