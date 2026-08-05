@@ -9,6 +9,8 @@ use otap_df_channel::error::SendError;
 use otap_df_config::TopicName;
 use otap_df_config::error::Error as ConfigError;
 use otap_df_config::node::NodeUserConfig;
+use otap_df_config::tenant::TenantContextRules;
+use otap_df_config::tenant::compiled::{BoundaryFilter, TenantTokenRegistry, TokenScratch};
 use otap_df_config::topic::{
     SubscriptionGroupName, TopicAckPropagationMode, TopicBroadcastOnLagPolicy,
 };
@@ -106,6 +108,10 @@ pub struct TopicReceiverConfig {
     /// Subscription options for this receiver.
     #[serde(default)]
     pub subscription: TopicSubscriptionConfig,
+    /// What tenant material may be admitted from the upstream pipeline, and
+    /// which tokens are rebuilt from it.
+    #[serde(default)]
+    pub tenant_context: TenantContextRules,
 }
 
 /// Subscription mode for a topic receiver.
@@ -127,13 +133,47 @@ impl Default for TopicSubscriptionConfig {
     }
 }
 
+/// Rebuilds the tenant context of each message admitted from a topic.
+///
+/// The inbound context is treated as evidence, never as identity: only the
+/// keys `import` names are visible, and the tokens rebuilt from them are the
+/// ones this pipeline declared, so downstream conditions are evaluated against
+/// identities this pipeline owns.
+struct TenantImport {
+    registry: Arc<TenantTokenRegistry>,
+    allow: BoundaryFilter,
+    /// Tokens this receiver binds, as a resolved-mask filter.
+    bound: u64,
+    scratch: TokenScratch,
+}
+
 /// Receiver for topic subscriptions.
 pub struct TopicReceiver {
     config: TopicReceiverConfig,
     subscription: Subscription<OtapPdata>,
     ack_propagation_mode: TopicAckPropagationMode,
     broadcast_on_lag: Option<TopicBroadcastOnLagPolicy>,
+    tenant_import: Option<TenantImport>,
     metrics: MetricSet<TopicReceiverMetrics>,
+}
+
+impl TenantImport {
+    /// Replace the inbound context with one this pipeline resolved itself.
+    ///
+    /// A message whose evidence resolves no local token carries no tenant
+    /// context at all, rather than keeping the upstream one: adopting a
+    /// context the downstream pipeline did not derive is exactly the
+    /// confusion the boundary exists to prevent.
+    fn rebuild(&mut self, pdata: &mut OtapPdata) {
+        let rebuilt = pdata.tenant_view().and_then(|view| {
+            self.registry
+                .resolve_imported(&mut self.scratch, &view, &self.allow, self.bound)
+        });
+        match rebuilt {
+            Some(words) => pdata.set_tenant(words),
+            None => pdata.clear_tenant(),
+        }
+    }
 }
 
 /// Message received from the topic runtime but not yet admitted to the
@@ -193,12 +233,28 @@ pub static TOPIC_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
                 .then(|| topic_binding.broadcast_on_lag_policy());
         let metrics = pipeline
             .register_metrics_with_topic::<TopicReceiverMetrics>(topic_binding.name().into());
+        // Without a registry there is nothing to rebuild a context from, so
+        // the hop drops whatever arrived rather than passing it through
+        // unexamined.
+        let tenant_import = match pipeline.tenant_registry().cloned() {
+            Some(registry) => {
+                let bound = registry.token_mask(config.tenant_context.bound_tokens())?;
+                Some(TenantImport {
+                    allow: registry.compile_filter(&config.tenant_context.import),
+                    registry,
+                    bound,
+                    scratch: TokenScratch::new(),
+                })
+            }
+            None => None,
+        };
         Ok(ReceiverWrapper::local(
             TopicReceiver {
                 config,
                 subscription,
                 ack_propagation_mode,
                 broadcast_on_lag,
+                tenant_import,
                 metrics,
             },
             node,
@@ -235,6 +291,7 @@ impl local::Receiver<OtapPdata> for TopicReceiver {
             mut subscription,
             ack_propagation_mode,
             broadcast_on_lag,
+            mut tenant_import,
             mut metrics,
         } = *self;
         let subscription_mode = match &config.subscription {
@@ -633,6 +690,14 @@ impl local::Receiver<OtapPdata> for TopicReceiver {
                                 // Ack/Nack routing context before forwarding.
                                 // Use source-tag-aware send so fan-in wiring can attribute source node.
                                 let mut pdata = delivery.envelope().payload.clone_without_context();
+                                // The upstream context is evidence, not
+                                // identity. Rebuilding before anything reads
+                                // it means no downstream node ever sees a
+                                // context this pipeline did not derive.
+                                match tenant_import.as_mut() {
+                                    Some(import) => import.rebuild(&mut pdata),
+                                    None => pdata.clear_tenant(),
+                                }
                                 let tracked_message_id =
                                     (ack_propagation_mode == TopicAckPropagationMode::Auto
                                         && delivery.tracked())
@@ -729,7 +794,10 @@ impl local::Receiver<OtapPdata> for TopicReceiver {
 
 #[cfg(test)]
 mod tests {
-    use super::{TOPIC_RECEIVER, TOPIC_RECEIVER_URN, TopicReceiver, TopicSubscriptionConfig};
+    use super::{
+        TOPIC_RECEIVER, TOPIC_RECEIVER_URN, TenantImport, TenantTokenRegistry, TokenScratch,
+        TopicReceiver, TopicSubscriptionConfig,
+    };
     use otap_df_config::node::NodeUserConfig;
     use otap_df_config::topic::TopicAckPropagationMode;
     use otap_df_engine::config::ReceiverConfig;
@@ -752,6 +820,192 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    use otap_df_config::tenant::compiled::{
+        TenantTokenRegistryBuilder, TokenInputs, TokenScratch as Scratch,
+    };
+    use otap_df_config::tenant::{
+        Extractor, TenantBoundaryPolicy, TenantContextRules, TenantTokenSpec, TenantTokens,
+    };
+    use otap_df_pdata::otlp::OtlpProtoBytes;
+
+    /// A registry where an edge pipeline captures two keys and a downstream
+    /// pipeline binds one of them by import.
+    fn boundary_registry() -> Arc<TenantTokenRegistry> {
+        let header = |key: &str, name: &str| Extractor::TransportHeader {
+            key: key.to_owned(),
+            transport_header: name.to_owned(),
+            retain: true,
+            bag: false,
+        };
+        let mut tokens = TenantTokens::default();
+        let _ = tokens.insert(
+            "edge".to_owned(),
+            TenantTokenSpec {
+                extractors: vec![
+                    header("tenant_id", "x-tenant-id"),
+                    header("secret", "x-secret"),
+                ],
+            },
+        );
+        let _ = tokens.insert(
+            "downstream".to_owned(),
+            TenantTokenSpec {
+                extractors: vec![Extractor::ImportedKey {
+                    key: "local_tenant".to_owned(),
+                    imported_key: "tenant_id".to_owned(),
+                    retain: true,
+                    bag: false,
+                }],
+            },
+        );
+        let mut builder = TenantTokenRegistryBuilder::new();
+        builder.add_tokens(&tokens).expect("tokens compile");
+        Arc::new(builder.build(0).expect("registry builds"))
+    }
+
+    fn allow(keys: &[&str]) -> TenantBoundaryPolicy {
+        TenantBoundaryPolicy {
+            allow_keys: keys.iter().map(|k| (*k).to_owned()).collect(),
+        }
+    }
+
+    fn tenant_import(registry: &Arc<TenantTokenRegistry>, import: &[&str]) -> TenantImport {
+        let rules = TenantContextRules {
+            import: allow(import),
+            export: TenantBoundaryPolicy::default(),
+            tenant_tokens: vec!["downstream".to_owned()],
+        };
+        TenantImport {
+            bound: registry
+                .token_mask(rules.bound_tokens())
+                .expect("tokens are declared"),
+            allow: registry.compile_filter(&rules.import),
+            registry: registry.clone(),
+            scratch: TokenScratch::new(),
+        }
+    }
+
+    /// One message as it leaves the edge pipeline, published through a
+    /// boundary that admits `export`.
+    fn published(registry: &Arc<TenantTokenRegistry>, export: &[&str]) -> OtapPdata {
+        let mut scratch = Scratch::new();
+        let words = registry
+            .resolve(
+                &mut scratch,
+                TokenInputs::new([
+                    ("x-tenant-id", b"acme".as_slice()),
+                    ("x-secret", b"hunter2".as_slice()),
+                ]),
+            )
+            .expect("edge token resolves");
+        let mut data = OtapPdata::new_todo_context(
+            OtlpProtoBytes::ExportLogsRequest(Vec::new().into()).into(),
+        );
+        data.set_tenant(words);
+
+        let allowed = registry.compile_policy(&allow(export));
+        let repacked = data
+            .tenant_view()
+            .and_then(|view| registry.export_boundary(&mut scratch, &view, &allowed));
+        match repacked {
+            Some(words) => data.set_tenant(words),
+            None => data.clear_tenant(),
+        }
+        data
+    }
+
+    fn value_of(registry: &TenantTokenRegistry, data: &OtapPdata, key: &str) -> Option<Vec<u8>> {
+        let view = data.tenant_view()?;
+        let key = registry.key_id(key)?;
+        registry.retained_value(&view, key).map(<[u8]>::to_vec)
+    }
+
+    /// Scenario: an edge pipeline captures a tenant id and a secret, exports
+    /// only the tenant id across a topic, and the receiving pipeline imports
+    /// that one key.
+    /// Guarantees: the admitted key arrives bound to the downstream token,
+    /// and the key the egress policy withheld is absent on the far side --
+    /// the property that makes a topic a tenant boundary rather than a pipe.
+    #[test]
+    fn only_the_admitted_key_survives_the_hop() {
+        let registry = boundary_registry();
+        let mut data = published(&registry, &["tenant_id"]);
+        assert_eq!(
+            value_of(&registry, &data, "secret"),
+            None,
+            "the egress policy must not publish a key it did not name"
+        );
+
+        tenant_import(&registry, &["tenant_id"]).rebuild(&mut data);
+        assert_eq!(
+            value_of(&registry, &data, "local_tenant").as_deref(),
+            Some(b"acme".as_slice()),
+            "the admitted key must bind the downstream token"
+        );
+        assert_eq!(
+            value_of(&registry, &data, "secret"),
+            None,
+            "a withheld key must stay absent after import"
+        );
+    }
+
+    /// Scenario: the egress side admits a key, but the receiving pipeline's
+    /// import policy does not name it.
+    /// Guarantees: the message arrives with no tenant context at all. Both
+    /// sides of a boundary hold a veto, so a downstream pipeline cannot
+    /// acquire tenant material merely because an upstream one offered it.
+    #[test]
+    fn an_unimported_key_is_dropped_by_the_receiving_side() {
+        let registry = boundary_registry();
+        let mut data = published(&registry, &["tenant_id"]);
+        tenant_import(&registry, &[]).rebuild(&mut data);
+        assert!(
+            data.tenant_view().is_none(),
+            "nothing may be adopted when the import policy names no key"
+        );
+    }
+
+    /// Scenario: an upstream pipeline exports nothing, and the receiving
+    /// pipeline would otherwise still see the context that arrived.
+    /// Guarantees: the published message carries no tenant context, so an
+    /// absent egress policy withholds everything rather than defaulting to
+    /// passing the whole context through.
+    #[test]
+    fn an_absent_export_policy_publishes_no_context() {
+        let registry = boundary_registry();
+        let data = published(&registry, &[]);
+        assert!(
+            data.tenant_view().is_none(),
+            "an empty allowlist must publish no tenant context"
+        );
+    }
+
+    /// Scenario: a context crosses the hop and the downstream pipeline
+    /// rebuilds its own token from it.
+    /// Guarantees: only the tokens this receiver binds are reported resolved.
+    /// The upstream `edge` token is not this pipeline's evidence, and a
+    /// downstream consumer keyed on it must not match.
+    #[test]
+    fn only_the_receivers_own_tokens_resolve_after_import() {
+        let registry = boundary_registry();
+        let mut data = published(&registry, &["tenant_id"]);
+        tenant_import(&registry, &["tenant_id"]).rebuild(&mut data);
+
+        let view = data.tenant_view().expect("a context was rebuilt");
+        let edge = registry
+            .token_mask(Some(&["edge".to_owned()]))
+            .expect("edge is declared");
+        let downstream = registry
+            .token_mask(Some(&["downstream".to_owned()]))
+            .expect("downstream is declared");
+        assert_eq!(view.resolved_mask() & downstream, downstream);
+        assert_eq!(
+            view.resolved_mask() & edge,
+            0,
+            "an upstream token must not appear resolved downstream"
+        );
+    }
 
     #[test]
     fn parse_config_defaults_to_broadcast() {

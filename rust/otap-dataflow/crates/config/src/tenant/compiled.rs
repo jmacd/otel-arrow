@@ -1458,7 +1458,7 @@ impl TenantTokenRegistry {
             }
         }
 
-        self.finish_resolve(scratch)
+        self.finish_resolve(scratch, u64::MAX)
     }
 
     /// Resolve this pipeline's tokens over a context handed across a boundary.
@@ -1468,11 +1468,15 @@ impl TenantTokenRegistry {
     /// downstream pipeline declared. Static extractors still run, so a
     /// dedicated pipeline can mint a `generic_key` identity of its own and
     /// combine it with imported values in a single token.
+    ///
+    /// `bound` is the mask of tokens this receiver declared, from
+    /// [`token_mask`](Self::token_mask). Only those can resolve here.
     pub fn resolve_imported(
         &self,
         scratch: &mut TokenScratch,
         view: &TenantView<'_>,
         allow: &BoundaryFilter,
+        bound: u64,
     ) -> Option<Arc<[u64]>> {
         // A boundary can join two registries -- an engine-scoped topic
         // connects pipeline groups, and each group builds its own. Slot
@@ -1509,17 +1513,45 @@ impl TenantTokenRegistry {
             }
         }
 
-        self.finish_resolve(scratch)
+        self.finish_resolve(scratch, bound)
     }
 
-    fn finish_resolve(&self, scratch: &mut TokenScratch) -> Option<Arc<[u64]>> {
-        // Tokens whose bits all cleared are resolved.
+    /// Bitmask of the named tokens, or of every declared token when `None`.
+    ///
+    /// A node binds the tokens it was configured with, so a token that some
+    /// other pipeline declared cannot resolve here and be mistaken for local
+    /// evidence.
+    pub fn token_mask(&self, names: Option<&[String]>) -> Result<u64, Error> {
+        let Some(names) = names else {
+            return Ok(if self.tokens.len() >= MAX_TOKENS {
+                u64::MAX
+            } else {
+                (1u64 << self.tokens.len()) - 1
+            });
+        };
+        let mut mask = 0u64;
+        for name in names {
+            let idx = self
+                .tokens
+                .iter()
+                .position(|t| t.name.as_ref() == name.as_str())
+                .ok_or_else(|| config_error(format!("unknown tenant token '{name}'")))?;
+            mask |= 1u64 << idx;
+        }
+        Ok(mask)
+    }
+
+    fn finish_resolve(&self, scratch: &mut TokenScratch, bound: u64) -> Option<Arc<[u64]>> {
+        // Tokens whose bits all cleared are resolved, of those this caller
+        // binds. A token the caller did not bind is not its evidence, so it
+        // must not appear resolved in the context the caller produces.
         let mut resolved: u64 = 0;
         for (idx, word) in scratch.unsatisfied.iter().enumerate() {
             if *word == 0 {
                 resolved |= 1u64 << idx;
             }
         }
+        resolved &= bound;
         if resolved == 0 {
             return None;
         }
