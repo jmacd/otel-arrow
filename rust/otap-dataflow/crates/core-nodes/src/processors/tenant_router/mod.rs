@@ -311,6 +311,16 @@ impl TenantRouter {
         self.outputs.get(usize::from(idx)).cloned()
     }
 
+    /// Selects the output port for one message, for benchmarking.
+    ///
+    /// Exposes the routing decision alone so it can be compared against
+    /// another router's decision without the admission and channel work that
+    /// both share.
+    #[cfg(feature = "bench")]
+    pub fn bench_select(&mut self, pdata: &OtapPdata) -> Option<PortName> {
+        self.resolve_route(pdata)
+    }
+
     fn record_forwarded_route(&mut self, route_kind: SelectedRouteKind) {
         if let Some(m) = self.metrics.as_mut() {
             match route_kind {
