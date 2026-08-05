@@ -193,6 +193,62 @@ pub struct Condition {
 /// Engine-level map of tenant token definitions, shared across pipeline groups.
 pub type TenantTokens = HashMap<TenantTokenId, TenantTokenSpec>;
 
+/// Node configuration key holding a tenant route table.
+///
+/// Every node that decides a destination from a tenant condition puts its
+/// route table under this key, so the controller can find the conditions
+/// without knowing which node types exist.
+pub const TENANT_ROUTING_KEY: &str = "tenant_routing";
+
+/// One route, as the controller reads it.
+///
+/// Only `entries` is read. The destination a route selects -- an output port
+/// for `processor:tenant_router`, a topic for `exporter:topic` -- is left to
+/// the node, which is why this type does not deny unknown fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct DeclaredRoute {
+    /// Entries that must all match for this route to be selected.
+    #[serde(default)]
+    pub entries: Vec<Entry>,
+}
+
+/// The part of a node's route table the controller must read before the
+/// tenant token registry is frozen.
+///
+/// A condition can only be looked up after the build if it was interned
+/// before it, because the registry assigns a signature and a dense pair slot
+/// per (token, signature) at build time. Collecting conditions from every
+/// node is therefore not an optimization; it is what makes a node's own
+/// `condition_set` call resolvable at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct DeclaredTenantRoutes {
+    /// Tenant tokens the node binds. Empty binds every declared token.
+    #[serde(default)]
+    pub tenant_tokens: Vec<TenantTokenId>,
+    /// Routes the node evaluates, in first-match-wins order.
+    #[serde(default)]
+    pub routes: Vec<DeclaredRoute>,
+}
+
+impl DeclaredTenantRoutes {
+    /// The routes' conditions, in route order.
+    #[must_use]
+    pub fn conditions(&self) -> Vec<Condition> {
+        self.routes
+            .iter()
+            .map(|route| Condition {
+                entries: route.entries.clone(),
+            })
+            .collect()
+    }
+
+    /// The bound token names, or `None` to bind every declared token.
+    #[must_use]
+    pub fn bound_tokens(&self) -> Option<&[TenantTokenId]> {
+        (!self.tenant_tokens.is_empty()).then_some(self.tenant_tokens.as_slice())
+    }
+}
+
 /// One route of a tenant-token router: a condition plus the destination topic
 /// selected when that condition is the first match.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -1794,6 +1794,32 @@ impl TenantTokenRegistry {
                         .iter()
                         .filter_map(|t| self.pair_index.get(&(*t, signature)).copied())
                         .collect();
+                    // A signature with no applicable pair slot can never be
+                    // probed, so every request would fall through to the
+                    // node's default destination while the configuration
+                    // still reads as though the condition were live. Routing
+                    // that fails open is worse than routing that fails to
+                    // start, so this is an error rather than an empty group.
+                    if pair_slots.is_empty() {
+                        let keys: Vec<&str> = self.signatures[usize::from(signature)]
+                            .required_keys
+                            .iter()
+                            .map(|k| self.key_name(*k))
+                            .collect();
+                        let names: Vec<&str> = bound
+                            .iter()
+                            .map(|t| self.tokens[usize::from(*t)].name.as_ref())
+                            .collect();
+                        return Err(config_error(format!(
+                            "tenant condition over keys [{}] applies to none of the \
+                             bound tenant tokens [{}]; a token must declare every \
+                             key its condition tests, so this condition could \
+                             never match and every request would take the \
+                             default destination",
+                            keys.join(", "),
+                            names.join(", "),
+                        )));
+                    }
                     let group_tokens: Vec<TokenIdx> = bound
                         .iter()
                         .copied()
@@ -1996,8 +2022,17 @@ impl<'a> TenantView<'a> {
     ///
     /// This is a dictionary encoding of the request's values, not a digest of
     /// them: comparing two words compares the values exactly.
+    ///
+    /// A slot the context does not carry reads as zero. A context packed by a
+    /// registry with no declared conditions has no fingerprints at all, and a
+    /// boundary export drops the ones it had, so a consumer holding a stale
+    /// slot number would otherwise index into the offset region and match on
+    /// whatever it found there.
     #[must_use]
     pub fn signature_word(&self, slot: PairSlot) -> u64 {
+        if usize::from(slot) >= self.n_fp() {
+            return 0;
+        }
         self.words[HEADER_WORDS + usize::from(slot)]
     }
 
