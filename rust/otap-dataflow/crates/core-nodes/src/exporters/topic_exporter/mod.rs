@@ -330,9 +330,9 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
         };
 
         let registry = pipeline.tenant_registry().cloned();
-        let export = match (&registry, config.tenant_context.export.is_empty()) {
-            (Some(registry), false) => registry.compile_policy(&config.tenant_context.export),
-            _ => Box::from([]),
+        let export = match &registry {
+            Some(registry) => registry.compile_policy(config.tenant_context.export_or_none()),
+            None => Box::from([]),
         };
 
         Ok(ExporterWrapper::local(
@@ -1031,10 +1031,10 @@ mod tests {
     fn a_fixed_topic_can_still_declare_an_export_allowlist() {
         let cfg = TopicExporter::parse_config(&json!({
             "topic": "raw",
-            "tenant_context": {"export": {"allow_keys": ["tenant_id"]}}
+            "tenant_context": {"export_keys": ["tenant_id"]}
         }))
         .expect("valid config");
-        assert_eq!(cfg.tenant_context.export.allow_keys, vec!["tenant_id"]);
+        assert_eq!(cfg.tenant_context.export_or_none(), ["tenant_id"]);
     }
 
     #[test]

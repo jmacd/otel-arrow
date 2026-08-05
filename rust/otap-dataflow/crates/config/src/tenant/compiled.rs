@@ -30,7 +30,7 @@
 //! added on top of it. See `docs/multitenancy-tenant.md`.
 
 use crate::error::Error;
-use crate::tenant::{Condition, Extractor, TenantBoundaryPolicy, TenantTokenSpec, TenantTokens};
+use crate::tenant::{Condition, Extractor, TenantTokenSpec, TenantTokens};
 use ahash::AHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -1367,10 +1367,10 @@ impl TenantTokenRegistry {
 
     /// Compile a boundary allowlist into a key-indexed filter.
     #[must_use]
-    pub fn compile_filter(&self, policy: &TenantBoundaryPolicy) -> BoundaryFilter {
+    pub fn compile_filter(&self, keys: &[String]) -> BoundaryFilter {
         let mut allow = vec![false; self.key_names.len()];
         let mut any = false;
-        for key in self.compile_policy(policy).iter() {
+        for key in self.compile_policy(keys).iter() {
             allow[usize::from(*key)] = true;
             any = true;
         }
@@ -1385,12 +1385,18 @@ impl TenantTokenRegistry {
     /// Unknown key names are silently dropped: a policy may name keys that
     /// only the other side of the boundary knows about.
     #[must_use]
-    pub fn compile_policy(&self, policy: &TenantBoundaryPolicy) -> Box<[KeyId]> {
-        policy
-            .allow_keys
-            .iter()
-            .filter_map(|name| self.key_id(name))
-            .collect()
+    pub fn compile_policy(&self, keys: &[String]) -> Box<[KeyId]> {
+        keys.iter().filter_map(|name| self.key_id(name)).collect()
+    }
+
+    /// Every key that some token retains, in value-slot order.
+    ///
+    /// This is what a store-and-forward boundary carries: it is a pause in one
+    /// pipeline rather than a crossing between two, so the context that comes
+    /// back means what it meant, and nothing is dropped.
+    #[must_use]
+    pub fn all_retained_keys(&self) -> Box<[KeyId]> {
+        self.retained.clone().into_boxed_slice()
     }
 
     /// Resolve the tenant tokens for one request and pack them into a single

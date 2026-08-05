@@ -240,7 +240,7 @@ pub static TOPIC_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
             Some(registry) => {
                 let bound = registry.token_mask(config.tenant_context.bound_tokens())?;
                 Some(TenantImport {
-                    allow: registry.compile_filter(&config.tenant_context.import),
+                    allow: registry.compile_filter(config.tenant_context.import_or_none()),
                     registry,
                     bound,
                     scratch: TokenScratch::new(),
@@ -824,9 +824,7 @@ mod tests {
     use otap_df_config::tenant::compiled::{
         TenantTokenRegistryBuilder, TokenInputs, TokenScratch as Scratch,
     };
-    use otap_df_config::tenant::{
-        Extractor, TenantBoundaryPolicy, TenantContextRules, TenantTokenSpec, TenantTokens,
-    };
+    use otap_df_config::tenant::{Extractor, TenantContextRules, TenantTokenSpec, TenantTokens};
     use otap_df_pdata::otlp::OtlpProtoBytes;
 
     /// A registry where an edge pipeline captures two keys and a downstream
@@ -864,23 +862,21 @@ mod tests {
         Arc::new(builder.build(0).expect("registry builds"))
     }
 
-    fn allow(keys: &[&str]) -> TenantBoundaryPolicy {
-        TenantBoundaryPolicy {
-            allow_keys: keys.iter().map(|k| (*k).to_owned()).collect(),
-        }
+    fn allow(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|k| (*k).to_owned()).collect()
     }
 
     fn tenant_import(registry: &Arc<TenantTokenRegistry>, import: &[&str]) -> TenantImport {
         let rules = TenantContextRules {
-            import: allow(import),
-            export: TenantBoundaryPolicy::default(),
+            import_keys: Some(allow(import)),
+            export_keys: None,
             tenant_tokens: vec!["downstream".to_owned()],
         };
         TenantImport {
             bound: registry
                 .token_mask(rules.bound_tokens())
                 .expect("tokens are declared"),
-            allow: registry.compile_filter(&rules.import),
+            allow: registry.compile_filter(rules.import_or_none()),
             registry: registry.clone(),
             scratch: TokenScratch::new(),
         }

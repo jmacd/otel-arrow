@@ -256,53 +256,39 @@ pub struct TenantHeader {
     pub binary: bool,
 }
 
-/// Policy limiting which retained token keys may cross a pipeline or group
-/// boundary.
+/// What tenant material may cross one trust boundary, in both directions.
 ///
-/// Boundaries are the only places tenant material can leak between tenants, so
-/// both sides of every boundary carry an explicit allowlist and everything not
-/// named is dropped. An empty or absent policy propagates nothing.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct TenantBoundaryPolicy {
-    /// Token keys admitted across the boundary. Anything else is dropped.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow_keys: Vec<String>,
-}
-
-impl TenantBoundaryPolicy {
-    /// True when the policy admits nothing.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.allow_keys.is_empty()
-    }
-}
-
-/// What tenant material may cross one boundary, in both directions.
+/// A boundary between two pipeline groups is where tenant material can leak
+/// between tenants, so each side names the keys it admits and everything
+/// unnamed is dropped. One type serves both sides: an egress node reads
+/// `export_keys`, an ingress node reads `import_keys` and `tenant_tokens`.
 ///
-/// A boundary is the only place tenant material can leak between tenants, so
-/// each side names an explicit allowlist and everything unnamed is dropped.
-/// One type serves both sides: an egress node reads `export`, an ingress node
-/// reads `import` and `tenant_tokens`, and a node that is both reads all
-/// three.
+/// The inbound context is never adopted as-is. The receiving side admits the
+/// keys it names, then resolves its own tokens over the admitted values plus
+/// any locally minted ones, so the downstream pipeline evaluates conditions
+/// against identities it declared itself.
 ///
-/// The inbound context from the upstream pipeline is never adopted as-is. The
-/// receiver admits the keys its `import` policy names, then resolves its own
-/// tokens over the admitted values plus any locally minted generic keys, so
-/// the downstream pipeline evaluates conditions against identities it declared
-/// itself.
+/// This does not apply to a store-and-forward boundary such as
+/// `processor:durable_buffer`, which writes and reads in one pipeline against
+/// one registry. A context that leaves and returns there means what it always
+/// meant, so there is nothing to re-derive and nothing to police.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TenantContextRules {
-    /// Keys admitted from the inbound cross-boundary context. Read by the
-    /// ingress side of a boundary.
-    #[serde(default)]
-    pub import: TenantBoundaryPolicy,
-    /// Keys allowed to leave with the published data. Read by the egress side
-    /// of a boundary, and independent of whether that side also routes: a node
-    /// publishing to one fixed destination still has a boundary to police.
-    #[serde(default)]
-    pub export: TenantBoundaryPolicy,
+    /// Keys admitted from the inbound context, read by the ingress side.
+    ///
+    /// Absent leaves the decision to the node. A trust boundary reads that as
+    /// admitting nothing, which is the fail-closed answer for a policy nobody
+    /// wrote. An empty list says the same thing explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_keys: Option<Vec<String>>,
+    /// Keys allowed to leave with the published data, read by the egress side.
+    ///
+    /// Independent of whether that side also routes: a node publishing to one
+    /// fixed destination still has a boundary to police. Absent is read by the
+    /// node, the same way as `import_keys`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_keys: Option<Vec<String>>,
     /// Tokens resolved after import. Empty resolves every declared token.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tenant_tokens: Vec<TenantTokenId>,
@@ -313,6 +299,18 @@ impl TenantContextRules {
     #[must_use]
     pub fn bound_tokens(&self) -> Option<&[TenantTokenId]> {
         (!self.tenant_tokens.is_empty()).then_some(self.tenant_tokens.as_slice())
+    }
+
+    /// Keys this side admits, with an absent policy admitting nothing.
+    #[must_use]
+    pub fn import_or_none(&self) -> &[String] {
+        self.import_keys.as_deref().unwrap_or(&[])
+    }
+
+    /// Keys this side lets out, with an absent policy letting nothing out.
+    #[must_use]
+    pub fn export_or_none(&self) -> &[String] {
+        self.export_keys.as_deref().unwrap_or(&[])
     }
 }
 
