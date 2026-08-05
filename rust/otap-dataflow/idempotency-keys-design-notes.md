@@ -12,6 +12,55 @@ Status markers used below:
   the session.
 - **[inferred]** reasoned, not confirmed. Treat as a claim to test.
 
+## 0. The claim
+
+Idempotency is not a feature the engine has to grow. It is something an
+operator implements **by configuration**, out of machinery that already
+exists for another purpose.
+
+That is the interesting part, and it is a claim about the tenant token
+feature rather than about idempotency. Tenant tokens are named for their
+motivating case, but what they actually provide is general: a declared set
+of request-scoped dimensions, extracted once at a named site, carried in one
+fixed per-request encoding, and projected explicitly at every boundary that
+data crosses. Tenancy is one use of that. Output identity is another.
+
+An idempotency key differs from a tenant id in three ways, none of which
+needs new mechanism:
+
+| | tenant id | idempotency key |
+| --- | --- | --- |
+| source | read from the request | minted locally |
+| use | routing and matching | output naming |
+| totality | may be absent | must always resolve |
+
+Minting is an extractor kind. Naming is what a retained value is for.
+Totality is a property of a token whose only extractor always succeeds, so
+it is a configuration choice rather than an architectural one.
+
+The test of the claim is that a second, unrelated use of the feature lands
+as YAML plus one extractor, and does not perturb the design of anything
+else. Section 7 is the honest accounting of how close that is.
+
+The complete shape, for reference before the argument:
+
+```yaml
+engine:
+  tenant_tokens:
+    durable:
+      extractors:
+        - key: idem
+          idempotency_key: uuid_v7   # the only new mechanism
+          retain: true               # carry it with the request
+          bag: true                  # and carry its name, so it survives
+                                     # a configuration change
+```
+
+Nothing else in the pipeline is configured for it. `durable_buffer`
+persists whatever context a request carries and hands the same context back
+on replay; an exporter names its output from the key by reading it like any
+other retained value.
+
 ## 1. Starting point
 
 PR #3588 (seddonm1) assigns a UUIDv7 to each `OtapPdata` at `Context`
@@ -69,6 +118,12 @@ across a queue rebuild -- the same weakness as a local `segment_seq`.
 An idempotency key is not a new mechanism. It is one **extractor kind** in
 the tenant token system, and its behavior is configured the same way every
 other request-context dimension is configured.
+
+This is the concrete form of the claim in section 0. The dimension is not a
+tenant, the use is not routing, and the value is minted rather than read --
+and none of that requires the feature to change shape. If the reframing
+holds for a dimension this unlike a tenant id, the mechanism is more general
+than its name.
 
 The general rule the tenant token work establishes: **a node that constructs
 an `OtapPdata` rather than forwarding one is a new-context creator, and
@@ -153,42 +208,69 @@ than at a pipeline batcher, and can adopt queue-before-batch without the
 tradeoff -- better positioned than the collector, whose queue stores opaque
 blobs that gain nothing from aggregation. **[inferred]**
 
-## 5. durable_buffer as a boundary
+## 5. durable_buffer is a pause, not a boundary
 
-`durable_buffer` is a boundary with two sides, like a topic exporter and
-topic receiver pair, except it crosses **time** rather than a pipeline
-group.
+An earlier draft of these notes treated `durable_buffer` as a boundary with
+two sides, symmetrical with a topic exporter and topic receiver pair. That
+was wrong, and correcting it removes most of the work the draft proposed.
 
-- **Ingress (send side)** behaves like a receiver in the full sense: it
-  declares its own tokens and runs extractors over the inbound context. This
-  is where the key is minted, and where a projection decides which
-  dimensions get persisted.
-- **Egress (replay side)** is a new-context creator that **imports** and
-  must never mint. `convert_bundle_to_pdata` is that site; in #3588 its
-  `context_from_bundle` falls back to `Context::default()` **[verified]**,
-  which mints a fresh UUID on the read path and destroys the property being
-  bought.
+A **topic** joins two pipeline groups. They may compile against different
+registries, they may belong to different operators, and the packed buffer
+handed across stays readable by whoever receives it. So each side names an
+allowlist, and the receiving side never adopts the inbound context: it
+admits the keys it named and re-resolves its own tokens over them, so it
+evaluates conditions against identities it declared itself. That machinery
+exists and works **[verified]**.
 
-The existing config shapes already fit: `TenantBoundaryPolicy { allow_keys }`
-for the export side, `TenantContextRules { import, tenant_tokens }` for the
-import side **[verified]**. One contract, three implementations: topic
-boundary, storage boundary, any future store.
+`durable_buffer` writes and reads in **one pipeline**, against **one**
+engine-scoped registry, separated only by time. The context that comes back
+is the context that went in, and it means exactly what it meant. There is
+nothing to re-derive and no second party to withhold anything from.
 
-`export_boundary(scratch, view, allow: &[KeyId])` is already a projection
-**[verified]** -- it rebuilds the blob rather than masking it, "because the
-packed buffer is shared and any byte left in it stays readable". And
-`partition_processor` already derives fresh contexts with `set_tenant(derived)`
-and `fork_request_scoped` **[verified]**, so the pattern is implemented, not
-hypothetical.
+| | topic | durable_buffer |
+| --- | --- | --- |
+| separates | two pipeline groups | one pipeline from itself |
+| across | trust | time |
+| registry | may differ | same |
+| inbound context | evidence, re-derived | identity, restored |
+| configuration | allowlists on both sides | none |
 
-`batch_processor` is the one unconverted site: line 1040 constructs
-`OtapPdata::new(Context::default(), ...)` and the file contains no tenant
-handling at all **[verified]**. When converted it becomes the first N-to-1
-projection, needing a per-key merge rule -- `require_equal` as a fail-closed
-default (which would enforce the single-tenant-per-batch invariant that the
-`attribute_field::SCOPE` comment already assumes), and `collect` where a
-series is wanted. `collect` needs `AnyValue.array_value`, the same encoding
-addition that `ClaimValue::Many` requires.
+Consequences, all subtractive:
+
+- **No tenant configuration on the node.** No export list, no import list,
+  no token binding. There is nothing an operator could usefully say.
+- **No re-resolution on replay.** The fast path is
+  `set_tenant(Arc::from(stored_bytes))`: no extractors, no repack, no
+  allocation beyond the restore itself. Replay is *cheaper* than a topic
+  hop, not comparable to it.
+- **No "must declare a retained idempotency dimension" validation rule.**
+  That rule existed only to stop a projection from silently dropping the
+  key. With no projection there is nothing to drop.
+
+What does still need care is `convert_bundle_to_pdata`, which builds the
+replayed pdata. It calls `OtapPdata::new(Context::default(), payload)` at
+two sites **[verified]**, so today a replayed message has no tenant context
+at all. It must restore the stored bytes instead. This is the one place
+where getting it wrong quietly destroys the property being bought, and it
+is the same site PR #3588 got wrong in the other direction by minting a
+fresh UUID on the read path **[verified]**.
+
+The general rule from section 3 still holds, and this is a case of it: a
+node that constructs an `OtapPdata` rather than forwarding one is a
+new-context creator. The projection such a node declares just happens, for
+a store-and-forward node, to be the identity projection.
+
+`partition_processor` already implements context-creating projection with
+`rewrite` and `fork_request_scoped` **[verified]**, and the topic pair
+implements the two-sided kind, so both patterns have working references.
+`batch_processor` remains the one unconverted site: it constructs
+`OtapPdata::new(Context::default(), ...)` and contains no tenant handling at
+all **[verified]**. It is not on the critical path here -- no durable-buffer
+config contains a batcher -- but when converted it becomes the first N-to-1
+projection, needing a per-key merge rule: `require_equal` as a fail-closed
+default, and `collect` where a series is wanted. `collect` needs
+`AnyValue.array_value`, the same encoding addition `ClaimValue::Many`
+requires.
 
 ## 6. Reconfiguration
 
@@ -249,43 +331,95 @@ rejected, which is the one failure mode the epoch exists to prevent.
 
 ## 7. Changes required
 
-Ordered roughly by dependency.
+Ordered roughly by dependency. This is the honest accounting against the
+claim in section 0: how much of "idempotency is configuration" is actually
+configuration today.
 
-1. **Produce `ValueKind::Binary`.** `TokenScratch::store` and
-   `export_boundary` both hardcode `ValueKind::Text` **[verified]**, so
-   `Binary` is defined and encoded by `put_any_value` but never produced. A
-   decoded gRPC `-bin` header, or a 16-byte UUID, is currently written as
-   `AnyValue.string_value` -- invalid OTLP for non-UTF-8 bytes. This is a
-   live bug independent of idempotency, and a prerequisite here because the
-   bag becomes the recovery representation.
-2. **Add the minting extractor kind.** `resolve`'s static-extractor loop
-   already branches on `extractor.value: Option<_>` (`Some` = literal,
-   `None` = peer address) **[verified]**; minting becomes a third case.
-3. **Fall back rather than drop on epoch mismatch.** `resolve_imported`
-   early-returns `None` at the top on mismatch **[verified]**. Partial
-   recovery needs a second path that extracts by name over the bag.
-4. **Record `bag_field` with a persisted context.** The run is pre-tagged
-   with the registry's attributes field number (`RESOURCE=1`, `SCOPE=3`,
-   `LOG_RECORD=6`, `EXEMPLAR=7`, `SPAN=9`) **[verified]**. A recovery parser
-   reading bytes from a differently-configured generation needs that number.
+**Done since the study session:**
+
+1. ~~**Produce `ValueKind::Binary`.**~~ `TokenScratch::store` and
+   `export_boundary` hardcoded `ValueKind::Text`, so a 16-byte UUID would
+   have been written as `AnyValue.string_value` -- invalid OTLP for
+   non-UTF-8 bytes. Value kind is now fixed per key at build time from the
+   source the key binds to, and every staging path reads it **[verified]**.
+   This was the stated prerequisite, and it is cleared: the bag can carry a
+   raw UUID today.
+
+**Still required, and the whole of what "implementing idempotency" costs:**
+
+2. **Add the minting extractor kind.** The one genuinely new mechanism.
+   Four touchpoints:
+   - `Extractor` gains an untagged variant keyed on `idempotency_key`.
+   - `StaticExtractor.value: Option<Box<[u8]>>` becomes three-way. Today
+     `None` *means* peer address **[verified]**, so minting cannot reuse it.
+   - `resolve_key_kinds` must mark a minted key `Binary`. Only `-bin`
+     headers get that today **[verified]**.
+   - `KeyBinding` gains a variant, so binding one key to both a mint and a
+     header is caught as the configuration error it is.
+
+**Required for durability across a configuration change, not for
+idempotency itself:**
+
+3. **Recover from the bag on epoch mismatch.** `resolve_imported`
+   early-returns `None` when the epoch differs **[verified]**, which is
+   right at a topic and wrong after storage. A second path is needed that
+   reads the bag by name rather than by slot:
+
+   ```rust
+   pub fn resolve_recovered(
+       &self, scratch: &mut TokenScratch,
+       attributes: &[u8], bag_field: u32,
+   ) -> Option<Arc<[u64]>>
+   ```
+
+   It walks the `<tag><len><KeyValue>` run, maps each name through
+   `key_id`, and repacks. `key_id` is a linear scan, which is acceptable
+   because this runs only when the epoch actually moved.
+
+4. **Record `bag_field` beside the stored bytes.** The run is pre-tagged
+   with the registry's attributes field number **[verified]**, and that
+   number is registry state rather than part of the packed context, so a
+   recovery parser cannot find the run without it.
+
 5. **Add a format version byte beside the generation.** The generation
    digests registry contents within one binary and says nothing about a
    layout change across builds. Harmless while contexts never outlive a
    process; not harmless once they are persisted.
+
+**Independent of this work:**
+
 6. **Convert `batch_processor`** to a projection site with per-key merge
-   rules, and add `AnyValue.array_value` support for `collect` and for
-   `ClaimValue::Many`.
+   rules, and add `AnyValue.array_value` for `collect` and for
+   `ClaimValue::Many`. Needed before a batcher may precede a durable buffer;
+   none does today **[verified]**.
+
+Item 2 is the feature. Items 3 through 5 are the price of letting a
+persisted context outlive the configuration that produced it, which is a
+storage concern rather than an idempotency one and would be owed by any
+persisted dimension.
 
 ### Validation rules
 
-- A pipeline containing `processor:durable_buffer` must declare a retained
-  idempotency dimension; fail at startup rather than silently persisting
-  unidentified bundles.
-- A replay projection may import that dimension but may not mint it.
+- A replay site may restore a stored key but must never mint one. Minting
+  at replay produces a fresh identity for data that already has one, which
+  is precisely the bug PR #3588 has at `context_from_bundle` **[verified]**.
 - A minted or derived key is non-matchable: a condition testing it is a
   compile error, not a silent never-match. The registry interns condition
-  literals at compile time and undeclared values fall to a reserved unknown
-  symbol, so such a config would otherwise be accepted and never fire.
+  literals at build time and undeclared values fall to a reserved unknown
+  symbol, so such a configuration would otherwise be accepted and never
+  fire.
+- A key that must survive a configuration change has to be `bag: true`.
+  `retain: true` alone is addressed by registry slot and is unreadable once
+  the layout digest changes. Warn when a pipeline persists a key that is
+  retained but not bagged, because the operator is buying a durability
+  property they will not get.
+
+Withdrawn from an earlier draft: "a pipeline containing
+`processor:durable_buffer` must declare a retained idempotency dimension."
+That rule guarded against a projection dropping the key at the storage
+boundary. Section 5 removes the projection, so the rule has nothing to
+guard. A pipeline that declares no idempotency dimension simply does not
+have idempotent output, which is a choice, not an error.
 
 ## 8. What Quiver itself needs
 
@@ -326,6 +460,18 @@ Ordered roughly by dependency.
 - Operator story for changing tenant token configuration with data still
   buffered. Draining before reconfiguration is the simple answer; it should
   be stated policy rather than emergent behavior.
+- Epoch reuse against retention. Section 6's invariant -- a retired epoch
+  must not be reused while any context carrying it still exists -- is easy
+  to hold for request contexts living milliseconds and becomes a joint
+  constraint between reconfiguration rate and retention period once
+  contexts are persisted. 65536 generations is ample arithmetically; the
+  hazard is that a recycled epoch reads as *valid* rather than being
+  rejected, which is the one failure the epoch exists to prevent. This
+  wants a startup check, not a comment.
+- Whether the second-use test in section 0 should be made explicit in the
+  tenant token documentation. If the feature is general, saying so where
+  operators read about it is most of the value; if it is not, an example
+  that only works for tenancy is the evidence.
 
 ## 10. Corrections made during the session
 
@@ -346,3 +492,42 @@ Recorded so they are not re-litigated.
 - **"Durability-critical dimensions need a format-defined fixed region to
   survive a generation change."** Superseded. `bag: true` already provides
   name-addressed, registry-free recovery.
+
+Corrections from the follow-up session, after the topic boundary was
+implemented:
+
+- **"`durable_buffer` is a boundary with two sides, like a topic exporter
+  and receiver pair, except it crosses time rather than a pipeline group."**
+  Wrong, and the error was treating "crosses time" as a variety of "crosses
+  trust". A topic joins two pipeline groups that may compile against
+  different registries; `durable_buffer` writes and reads in one pipeline
+  against one registry. The context that returns needs no re-derivation and
+  no policing. Section 5 is rewritten; the export policy, the import
+  policy, the token binding and one validation rule all drop out.
+
+- **"`export_boundary` is already the projection the storage boundary
+  needs."** True of the primitive, wrong as a recommendation. Projecting at
+  a storage boundary costs a repack per message and buys nothing: the leak
+  it prevents is a second party reading bytes left in a shared buffer, and
+  storage has no second party. Its only real use there would be data
+  minimization at rest, which is a different argument and not one these
+  notes made.
+
+- **`TenantBoundaryPolicy { allow_keys }`.** Renamed. The struct wrapped one
+  `Vec<String>`, there is no `deny_keys` and no other relationship a
+  boundary can express, and the enclosing field already named the
+  direction. Now `import_keys` and `export_keys` directly. Worth recording
+  why they name *keys* and not tokens: a value is addressed by its key's
+  slot, so anything crossing a boundary is necessarily key-granular, while
+  a token is a resolution outcome that each side recomputes. Keys and
+  tokens are many-to-many **[verified]**, so neither list derives from the
+  other.
+
+- **"The idempotency key should be minted at `durable_buffer` ingress."**
+  Still defensible but not obviously right, and the notes did not
+  acknowledge the choice. Minting at a receiver identifies the *request*;
+  minting at durable-buffer ingress identifies the *bundle*. With today's
+  configurations, one pdata is one bundle and the two coincide
+  **[verified]**. They diverge as soon as a batcher sits upstream, at which
+  point receiver-side minting yields N keys for one bundle and needs the
+  merge rule from item 6.
