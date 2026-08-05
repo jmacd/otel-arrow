@@ -41,20 +41,27 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use otap_df_channel::mpsc;
 use otap_df_config::PortName;
 use otap_df_config::tenant::compiled::{
-    TenantTokenRegistry, TenantTokenRegistryBuilder, TokenInputs, TokenScratch,
+    BoundaryFilter, ConditionSet, KeyId, TenantTokenRegistry, TenantTokenRegistryBuilder,
+    TokenInputs, TokenScratch,
 };
 use otap_df_config::tenant::{
-    Condition, Entry, Extractor, TenantRoute, TenantRouting, TenantTokenSpec, TenantTokens,
+    Condition, Entry, Extractor, TenantBoundaryPolicy, TenantRoute, TenantRouting, TenantTokenSpec,
+    TenantTokens,
 };
 use otap_df_core_nodes::processors::signal_type_router::{
     PORT_LOGS, SignalTypeRouter, SignalTypeRouterConfig,
 };
 use otap_df_core_nodes::processors::tenant_router::{TenantRouter, TenantRouterConfig};
+use otap_df_engine::MessageSourceLocalEffectHandlerExtension;
 use otap_df_engine::context::{ControllerContext, PipelineContext};
 use otap_df_engine::local::message::LocalSender;
 use otap_df_engine::local::processor::{EffectHandler as LocalEffectHandler, Processor as _};
 use otap_df_engine::message::{Message, Sender};
 use otap_df_engine::testing::{setup_test_runtime, test_node};
+use otap_df_engine::topic::{
+    InMemoryBackend, PublishOutcome, RecvItem, SubscriberOptions, SubscriptionMode, TopicBroker,
+    TopicOptions,
+};
 use otap_df_otap::pdata::OtapPdata;
 use otap_df_pdata::otlp::OtlpProtoBytes;
 use otap_df_pdata::proto::opentelemetry::{
@@ -395,5 +402,205 @@ fn bench_decision(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_dispatch, bench_payload, bench_decision);
+// -- The inter-pipeline hop -------------------------------------------------
+
+/// A registry shaped for a boundary: an edge pipeline retains the tenant id,
+/// and a downstream pipeline binds it by import.
+///
+/// Retention is what a hop costs before anything is published. A local router
+/// can match on a key without carrying it, but a value that has to reach
+/// another pipeline must be retained, so the same routing decision implies a
+/// larger per-request context on this path.
+fn hop_registry(routes: usize) -> Arc<TenantTokenRegistry> {
+    let mut tokens = TenantTokens::default();
+    let _ = tokens.insert(
+        "edge".to_owned(),
+        TenantTokenSpec {
+            extractors: vec![Extractor::TransportHeader {
+                key: "tenant_id".to_owned(),
+                transport_header: HEADER.to_owned(),
+                retain: true,
+                bag: false,
+            }],
+        },
+    );
+    let _ = tokens.insert(
+        "downstream".to_owned(),
+        TenantTokenSpec {
+            extractors: vec![Extractor::ImportedKey {
+                key: "local_tenant".to_owned(),
+                imported_key: "tenant_id".to_owned(),
+                retain: true,
+                bag: false,
+            }],
+        },
+    );
+    let mut builder = TenantTokenRegistryBuilder::new();
+    builder.add_tokens(&tokens).expect("tokens compile");
+    let conditions: Vec<Condition> = (0..routes)
+        .map(|i| Condition {
+            entries: vec![Entry {
+                key: "tenant_id".to_owned(),
+                value: Some(tenant_value(i)),
+            }],
+        })
+        .collect();
+    builder
+        .declare_conditions(Some(&["edge".to_owned()]), &conditions)
+        .expect("conditions declare");
+    Arc::new(builder.build(0).expect("registry builds"))
+}
+
+/// The compiled boundary a message crosses, both halves.
+struct Boundary {
+    registry: Arc<TenantTokenRegistry>,
+    conditions: ConditionSet,
+    export: Box<[KeyId]>,
+    import: BoundaryFilter,
+    bound: u64,
+}
+
+fn boundary(routes: usize) -> Boundary {
+    let registry = hop_registry(routes);
+    let conditions: Vec<Condition> = (0..routes)
+        .map(|i| Condition {
+            entries: vec![Entry {
+                key: "tenant_id".to_owned(),
+                value: Some(tenant_value(i)),
+            }],
+        })
+        .collect();
+    let allow = TenantBoundaryPolicy {
+        allow_keys: vec!["tenant_id".to_owned()],
+    };
+    Boundary {
+        conditions: registry
+            .condition_set(Some(&["edge".to_owned()]), &conditions)
+            .expect("conditions compile"),
+        export: registry.compile_policy(&allow),
+        import: registry.compile_filter(&allow),
+        bound: registry
+            .token_mask(Some(&["downstream".to_owned()]))
+            .expect("downstream is declared"),
+        registry,
+    }
+}
+
+/// What it costs to move one message to the destination its tenant selects,
+/// staying inside one pipeline versus crossing a topic into another.
+///
+/// Both arms start from the same decision -- one `ConditionSet` probe over the
+/// same packed context -- and end the same way, with the message admitted to a
+/// local downstream port. Everything between them is what the boundary costs:
+/// two clones, a repack out, a publish, a receive, and a repack in.
+fn bench_hop(c: &mut Criterion) {
+    let (rt, local) = setup_test_runtime();
+    let mut group = c.benchmark_group("tenant_routing/hop");
+
+    for routes in [1usize, 16] {
+        let value = tenant_value(routes - 1);
+
+        // Local: the floor, re-measured on the retained-key registry so the
+        // two arms differ only by the hop.
+        let reg = hop_registry(routes);
+        let data = pdata(&reg, 1, &value);
+        let ports: Vec<String> = (0..routes).map(port_name).collect();
+        let (mut eh, rx) = wire(&ports);
+        let mut router = tenant_router(reg.clone(), routes);
+        bench_process!(
+            group,
+            BenchmarkId::new("local", routes),
+            &routes,
+            rt,
+            local,
+            router,
+            eh,
+            rx,
+            data
+        );
+
+        // Topic: the same decision, then the boundary.
+        let b = boundary(routes);
+        let hop_data = pdata(&b.registry, 1, &value);
+        let broker = TopicBroker::<OtapPdata>::new();
+        let topic = broker
+            .create_topic(
+                "bench_hop",
+                TopicOptions::BalancedOnly { capacity: 4096 },
+                InMemoryBackend,
+            )
+            .expect("topic creates");
+        let mut subscription = topic
+            .subscribe(
+                SubscriptionMode::Balanced { group: "g1".into() },
+                SubscriberOptions::default(),
+            )
+            .expect("subscription creates");
+        let (hop_eh, hop_rx) = wire(&ports);
+        let out_port = PortName::from(port_name(routes - 1));
+        let mut scratch = TokenScratch::new();
+
+        let _ = group.bench_with_input(BenchmarkId::new("topic", routes), &routes, |bch, _| {
+            bch.iter_custom(|iters| {
+                rt.block_on(local.run_until(async {
+                    let start = Instant::now();
+                    for i in 0..iters {
+                        // Egress: decide, then repack to what the boundary admits.
+                        let selected = hop_data
+                            .tenant_view()
+                            .and_then(|v| b.conditions.first_match(&v));
+                        let _ = black_box(selected.expect("the probe must match"));
+
+                        let mut published = hop_data.clone_without_context();
+                        let repacked = published
+                            .tenant_view()
+                            .and_then(|v| b.registry.export_boundary(&mut scratch, &v, &b.export));
+                        match repacked {
+                            Some(words) => published.set_tenant(words),
+                            None => published.clear_tenant(),
+                        }
+                        match topic.try_publish(Arc::new(published)).expect("publish") {
+                            PublishOutcome::Published => {}
+                            PublishOutcome::DroppedOnFull => panic!("topic queue full"),
+                        }
+
+                        // Ingress: admit, then rebuild this pipeline's tokens.
+                        let RecvItem::Message(env) = subscription.recv().await.expect("delivery")
+                        else {
+                            panic!("unexpected lag on a balanced subscription");
+                        };
+                        let mut inbound = env.payload.clone_without_context();
+                        let rebuilt = inbound.tenant_view().and_then(|v| {
+                            b.registry
+                                .resolve_imported(&mut scratch, &v, &b.import, b.bound)
+                        });
+                        match rebuilt {
+                            Some(words) => inbound.set_tenant(words),
+                            None => inbound.clear_tenant(),
+                        }
+
+                        let _ = hop_eh
+                            .try_admit_message_with_source_node_to(out_port.clone(), inbound)
+                            .expect("downstream admits");
+                        if i % 32 == 31 {
+                            drain(&hop_rx);
+                        }
+                    }
+                    let elapsed = start.elapsed();
+                    drain(&hop_rx);
+                    elapsed
+                }))
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_dispatch,
+    bench_payload,
+    bench_decision,
+    bench_hop
+);
 criterion_main!(benches);
