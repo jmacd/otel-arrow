@@ -9,127 +9,166 @@ Two other open-source systems influence this design:
 - [Kubernetes multitenant concepts](https://kubernetes.io/docs/concepts/security/multitenancy/)
 - [Envoy rate limit configuration](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/other_features/global_rate_limiting.html)
 
-Both of these systems will be familiar to many users and we aim to
-keep our concepts close to theirs.
+Both will be familiar to many users and we aim to keep our concepts close to
+theirs.
 
 ## Definitions
 
-As the dataflow engine can be deployed to perform in a wide range of
-application scenarios, there is no single definition of or data model
-for a tenant. Multitenancy describes a set of features for managing
-tenancy requirements, not a specific aspect of the dataflow engine.
+The dataflow engine is deployed across a wide range of scenarios, so there is
+no single definition of or data model for a tenant. Multitenancy describes a
+set of features for managing tenancy requirements, not one specific aspect of
+the engine. What those requirements are depends on what is being shared, what
+must be isolated, and how much operational complexity is acceptable. Common
+cases include:
 
-Tenancy requirements depend on the use-case, covering what resources
-are being shared, what needs to be isolated, and the acceptable level
-of operational complexity. Tenancy use-cases are often divided into
-categories based on the types of relationship between the principal
-and the tenant(s):
+- **Multiple teams** sharing an administrative boundary. Usually small in
+  number, cooperative, and under shared administrative control.
+- **Multiple customers** of a SaaS sharing a service endpoint. They have a
+  contractual relationship, compete for shared resources, and may be many.
+- The **self-observability** pipeline, treated as a special tenant.
+- **Multiple producers** of telemetry in different namespaces, processed
+  separately.
 
-- **Multiple teams** that share an administrator boundary (e.g., divisions
-  in a company). These are usually small in number, tenants are
-  cooperative and share administrative control.
-- **Multiple customers** of a SaaS sharing a service endpoint have a
-  contractual relationship, compete for shared service resources, and
-  may be large in number.
-- The **self-observability** pipeline is treated as a special tenant.
-- **Multiple producers** of telemetry in different namespaces are
-  processed separately.
+More than one concept of tenancy is often in use at a time, such as a SaaS
+customer account and a signed-in user, and multitenancy is often applied at
+several levels at once.
 
-Sometimes there will be more than one concept of tenancy in use at a
-time (e.g., SaaS customer account and signed-in user). Sometimes
-multitenancy is applied at multiple levels (e.g., both thread-local
-and global rate limits).
+## Coarse multitenancy through configuration
 
-## CPU limit policies
+Tenant tokens are sufficient to implement multitenant controls without any
+per-tenant limiter. Resolve the tenant identity once at the receiver, route on
+it -- to another node within a pipeline, or across a topic boundary into
+another pipeline group -- and each tenant's data lands in a pipeline of its
+own. That pipeline declares its own resource policies, which the operating
+system enforces through control groups or Job Objects.
 
-CPU limits are provided through built-in integration with the
-operating system through such mechanisms as Linux control groups
-(a.k.a. `cgroups`) and Windows Job Objects. The dataflow engine is
-required to support both absolute maximum and relative CPU limits,
-under `resources.cpu_limiter` configuration.
+Isolation becomes a property of the deployment rather than of a shared limiter
+table:
 
-CPU limits are given as an example of a multitenant mechanism because
-they are relatively simple, and directly supported by operating
-systems. Here we establish a convention for naming the aspects of a
-limit, either in absolute or in relative terms.
+- **CPU**: a tenant's pipeline is capped absolutely or weighted against its
+  siblings.
+- **Memory**: a tenant's pipeline group is given an absolute or relative share
+  of container memory.
+- **Failure**: one tenant's pipeline can stall, backpressure or restart
+  without touching another's.
+- **Observability**: engine telemetry is already labeled by pipeline and node,
+  so per-tenant accounting follows from the deployment.
 
-- The `cpu_limiter.cpu_limit` policy field indicates an absolute
-  limit in milli-CPUs. Example "100m" indicates 10% of one
+This is macro-scale tenancy: coarse, statically configured, and appropriate
+whenever tenants are few enough to name in configuration. It does not provide
+fairness among tenants that share one pipeline, nor per-request rate limits,
+and it scales only as far as tenants can be given pipelines of their own.
+Those requirements are addressed by the finer-grained limits below.
+
+Tenant tokens and the conditions evaluated over them are [detailed in a
+separate document](./multitenancy-tenant.md). They are resolved once and
+compiled, so every downstream decision is a fixed-cost lookup. Routing,
+batching, egress headers and trust-boundary policy are all consumers of the
+same identity, which is why a new per-tenant behavior needs a new consumer
+rather than a new matching mechanism.
+
+## Resource policies
+
+Resource policies are hierarchical: a limit declared at the top level is
+overridden by pipeline-group policies and then by pipeline policies. The
+resolution rules are defined in
+[configuration-model.md](./configuration-model.md). CPU and memory share one
+naming convention, giving either an absolute limit or a relative weight taken
+as a ratio against siblings.
+
+### CPU
+
+CPU limits are provided through built-in integration with the operating
+system, using mechanisms such as Linux control groups and Windows Job Objects.
+
+- `cpu_limiter.cpu_limit` is absolute, in milli-CPUs, so `100m` is 10% of one
   CPU.
-- The `cpu_limiter.cpu_weight` policy field indicates a relative
-  limit, taken as a ratio compared with the sum across all siblings
-  in the configuration.
+- `cpu_limiter.cpu_weight` is relative to the sum across siblings.
 
-As an example, the following dataflow engine configuration allows the
-dataflow engine to consume 10% of one CPU.
+### Memory
 
-```
+Enforcement is asymmetric, which is why memory needs separate attention. When
+CPU demand exceeds a limit, the operating system throttles the process by
+making it wait. When memory exceeds its limit, the operating system kills the
+process. The engine must therefore stay clear of its own limit rather than
+discover it.
+
+- `memory_limiter.soft_limit` and `memory_limiter.hard_limit` are coarse
+  thresholds defined against the operating system's memory accounting, used as
+  a load signal and to stop admitting new requests.
+- `memory_limiter.memory_limit` and `memory_limiter.memory_weight` size a
+  pipeline group absolutely or relatively.
+
+Memory is accounted at group level and shared by the group's pipelines, so a
+tenant needing a memory guarantee is given a group of its own.
+
+### Example
+
+```yaml
 policies:
   resources:
     cpu_limiter:
-      # Engine limited to maximum 100 mCPU or 10% CPU usage
-      cpu_limit: 100m
+      cpu_limit: 100m     # whole engine: 10% of one CPU
+    memory_limiter:
+      # In a 100MiB container, signal overload at 85% and treat 90% as fatal.
+      soft_limit: 85MiB
+      hard_limit: 90MiB
 
 engine:
   observability:
     policies:
       resources:
         cpu_limiter:
-          # Self observability at maximum 1% CPU usage
-          cpu_limit: 10m
+          cpu_limit: 10m  # self-observability: 1% of one CPU
+        memory_limiter:
+          memory_weight: 10
     pipeline: { ... }
 
 groups:
-  main-group:
-    pipelines:
-      first-pipe:
-        policies:
-          resources:
-            cpu_limiter:
-              # First pipeline at 80% relative
-              cpu_weight: 80
-        # ...
-      second-pipe:
-        policies:
-          resources:
-            cpu_limiter:
-              # Second pipeline at 20% relative
-              cpu_weight: 20
-        # ...
-
+  acme:                   # one tenant, reached by tenant-token routing
+    policies:
+      resources:
+        cpu_limiter:
+          cpu_weight: 80
+        memory_limiter:
+          memory_weight: 90
+    pipelines: { ... }
 ```
 
-## Detailed design documents
+## Finer-grained limits (future work)
 
-### Memory management
+Where tenants must share a pipeline, coarse configuration is not enough and
+the engine needs limits that select a bucket per tenant. Such limits are a
+**consumer of tenant tokens**, not a separate mechanism: a limiter names the
+tokens it binds and selects its bucket with the same first-match-wins
+conditions used for routing, plus a cardinality limit bounding how many
+buckets may exist.
 
-Process-wide memory limits and a system of regulation for real memory
-allocations is [detailed in a separate
-document](./multitenancy-memory.md).
+Limits will be declared in named units, so that a policy can restrict requests
+per second, network bytes per second, items in flight or storage operations,
+using unit names such as `request_bytes`, `network_bytes`, `request_count`,
+`request_items`, `storage_bytes` and `storage_ops`. They fall into two
+families:
 
-### Tenant identification
+- **Rate limits** count a resource consumed as a function of time. It is not
+  returned, and a caller that cannot proceed may wait a definite amount of
+  time. The built-in implementation is a token bucket.
+- **Resource limits** count a resource held by ongoing work in queues, batches
+  and topics. A caller may wait indefinitely for it to be returned. The
+  built-in implementation is a semaphore.
 
-A mechanism for extracting tenant-specific details from request
-context is defined. A corresponding mechanism for conditional behavior
-based on propagating tenant "tokens" is [detailed in a separate
-document](./multitenancy-tenant.md).
+The built-in limiters are thread-local, so they resolve at pipeline scope and
+are therefore per-tenant and per-core. Limits shared across threads or CPUs
+are served by policy extensions, which may delegate to systems such as the
+[Envoy gRPC rate limit service](https://github.com/envoyproxy/ratelimit) or
+[Gubernator](https://github.com/gubernator-io/gubernator). A shared limiter
+must separate its hot and cold paths to avoid interfering with the engine.
+The alternative is the coarse pattern above: route by tenant token to a
+pipeline of its own, where the built-in thread-local limiter suffices.
 
-### Limiter extensions
-
-A general-purpose mechanism for limiter policies and limiter
-implementations is developed, covering rate limits and resource limits
-in pre-defined units, for example to limit the number of requests per
-second or network bytes per second and concurrent quantities such as
-requests in flight. Limiter units name the quantity being measured
-such as:
-
-- `request_bytes` measures the in-memory size of the request
-- `network_bytes` measures the on-wire size of the request
-- `request_count` measures one unit per request
-- `request_items` measures one unit per item of telemetry data
-- `storage_bytes` measures one unit per byte of storage
-- `storage_ops` measures one unit per storage read or write
-
-Rate and Resource limiter extensions are [detailed in a separate
-document](./multitenancy-limiters.md)
-
+A related direction is budgeting the memory retained by work in flight, so
+that queues, batches, retry buffers and pending exporter requests are charged
+to the tenant that caused them, with ownership moving as data crosses queues
+and topics. Detailed limiter configuration, fairness modes, cardinality
+failure modes, observability and retained-work memory budgeting are deferred
+until the tenant token mechanism has landed.

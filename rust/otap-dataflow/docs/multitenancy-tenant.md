@@ -1,383 +1,369 @@
-# Multitenancy Tenant Identity
+# Multitenancy: Tenant Tokens
 
 **Status:** Draft
 
-## Request and tenant context
+A **tenant token** names the identity a request belongs to: a small set of
+`key: value` identifiers, resolved once at the receiver from request-scoped
+material, and carried with the request for the rest of its life in the engine.
 
-System operators require multiple tenants to share pipeline
-resources, with fine-grained limits configured to achieve isolation
-and fairness between tenants. Tenant identification depends on the
-use-case and what is being shared. How the engine identifies a tenant
-is a matter of choice. It is often possible to express tenancy
-directly through configuration, by associating specific resources with
-specific tenants in whole terms. As an example, by giving each tenant
-a dedicated port and pipeline, they can physically separate tenants
-without the use of specific multi-tenant features. By isolating
-whole-ports, whole CPUs, or whole threads to a single tenant or tenant
-group, the operator may be able to avoid using tenant tokens
-entirely.
+Tokens are the substrate for per-tenant behavior in the dataflow engine.
+Routing, batching, egress headers, trust-boundary policy and eventually limits
+all read the same resolved identity, evaluate the same condition vocabulary,
+and share one compiled representation. Adding a per-tenant behavior means
+adding a consumer, not a second matching mechanism.
 
-However, where there are context-specific attributes used for
-limiting, a **tenant token** will be used. A tenant token is
-a small vector of key:value identifiers which represent the current
-tenant in some context. Usually, the context is a request, however,
-custom contexts can be defined as long as a tenant token can be
-stored.
+This document describes the mechanism as built in the tenant token prototype
+([otel-arrow#3635](https://github.com/open-telemetry/otel-arrow/pull/3635),
+[otel-arrow#3636](https://github.com/open-telemetry/otel-arrow/pull/3636)).
 
-Tenant tokens are multi-dimensional to enable tenant assignment
-in logically independent ways with user control over cardinality. For
-example, a request may be accompanied by an environment name, a
-project name, and a user name for three forms of tenancy. Choosing
-three forms means a single limiter table with three-dimensions.
+## Tenant tokens
 
-Multiple tenant tokens per request are supported, enabling
-multiple independent limiters with lower dimensions. For example, a
-request may be accompanied by both an end-user tenant identifier and
-an acting-on-behalf-of tenant identifier. These are logically
-independent, two single-dimensional limiters.
-
-Multiple tenant tokens can be used to express various forms of a
-single tenant identity. When there are multiple sets of header
-conventions that describe a tenant (e.g., "modern" and "legacy"), they
-are listed as alternatives. Generally, the alternatives should be
-non-overlapping, but the behavior is well-defined either way: all
-tokens of the request must match all the conditions of the
-limiter.
-
-To create a new request context, tenant token extractors are
-applied; we take the union of key:values of the resolved tenant
-tokens and precompute a table lookup key for every distinct set
-of condition entries defined in the engine. Later in the pipeline,
-these precomputed table-lookup keys will be used to evaluate limiter
-conditions in **O(1)** time.
-
-To evaluate which limiter bucket a given request falls into, the
-sequence of conditions is applied in order. For a context to match a
-condition, all its entries must match for all tenant token values
-to qualify.
-
-### Model terms and request flow
-
-The model uses the following terms, which are developed in more detail below.
-
-| Term            | Definition                                                                                                                                       |
-|-----------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
-| Tenant token    | A list of extractors, possibly conditional, that determine a resolved token value. These can be defined at several levels for restricted access. |
-| Token extractor | A configured rule that extracts and/or matches one token key from a request.                                                                     |
-| Token value     | The set of keys and values forming a resolved token, with a number of associated table lookup keys.                                              |
-| Key / value     | A single dimension of a tenant token value.                                                                                                      |
-| Entry           | A single `{ key, value }` term within a condition; no `value` means wildcard.                                                                    |
-| Condition       | An ordered list of entries selecting a bucket; the first matching condition wins.                                                                |
-| Bucket          | Contains one distinct limiter instance per distinct set of entry keys for the matching condition, up to the cardinality limit.                   |
-
-Token extractors are evaluated and the matching results are placed
-in the request context where it passes with the request data in a
-pipeline where individual nodes will apply specific limiters.
-
-![A flow diagram showing how tenant token values are computed and flow through the pipeline](./multitenancy-tenant-diagram.svg)
-
-### Tenant token extractors
-
-Tenant tokens originate in a series of extractors, configured at the
-top level, group-level, and pipeline-level of the dataflow engine
-configuration, since these definitions are shared across pipeline
-groups. Token values refer to one or more tenant associations,
-each association consisting of multiple keys and values and used as a
-lookup key for evaluating limiter conditions. Tenant token values
-must be erased when they go out of scope to avoid leaking sensitive
-data across unintended boundaries.
-
-Token extractors are applied by receivers (or processors) when they
-originate new request contexts. They support attribute
-extraction in a variety of ways, for example,
-
-- `receiver_id`, `source_node_id`: the first node or preceding node traversed by the request.
-- `remote_address`, `masked_remote_address`: origin network address, optionally CIDR-masked.
-- `generic_key`: a static, hard-coded key-value.
-- `transport_header`: copy a transport header value into a token key.
-- `transport_header_match`: token key value must match a condition.
-
-Here, the term _transport header_ is generic. Although we model these as
-HTTP headers, receivers for other protocols are responsible for
-deriving headers according to the protocol that is in use, using
-semantic conventions as needed. The engine reserves the token key
-`signal` to identify the type of signal in the request (e.g., "logs").
-
-### Tenant token examples
-
-Here is an example of a single token extractor list based on the
-client address, a hard-coded value, and an extracted transport header as
-the keys:
+Tokens are declared once, at engine scope:
 
 ```yaml
-extractors:
-- key: client_address
-  remote_address: {}     # use the network peer's socket address as the value
-- key: route_name
-  generic_key: http/otlp
-- key: user_id
-  transport_header: x-user-id
+engine:
+  tenant_tokens:
+    edge_tenant:
+      extractors:
+      - key: tenant_id
+        transport_header: x-tenant-id
+        retain: true
+      - key: project_id
+        transport_header: x-project-id
 ```
 
-Here is an example engine configuration defining three tenant
-tokens: two end-user forms (modern and legacy) and one
-acting-on-behalf-of service token.
+There is no per-group, per-pipeline or per-node override. A token is a shared
+vocabulary; scoping it would let two pipelines disagree about what `tenant_id`
+means, and a value resolved in one pipeline must be readable by the same key
+in the next hop.
+
+A token is a list of extractors and **resolves only when every extractor
+resolves**. `edge_tenant` above requires both headers; a request carrying only
+`x-tenant-id` resolves nothing. Keys that should resolve independently are
+declared as separate tokens. Several tokens may resolve on one request, which
+is how independent forms of tenancy coexist: an end-user identity alongside an
+acting-on-behalf-of identity, or a modern header convention alongside a legacy
+one.
+
+## Extractors
+
+| Extractor | Source of the value |
+| --- | --- |
+| `transport_header: <name>` | An inbound header, matched case-insensitively |
+| `generic_key: <value>` | A static value the pipeline mints for itself |
+| `remote_address: true` | The network peer's address |
+| `imported_key: <name>` | A key admitted at an upstream topic boundary |
+
+The term _transport header_ is generic. Receivers for non-HTTP protocols
+derive headers according to the protocol in use: the Kafka receiver resolves
+message headers exactly as the gRPC receiver resolves metadata, so a Kafka hop
+is not a hole in the identity chain. Authorization extensions are the source
+of trusted material; token definitions are not required to use secure fields,
+so pipeline operators remain responsible for secure configurations.
+
+### Retaining values
+
+By default an extracted value is available for **matching only**: conditions
+test it, but it costs no bytes on the request and cannot be read back.
+
+- `retain: true` keeps the value, which is what lets an exporter re-emit it or
+  a processor name a partition from it.
+- `bag: true` implies `retain` and additionally carries the key's _name_. This
+  is the only way a name travels with a request; every other use of a key name
+  is compiled out at startup. Bagged values are encoded as a complete OTLP
+  `repeated KeyValue` field, so instrumentation can append a request's tenant
+  identity to span or log attributes by copying bytes.
+
+Retention is what allows tenant tokens to **subsume the general-purpose
+transport header map**. The engine previously copied every captured header
+into an owned name/value pair on every request. It now copies only the values
+the operator declared, packed into one allocation with the key names compiled
+out, and the separate transport-header capture policy is retired.
+
+## Conditions: the shared vocabulary
+
+Every node that makes a per-tenant decision evaluates an ordered list of
+**conditions**, first match wins. A condition is a set of **entries** that
+must all match. An entry with a `value` requires that exact value; an entry
+without one is a wildcard requiring only that the key be present.
 
 ```yaml
-# Engine top-level tenant tokens, shared across all pipeline groups.
-tenant_tokens:
-  enduser_tenant_modern:
-    extractors:
-    - key: customer_id
-      transport_header: x-customer-id
-    - key: workspace_id
-      transport_header: x-workspace-id
-    - key: tier
-      transport_header: x-customer-tier
-  enduser_tenant_legacy:
-    extractors:
-    - key: customer_id
-      transport_header: x-legacy-customer-id
-    - key: workspace_id
-      transport_header: x-legacy-workspace-id
-    # legacy tenants are identified by a version header
-    - transport_header_match: x-protocol-version
-      value: "very-old"
-  onbehalfof_tenant:
-    extractors:
-    - key: service_id
-      transport_header: x-service-id
-    - key: subscription_id
-      transport_header: x-subscription-id
-groups:
-  # ... pipeline groups reference the tokens above ...
+routes:
+- entries:
+  - key: tenant_id
+    value: acme
+  - key: tier          # no value: present with any value
+  to: acme_priority
+- entries:
+  - key: tenant_id
+    value: acme
+  to: acme_bulk
 ```
 
-### Engine tenancy support
+`Entry` and `Condition` are engine-level configuration types rather than
+node-local ones, and every consumer reuses them:
 
-The Dataflow Engine's pipeline data type (`OtapPdata`) will be
-modified to propagate tenant tokens in the context. Receivers and
-processors that create new contexts will be upgraded to evaluate the
-applicable tenant token extractors based on their transport headers.
-When all extractor conditions succeed for a token and request, the
-resulting tenant token value is entered into the context.
+| Consumer | Configuration type | Decision |
+| --- | --- | --- |
+| `processor:tenant_router` | `TenantRouting` | Output port |
+| `exporter:topic` | `TenantRouting` | Topic |
+| `exporter:kafka` | `TenantRouting` | Topic, partition key, record headers |
+| `processor:batch` | `TenantPartitioning` | Partition, so a merged batch never mixes tenants |
+| `exporter:topic`, `receiver:topic` | `TenantContextRules` | Keys admitted across a trust boundary |
+| Limiter policies (future) | `Condition` | Limit bucket |
 
-Any kind of node can apply a limit. When the engine starts, it applies
-the resolved limit policies at the nodes and chokepoints where they
-take effect. The engine implements the standard limits itself and
-provides helpers to apply them in a uniform way, so most limits require
-no custom code.
+Keeping one route type means both kinds of routing are declared, collected and
+validated by the same code, and a new consumer inherits the entire compiler
+without contributing any matching logic of its own.
 
-### Resource-level tenants
+### Where conditions are declared
 
-At the top of the OpenTelemetry data model, the Resource value
-describes a single producer of telemetry. When a pipeline request
-contains data for a single resource, as typically produced by an OpenTelemetry SDK,
-the request's resource attributes can be made to act like transport headers as the input
-for tenant token extractors.
+Nodes place their route table under the well-known configuration key
+`tenant_routing`, and their boundary policy under `tenant_context`. The
+controller collects conditions by walking every node config in a pipeline
+group **without knowing which node types exist**, builds the registry, and
+publishes it through the pipeline context before any node starts.
 
-Receivers for non-HTTP telemetry protocols that convey single-resource
-requests may apply token extractors directly to resource
-attributes. Limiters that are applied in those contexts may refer to
-single-resource token extractors `resource_attribute` and
-`resource_attribute_match` to extract or conditionally extract tenancy
-information. These extractors can only be applied in single-resource
-contexts. For example to extract a `service_name` tenant for the
-production namespace in a single-resource context:
+That is the hinge of the design: because declarations are discoverable from
+configuration alone, the compiler sees the whole engine's demand up front. A
+condition testing a key that no bound token declares, or a value never
+declared to the registry, fails the configuration at startup rather than
+silently matching nothing at runtime.
+
+## Egress: naming the wire
+
+A token says nothing about the header name its retained value is re-emitted
+under. The token is the portable identity; the wire name is a site-specific
+decision belonging to whichever node does the emitting.
 
 ```yaml
-extractors:
-- key: service_name
-  resource_attribute: service.name
-- resource_attribute_match: service.namespace
-  value: production
+exporter:
+  type: exporter:otlp_grpc
+  config:
+    grpc_endpoint: http://backend:4317
+    tenant_headers:
+    - key: tenant_id
+      header: x-acme-customer
+    - key: trace_state
+      header: x-trace-state
+      binary: true
 ```
 
-These extractors do not apply in contexts where multiple resources are
-present. Under this proposal, the options for handling multi-resource
-requests with these resource token extractors are:
+- The same token leaves one exporter as `x-acme-customer` and another as
+  `x-customer-id`. Neither is "the" name, and a token carries no assumptions
+  about any backend.
+- `binary: true` selects gRPC binary metadata. The `-bin` suffix gRPC requires
+  is appended at startup, and raw bytes are emitted rather than a base64 form,
+  so a value cannot be double-encoded by a second hop.
+- **Static configuration wins on collision.** A tenant header configured under
+  a name the exporter also sets statically, typically `authorization`, is
+  dropped. Tenant material can never shadow a backend credential.
+- A key that no token retains is reported and skipped at startup.
 
-- Nack the request.
-- Reject the configuration: callers assert single-resource context or else
-  invalid configuration.
-- Do not resolve the extractor, the token will be unresolved; receivers
-  and limiters that require this token will reject, otherwise these
-  requests will not match conditions and take the default limit.
+## Trust boundaries
 
-Routing and batching by tenant token based on resource attributes
-generalizes in useful ways. Telemetry configurations sometimes
-aggregate by both tenant-token property and sub-characteristic such as
-metric name or TraceId. In general, the dataflow engine must add
-support splitting requests in these ways to enable routing, shuffling,
-grouping and load balancing by tenant token among other characteristics.
-
-### Tenant trust
-
-Authorization extensions are the source of trusted material for
-defining tenant tokens. While tenant token definitions are not
-required to use these secure fields, pipeline operators are
-responsible for secure tenant configurations.
-
-Tenant tokens can be defined at multiple levels of the engine
-configuration (e.g., global, pipeline group, pipeline) to avoid
-leaking tenant details outside their scope. The dataflow engine is
-responsible for enforcing this discipline automatically.
-
-Pipeline operators are advised to configure sensible cardinality
-limits to protect the pipeline.
-
-### Routing/batching by tenant token
-
-Processors (e.g., fanout) and exporters (e.g., topic) will be
-configurable to route by token condition.
+A boundary between pipeline groups is where tenant material could leak between
+tenants, so each side names the keys it admits and everything unnamed is
+dropped. One type serves both directions:
 
 ```yaml
-nodes:
-  tenant_split:
-    type: processor:tenant_router
-    config:
-      tenant_tokens: [enduser_tenant_modern, enduser_tenant_legacy]
-
-      # first-match wins
-      routes:
-      # customer_id=bigfish
-      - entries:
-        - key: customer_id
-          value: bigfish
-        output: bigfish_pipeline
-      # for premium-tier customers
-      - entries:
-        - key: tier
-          value: premium
-        output: premium_pipeline
-      # for any customer
-      - entries:
-        - key: customer_id
-        output: shared_pipeline
-      default_output: fallback
-
-    outputs:
-      bigfish_pipeline: {...}
-      premium_pipeline: {...}
-      shared_pipeline: {...}
-      fallback: {...}
+tenant_context:
+  export_keys: [tenant_id]     # read by the egress side
+  import_keys: [tenant_id]     # read by the ingress side
+  tenant_tokens: [edge_tenant] # resolved after import
 ```
 
-The same applies to the batch processor specifically. Note that
-[OpenTelemetry Collector supports batching by selected transport headers
-using
-`sending_queue::batch::partition::metadata_keys`](https://github.com/open-telemetry/opentelemetry-collector/blob/main/exporter/exporterhelper/README.md#sending-queue-batch-settings)
-and a configurable cardinality limit. Tenant tokens and batching
-conditions will be used to this effect in the dataflow engine.
+The inbound context is never adopted as-is. The receiving side admits the keys
+it names, then resolves its own tokens over the admitted values plus any
+locally minted ones, so the downstream pipeline evaluates conditions against
+identities it declared itself. An absent policy admits nothing, the
+fail-closed answer for a policy nobody wrote.
 
-### Load balancing by tenant token
+Store-and-forward within one pipeline, such as `processor:durable_buffer`, is
+not a trust boundary: the context leaves and returns against one registry, so
+it means what it always meant and there is nothing to re-derive.
 
-The example above shows to isolate a small number of routes in static
-configuration based on the tenant token. Engines running on
-multiple cores are also required to route and load balance when the
-number of tokens is large.
+## Compiler mechanics
 
-Load balancing by tenant token will be organized using the
-dataflow engine's topic broker infrastructure based using tenant
-tokens and conditions to compute a hash value, and then to use
-(hash-value % N) to distribute the request to one of N topic
-receivers. The design of the load balancing mechanism is out of scope
-for this document and part of a larger scope. Often, there is a
-simultaneous need to aggregate and load-balance multi-tenant request
-by features in the data other than tenant, such as metric name or
-TraceId. In both cases, the dataflow engine requires a mechanism to
-create multi-tenant, multi-request batches destined for a single
-consumer.
+Conditions are compiled, not interpreted. All string comparison happens once,
+at startup, and each request costs a fixed number of lookups no matter how
+many conditions are declared. The shape is a compile-time hash join.
 
-### Tenant reconfiguration
+![Tenant token lifecycle: the registry compiled from configuration, the packed
+context constructed at the receiver, and the downstream consumers that probe
+it](./multitenancy-tenant-diagram.svg)
 
-The dataflow engine is required to support reconfiguration of tenant
-token extractors and limiter conditions. As these two aspects of
-multitenancy are coupled, they will be reconfigured atomically. Tenant
-tokens will carry the identity of the matching condition set.
+### Build phase (startup)
 
-Specific details about reconfiguring tenant token extractors and
-limiter conditions and potential limitations are outside the scope
-of this document.
+- Key names are interned to a key id, token names to a token index.
+- Each token gets a `key_mask`, one bit per extractor.
+- Header extractors are indexed by lowercased header name; static and imported
+  extractors have their own indexes.
+- Conditions are grouped by **signature**: the pair of sorted fixed keys and
+  sorted wildcard keys they test. Conditions sharing a signature share a hash
+  table, because they hash the same terms in the same order.
+- A signature applies to a token only when its required keys are a subset of
+  that token's keys. Each applicable (token, signature) pair is assigned a
+  dense slot.
 
-## Implementation details
+### Resolve phase (per request)
 
-The tenancy features described above have an efficient, table-driven
-implementation. It runs in three steps: a one-time build step, then
-two per-request steps: context creation and limiter lookup. Using
-these structures, the algorithm reduces to O(1) work per condition. We
-assume the use of a fixed-size hash function over ordered key:values,
-as in a database group-by hash-join operation.
+1. Reset a reusable, receiver-owned scratch buffer. Steady state allocates
+   nothing here.
+2. Run the static extractors, then make **one pass over the request headers**,
+   clearing `key_mask` bits as extractors are satisfied.
+3. A token whose mask reaches zero is resolved. If no token resolves, the
+   request carries no tenant context at all and the whole feature costs one
+   branch.
+4. Resolve each key's value to a **symbol** by exact dictionary lookup, then
+   pack one word per allocated pair slot, projecting symbols onto the
+   signature's keys in signature order.
 
-### Compile tokens and conditions
+Token resolution being all-or-nothing yields a useful simplification: if a
+signature applies to a resolved token, every wildcard key it requires is
+necessarily present, so no per-request presence mask is needed.
 
-When loading the engine configuration, produce static data
-structures to accelerate the two steps that follow. First, from
-the pipeline graph structure, determine a reachability mapping
-for all nodes, indicating whether a context created at any given
-node can reach any other limiter in the engine.
+### Probe phase
 
-Next, partition the token extractors into two groups. Conditional
-extractors are those whose key is tested by some reachable condition;
-their presence and value will resolve the tokens, and they are
-indexed here. Wildcard extractors that require a key without a specific
-value are indexed to accept all values. Remaining extractors are deferred
-until the matching tokens are known.
+Evaluating a node's conditions costs one bit test plus one integer lookup per
+bound (token, signature) pair, keeping the lowest matching condition index so
+that first-match-wins holds across signatures. It allocates nothing, and the
+cost is independent of how many routes are configured, how many entries each
+route tests, and how large the batch is.
 
-The index is a map by header key; any-value cases are resolved here,
-then a second map by header value. The any-value and specific-value
-cases are identical, each a list of _(token, extractor)_ slots that the
-corresponding header satisfies.
+### The packed request context
 
-Finally, precompute the token-by-condition cross-product: for
-every token and every reachable condition (the conditions of
-limiters reachable from the node), the projection that yields that
-condition's table-lookup key.
+The per-request result is a single allocation carried with the request data.
+Nothing in the layout is self-describing: every key is registered, so a value
+is addressed by the **value slot** its key occupies in the registry, and no
+name, key id or descriptor travels with it.
 
-### Context creation step
+![What one request carries: the arriving request and the engine declaration,
+the counts in w0, and then three columns -- packed symbols, value offsets and
+the values -- each showing the configuration that creates it, the bytes it
+holds, and the node that reads it](./multitenancy-context-diagram.svg)
 
-Using the structures above, a receiver builds the token values
-for a request:
+The figure above works one request all the way through, and pairs each region
+with the configuration that causes it. Only the first two words sit at fixed
+positions; the two counts they carry locate everything after them, so a reader
+computes the start of the symbol words, the offset array and the blob with two
+shifts and an add. The blob's split is what makes the bag copyable whole: its
+leading `bag_len` bytes are already the bytes a `LogRecord.attributes` or
+`Span.attributes` field wants, tagged with the consumer's own field number at
+compile time. A slot addresses its value directly in either region, so a reader
+never needs to know which region a key landed in, and an absent key is one
+compare against an empty offset.
 
-- Take the union of tokens over the applicable limiters. Initialize a
-  candidate vector indexed by token, each entry a bit-vector with a
-  1-bit for every unsatisfied token key.
-- For each header key/value on the request, look up the key, consider
-  any-value case, then the specific case. For each (token,
-  extractor) slot listed, clear that token's corresponding bit.
-- A token whose bit-vector reaches 0 has all keys present and
-  matching: construct its value, and with it the precomputed lookup
-  key for each reachable condition that references it. A token
-  that never reaches 0 is unresolved for this request.
+Reading the three regions together shows why the layout is shaped this way.
+Conditions produce the packed symbol words, and each node resolves at startup
+which word its own (token, signature) pair occupies, so at runtime it reads one
+known word and looks it up in its own compiled table. The `retain` and `bag`
+modifiers produce the offsets and the values, which are read by index rather
+than matched. Nothing is searched and nothing is decoded.
 
-### Algorithm Analysis
+Two details in the figure are worth naming, because they are what keep the
+representation honest. A key that is matched but never retained, like `tier`,
+appears in a packed symbol word but owns no value slot and therefore costs no
+bytes. And a value no condition ever named, like `gold`, packs the reserved
+`unknown` symbol rather than a symbol of its own, so a condition naming that
+key fails to match instead of matching by accident: in the figure that is
+exactly why the batch partition misses and the request takes the catch-all.
 
-The context value carries, for each resolved token, a precomputed
-lookup key per reachable condition. When a request arrives, each
-limiter scans its conditions and performs one table lookup per
-condition, per bound token, using the precomputed keys.
+Because the layout is positional, two requests with equal tenant values
+produce byte-equal contexts regardless of header ordering, which is what makes
+partition names derived from the context stable across producers.
 
-Let `D_recv` be the number of tokens in the node, `C_reachable`
-the reachable limiter conditions from that node, `H` the header count,
-and `k_d`, `k_c` the token and condition key counts. A condition
-applies to a token only when the token's schema covers the
-condition's keys. Let `P` be the number of applicable (token,
-condition) pairs: `C_reachable <= P <= D_recv * C_reachable`, the
-upper bound reached only when a limiter binds multiple same-schema
-tokens.
+### Matching is exact
 
-The space used in this approach:
+The integer probed is a packed tuple of dictionary symbols, not a digest.
+Hashing selects a candidate and the candidate is verified against the literal
+the registry owns, exactly as a database hash join verifies equality after the
+hash narrows the candidates. **A hash collision cannot route one tenant's data
+to another tenant's destination.**
 
-- resolved token values: `O(D_recv * k_d)`
-- precomputed lookup keys: one fixed-size fingerprint per applicable pair,
-  total size `O(P)`.
+A value that no condition mentions resolves to a reserved "unknown" symbol, so
+it matches nothing rather than colliding with something. Such a request takes
+the configured default, never another tenant's port.
 
-The time used in this approach:
+### Budgets
 
-- context creation: `O(H + D_recv * k_d)` to resolve tokens and
-  materialize values, plus `O(P * k_c)` to project and hash one lookup
-  key per applicable pair
-- limiter lookup: one `O(1)` table probe per applicable (token,
-  condition) pair, `O(P)` total, independent of `k_d` and `k_c`,
-  because projection and hashing cost were paid at context creation.
+Symbol width trades breadth for density. The compiler enforces the budget at
+startup and fails the configuration rather than truncating.
 
+| Declared keys | Distinct values per key |
+| --- | --- |
+| up to 4 | about 65,000 |
+| up to 8 | 254 |
+| up to 16 | 14 |
+
+Values are counted per key across all conditions that mention them, not per
+request, and a key that is retained but never matched consumes no symbol
+space. Retained values are separately budgeted at 65,535 bytes per request
+after encoding; a value that does not fit is dropped whole and reads as absent
+downstream, so nothing is truncated and the attribute bag stays a well-formed
+OTLP field.
+
+## Routing, batching and load balancing
+
+`processor:tenant_router` sends each message to a named output port. The
+decision reads no telemetry, which is the difference from
+`processor:content_router`: route on the tenant context when the routing
+dimension is _who sent the request_, and on content when it is _what the data
+says_. Routing is exclusive and a message is routed whole.
+
+```yaml
+type: processor:tenant_router
+outputs: [acme, premium, unmatched]
+config:
+  tenant_routing:
+    routes:
+    - entries: [{ key: tenant_id, value: acme }]
+      to: acme
+    - entries: [{ key: tier, value: premium }]
+      to: premium
+    default_to: unmatched
+```
+
+Without `default_to`, an unmatched message is NACKed; unmatched data is never
+delivered to an arbitrary port. `exporter:topic` and the Kafka exporter use
+the same route table to select a topic, with one deliberate asymmetry: an
+unresolvable topic-routing key fails at startup, because falling back to the
+static topic would deliver one tenant's data to another tenant's topic, while
+an unresolvable header key only drops decoration and is reported and skipped.
+
+Routing across a topic boundary is what turns tenant identity into resource
+isolation: a tenant's data is delivered into a pipeline group of its own,
+which carries its own CPU and memory policies enforced by the operating
+system. No per-tenant limiter is involved, because the isolation is a property
+of the deployment. See [coarse multitenancy through
+configuration](./multitenancy-overview.md#coarse-multitenancy-through-configuration).
+
+Batching reuses conditions as partitions, so every output batch carries a
+single tenant context and retained values survive the merge intact. This
+serves the same purpose as the OpenTelemetry Collector's
+[`sending_queue::batch::partition::metadata_keys`](https://github.com/open-telemetry/opentelemetry-collector/blob/main/exporter/exporterhelper/README.md#sending-queue-batch-settings).
+
+Static routes isolate a small number of destinations. Engines running on many
+cores also need to spread a large number of tenants, which is organized
+through the topic broker: a hash over the tenant context selects one of N
+topic receivers. The design of load balancing is out of scope for this
+document.
+
+## Future work
+
+- **Limits.** Rate and resource limiters select their bucket with the same
+  conditions, giving per-tenant limits with no second matching mechanism. See
+  [the overview](./multitenancy-overview.md).
+- **Resource-attribute tenants.** In single-resource requests, resource
+  attributes can serve as extractor input, for example `resource_attribute:
+  service.name`. Behavior in multi-resource contexts remains unresolved.
+- **Reconfiguration.** Extractors and conditions are coupled and must be
+  reconfigured atomically; the context header carries an `epoch` naming the
+  layout generation for this purpose.
+- **Coverage.** OTLP gRPC, OTLP HTTP and Kafka receivers resolve tokens today;
+  the OTAP receiver does not yet.
+
+## See also
+
+- [Multitenancy overview](./multitenancy-overview.md)
+- [Configuration model](./configuration-model.md)

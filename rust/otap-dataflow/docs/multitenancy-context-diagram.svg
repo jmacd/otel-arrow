@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="916" viewBox="0 0 1240 916" font-family="'Segoe UI', Helvetica, Arial, sans-serif" xml:space="preserve">
+  <defs>
+    <style>
+      .title { font-weight:700; font-size:21px; fill:#1f2733; }
+      .sub   { font-weight:400; font-size:13px; fill:#5b6470; }
+      .stage { font-weight:700; font-size:12px; fill:#1f2733; }
+      .colh  { font-weight:700; font-size:13px; fill:#ffffff; }
+      .colhs { font-weight:400; font-size:11px; fill:#e8eef5; }
+      .small { font-weight:400; font-size:11px; fill:#5b6470; }
+      .tiny  { font-weight:400; font-size:10px; fill:#6b7482; }
+      .step  { font-weight:700; font-size:10px; fill:#8a94a0; }
+      .mono  { font-family:Consolas,'SF Mono',Menlo,monospace; font-size:11px; fill:#3a4250; }
+      .yaml  { font-family:Consolas,'SF Mono',Menlo,monospace; font-size:10px; fill:#3a4250; }
+      .yamlc { font-family:Consolas,'SF Mono',Menlo,monospace; font-size:10px; fill:#8a94a0; }
+      .monob { font-family:Consolas,'SF Mono',Menlo,monospace; font-size:11px; font-weight:700; fill:#1f2733; }
+      .monot { font-family:Consolas,'SF Mono',Menlo,monospace; font-size:10px; fill:#5b6470; }
+      .monog { font-family:Consolas,'SF Mono',Menlo,monospace; font-size:10px; fill:#9aa4b0; }
+      .ok    { font-family:Consolas,'SF Mono',Menlo,monospace; font-size:10px; font-weight:700; fill:#1f7a4d; }
+      .bad   { font-family:Consolas,'SF Mono',Menlo,monospace; font-size:10px; font-weight:700; fill:#a33333; }
+    </style>
+    <marker id="mDn" markerWidth="10" markerHeight="10" refX="5" refY="9" orient="auto"><path d="M0,0 L10,0 L5,10 z" fill="#5b6470"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1240" height="916" fill="#ffffff"/>
+
+  <text class="title" x="28" y="34">What one request carries, and what each part of it is for</text>
+  <text class="sub" x="28" y="54">The tenant context is one allocation of nine 64-bit words. Each region below exists because of a line of configuration, and is read by a node that was compiled against it.</text>
+
+  <!-- ===== row A: the request and the declaration ===== -->
+  <rect x="28" y="68" width="1184" height="142" rx="8" fill="#f7f8fa" stroke="#dde2e8"/>
+
+  <rect x="45" y="80" width="290" height="118" rx="6" fill="#ffffff" stroke="#c3cbd4"/>
+  <text class="stage" x="57" y="98">the request arrives</text>
+  <text class="mono" x="57" y="120">x-tenant-id:  acme</text>
+  <text class="mono" x="57" y="138">x-project-id: p-42</text>
+  <text class="mono" x="57" y="156">x-tier:       gold</text>
+  <text class="tiny" x="57" y="180">Resolved once, at the receiver.</text>
+
+  <rect x="350" y="80" width="485" height="118" rx="6" fill="#ffffff" stroke="#c3cbd4"/>
+  <text class="stage" x="362" y="98">what the operator declares once, at engine scope</text>
+  <text class="yaml" x="362" y="114">engine:</text>
+  <text class="yaml" x="362" y="127">  tenant_tokens:</text>
+  <text class="yaml" x="362" y="140">    edge_tenant:</text>
+  <text class="yaml" x="362" y="153">      extractors:</text>
+  <text class="yaml" x="362" y="166">      - {key: tenant_id,  transport_header: x-tenant-id,  bag: true}</text>
+  <text class="yaml" x="362" y="179">      - {key: project_id, transport_header: x-project-id, retain: true}</text>
+  <text class="yaml" x="362" y="192">      - {key: tier,       transport_header: x-tier}</text>
+
+  <rect x="850" y="80" width="345" height="118" rx="6" fill="#ffffff" stroke="#c3cbd4"/>
+  <text class="stage" x="862" y="98">w1: which tokens resolved</text>
+  <text class="monob" x="862" y="122">resolved = ...0001</text>
+  <text class="tiny" x="862" y="144">Bit 0 is edge_tenant. A token resolves only</text>
+  <text class="tiny" x="862" y="157">when every one of its extractors resolves, so</text>
+  <text class="tiny" x="862" y="170">all three headers had to be present.</text>
+  <text class="tiny" x="862" y="190">No bit set means no context at all.</text>
+
+  <!-- ===== row B: the counts ===== -->
+  <rect x="28" y="220" width="1184" height="80" rx="8" fill="#eef4fb" stroke="#9dc2e0"/>
+  <text class="stage" x="45" y="240">w0: four counts, and the only fixed position in the whole context</text>
+
+  <rect x="45" y="250" width="150" height="30" fill="#dbe7f3" stroke="#7fa6c6"/>
+  <rect x="200" y="250" width="150" height="30" fill="#dbe7f3" stroke="#7fa6c6"/>
+  <rect x="355" y="250" width="150" height="30" fill="#dbe7f3" stroke="#7fa6c6"/>
+  <rect x="510" y="250" width="150" height="30" fill="#dbe7f3" stroke="#7fa6c6"/>
+  <text class="monob" x="120" y="270" text-anchor="middle">n_fp = 2</text>
+  <text class="monob" x="275" y="270" text-anchor="middle">n_slots = 2</text>
+  <text class="monob" x="430" y="270" text-anchor="middle">epoch = 7</text>
+  <text class="monob" x="585" y="270" text-anchor="middle">bag_len = 21</text>
+
+  <text class="tiny" x="690" y="248">These counts are the whole index. A reader gets all three region</text>
+  <text class="tiny" x="690" y="262">starts from them with two shifts and an add, so nothing is scanned:</text>
+  <text class="monot" x="690" y="280">symbols at 2   offsets at 2 + n_fp = 4   blob at 2 + n_fp + ceil(n_slots/2) = 5</text>
+
+  <path d="M223,300 L223,318" stroke="#5b6470" stroke-width="1.4" marker-end="url(#mDn)"/>
+  <path d="M621,300 L621,318" stroke="#5b6470" stroke-width="1.4" marker-end="url(#mDn)"/>
+  <path d="M1018,300 L1018,318" stroke="#5b6470" stroke-width="1.4" marker-end="url(#mDn)"/>
+
+  <!-- ===== column 1: packed symbols ===== -->
+  <rect x="28" y="322" width="390" height="540" rx="8" fill="#ffffff" stroke="#b25f19"/>
+  <path d="M28,330 a8,8 0 0 1 8,-8 h374 a8,8 0 0 1 8,8 v34 h-390 z" fill="#b25f19"/>
+  <text class="colh" x="45" y="342">WORDS 2-3: PACKED SYMBOLS</text>
+  <text class="colhs" x="45" y="356">n_fp = 2 words, one per (token, signature) pair</text>
+
+  <rect x="40" y="374" width="366" height="180" rx="6" fill="#fdf9f5" stroke="#e0b48a"/>
+  <text class="stage" x="52" y="392">the operator writes</text>
+  <text class="yamlc" x="52" y="410"># processor:tenant_router</text>
+  <text class="yaml" x="52" y="424">tenant_routing:</text>
+  <text class="yaml" x="52" y="438">  routes:</text>
+  <text class="yaml" x="52" y="452">  - entries: [{key: tenant_id, value: acme}]</text>
+  <text class="yaml" x="52" y="466">    to: acme</text>
+  <text class="yaml" x="52" y="480">  default_to: unmatched</text>
+  <text class="yamlc" x="52" y="502"># processor:batch</text>
+  <text class="yaml" x="52" y="516">tenant_partitioning:</text>
+  <text class="yaml" x="52" y="530">  partitions:</text>
+  <text class="yaml" x="52" y="544">  - entries: [{key: tenant_id, value: acme},</text>
+  <text class="yaml" x="52" y="558">               {key: tier, value: premium}]</text>
+
+  <path d="M60,562 L60,584" stroke="#5b6470" stroke-width="1.4" marker-end="url(#mDn)"/>
+  <text class="step" x="76" y="578">COMPILES TO: two distinct key-sets, two words</text>
+
+  <rect x="40" y="590" width="366" height="140" rx="6" fill="#ffffff" stroke="#e0b48a"/>
+  <text class="stage" x="52" y="608">the request carries</text>
+  <text class="monot" x="52" y="624">w2   signature {tenant_id}</text>
+  <rect x="52" y="630" width="85" height="22" fill="#bcd6ec" stroke="#7fa6c6"/>
+  <rect x="137" y="630" width="85" height="22" fill="#eef2f6" stroke="#c3cbd4"/>
+  <rect x="222" y="630" width="85" height="22" fill="#eef2f6" stroke="#c3cbd4"/>
+  <rect x="307" y="630" width="85" height="22" fill="#eef2f6" stroke="#c3cbd4"/>
+  <text class="monot" x="94" y="645" text-anchor="middle">acme = 2</text>
+  <text class="monog" x="179" y="645" text-anchor="middle">0</text>
+  <text class="monog" x="264" y="645" text-anchor="middle">0</text>
+  <text class="monog" x="349" y="645" text-anchor="middle">0</text>
+
+  <text class="monot" x="52" y="668">w3   signature {tenant_id, tier}</text>
+  <rect x="52" y="674" width="85" height="22" fill="#bcd6ec" stroke="#7fa6c6"/>
+  <rect x="137" y="674" width="85" height="22" fill="#f7dcdc" stroke="#d99a9a"/>
+  <rect x="222" y="674" width="85" height="22" fill="#eef2f6" stroke="#c3cbd4"/>
+  <rect x="307" y="674" width="85" height="22" fill="#eef2f6" stroke="#c3cbd4"/>
+  <text class="monot" x="94" y="689" text-anchor="middle">acme = 2</text>
+  <text class="monot" x="179" y="689" text-anchor="middle">tier = 1</text>
+  <text class="monog" x="264" y="689" text-anchor="middle">0</text>
+  <text class="monog" x="349" y="689" text-anchor="middle">0</text>
+
+  <text class="tiny" x="52" y="706">acme and premium are values the routes named, so each got a symbol.</text>
+  <text class="tiny" x="52" y="719">gold was never named, so tier packs the reserved unknown = 1.</text>
+
+  <path d="M60,738 L60,760" stroke="#5b6470" stroke-width="1.4" marker-end="url(#mDn)"/>
+  <text class="step" x="76" y="754">READ AS: one probe per node</text>
+
+  <rect x="40" y="766" width="366" height="84" rx="6" fill="#ffffff" stroke="#e0b48a"/>
+  <text class="stage" x="52" y="784">at runtime</text>
+  <text class="ok" x="52" y="804">tenant_router  word 2 -&gt; {2: acme}  -&gt;  port acme</text>
+  <text class="bad" x="52" y="822">batch          word 3 -&gt; {(2,2): premium}  -&gt;  no entry</text>
+  <text class="tiny" x="52" y="838">No partition names unknown, so this request takes the catch-all.</text>
+
+  <!-- ===== column 2: offsets ===== -->
+  <rect x="428" y="322" width="386" height="540" rx="8" fill="#ffffff" stroke="#2f6fa0"/>
+  <path d="M428,330 a8,8 0 0 1 8,-8 h370 a8,8 0 0 1 8,8 v34 h-386 z" fill="#2f6fa0"/>
+  <text class="colh" x="445" y="342">WORD 4: VALUE OFFSETS</text>
+  <text class="colhs" x="445" y="356">ceil(n_slots / 2) = 1 word, two u32 offsets per word</text>
+
+  <rect x="440" y="374" width="362" height="180" rx="6" fill="#f7fafd" stroke="#9dc2e0"/>
+  <text class="stage" x="452" y="392">the operator writes</text>
+  <text class="yamlc" x="452" y="410"># the modifiers in the engine block above</text>
+  <text class="yaml" x="452" y="428">- {key: tenant_id,  ..., bag: true}</text>
+  <text class="yaml" x="452" y="442">- {key: project_id, ..., retain: true}</text>
+  <text class="yaml" x="452" y="456">- {key: tier,       ...}</text>
+  <text class="tiny" x="452" y="480">A key is carried only if it asks to be. Without</text>
+  <text class="tiny" x="452" y="493">retain or bag, a key can still be matched, but</text>
+  <text class="tiny" x="452" y="506">its value is not part of the request.</text>
+  <text class="tiny" x="452" y="528">So two of the three keys get a value slot. Slots are</text>
+  <text class="tiny" x="452" y="541">numbered by the registry, not by header arrival order.</text>
+
+  <path d="M460,562 L460,584" stroke="#5b6470" stroke-width="1.4" marker-end="url(#mDn)"/>
+  <text class="step" x="476" y="578">COMPILES TO: n_slots = 2, so one word</text>
+
+  <rect x="440" y="590" width="362" height="140" rx="6" fill="#ffffff" stroke="#9dc2e0"/>
+  <text class="stage" x="452" y="608">the request carries</text>
+  <rect x="452" y="622" width="170" height="30" fill="#e3edf6" stroke="#7fa6c6"/>
+  <rect x="622" y="622" width="168" height="30" fill="#e3edf6" stroke="#7fa6c6"/>
+  <text class="monob" x="537" y="642" text-anchor="middle">offset[slot 0] = 14</text>
+  <text class="monob" x="706" y="642" text-anchor="middle">offset[slot 1] = 21</text>
+  <text class="tiny" x="452" y="672">Each offset is a byte position in the blob below: slot 0 is</text>
+  <text class="tiny" x="452" y="685">tenant_id's value, slot 1 is project_id's.</text>
+  <text class="tiny" x="452" y="705">tier owns no slot, so it appears nowhere in this word.</text>
+
+  <path d="M460,738 L460,760" stroke="#5b6470" stroke-width="1.4" marker-end="url(#mDn)"/>
+  <text class="step" x="476" y="754">READ AS: an index, never a search</text>
+
+  <rect x="440" y="766" width="362" height="84" rx="6" fill="#ffffff" stroke="#9dc2e0"/>
+  <text class="stage" x="452" y="784">at runtime</text>
+  <text class="monot" x="452" y="804">value(slot) = blob[ offset[slot] .. ]</text>
+  <text class="tiny" x="452" y="824">An unresolved key holds 0xFFFFFFFF, so a missing value costs</text>
+  <text class="tiny" x="452" y="837">one compare and no branch into the blob at all.</text>
+
+  <!-- ===== column 3: the values ===== -->
+  <rect x="824" y="322" width="388" height="540" rx="8" fill="#ffffff" stroke="#d99a3c"/>
+  <path d="M824,330 a8,8 0 0 1 8,-8 h372 a8,8 0 0 1 8,8 v34 h-388 z" fill="#d99a3c"/>
+  <text class="colh" x="841" y="342">WORDS 5-8: THE VALUES</text>
+  <text class="colhs" x="841" y="356">28 bytes, bagged entries first, then values only</text>
+
+  <rect x="836" y="374" width="364" height="180" rx="6" fill="#fffaf2" stroke="#e0b48a"/>
+  <text class="stage" x="848" y="392">the operator writes</text>
+  <text class="yamlc" x="848" y="410"># exporter:otlp_grpc</text>
+  <text class="yaml" x="848" y="424">tenant_headers:</text>
+  <text class="yaml" x="848" y="438">- key: tenant_id</text>
+  <text class="yaml" x="848" y="452">  header: x-acme-customer</text>
+  <text class="tiny" x="848" y="476">The wire name is chosen here, by the node doing</text>
+  <text class="tiny" x="848" y="489">the emitting -- not in the token. The same value</text>
+  <text class="tiny" x="848" y="502">can leave one exporter as x-acme-customer and</text>
+  <text class="tiny" x="848" y="515">another as x-customer-id.</text>
+  <text class="tiny" x="848" y="535">A tenant header can never overwrite one the</text>
+  <text class="tiny" x="848" y="548">exporter sets statically, such as authorization.</text>
+
+  <path d="M856,562 L856,584" stroke="#5b6470" stroke-width="1.4" marker-end="url(#mDn)"/>
+  <text class="step" x="872" y="578">COMPILES TO: a read of slot 0</text>
+
+  <rect x="836" y="590" width="364" height="140" rx="6" fill="#ffffff" stroke="#e0b48a"/>
+  <text class="stage" x="848" y="608">the request carries</text>
+  <rect x="848" y="622" width="170" height="42" fill="#ffe9c9" stroke="#d99a3c"/>
+  <rect x="1018" y="622" width="85" height="42" fill="#ffd79a" stroke="#d99a3c"/>
+  <rect x="1103" y="622" width="85" height="42" fill="#eef2f6" stroke="#7fa6c6"/>
+  <text class="tiny" x="933" y="638" text-anchor="middle">slot 0: the name</text>
+  <text class="monot" x="933" y="654" text-anchor="middle">"tenant_id"</text>
+  <text class="tiny" x="1060" y="638" text-anchor="middle">slot 0 value</text>
+  <text class="monob" x="1060" y="656" text-anchor="middle">"acme"</text>
+  <text class="tiny" x="1145" y="638" text-anchor="middle">slot 1 value</text>
+  <text class="monob" x="1145" y="656" text-anchor="middle">"p-42"</text>
+  <path d="M848,672 L848,678 L1103,678 L1103,672" stroke="#b25f19" stroke-width="1.3" fill="none"/>
+  <text class="tiny" x="975" y="692" text-anchor="middle" fill="#b25f19">bag_len = 21 bytes</text>
+  <text class="tiny" x="848" y="712">Only a bagged key carries its name; every other key's name was compiled away.</text>
+
+  <path d="M856,738 L856,760" stroke="#5b6470" stroke-width="1.4" marker-end="url(#mDn)"/>
+  <text class="step" x="872" y="754">READ AS: a copy, not a walk</text>
+
+  <rect x="836" y="766" width="364" height="84" rx="6" fill="#ffffff" stroke="#e0b48a"/>
+  <text class="stage" x="848" y="784">at runtime</text>
+  <text class="ok" x="848" y="804">exporter emits  x-acme-customer: acme</text>
+  <text class="tiny" x="848" y="824">And because the bagged prefix is already a well-formed OTLP</text>
+  <text class="tiny" x="848" y="837">attributes field, a consumer appends it to a span by copying 21 bytes.</text>
+
+  <text class="small" x="28" y="890">Nothing in the layout is self-describing, which is what epoch guards: a context means what it means only against the registry that packed it.</text>
+</svg>
