@@ -12,7 +12,7 @@ the OTAP DFE request carrying request-specific metadata including:
 - Authorized identity information
 - Idempotency keys
 
-Tenant contexts are effiently encoded and carried by reference-counted
+Tenant contexts are efficiently encoded and carried by reference-counted
 bytes.  Multitenant features are provided for producers and consumers
 of tenant context:
 
@@ -30,12 +30,12 @@ distinct token signatures, enabling `O(1)` match operations.
 
 Taken alongside a DFE pipeline configuration, the tenant context
 defines a parallel metadata pipeline where extraction and application
-of key metadata are configured controlled by the user. Metadata
+of key metadata are configured and controlled by the user. Metadata
 variables are each an aspect of the tenant context belonging to one or
 more tenant tokens that are used for matching and propagating metadata
 in the pipeline.
 
-A **tenant key** is one key and value belonging a tenant context.
+A **tenant key** is one key and value belonging to a tenant context.
 
 An **extractor** produces one tenant key. Extractors are conditional, they
 can fail to match.
@@ -66,7 +66,7 @@ We emphasize `transport_header` in this design because at the time of
 writing, transport headers are encoded using
 `Option<Arc<Vec<TransportHeader>>>`. This design will replace the
 implementation of transport headers with tenant context, a
-reference-counted `Bytes`. Then, uusing scratch space to construct
+reference-counted `Bytes`. Then, using scratch space to construct
 tenant tokens, we will reduce the number of allocations to one per
 tenant context.
 
@@ -76,7 +76,7 @@ when they may be present and required when they must be present.
 ```yaml
 nodes:
   ingest:
-    type: receiver:otlp_grpc
+    type: receiver:otlp
     policies:
       ingress:
         optional_tokens: [edge]
@@ -94,7 +94,7 @@ Consumers of the tenant context fall into two categories:
   tenant context, either in configuration or in runtime data structures.
 
 As an example of the carrier pattern, the gRPC OTLP exporter can be
-configured to export a specific tenant key:
+configured to export specific tenant keys:
 
 ```yaml
 nodes:
@@ -104,14 +104,16 @@ nodes:
       grpc_endpoint: http://backend:4317
       tenant_headers:
         - key: tenant_id
-          header: x-scope-orgid
+          header: x-customer-id
+        - key: project_id
+          header: x-workspace-id
 ```
 
 In this example, the tenant compiler knows that tenant headers must be
 carried in the tenant context, so that callers are able to reproduce
-the value of `tenant_id`. In the example above, the tenant token is
-not required, so the `x-scope-orgid` header will be absent when the
-tenant key is undefined.
+the values of `tenant_id` and `project_id`. In the example above, the
+tenant token is not required, so the `x-customer-id` header will be
+absent when the tenant key is undefined.
 
 As an example of the matcher pattern, a new `tenant_router` processor
 will be introduced to route by tenant context variables. The first
@@ -137,7 +139,6 @@ nodes:
         - entries:
             - key: tenant_id
           port: shared
-      ...
 ```
 
 ### Propagation
@@ -147,16 +148,16 @@ request data, tenant context can be cheaply cloned. Some nodes will
 implement specific translation of tenant context. This may be done
 however they see fit, for example, the batch processor can be
 configured using tenant context, first by listing required tenant
-tokens, then the set of partition keys.
+tokens, then the set of metadata keys it partitions by.
 
 ```yaml
 nodes:
-  route:
+  batch:
     type: processor:batch
     policies:
       ingress:
         required_tokens: [edge]
-        partition_keys: [tenant_id, project_id]
+        metadata_keys: [tenant_id, project_id]
         max_cardinality: 100
     config:
       ...
@@ -179,11 +180,11 @@ can be required by the recipient.
 
 ```yaml
 nodes:
-  route:
+  buffer:
     type: processor:durable_buffer
     policies:
       ingress:
-        required_tokens: [tenant_id, project_id, idempotent]
+        required_tokens: [edge, idempotent]
     config:
       ...
 ```
@@ -229,7 +230,7 @@ procedure to remove an old tenant configuration from memory.
 The first deliverable in the timeline below, where tenant context is
 used in the pipeline, will be a re-implementation of transport headers
 in the DFE. The diagram explains how the tenant compiler works, with a
-tenant a context producer and two consumers illustrating the process.
+tenant context producer and two consumers illustrating the process.
 
 ![Tenant context with only transport headers](images/tenant-context-only-transport-headers.svg)
 
@@ -244,17 +245,17 @@ Tenant context will be implemented in approximately 10 PRs.
 
 | PR | Main feature                | Main development                                                |
 |----|-----------------------------|-----------------------------------------------------------------|
-| 1  | Tenant Compiler             | Intern strings, assign slots, compute bagged encoding           |
+| 1  | Tenant Compiler             | Intern strings, index values, compute bagged encoding           |
 | 2  | Transport header extractors | Map request context, transport header policy into tenant tokens |
 | 3  | Propagation                 | Tenant context travels with request context                     |
 | 4  | Carriers                    | Tenant consumers can extract key values                         |
 | 5  | Remove transport headers    | Net-negative cost compared with starting point                  |
 | 6  | Authorization               | New extractors for authorization subject/audience/claims        |
 | 7  | Matchers                    | Compiler computes hash-join value array, adds tenant_router     |
-| 8  | Topics                      | Topic exporter and receiver use a special extractors            |
+| 8  | Topics                      | Topic exporter and receiver use special extractors              |
 | 9  | Batch processor             | Batch processor gains `metadata_keys`                           |
 | 10 | Ingress rules               | Required token checking, idempotency key support                |
 
-At this point, many more nodes will come up for review, and how we 
+At this point, many more nodes will come up for review, and how we
 design the use of tenant tokens for matching and propagation will
-be extended most of the remaining components as separate issues.
+be extended to most of the remaining components as separate issues.
