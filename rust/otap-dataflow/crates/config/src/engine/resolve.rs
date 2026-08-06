@@ -186,10 +186,13 @@ impl OtelDataflowSpec {
             .map(|p| p.clone().into_policies())
             .unwrap_or_default();
         let mut policies = Policies::resolve([&obs_as_policies, &self.policies]);
-        // Observability pipelines use default resources and do not
-        // capture/propagate transport headers.
+        // Observability pipelines use default resources, do not capture or
+        // propagate transport headers, and carry no tenant context: their
+        // requests are minted by the engine rather than received from a
+        // tenant.
         policies.resources = ResourcesPolicy::default();
         policies.transport_headers = None;
+        policies.tenant = None;
         pipelines.push(ResolvedPipelineConfig {
             pipeline_group_id: SYSTEM_PIPELINE_GROUP_ID.into(),
             pipeline_id: SYSTEM_OBSERVABILITY_PIPELINE_ID.into(),

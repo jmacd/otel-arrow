@@ -253,6 +253,9 @@ Listed here so their absence reads as a decision rather than an oversight.
 Each is a later step in the plan below.
 
 - Extractor kinds other than `transport_header`.
+- Match-only keys. Every declared key is stored today; the option to declare a
+  key that conditions may test but nothing may read is an optimization that
+  only pays once conditions exist.
 - The attribute bag: carrying key *names* with the request so instrumentation
   can copy tenant identity into span or log attributes without re-encoding.
 - Cross-boundary policy: what a topic hop admits in each direction.
@@ -280,12 +283,20 @@ is designed around them, and none of them requires revisiting an earlier step.
 
 ## Limits
 
-The registry trades breadth for density, and enforces the budget at startup by
-failing the configuration rather than truncating at request time. The concrete
-numbers belong with the implementation and are documented in step 1; the shape
-of the trade is that more declared keys means fewer distinct values per key,
-because both are packed into a fixed-width signature.
+The registry trades breadth for density, and enforces its limits at startup by
+failing the configuration rather than truncating at request time:
+
+| Limit | Value | Why |
+| ----- | ----- | --- |
+| keys | 64 | token membership and value presence are each one `u64` bitmask |
+| tokens | 64 | same |
+| values per request | 65,535 bytes | counted across every key; an overflowing request is reported, never truncated |
 
 Header names are matched exactly and case-insensitively. Glob and regex
 matching are not supported, because a compiled table cannot intern the literals
 a pattern would admit.
+
+One header fills exactly one key, and one key reads exactly one source. Both
+are rejected at startup rather than resolved by precedence: a key is the name
+of one fact, and a value a consumer reads must not depend on which token
+happened to resolve.

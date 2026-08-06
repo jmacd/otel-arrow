@@ -5,6 +5,7 @@
 
 use crate::byte_units;
 use crate::health::HealthPolicy;
+use crate::tenant::TenantPolicy;
 use crate::transport_headers_policy::TransportHeadersPolicy;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,27 @@ pub struct Policies {
     /// (the feature is entirely opt-in).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) transport_headers: Option<TransportHeadersPolicy>,
+    /// Tenant declarations: the request-scoped keys the engine may read, and
+    /// the tokens that bundle them into identities.
+    ///
+    /// Honored at engine scope only. A key is shared vocabulary, so a group
+    /// that could redefine `tenant_id` would defeat the reason the vocabulary
+    /// exists; declaring this at any inner scope is a configuration error
+    /// rather than a silently ignored field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tenant: Option<TenantPolicy>,
+}
+
+/// Where a policy set was declared.
+///
+/// Most policies resolve by scope precedence. A few are meaningful only at one
+/// scope, so validation has to know which scope it is looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyScope {
+    /// The top-level `policies:` block.
+    Engine,
+    /// A pipeline group, a pipeline, or the observability pipeline.
+    Inner,
 }
 
 impl Policies {
@@ -76,6 +98,7 @@ impl Policies {
         let mut telemetry = None;
         let mut resources = None;
         let mut transport_headers = None;
+        let mut tenant = None;
         for scope in scopes {
             if channel_capacity.is_none() {
                 channel_capacity = scope.channel_capacity.as_ref();
@@ -95,6 +118,9 @@ impl Policies {
             if transport_headers.is_none() {
                 transport_headers = scope.transport_headers.as_ref();
             }
+            if tenant.is_none() {
+                tenant = scope.tenant.as_ref();
+            }
         }
         ResolvedPolicies {
             channel_capacity: channel_capacity.cloned().unwrap_or_default(),
@@ -103,13 +129,22 @@ impl Policies {
             telemetry: telemetry.cloned().unwrap_or_default(),
             resources: resources.cloned().unwrap_or_default(),
             transport_headers: transport_headers.cloned(),
+            tenant: tenant.cloned(),
         }
     }
 
     /// Returns validation errors for explicitly configured fields.
     #[must_use]
-    pub fn validation_errors(&self, path_prefix: &str) -> Vec<String> {
+    pub fn validation_errors(&self, path_prefix: &str, scope: PolicyScope) -> Vec<String> {
         let mut errors = Vec::new();
+        if let Some(tenant) = &self.tenant {
+            if scope == PolicyScope::Inner {
+                errors.push(format!(
+                    "{path_prefix}.tenant is honored at engine scope only; declare tenant tokens once under the top-level `policies:` block"
+                ));
+            }
+            errors.extend(tenant.validation_errors(&format!("{path_prefix}.tenant")));
+        }
         if let Some(channel_capacity) = &self.channel_capacity {
             if channel_capacity.control.node == 0 {
                 errors.push(format!(
@@ -227,6 +262,9 @@ pub struct ResolvedPolicies {
     /// Transport headers policy. `None` when the feature is not configured
     /// (opt-in only -- no headers are captured or propagated by default).
     pub transport_headers: Option<TransportHeadersPolicy>,
+    /// Tenant declarations, always the engine-scoped ones. `None` when no
+    /// token is declared, in which case no request carries a tenant context.
+    pub tenant: Option<TenantPolicy>,
 }
 
 impl ResolvedPolicies {
@@ -241,6 +279,7 @@ impl ResolvedPolicies {
             runtime_recovery: self_runtime_recovery,
             resources: _,
             transport_headers: self_transport_headers,
+            tenant: self_tenant,
         } = self;
         let Self {
             channel_capacity: other_channel_capacity,
@@ -249,6 +288,7 @@ impl ResolvedPolicies {
             runtime_recovery: other_runtime_recovery,
             resources: _,
             transport_headers: other_transport_headers,
+            tenant: other_tenant,
         } = other;
 
         self_channel_capacity == other_channel_capacity
@@ -256,6 +296,7 @@ impl ResolvedPolicies {
             && self_telemetry == other_telemetry
             && self_runtime_recovery == other_runtime_recovery
             && self_transport_headers == other_transport_headers
+            && self_tenant == other_tenant
     }
 }
 
@@ -847,7 +888,7 @@ const fn default_pdata_channel_capacity() -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemoryLimiterMode, MemoryLimiterPolicy, MemoryLimiterSource, Policies,
+        MemoryLimiterMode, MemoryLimiterPolicy, MemoryLimiterSource, Policies, PolicyScope,
         RuntimeRecoveryPolicy,
     };
     use std::time::Duration;
@@ -1001,7 +1042,7 @@ unknown_recovery_option: true
             ..Policies::default()
         };
 
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
 
         assert_eq!(errors.len(), 5);
         assert!(errors.iter().any(|error| error.contains("max_restarts")));
@@ -1025,7 +1066,7 @@ unknown_recovery_option: true
             ..Default::default()
         };
 
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert_eq!(errors.len(), 4);
         assert!(errors.iter().any(|e| e.contains("control.node")));
         assert!(errors.iter().any(|e| e.contains("control.pipeline")));
@@ -1200,7 +1241,7 @@ unknown_recovery_option: true
             }),
             ..Default::default()
         };
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert!(
             errors
                 .iter()
@@ -1228,7 +1269,7 @@ unknown_recovery_option: true
             }),
             ..Default::default()
         };
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert!(errors.iter().any(|error| error.contains("duplicate")));
     }
 
@@ -1253,7 +1294,7 @@ unknown_recovery_option: true
             ..Policies::default()
         };
 
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert_eq!(errors.len(), 3);
         assert!(errors.iter().any(|error| error.contains("check_interval")));
         assert!(errors.iter().any(|error| error.contains("hard_limit")));
@@ -1281,7 +1322,7 @@ unknown_recovery_option: true
             ..Policies::default()
         };
 
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("must either both be set or both be omitted"));
     }
@@ -1307,7 +1348,7 @@ unknown_recovery_option: true
             ..Policies::default()
         };
 
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("soft_limit must be greater than 0"));
     }
@@ -1333,7 +1374,7 @@ unknown_recovery_option: true
             ..Policies::default()
         };
 
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("source is not auto"));
     }
@@ -1359,7 +1400,7 @@ unknown_recovery_option: true
             ..Policies::default()
         };
 
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("retry_after_secs must be greater than 0"));
     }
@@ -1385,7 +1426,7 @@ unknown_recovery_option: true
             ..Policies::default()
         };
 
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("purge_min_interval must be greater than 0"));
     }
@@ -1413,7 +1454,7 @@ unknown_recovery_option: true
             }),
             ..Default::default()
         };
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("transport_headers.header_propagation.default.selector"));
         assert!(errors[0].contains("'named' list is required"));
@@ -1528,9 +1569,88 @@ unknown_recovery_option: true
             }),
             ..Default::default()
         };
-        let errors = policies.validation_errors("policies");
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("resources.core_allocation"));
         assert!(errors[0].contains("'count' is required"));
+    }
+
+    /// Scenario: the same valid tenant declaration is validated once as the
+    /// top-level policy block and once as a group, pipeline or observability
+    /// policy block.
+    /// Guarantees: it is accepted only at engine scope, so a group cannot
+    /// redefine what a tenant key means for the pipelines it contains.
+    #[test]
+    fn tenant_policy_is_rejected_outside_engine_scope() {
+        let policies = Policies {
+            tenant: Some(
+                serde_yaml::from_str(
+                    r"
+tokens:
+  edge:
+    extractors:
+      - key: tenant_id
+        transport_header: x-tenant-id
+",
+                )
+                .expect("declaration should parse"),
+            ),
+            ..Default::default()
+        };
+
+        assert!(
+            policies
+                .validation_errors("policies", PolicyScope::Engine)
+                .is_empty()
+        );
+
+        let errors = policies.validation_errors("groups.g.policies", PolicyScope::Inner);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("groups.g.policies.tenant is honored at engine scope only"),
+            "unexpected error: {}",
+            errors[0]
+        );
+    }
+
+    /// Scenario: an engine-scoped tenant declaration binds one key to two
+    /// different headers.
+    /// Guarantees: the compiler's errors surface through policy validation
+    /// under the field's own path, so a bad declaration fails startup rather
+    /// than failing later when a registry is built.
+    #[test]
+    fn tenant_policy_reports_compiler_errors_under_its_own_path() {
+        let policies = Policies {
+            tenant: Some(
+                serde_yaml::from_str(
+                    r"
+tokens:
+  a:
+    extractors:
+      - key: tenant_id
+        transport_header: x-tenant-id
+  b:
+    extractors:
+      - key: tenant_id
+        transport_header: x-customer-id
+",
+                )
+                .expect("declaration should parse"),
+            ),
+            ..Default::default()
+        };
+
+        let errors = policies.validation_errors("policies", PolicyScope::Engine);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].starts_with("policies.tenant: "),
+            "unexpected error: {}",
+            errors[0]
+        );
+        assert!(
+            errors[0].contains("two different sources"),
+            "unexpected error: {}",
+            errors[0]
+        );
     }
 }

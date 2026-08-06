@@ -37,6 +37,9 @@ pub mod pipeline_group;
 pub mod policy;
 /// Engine telemetry settings.
 pub mod settings;
+/// Tenant key, extractor and token declarations, and the compiler that turns
+/// them into a request-time registry.
+pub mod tenant;
 /// TLS configuration.
 pub mod tls;
 pub mod topic;

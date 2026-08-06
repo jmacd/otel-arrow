@@ -5,7 +5,7 @@
 
 use crate::error::Error;
 use crate::pipeline::PipelineConfig;
-use crate::policy::Policies;
+use crate::policy::{Policies, PolicyScope};
 use crate::topic::TopicSpec;
 use crate::{PipelineGroupId, PipelineId, TopicName};
 use schemars::JsonSchema;
@@ -76,7 +76,7 @@ impl PipelineGroupConfig {
             let path = format!("groups.{pipeline_group_id}.policies");
             errors.extend(
                 policies
-                    .validation_errors(&path)
+                    .validation_errors(&path, PolicyScope::Inner)
                     .into_iter()
                     .map(|error| Error::InvalidUserConfig { error }),
             );
@@ -97,7 +97,7 @@ impl PipelineGroupConfig {
                 let path = format!("groups.{pipeline_group_id}.pipelines.{pipeline_id}.policies");
                 errors.extend(
                     policies
-                        .validation_errors(&path)
+                        .validation_errors(&path, PolicyScope::Inner)
                         .into_iter()
                         .map(|error| Error::InvalidUserConfig { error }),
                 );

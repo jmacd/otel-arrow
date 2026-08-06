@@ -26,7 +26,7 @@ impl OtelDataflowSpec {
 
         errors.extend(
             self.policies
-                .validation_errors("policies")
+                .validation_errors("policies", crate::policy::PolicyScope::Engine)
                 .into_iter()
                 .map(|error| Error::InvalidUserConfig { error }),
         );

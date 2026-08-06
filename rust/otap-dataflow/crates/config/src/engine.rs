@@ -16,7 +16,7 @@ use crate::observed_state::ObservedStateSettings;
 use crate::pipeline::telemetry::TelemetryConfig;
 use crate::pipeline::{PipelineConfig, PipelineConnection, PipelineNodes};
 use crate::pipeline_group::PipelineGroupConfig;
-use crate::policy::{ChannelCapacityPolicy, Policies, TelemetryPolicy};
+use crate::policy::{ChannelCapacityPolicy, Policies, PolicyScope, TelemetryPolicy};
 use crate::topic::{TopicImplSelectionPolicy, TopicSpec};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -436,12 +436,15 @@ impl EngineObservabilityPolicies {
             resources: None,
             runtime_recovery: None,
             transport_headers: None,
+            tenant: None,
         }
     }
 
     #[must_use]
     pub(crate) fn validation_errors(&self, path_prefix: &str) -> Vec<String> {
-        self.clone().into_policies().validation_errors(path_prefix)
+        self.clone()
+            .into_policies()
+            .validation_errors(path_prefix, PolicyScope::Inner)
     }
 }
 
