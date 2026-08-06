@@ -218,83 +218,32 @@ consumer information in the form of an epoch number.
 
 ## The first cut
 
-The diagram below shows the engine after the first few steps of the
-plan, when the only extractor is `transport_header` and every declared
-key is bagged. This is the smallest change that is worth shipping: it
-replaces `Option<Arc<Vec<TransportHeader>>>` without adding a feature
-anyone has to learn.
+The first cut is the smallest version worth shipping: the only
+extractor is `transport_header`, and every declared key is bagged.
 
-```text
-  configuration                                        once, at startup
-  ----------------------------------------------------------------------
-    policies.tenant                    node policies
-      tokens:                            ingest:
-        edge:                              optional_tokens: [edge]
-          tenant_id  <- x-tenant-id      backend:
-          project_id <- x-project-id       tenant_headers:
-                                             tenant_id -> x-scope-orgid
-                        \                 /
-                         v               v
-                     +------------------------+
-                     |    tenant compiler     |
-                     +------------------------+
-                        |                   |
-          extractor plan|                   |slot numbers
-                        v                   v
+![Tenant context, first cut](images/tenant-context-first-cut.svg)
 
-  one request                                        repeated, at runtime
-  ----------------------------------------------------------------------
+Every node's tenant configuration is compiled together, once, and each
+node then uses only its own part of the result. The receiver is the
+only node that reads a wire name and the exporter is the only node
+that writes one, so every name appears exactly once in the
+configuration and nowhere in between: a key arrives as `x-tenant-id`
+and leaves as `x-customer-id`, and nothing on the path between them
+knows either spelling. An undeclared header is never copied, which is
+where the saving comes from: the current implementation allocates per
+header received.
 
-   inbound headers            +-----------+
-   x-tenant-id:   acme  --->  |  ingest   |  2 of 3 headers are declared
-   x-project-id:  p1    --->  | receiver  |  1 allocation, not 1 per header
-   authorization: ...    -X   +-----------+
-                                    |
-                                    | tenant context: refcounted Bytes
-                                    v
-                +--------------------------------------+
-                | epoch | tokens | slot ends           |  fixed header
-                |--------------------------------------|
-                | bag: an OTLP KeyValue run            |
-                |   tenant_id  = "acme"                |  slot 0
-                |   project_id = "p1"                  |  slot 1
-                +--------------------------------------+
-                                    |
-                                    | clone is a refcount, not a copy
-                                    v
-                               +-----------+
-                               | processor |  neither reads it nor loses it
-                               +-----------+
-                                    |
-                                    v
-                               +-----------+
-                               |  backend  |  read slot 0
-                               | exporter  |  write x-scope-orgid
-                               +-----------+
-                                    |
-                                    v
-                        outbound: x-scope-orgid: acme
-```
+Consumers differ only in which part they read. The batch processor
+partitions on the tenant keys, so a merged batch carries one tenant
+context rather than a mixture; the exporter reads both values and
+gives each the name this particular backend expects. Neither searches:
+the index says where each value begins, and reading is an offset
+away.
 
-Everything above the dividing line happens once, over the whole engine
-configuration; everything below happens per request. The receiver is
-the only node that sees a wire name on the way in and the exporter is
-the only node that writes one on the way out, so `x-tenant-id` and
-`x-scope-orgid` each appear exactly once in the configuration and
-nowhere in between. An undeclared header such as `authorization` is
-never copied, which is where most of the saving comes from: the
-current implementation allocates per header received, whether or not
-any rule wants it.
-
-In this first cut every retained key is bagged, so the context is
-little more than the fixed header plus an OTLP `KeyValue` run, and
-reading a key is a slot lookup into that run. Later steps add to the
-header region rather than changing the bag: match-only keys, which are
-tested but never stored, arrive with the first matcher, and the
-compiler's condition tables arrive with it. Because the bag is already
-a valid OTLP repeated field, instrumentation can borrow it as `&[u8]`
-and append the request's tenant identity to scope attributes without
-re-encoding anything.
+The data region is a valid OTLP `KeyValue` run as it stands. For the
+sampled requests that produce internal telemetry, it is appended to
+span attributes as bytes, with nothing to walk and nothing to
+re-encode.
 
 ## PR series
 
