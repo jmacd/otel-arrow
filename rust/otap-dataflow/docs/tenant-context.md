@@ -1,6 +1,6 @@
 # Tenant Context
 
-**Status: draft**
+**Status:** Draft
 
 ## Overview
 
@@ -59,7 +59,7 @@ policies:
             transport_header: x-tenant-id
           - key: project_id
             transport_header: x-project-id
-            
+
 ```
 
 We emphasize `transport_header` in this design because at the time of
@@ -68,7 +68,7 @@ writing, transport headers are encoded using
 implementation of transport headers with tenant context, a
 reference-counted `Bytes`. Then, uusing scratch space to construct
 tenant tokens, we will reduce the number of allocations to one per
-tenant context. 
+tenant context.
 
 Receivers evaluate their required and optional tenant tokens, optional
 when they may be present and required when they must be present.
@@ -125,7 +125,7 @@ nodes:
     policies:
       ingress:
         required_tokens: [edge]
-    outputs: 
+    outputs:
       - priority
       - shared
     config:
@@ -165,8 +165,6 @@ nodes:
 
 Nodes may require tenant tokens even when they do not use them,
 for example to declare that an idempotency key,
-
-
 
 ```yaml
 policies:
@@ -217,3 +215,109 @@ Live reconfiguration of the tenant compiler will be supported. Tenant
 producer and consumer configuration are paired, when either changes
 both sides will be recompiled. The tenant context carries the compiled
 consumer information in the form of an epoch number.
+
+## The first cut
+
+The diagram below shows the engine after the first few steps of the
+plan, when the only extractor is `transport_header` and every declared
+key is bagged. This is the smallest change that is worth shipping: it
+replaces `Option<Arc<Vec<TransportHeader>>>` without adding a feature
+anyone has to learn.
+
+```text
+  configuration                                        once, at startup
+  ----------------------------------------------------------------------
+    policies.tenant                    node policies
+      tokens:                            ingest:
+        edge:                              optional_tokens: [edge]
+          tenant_id  <- x-tenant-id      backend:
+          project_id <- x-project-id       tenant_headers:
+                                             tenant_id -> x-scope-orgid
+                        \                 /
+                         v               v
+                     +------------------------+
+                     |    tenant compiler     |
+                     +------------------------+
+                        |                   |
+          extractor plan|                   |slot numbers
+                        v                   v
+
+  one request                                        repeated, at runtime
+  ----------------------------------------------------------------------
+
+   inbound headers            +-----------+
+   x-tenant-id:   acme  --->  |  ingest   |  2 of 3 headers are declared
+   x-project-id:  p1    --->  | receiver  |  1 allocation, not 1 per header
+   authorization: ...    -X   +-----------+
+                                    |
+                                    | tenant context: refcounted Bytes
+                                    v
+                +--------------------------------------+
+                | epoch | tokens | slot ends           |  fixed header
+                |--------------------------------------|
+                | bag: an OTLP KeyValue run            |
+                |   tenant_id  = "acme"                |  slot 0
+                |   project_id = "p1"                  |  slot 1
+                +--------------------------------------+
+                                    |
+                                    | clone is a refcount, not a copy
+                                    v
+                               +-----------+
+                               | processor |  neither reads it nor loses it
+                               +-----------+
+                                    |
+                                    v
+                               +-----------+
+                               |  backend  |  read slot 0
+                               | exporter  |  write x-scope-orgid
+                               +-----------+
+                                    |
+                                    v
+                        outbound: x-scope-orgid: acme
+```
+
+Everything above the dividing line happens once, over the whole engine
+configuration; everything below happens per request. The receiver is
+the only node that sees a wire name on the way in and the exporter is
+the only node that writes one on the way out, so `x-tenant-id` and
+`x-scope-orgid` each appear exactly once in the configuration and
+nowhere in between. An undeclared header such as `authorization` is
+never copied, which is where most of the saving comes from: the
+current implementation allocates per header received, whether or not
+any rule wants it.
+
+In this first cut every retained key is bagged, so the context is
+little more than the fixed header plus an OTLP `KeyValue` run, and
+reading a key is a slot lookup into that run. Later steps add to the
+header region rather than changing the bag: match-only keys, which are
+tested but never stored, arrive with the first matcher, and the
+compiler's condition tables arrive with it. Because the bag is already
+a valid OTLP repeated field, instrumentation can borrow it as `&[u8]`
+and append the request's tenant identity to scope attributes without
+re-encoding anything.
+
+## PR series
+
+Nine changes, each one reviewable on its own. The first four are
+purely additive: if the design is wrong they are deleted and the
+engine is exactly as it is today. Only PR5 removes an existing
+feature, and only after PR2 through PR4 have shown the replacement
+running end to end. PR6 onward are independent of each other and can
+land in any order.
+
+| PR | Lands | Size | What the reviewer is asked to judge |
+| -- | ----- | ---- | ----------------------------------- |
+| 1 | **Compiler.** `policies.tenant`, the registry, the packed layout. Resolution defined against a source trait, so no protocol crate is involved and nothing in the pipeline reads it. | ~1.1k, no deletions | Is the vocabulary right: keys, extractors, all-or-nothing tokens, engine scope only? |
+| 2 | **Transport header extractors.** Node `policies.ingress` with `required_tokens` and `optional_tokens`; the OTLP gRPC and HTTP receivers become producers. Nothing consumes the result yet. | ~0.8k | Does a receiver resolve the same context a reviewer would predict from the config, including the `-bin` and repeated-header cases? |
+| 3 | **Propagators.** The context rides on the request and survives every node that only forwards. Processors need no change; cloning is a refcount. | ~0.6k | Can a context be silently dropped or replaced anywhere on the path? |
+| 4 | **Carriers.** Exporters read by key: `tenant_headers` on OTLP gRPC, then OTLP HTTP. The feature is now end to end, with one runnable config as proof. | ~0.7k | Static config wins on collision, so tenant material can never shadow a backend credential. Is that airtight? |
+| 5 | **Remove transport headers.** Delete `header_capture`, `header_propagation`, the policy, the three resolution scopes and the docs, with migration notes. | ~2.5k removed | Is every old capability either replaced or deliberately dropped, and is each drop written down? |
+| 6 | **Matchers.** Conditions in the compiler -- interned literals, packed signatures, `O(1)` probe -- and `processor:tenant_router` as the first matcher. | ~1.2k | Exact matching and fail-closed on undeclared input: can a collision or a gap route one tenant's data to another tenant's destination? |
+| 7 | **Boundaries.** Topic exporter and receiver gain explicit control over what crosses a pipeline group boundary in each direction. The far side re-derives its own tokens rather than adopting the inbound context. | ~0.8k | Is the default closed, and is a hop across a boundary a place where tenant material can leak? |
+| 8 | **Partitioning.** Batch processor partitions on tenant keys with a cardinality bound, so a merged batch never mixes tenants. | ~0.5k | What happens at the cardinality limit, and can a merge produce a batch whose context is a lie? |
+| 9 | **Minting and durability.** An `idempotency` extractor, and `required_tokens` on `processor:durable_buffer` so a persisted request carries an identity that outlives the process. | ~0.6k | A replay site may restore a stored key but must never mint a fresh one. Is that enforced? |
+
+Live reconfiguration is deliberately not a PR of its own. The epoch is
+in the layout from PR1 and each step maintains it, so recompiling both
+sides of a producer/consumer pair is a property the series carries
+rather than a feature bolted on at the end.
