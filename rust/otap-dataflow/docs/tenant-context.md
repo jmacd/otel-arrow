@@ -156,10 +156,9 @@ nodes:
     policies:
       ingress:
         required_tokens: [edge]
-    config:
-      partition:
-        metadata_keys: [tenant_id, project_id]
+        partition_keys: [tenant_id, project_id]
         max_cardinality: 100
+    config:
       ...
 ```
 
@@ -211,62 +210,51 @@ The topic exporter and receiver will be extended with dedicated
 configuration for controlling the propagation of tenant context across
 pipeline group boundaries.
 
+### Live reconfiguration
+
 Live reconfiguration of the tenant compiler will be supported. Tenant
 producer and consumer configuration are paired, when either changes
-both sides will be recompiled. The tenant context carries the compiled
-consumer information in the form of an epoch number.
+both sides will be recompiled and reconfigured. Consumer
+reconfiguration events will be distributed ahead of producer
+reconfiguration events. The tenant context carries state to indicate
+which version of the compiler was used as an epoch number.
 
-## The first cut
+In some cases, live reconfiguration will be possible without
+restarting a pipeline. Multiple tenant-compiler epochs can run
+concurrently.  In some cases, it will require a draining or flushing
+procedure to remove an old tenant configuration from memory.
 
-The first cut is the smallest version worth shipping: the only
-extractor is `transport_header`, and every declared key is bagged.
+## Transport headers
 
-![Tenant context, first cut](images/tenant-context-first-cut.svg)
+The first deliverable in the timeline below, where tenant context is
+used in the pipeline, will be a re-implementation of transport headers
+in the DFE. The diagram explains how the tenant compiler works, with a
+tenant a context producer and two consumers illustrating the process.
 
-Every node's tenant configuration is compiled together, once, and each
-node then uses only its own part of the result. The receiver is the
-only node that reads a wire name and the exporter is the only node
-that writes one, so every name appears exactly once in the
-configuration and nowhere in between: a key arrives as `x-tenant-id`
-and leaves as `x-customer-id`, and nothing on the path between them
-knows either spelling. An undeclared header is never copied, which is
-where the saving comes from: the current implementation allocates per
-header received.
+![Tenant context with only transport headers](images/tenant-context-only-transport-headers.svg)
 
-Consumers differ only in which part they read. The batch processor
-partitions on the tenant keys, so a merged batch carries one tenant
-context rather than a mixture; the exporter reads both values and
-gives each the name this particular backend expects. Neither searches:
-the index says where each value begins, and reading is an offset
-away.
-
-The data region is a valid OTLP `KeyValue` run as it stands. For the
-sampled requests that produce internal telemetry, it is appended to
-span attributes as bytes, with nothing to walk and nothing to
-re-encode.
+Conditional matching is not supported in the initial step. Moving
+forward, the ability to match based on tenant token values will
+introduce new fields in the encoded tenant context implementing a
+`O(1)` hash-function-based lookup.
 
 ## PR series
 
-Nine changes, each one reviewable on its own. The first four are
-purely additive: if the design is wrong they are deleted and the
-engine is exactly as it is today. Only PR5 removes an existing
-feature, and only after PR2 through PR4 have shown the replacement
-running end to end. PR6 onward are independent of each other and can
-land in any order.
+Tenant context will be implemented in approximately 10 PRs.
 
-| PR | Lands | Size | What the reviewer is asked to judge |
-| -- | ----- | ---- | ----------------------------------- |
-| 1 | **Compiler.** `policies.tenant`, the registry, the packed layout. Resolution defined against a source trait, so no protocol crate is involved and nothing in the pipeline reads it. | ~1.1k, no deletions | Is the vocabulary right: keys, extractors, all-or-nothing tokens, engine scope only? |
-| 2 | **Transport header extractors.** Node `policies.ingress` with `required_tokens` and `optional_tokens`; the OTLP gRPC and HTTP receivers become producers. Nothing consumes the result yet. | ~0.8k | Does a receiver resolve the same context a reviewer would predict from the config, including the `-bin` and repeated-header cases? |
-| 3 | **Propagators.** The context rides on the request and survives every node that only forwards. Processors need no change; cloning is a refcount. | ~0.6k | Can a context be silently dropped or replaced anywhere on the path? |
-| 4 | **Carriers.** Exporters read by key: `tenant_headers` on OTLP gRPC, then OTLP HTTP. The feature is now end to end, with one runnable config as proof. | ~0.7k | Static config wins on collision, so tenant material can never shadow a backend credential. Is that airtight? |
-| 5 | **Remove transport headers.** Delete `header_capture`, `header_propagation`, the policy, the three resolution scopes and the docs, with migration notes. | ~2.5k removed | Is every old capability either replaced or deliberately dropped, and is each drop written down? |
-| 6 | **Matchers.** Conditions in the compiler -- interned literals, packed signatures, `O(1)` probe -- and `processor:tenant_router` as the first matcher. | ~1.2k | Exact matching and fail-closed on undeclared input: can a collision or a gap route one tenant's data to another tenant's destination? |
-| 7 | **Boundaries.** Topic exporter and receiver gain explicit control over what crosses a pipeline group boundary in each direction. The far side re-derives its own tokens rather than adopting the inbound context. | ~0.8k | Is the default closed, and is a hop across a boundary a place where tenant material can leak? |
-| 8 | **Partitioning.** Batch processor partitions on tenant keys with a cardinality bound, so a merged batch never mixes tenants. | ~0.5k | What happens at the cardinality limit, and can a merge produce a batch whose context is a lie? |
-| 9 | **Minting and durability.** An `idempotency` extractor, and `required_tokens` on `processor:durable_buffer` so a persisted request carries an identity that outlives the process. | ~0.6k | A replay site may restore a stored key but must never mint a fresh one. Is that enforced? |
+| PR | Main feature                | Main development                                                |
+|----|-----------------------------|-----------------------------------------------------------------|
+| 1  | Tenant Compiler             | Intern strings, assign slots, compute bagged encoding           |
+| 2  | Transport header extractors | Map request context, transport header policy into tenant tokens |
+| 3  | Propagation                 | Tenant context travels with request context                     |
+| 4  | Carriers                    | Tenant consumers can extract key values                         |
+| 5  | Remove transport headers    | Net-negative cost compared with starting point                  |
+| 6  | Authorization               | New extractors for authorization subject/audience/claims        |
+| 7  | Matchers                    | Compiler computes hash-join value array, adds tenant_router     |
+| 8  | Topics                      | Topic exporter and receiver use a special extractors            |
+| 9  | Batch processor             | Batch processor gains `metadata_keys`                           |
+| 10 | Ingress rules               | Required token checking, idempotency key support                |
 
-Live reconfiguration is deliberately not a PR of its own. The epoch is
-in the layout from PR1 and each step maintains it, so recompiling both
-sides of a producer/consumer pair is a property the series carries
-rather than a feature bolted on at the end.
+At this point, many more nodes will come up for review, and how we 
+design the use of tenant tokens for matching and propagation will
+be extended most of the remaining components as separate issues.
