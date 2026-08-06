@@ -27,7 +27,7 @@
   <text x="36" y="93" font-size="11" font-family="monospace" fill="#3a414a">project_id &lt;- x-project-id</text>
 
   <rect x="300" y="38" width="260" height="68" rx="5" fill="#eef1f4" stroke="#8a94a0"/>
-  <text x="312" y="57" font-size="11" font-weight="bold" fill="#3a414a">batch config</text>
+  <text x="312" y="57" font-size="11" font-weight="bold" fill="#3a414a">batch policies</text>
   <text x="312" y="77" font-size="11" font-family="monospace" fill="#3a414a">metadata_keys:</text>
   <text x="312" y="93" font-size="11" font-family="monospace" fill="#3a414a">  [tenant_id, project_id]</text>
 
