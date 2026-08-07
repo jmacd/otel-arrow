@@ -43,6 +43,15 @@ can fail to match.
 A **tenant token** is one set of tenant keys, defined when a list of
 extractors all match.
 
+In most case, tenant context behavior will be specified entirely
+through policies, where tenant extractors and ingress rules are
+expressed. Policies inform the engine that a combination of tenant
+keys translates into a per-tenant configuration, generally, so that
+`batch_processor` does not need to know how it is being used with
+multiple tenants. In a few cases, such as the topic exporter and
+receiver, and a new processor named `tenant_router`, will the
+configuration directly refer to tenant values by key.
+
 ### Producers
 
 Receivers and processor nodes that create new contexts will use engine
@@ -62,7 +71,7 @@ policies:
 
 ```
 
-We emphasize `transport_header` in this design because at the time of
+We emphasize transport header in this document because at the time of
 writing, transport headers are encoded using
 `Option<Arc<Vec<TransportHeader>>>`. This design will replace the
 implementation of transport headers with tenant context, a
@@ -157,7 +166,7 @@ nodes:
     policies:
       ingress:
         required_tokens: [edge]
-        metadata_keys: [tenant_id, project_id]
+        partition_keys: [tenant_id, project_id]
         max_cardinality: 100
     config:
       ...
@@ -253,7 +262,7 @@ Tenant context will be implemented in approximately 10 PRs.
 | 6  | Authorization               | New extractors for authorization subject/audience/claims        |
 | 7  | Matchers                    | Compiler computes hash-join value array, adds tenant_router     |
 | 8  | Topics                      | Topic exporter and receiver use special extractors              |
-| 9  | Batch processor             | Batch processor gains `metadata_keys`                           |
+| 9  | Batch processor             | Batch processor gains partition keys                            |
 | 10 | Ingress rules               | Required token checking, idempotency key support                |
 
 At this point, many more nodes will come up for review, and how we
