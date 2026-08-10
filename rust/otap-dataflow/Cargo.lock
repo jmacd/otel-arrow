@@ -7666,6 +7666,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "otap-df-metadata"
+version = "0.50.0"
+dependencies = [
+ "bytes",
+ "hashbrown 0.17.1",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "otap-df-otap"
 version = "0.50.0"
 dependencies = [
