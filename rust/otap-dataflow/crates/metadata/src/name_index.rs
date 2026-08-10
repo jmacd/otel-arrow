@@ -11,35 +11,27 @@
 //! folds the offered name into the hasher in place.
 //!
 //! One name may feed several extractors, because two tokens may read the same
-//! header into different keys. Each target also records which of its extractor's
-//! names matched, which is how a preserved wire name costs one byte instead of a
-//! string.
+//! header into different keys. Which of an extractor's declared names matched is
+//! not recorded: the compiled epoch owns every name, so a caller that needs to
+//! re-emit a value under the name it arrived on declares one extractor per name
+//! and reads the answer from the resolved token.
 
 use crate::condition::Range;
 use crate::hashing::{CaseFolding, Hasher64, hash_bytes};
 use crate::ids::ExtractorId;
 use hashbrown::HashTable;
 
-/// One extractor that wants a given name, and which of its names this is.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct NameTarget {
-    /// The extractor to stage the value under.
-    pub(crate) extractor: ExtractorId,
-    /// The position of this name in the extractor's declared name list.
-    pub(crate) ordinal: u8,
-}
-
 /// Names, interned, mapped to the extractors that want them.
 #[derive(Debug)]
 pub(crate) struct NameIndex {
     /// Name bytes, concatenated, as declared rather than folded, so that a
-    /// preserved wire name is reproduced exactly.
+    /// probe can compare candidate bytes exactly under its folding rule.
     names: Box<[u8]>,
     /// One more entry than there are names.
     bounds: Box<[u32]>,
     /// Per name, the range of [`Self::targets`] that wants it.
     target_ranges: Box<[Range]>,
-    targets: Box<[NameTarget]>,
+    targets: Box<[ExtractorId]>,
     index: HashTable<u32>,
     hasher: Hasher64,
     folding: CaseFolding,
@@ -47,7 +39,7 @@ pub(crate) struct NameIndex {
 
 impl NameIndex {
     /// Returns the extractors that want `name`, or an empty slice.
-    pub(crate) fn lookup(&self, name: &[u8]) -> &[NameTarget] {
+    pub(crate) fn lookup(&self, name: &[u8]) -> &[ExtractorId] {
         let hash = hash_bytes(&self.hasher, name, self.folding);
         match self
             .index
@@ -71,7 +63,7 @@ impl NameIndex {
 pub(crate) struct NameIndexBuilder {
     names: Vec<u8>,
     bounds: Vec<u32>,
-    targets: Vec<Vec<NameTarget>>,
+    targets: Vec<Vec<ExtractorId>>,
     index: HashTable<u32>,
     hasher: Hasher64,
     folding: CaseFolding,
@@ -89,8 +81,8 @@ impl NameIndexBuilder {
         }
     }
 
-    /// Records that `extractor` wants `name` as its `ordinal`-th name.
-    pub(crate) fn insert(&mut self, name: &str, extractor: ExtractorId, ordinal: u8) {
+    /// Records that `extractor` wants `name`.
+    pub(crate) fn insert(&mut self, name: &str, extractor: ExtractorId) {
         let Self {
             names,
             bounds,
@@ -120,7 +112,7 @@ impl NameIndexBuilder {
             }
         };
 
-        targets[entry as usize].push(NameTarget { extractor, ordinal });
+        targets[entry as usize].push(extractor);
     }
 
     pub(crate) fn build(self) -> NameIndex {

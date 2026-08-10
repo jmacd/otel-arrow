@@ -17,7 +17,7 @@
 use crate::compiled::CompiledMetadata;
 use crate::condition::ConditionMatch;
 use crate::encoder::REPEATED_VALUE_PREFIX;
-use crate::ids::{BagId, ConditionSetId, ConsumerId, Epoch, TokenId, ValueSlotId};
+use crate::ids::{ConditionSetId, ConsumerId, Epoch, TokenId, ValueSlotId};
 use crate::layout::{CONTEXT_ID_BYTES, EPOCH_BYTES, read_bits};
 use bytes::Bytes;
 
@@ -241,42 +241,6 @@ impl<'a> MetadataView<'a> {
         }
     }
 
-    /// Returns the wire name the sender actually used, for a slot whose key
-    /// preserves it.
-    ///
-    /// The context stores a one-byte ordinal, because the candidate names are
-    /// compile-time constants of the extractor that matched.
-    #[must_use]
-    pub fn slot_matched_name(&self, slot: ValueSlotId) -> Option<&'a str> {
-        let compiled_slot = self.compiled.value_slot_at(slot);
-        let at = compiled_slot.name_ordinal?;
-        if self.region(slot.index())?.is_empty() {
-            return None;
-        }
-        let ordinal = self.bytes[self.compiled.layout.name_ordinals_offset + at as usize];
-        if !self.has_token(compiled_slot.token) {
-            return None;
-        }
-        self.compiled
-            .extractor(compiled_slot.extractor)
-            .names
-            .get(usize::from(ordinal))
-            .map(AsRef::as_ref)
-    }
-
-    /// Borrows a pre-encoded attribute region.
-    ///
-    /// The bytes are a valid fragment of the consumer's own repeated `KeyValue`
-    /// field, already tagged, so they are copied in rather than encoded.
-    #[must_use]
-    pub fn bag(&self, bag: BagId) -> &'a [u8] {
-        self.compiled
-            .bag(bag)
-            .region
-            .and_then(|region| self.region(region))
-            .unwrap_or_default()
-    }
-
     fn region(&self, index: usize) -> Option<&'a [u8]> {
         if self.bytes.is_empty() {
             return None;
@@ -345,7 +309,7 @@ impl<'a> ConsumerMetadataView<'a> {
         }
     }
 
-    /// Returns the admitted context view for reading retained values and bags.
+    /// Returns the admitted context view for reading retained values.
     #[must_use]
     pub fn metadata(&self) -> MetadataView<'a> {
         self.view

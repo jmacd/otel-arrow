@@ -20,12 +20,12 @@ use crate::dictionary::ValueDictionary;
 use crate::error::CompileWarning;
 use crate::hashing::CaseFolding;
 use crate::ids::{
-    BagId, ConditionSetId, ConsumerId, Epoch, ExtractorId, KeyId, PairSlotId, ProducerId,
-    SymbolSlotId, TokenId, ValueSlotId,
+    ConditionSetId, ConsumerId, Epoch, ExtractorId, KeyId, PairSlotId, ProducerId, SymbolSlotId,
+    TokenId, ValueSlotId,
 };
 use crate::layout::ContextLayout;
 use crate::limits::Limits;
-use crate::name_index::{NameIndex, NameTarget};
+use crate::name_index::NameIndex;
 use crate::pair_slot::{CompiledPairSlot, PairSlotField};
 use crate::plan::ExtractionPlan;
 use crate::scratch::MetadataScratch;
@@ -38,9 +38,6 @@ pub(crate) struct CompiledExtractor {
     pub(crate) repetition: Repetition,
     /// The source-specific limit tightened by [`Limits::value_bytes`].
     pub(crate) value_limit: usize,
-    /// The names this extractor matches, in declared order, so that a preserved
-    /// ordinal can be turned back into the name the sender used.
-    pub(crate) names: Box<[Box<str>]>,
 }
 
 /// A named group of extractors that resolves all-or-nothing.
@@ -79,18 +76,6 @@ pub(crate) struct CompiledValueSlot {
     /// Whether the slot holds a sequence of values rather than one.
     pub(crate) repeated: bool,
     pub(crate) value_kind: ValueKind,
-    /// Where this slot's matched-name ordinal lives, when it preserves one.
-    pub(crate) name_ordinal: Option<u16>,
-}
-
-/// One member of a pre-encoded attribute bag.
-#[derive(Debug)]
-pub(crate) struct BagMember {
-    pub(crate) value_slot: ValueSlotId,
-    /// The encoded `KeyValue.key` field, a range into
-    /// [`CompiledMetadata::bag_bytes`].
-    pub(crate) key_field: Range,
-    pub(crate) value_kind: ValueKind,
 }
 
 /// One consumer's admission contract, as bitmaps over tokens.
@@ -103,18 +88,6 @@ pub struct TokenRequirements {
     pub required: u64,
     /// Tokens the consumer uses when they are there.
     pub optional: u64,
-}
-
-/// One pre-encoded attribute region.
-#[derive(Debug)]
-pub(crate) struct CompiledBag {
-    /// Its region in the packed context, absent when no producer can reach its
-    /// consumer and reachability pruned it from the layout.
-    pub(crate) region: Option<usize>,
-    /// The repeated-field tag every member is introduced by, a range into
-    /// [`CompiledMetadata::bag_bytes`].
-    pub(crate) field_tag: Range,
-    pub(crate) members: Range,
 }
 
 /// One immutable epoch of compiled metadata state.
@@ -154,10 +127,6 @@ pub struct CompiledMetadata {
     pub(crate) value_slots: Box<[CompiledValueSlot]>,
     /// Maps exact token-qualified fields to their carried value slots.
     pub(crate) field_value_slots: Box<[(crate::ids::MetadataFieldId, ValueSlotId)]>,
-
-    pub(crate) bags: Box<[CompiledBag]>,
-    pub(crate) bag_members: Box<[BagMember]>,
-    pub(crate) bag_bytes: Box<[u8]>,
 
     pub(crate) layout: ContextLayout,
     pub(crate) plans: Box<[ExtractionPlan]>,
@@ -307,17 +276,17 @@ impl CompiledMetadata {
 
     /// Returns the extractors that want an offered transport header name,
     /// compared without regard to case.
-    pub(crate) fn header_targets(&self, name: &str) -> &[NameTarget] {
+    pub(crate) fn header_targets(&self, name: &str) -> &[ExtractorId] {
         self.header_names.lookup(name.as_bytes())
     }
 
     /// Returns the extractors that want an offered claim name, compared exactly.
-    pub(crate) fn claim_targets(&self, name: &str) -> &[NameTarget] {
+    pub(crate) fn claim_targets(&self, name: &str) -> &[ExtractorId] {
         self.claim_names.lookup(name.as_bytes())
     }
 
     /// Returns the extractors that want a value the producing node computed.
-    pub(crate) fn derived_targets(&self, name: &str) -> &[NameTarget] {
+    pub(crate) fn derived_targets(&self, name: &str) -> &[ExtractorId] {
         self.derived_names.lookup(name.as_bytes())
     }
 
@@ -343,10 +312,6 @@ impl CompiledMetadata {
 
     pub(crate) fn value_slot_at(&self, id: ValueSlotId) -> &CompiledValueSlot {
         &self.value_slots[id.index()]
-    }
-
-    pub(crate) fn bag(&self, id: BagId) -> &CompiledBag {
-        &self.bags[id.index()]
     }
 }
 

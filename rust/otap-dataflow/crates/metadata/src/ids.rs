@@ -115,11 +115,6 @@ dense_id! {
 }
 
 dense_id! {
-    /// A pre-encoded OTLP attribute region within the packed context.
-    BagId
-}
-
-dense_id! {
     /// A site that builds contexts, such as a receiver.
     ProducerId
 }

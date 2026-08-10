@@ -46,8 +46,6 @@ pub struct Limits {
     pub values_per_key: usize,
     /// Keys the packed context may retain, which sizes its value index.
     pub value_slots: usize,
-    /// Pre-encoded attribute regions.
-    pub bags: usize,
     /// Bytes one packed context may occupy. Bounded by 65535 because the value
     /// index holds `u16` offsets.
     pub context_bytes: usize,
@@ -102,7 +100,6 @@ impl Default for Limits {
             value_bytes: 4096,
             values_per_key: 16,
             value_slots: 64,
-            bags: 8,
             context_bytes: Self::MAX_CONTEXT_BYTES,
             scratch_bytes: 1 << 16,
             producers: 256,

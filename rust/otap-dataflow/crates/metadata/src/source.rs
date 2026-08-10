@@ -73,7 +73,7 @@ pub enum Repetition {
     ///
     /// A key that keeps every value cannot be tested by value, because equality
     /// against a repeated value is not defined and an Envoy descriptor entry
-    /// holds exactly one value. Such a key may still be read and bagged.
+    /// holds exactly one value. Such a key may still be read.
     All,
 }
 
@@ -100,18 +100,15 @@ pub struct TransportHeaderSource {
     /// The wire names to match, compared without regard to case.
     ///
     /// Several names may feed one key, which is how a deployment accepts both
-    /// its own header and a legacy one for the same field.
+    /// its own header and a legacy one for the same field. Which of them matched
+    /// is deliberately not recorded: a caller that has to re-emit a value under
+    /// the name it arrived on declares one extractor per name, so the resolved
+    /// token identifies the source and the name stays compile-time state.
     pub names: Vec<String>,
     /// What to do when the header appears more than once.
     pub repetition: Repetition,
     /// Reject a value longer than this, in bytes.
     pub max_value_bytes: Option<usize>,
-    /// Remember which of [`names`](Self::names) matched.
-    ///
-    /// An exporter that propagates a header under its original name needs this.
-    /// Because the candidate names are compile-time constants, the context
-    /// stores a one-byte ordinal rather than the name itself.
-    pub preserve_matched_name: bool,
 }
 
 /// Reads a value from the authenticated principal.
@@ -158,15 +155,6 @@ impl ExtractorSource {
             Self::PeerAddress(_) => Repetition::Last,
             Self::AuthorizedClaim(source) => source.repetition,
             Self::Derived(source) => source.repetition,
-        }
-    }
-
-    /// Returns whether this source preserves which of its names matched.
-    #[must_use]
-    pub fn preserves_matched_name(&self) -> bool {
-        match self {
-            Self::TransportHeader(source) => source.preserve_matched_name,
-            _ => false,
         }
     }
 

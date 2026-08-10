@@ -29,11 +29,10 @@
 //! and a claim only through [`ContextEncoder::offer_authorized_claim`], which an
 //! authorization extension owns. Naming a header after a claim cannot forge one.
 
-use crate::bag::{ByteCursor, member_len, write_member};
 use crate::compiled::CompiledMetadata;
 use crate::context::MetadataContext;
 use crate::error::EncodeError;
-use crate::ids::{BagId, ExtractorId, ProducerId, ValueSlotId};
+use crate::ids::{ExtractorId, ProducerId, ValueSlotId};
 use crate::layout::{CONTEXT_ID_BYTES, EPOCH_BYTES, LAYOUT_FINGERPRINT_BYTES, write_bits};
 use crate::plan::ExtractionPlan;
 use crate::scratch::{MetadataScratch, RegionPlan};
@@ -43,6 +42,28 @@ use std::net::SocketAddr;
 
 /// Bytes of length prefix in front of each value of a repeated slot.
 pub(crate) const REPEATED_VALUE_PREFIX: usize = size_of::<u16>();
+
+/// Writes into a slice that was sized in advance.
+///
+/// The packed context is measured before it is written, so every length is
+/// already known and the bytes go straight into their final home. This is what
+/// keeps a context to one allocation rather than one plus a staging buffer.
+#[derive(Debug)]
+struct ByteCursor<'a> {
+    buffer: &'a mut [u8],
+    at: usize,
+}
+
+impl<'a> ByteCursor<'a> {
+    fn new(buffer: &'a mut [u8]) -> Self {
+        Self { buffer, at: 0 }
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        self.buffer[self.at..self.at + bytes.len()].copy_from_slice(bytes);
+        self.at += bytes.len();
+    }
+}
 
 /// Builds one context for one request.
 #[derive(Debug)]
@@ -76,16 +97,16 @@ impl<'a> ContextEncoder<'a> {
     /// to this name, and it can never fill an authorized claim.
     pub fn offer_transport_header(&mut self, wire_name: &str, value: &[u8]) {
         let compiled = self.compiled;
-        for target in compiled.header_targets(wire_name) {
-            self.stage(target.extractor, target.ordinal, value);
+        for &extractor in compiled.header_targets(wire_name) {
+            self.stage(extractor, value);
         }
     }
 
     /// Offers a claim an authorization extension proved.
     pub fn offer_authorized_claim(&mut self, claim: &str, value: &[u8]) {
         let compiled = self.compiled;
-        for target in compiled.claim_targets(claim) {
-            self.stage(target.extractor, target.ordinal, value);
+        for &extractor in compiled.claim_targets(claim) {
+            self.stage(extractor, value);
         }
     }
 
@@ -93,8 +114,8 @@ impl<'a> ContextEncoder<'a> {
     /// an idempotency key.
     pub fn offer_derived_value(&mut self, name: &str, value: &[u8]) {
         let compiled = self.compiled;
-        for target in compiled.derived_targets(name) {
-            self.stage(target.extractor, target.ordinal, value);
+        for &extractor in compiled.derived_targets(name) {
+            self.stage(extractor, value);
         }
     }
 
@@ -120,7 +141,7 @@ impl<'a> ContextEncoder<'a> {
             }
             let part = entry.part;
             self.scratch
-                .stage_formatted(entry.extractor, 0, |out| match part {
+                .stage_formatted(entry.extractor, |out| match part {
                     PeerAddressPart::Address => append_display(out, format_args!("{}", peer.ip())),
                     PeerAddressPart::AddressAndPort => append_display(out, format_args!("{peer}")),
                 });
@@ -145,7 +166,7 @@ impl<'a> ContextEncoder<'a> {
     }
 
     /// Stages a value, honouring the extractor's repetition rule.
-    fn stage(&mut self, extractor: ExtractorId, ordinal: u8, value: &[u8]) {
+    fn stage(&mut self, extractor: ExtractorId, value: &[u8]) {
         if self.rejected.is_some() || !self.plan.wants(extractor) {
             return;
         }
@@ -190,7 +211,7 @@ impl<'a> ContextEncoder<'a> {
                     self.scratch.stage_additional(extractor, value);
                 }
             }
-            _ => self.scratch.stage_first(extractor, ordinal, value),
+            _ => self.scratch.stage_first(extractor, value),
         }
     }
 
@@ -245,35 +266,7 @@ impl<'a> ContextEncoder<'a> {
             );
         }
 
-        for &bag_id in &plan.bags {
-            let bytes = self.measure_bag(bag_id, resolved);
-            self.scratch.set_region(
-                self.bag_region(bag_id),
-                RegionPlan {
-                    source: None,
-                    bytes,
-                    offset: 0,
-                },
-            );
-        }
-
         self.scratch.place_regions(compiled.layout.regions)
-    }
-
-    fn measure_bag(&self, bag_id: BagId, resolved: u64) -> usize {
-        let bag = self.compiled.bag(bag_id);
-        let tag = &self.compiled.bag_bytes[bag.field_tag.as_usize()];
-        let mut bytes = 0;
-        for member in &self.compiled.bag_members[bag.members.as_usize()] {
-            let Some(source) = self.field_source(member.value_slot, resolved) else {
-                continue;
-            };
-            let key_field = &self.compiled.bag_bytes[member.key_field.as_usize()];
-            for value in self.scratch.staged_values(source) {
-                bytes += member_len(tag, key_field, value.len());
-            }
-        }
-        bytes
     }
 
     /// Returns the one extractor this token-qualified slot carries, when its
@@ -282,13 +275,6 @@ impl<'a> ContextEncoder<'a> {
     fn field_source(&self, slot_id: ValueSlotId, resolved: u64) -> Option<ExtractorId> {
         let slot = self.compiled.value_slot_at(slot_id);
         is_resolved(resolved, slot.token).then_some(slot.extractor)
-    }
-
-    fn bag_region(&self, bag: BagId) -> usize {
-        self.compiled
-            .bag(bag)
-            .region
-            .expect("extraction plans contain only live bags")
     }
 
     fn write(self, resolved: u64, data_bytes: usize) -> Result<MetadataContext, EncodeError> {
@@ -309,9 +295,8 @@ impl<'a> ContextEncoder<'a> {
             .copy_from_slice(&resolved.to_le_bytes()[..layout.token_bitmap_bytes]);
 
         self.write_symbols(&mut packed);
-        self.write_name_ordinals(&mut packed);
         self.write_region_index(&mut packed);
-        self.write_data(&mut packed, resolved);
+        self.write_data(&mut packed);
 
         Ok(MetadataContext::new(packed.freeze()))
     }
@@ -342,19 +327,6 @@ impl<'a> ContextEncoder<'a> {
         }
     }
 
-    fn write_name_ordinals(&self, packed: &mut BytesMut) {
-        let layout = &self.compiled.layout;
-        for &slot_id in &self.plan.value_slots {
-            let Some(at) = self.compiled.value_slot_at(slot_id).name_ordinal else {
-                continue;
-            };
-            let Some(source) = self.scratch.region(slot_id.index()).source else {
-                continue;
-            };
-            packed[layout.name_ordinals_offset + at as usize] = self.scratch.staged_ordinal(source);
-        }
-    }
-
     fn write_region_index(&self, packed: &mut BytesMut) {
         let layout = &self.compiled.layout;
         if layout.regions == 0 {
@@ -371,7 +343,7 @@ impl<'a> ContextEncoder<'a> {
         }
     }
 
-    fn write_data(&self, packed: &mut BytesMut, resolved: u64) {
+    fn write_data(&self, packed: &mut BytesMut) {
         let layout = &self.compiled.layout;
 
         for &slot_id in &self.plan.value_slots {
@@ -388,24 +360,6 @@ impl<'a> ContextEncoder<'a> {
                 }
                 cursor.extend(value);
             }
-        }
-
-        for &bag_id in &self.plan.bags {
-            let region = self.scratch.region(self.bag_region(bag_id));
-            let start = layout.data_offset + region.offset;
-            let mut cursor = ByteCursor::new(&mut packed[start..start + region.bytes]);
-            let bag = self.compiled.bag(bag_id);
-            let tag = &self.compiled.bag_bytes[bag.field_tag.as_usize()];
-            for member in &self.compiled.bag_members[bag.members.as_usize()] {
-                let Some(source) = self.field_source(member.value_slot, resolved) else {
-                    continue;
-                };
-                let key_field = &self.compiled.bag_bytes[member.key_field.as_usize()];
-                for value in self.scratch.staged_values(source) {
-                    write_member(&mut cursor, tag, key_field, member.value_kind, value);
-                }
-            }
-            debug_assert_eq!(cursor.position(), region.bytes);
         }
     }
 }

@@ -19,29 +19,25 @@
 //!    is left, and give every (token, signature) pair a word.
 //! 5. **Branch tables.** Turn each condition into one entry in a dense table
 //!    indexed by that word.
-//! 6. **Retention and bags.** Decide which keys' bytes travel, and pre-encode
-//!    the attribute regions that do not depend on the request.
+//! 6. **Retention.** Decide which keys' bytes travel.
 //! 7. **Layout and plans.** Fix the epoch's byte layout, then give each producer
 //!    the subset of the work it actually has to do.
 
-use crate::bag::{encode_field_tag, encode_key_field};
 use crate::branch_table::BranchTableBuilder;
 use crate::compiled::{
-    BagMember, CompileReport, CompiledBag, CompiledExtractor, CompiledMetadata, CompiledSymbolSlot,
-    CompiledToken, CompiledValueSlot, EXACT_FOLDING, HEADER_FOLDING, PeerAddressExtractor,
-    TokenRequirements,
+    CompileReport, CompiledExtractor, CompiledMetadata, CompiledSymbolSlot, CompiledToken,
+    CompiledValueSlot, EXACT_FOLDING, HEADER_FOLDING, PeerAddressExtractor, TokenRequirements,
 };
 use crate::condition::{CompiledConditionSet, Condition, KeyPredicate, Range, TableParticipant};
 use crate::declaration::{
-    BagDeclaration, ConditionSetDeclaration, Declarations, ExtractorDeclaration, KeyDeclaration,
-    MetadataField, ReadDeclaration, Requirement, RequirementDeclaration, SiteDeclaration,
-    TokenDeclaration,
+    ConditionSetDeclaration, Declarations, ExtractorDeclaration, KeyDeclaration, MetadataField,
+    ReadDeclaration, Requirement, RequirementDeclaration, SiteDeclaration, TokenDeclaration,
 };
 use crate::dictionary::{ValueDictionary, ValueDictionaryBuilder};
 use crate::error::{CompileError, CompileProblem};
 use crate::ids::{
-    BagId, ConditionSetId, ConsumerId, Epoch, ExtractorId, KeyId, MetadataFieldId, PairSlotId,
-    ProducerId, SymbolSlotId, TokenId, ValueSlotId,
+    ConditionSetId, ConsumerId, Epoch, ExtractorId, KeyId, MetadataFieldId, PairSlotId, ProducerId,
+    SymbolSlotId, TokenId, ValueSlotId,
 };
 use crate::layout::ContextLayout;
 use crate::limits::Limits;
@@ -162,44 +158,6 @@ impl MetadataCompiler {
         });
     }
 
-    /// Declares a pre-encoded attribute region.
-    ///
-    /// `attributes_field_number` is the protobuf field number of the repeated
-    /// `KeyValue` field the bytes are destined for, so the region can be copied
-    /// into the consumer's own message without re-tagging.
-    pub fn declare_bag(
-        &mut self,
-        consumer: ConsumerId,
-        attributes_field_number: u32,
-        keys: &[KeyId],
-    ) -> BagId {
-        self.declare_bag_fields(
-            consumer,
-            attributes_field_number,
-            keys.iter().copied().map(MetadataField::Key),
-        )
-    }
-
-    /// Declares a pre-encoded attribute region with optional token-qualified
-    /// field selections.
-    pub fn declare_bag_fields<F>(
-        &mut self,
-        consumer: ConsumerId,
-        attributes_field_number: u32,
-        fields: impl IntoIterator<Item = F>,
-    ) -> BagId
-    where
-        F: Into<MetadataField>,
-    {
-        let id = BagId::from_index(self.declarations.bags.len());
-        self.declarations.bags.push(BagDeclaration {
-            consumer,
-            attributes_field_number,
-            fields: fields.into_iter().map(Into::into).collect(),
-        });
-        id
-    }
-
     /// Declares one consumer's ordered descriptor-map entries.
     ///
     /// A condition names a key sequence, not a token. At compilation the
@@ -240,7 +198,6 @@ impl MetadataCompiler {
         build.intern_dictionaries();
         build.build_matching();
         build.build_retention();
-        build.build_bags();
         build.validate_layout();
         if !build.problems.is_empty() {
             return Err(CompileError::new(build.problems));
@@ -265,7 +222,7 @@ impl MetadataCompiler {
     /// Rejects a configuration that would grow compiled state past its bounds.
     fn check_dimensions(&mut self) {
         let declarations = &self.declarations;
-        let checks: [(&'static str, usize, usize); 8] = [
+        let checks: [(&'static str, usize, usize); 7] = [
             ("keys", declarations.keys.len(), self.limits.keys),
             (
                 "extractors",
@@ -278,7 +235,6 @@ impl MetadataCompiler {
                 declarations.condition_sets.len(),
                 self.limits.condition_sets,
             ),
-            ("bags", declarations.bags.len(), self.limits.bags),
             (
                 "producers",
                 declarations.producers.len(),
@@ -473,20 +429,6 @@ impl MetadataCompiler {
         for (consumer, field) in read_fields {
             self.check_field_supplied(consumer, field);
         }
-        let bag_fields: Vec<(ConsumerId, MetadataField)> = self
-            .declarations
-            .bags
-            .iter()
-            .flat_map(|bag| {
-                bag.fields
-                    .iter()
-                    .copied()
-                    .map(move |field| (bag.consumer, field))
-            })
-            .collect();
-        for (consumer, field) in bag_fields {
-            self.check_field_supplied(consumer, field);
-        }
     }
 
     fn check_field_supplied(&mut self, consumer: ConsumerId, field: MetadataField) {
@@ -656,11 +598,6 @@ struct Build<'a> {
 
     value_slots: Vec<CompiledValueSlot>,
     field_value_slots: Vec<(MetadataFieldId, ValueSlotId)>,
-    name_ordinals: usize,
-
-    bags: Vec<CompiledBag>,
-    bag_members: Vec<BagMember>,
-    bag_bytes: Vec<u8>,
 }
 
 impl<'a> Build<'a> {
@@ -697,10 +634,6 @@ impl<'a> Build<'a> {
             tables: BranchTableBuilder::default(),
             value_slots: Vec::new(),
             field_value_slots: Vec::new(),
-            name_ordinals: 0,
-            bags: Vec::new(),
-            bag_members: Vec::new(),
-            bag_bytes: Vec::new(),
         }
     }
 
@@ -948,11 +881,6 @@ impl<'a> Build<'a> {
                 continue;
             };
             let source = &self.declarations.extractors[extractor.index()].source;
-            let name_ordinal = source.preserves_matched_name().then(|| {
-                let at = self.name_ordinals as u16;
-                self.name_ordinals += 1;
-                at
-            });
             let id = ValueSlotId::from_index(self.value_slots.len());
             self.value_slots.push(CompiledValueSlot {
                 field,
@@ -961,7 +889,6 @@ impl<'a> Build<'a> {
                 extractor,
                 repeated: source.repetition().is_repeated(),
                 value_kind: self.declarations.keys[field.key().index()].value_kind,
-                name_ordinal,
             });
             self.field_value_slots.push((field, id));
         }
@@ -993,86 +920,7 @@ impl<'a> Build<'a> {
                 fields.push(field);
             }
         }
-        for bag in &self.declarations.bags {
-            if !live_consumers.contains(&bag.consumer) {
-                continue;
-            }
-            for &selection in &bag.fields {
-                if let Ok(field) = resolve_field(self.declarations, bag.consumer, selection)
-                    && seen.insert(field)
-                {
-                    fields.push(field);
-                }
-            }
-        }
         fields
-    }
-
-    /// Pre-encodes everything about an attribute bag that does not depend on the
-    /// request: the repeated-field tag, and each member's `KeyValue.key`.
-    fn build_bags(&mut self) {
-        let live_consumers: HashSet<ConsumerId> = self
-            .reach
-            .per_producer
-            .iter()
-            .flat_map(|producer| producer.consumers.iter().copied())
-            .collect();
-        for bag in &self.declarations.bags {
-            if !live_consumers.contains(&bag.consumer) {
-                self.bags.push(CompiledBag {
-                    region: None,
-                    field_tag: Range::default(),
-                    members: Range::default(),
-                });
-                continue;
-            }
-            let tag = encode_field_tag(bag.attributes_field_number);
-            let field_tag = self.push_bag_bytes(&tag);
-            let members_start = self.bag_members.len() as u32;
-
-            for &selection in &bag.fields {
-                let Ok(field) = resolve_field(self.declarations, bag.consumer, selection) else {
-                    continue;
-                };
-                let Some(value_slot) = self.value_slot_for_field(field) else {
-                    continue;
-                };
-                let encoded = encode_key_field(self.declarations.key_name(field.key()));
-                let key_field = self.push_bag_bytes(&encoded);
-                self.bag_members.push(BagMember {
-                    value_slot,
-                    key_field,
-                    value_kind: self.declarations.keys[field.key().index()].value_kind,
-                });
-            }
-
-            self.bags.push(CompiledBag {
-                region: Some(
-                    self.value_slots.len()
-                        + self.bags.iter().filter(|bag| bag.region.is_some()).count(),
-                ),
-                field_tag,
-                members: Range {
-                    start: members_start,
-                    end: self.bag_members.len() as u32,
-                },
-            });
-        }
-    }
-
-    fn value_slot_for_field(&self, field: MetadataFieldId) -> Option<ValueSlotId> {
-        self.field_value_slots
-            .iter()
-            .find_map(|&(candidate, slot)| (candidate == field).then_some(slot))
-    }
-
-    fn push_bag_bytes(&mut self, bytes: &[u8]) -> Range {
-        let start = self.bag_bytes.len() as u32;
-        self.bag_bytes.extend_from_slice(bytes);
-        Range {
-            start,
-            end: self.bag_bytes.len() as u32,
-        }
     }
 
     /// Rejects an epoch whose fixed header alone cannot fit the packed-context
@@ -1096,13 +944,7 @@ impl<'a> Build<'a> {
             .map(|token| token.index() + 1)
             .max()
             .unwrap_or(0);
-        ContextLayout::new(
-            token_bits,
-            self.symbol_bits,
-            self.name_ordinals,
-            self.value_slots.len(),
-            self.bags.iter().filter(|bag| bag.region.is_some()).count(),
-        )
+        ContextLayout::new(token_bits, self.symbol_bits, self.value_slots.len())
     }
 
     /// Assembles the epoch: the dispatch tables, the layout, and one extraction
@@ -1120,7 +962,6 @@ impl<'a> Build<'a> {
         for (index, declared) in declarations.extractors.iter().enumerate() {
             let id = ExtractorId::from_index(index);
             let live = live_extractors.contains(&id);
-            let mut names: Vec<Box<str>> = Vec::new();
             let mut value_limit = limits.value_bytes;
 
             match &declared.source {
@@ -1129,24 +970,21 @@ impl<'a> Build<'a> {
                         .max_value_bytes
                         .unwrap_or(limits.value_bytes)
                         .min(limits.value_bytes);
-                    for (ordinal, name) in source.names.iter().enumerate() {
-                        if live {
-                            headers.insert(name, id, ordinal as u8);
+                    if live {
+                        for name in &source.names {
+                            headers.insert(name, id);
                         }
-                        names.push(name.as_str().into());
                     }
                 }
                 ExtractorSource::AuthorizedClaim(source) => {
                     if live {
-                        claims.insert(&source.claim, id, 0);
+                        claims.insert(&source.claim, id);
                     }
-                    names.push(source.claim.as_str().into());
                 }
                 ExtractorSource::Derived(source) => {
                     if live {
-                        derived.insert(&source.name, id, 0);
+                        derived.insert(&source.name, id);
                     }
-                    names.push(source.name.as_str().into());
                 }
                 ExtractorSource::PeerAddress(part) => {
                     if live {
@@ -1162,7 +1000,6 @@ impl<'a> Build<'a> {
                 key: declared.key,
                 repetition: declared.source.repetition(),
                 value_limit,
-                names: names.into_boxed_slice(),
             });
         }
 
@@ -1234,9 +1071,6 @@ impl<'a> Build<'a> {
             tables: self.tables.build(),
             value_slots: self.value_slots.into_boxed_slice(),
             field_value_slots: self.field_value_slots.into_boxed_slice(),
-            bags: self.bags.into_boxed_slice(),
-            bag_members: self.bag_members.into_boxed_slice(),
-            bag_bytes: self.bag_bytes.into_boxed_slice(),
             layout,
             plans,
         }
@@ -1248,7 +1082,6 @@ impl<'a> Build<'a> {
             .per_producer
             .iter()
             .map(|reach| {
-                let consumers: HashSet<ConsumerId> = reach.consumers.iter().copied().collect();
                 let tokens: HashSet<TokenId> = reach.tokens.iter().copied().collect();
 
                 let symbol_slots: Vec<SymbolSlotId> = self
@@ -1267,16 +1100,6 @@ impl<'a> Build<'a> {
                     .map(|(index, _)| ValueSlotId::from_index(index))
                     .collect();
 
-                let bags: Vec<BagId> = declarations
-                    .bags
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, bag)| {
-                        consumers.contains(&bag.consumer) && self.bags[*index].region.is_some()
-                    })
-                    .map(|(index, _)| BagId::from_index(index))
-                    .collect();
-
                 ExtractionPlan::new(
                     declarations.producers[reach.producer.index()].name.clone(),
                     declarations.extractors.len(),
@@ -1284,7 +1107,6 @@ impl<'a> Build<'a> {
                     &reach.tokens,
                     symbol_slots.into_boxed_slice(),
                     value_slots.into_boxed_slice(),
-                    bags.into_boxed_slice(),
                 )
             })
             .collect()

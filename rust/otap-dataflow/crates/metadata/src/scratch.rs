@@ -62,8 +62,6 @@ struct StagedExtractor {
     last: u32,
     /// How many values were kept.
     count: u16,
-    /// Which of the extractor's names matched.
-    ordinal: u8,
 }
 
 /// Reusable working memory for building contexts.
@@ -105,7 +103,6 @@ impl MetadataScratch {
             first: NO_NEXT,
             last: NO_NEXT,
             count: 0,
-            ordinal: 0,
         };
         self.staged.resize(compiled.extractors.len(), blank);
 
@@ -122,14 +119,13 @@ impl MetadataScratch {
     }
 
     /// Records a value for an extractor, replacing whatever was there.
-    pub(crate) fn stage_first(&mut self, extractor: ExtractorId, ordinal: u8, value: &[u8]) {
+    pub(crate) fn stage_first(&mut self, extractor: ExtractorId, value: &[u8]) {
         let index = self.push_value(value);
         self.staged[extractor.index()] = StagedExtractor {
             stamp: self.stamp,
             first: index,
             last: index,
             count: 1,
-            ordinal,
         };
     }
 
@@ -158,11 +154,6 @@ impl MetadataScratch {
         }
     }
 
-    /// Returns which of an extractor's names matched.
-    pub(crate) fn staged_ordinal(&self, extractor: ExtractorId) -> u8 {
-        self.staged[extractor.index()].ordinal
-    }
-
     /// Borrows every value staged for an extractor, in the order offered.
     pub(crate) fn staged_values(&self, extractor: ExtractorId) -> StagedValues<'_> {
         StagedValues {
@@ -188,7 +179,6 @@ impl MetadataScratch {
     pub(crate) fn stage_formatted(
         &mut self,
         extractor: ExtractorId,
-        ordinal: u8,
         write: impl FnOnce(&mut Vec<u8>),
     ) {
         let start = self.bytes.len() as u32;
@@ -204,7 +194,6 @@ impl MetadataScratch {
             first: index,
             last: index,
             count: 1,
-            ordinal,
         };
     }
 

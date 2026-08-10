@@ -91,7 +91,7 @@ pub enum CompileProblem {
         hint: String,
     },
 
-    /// A consumer reads or bags a key that none of the tokens it declares can
+    /// A consumer reads a key that none of the tokens it declares can
     /// supply.
     #[error(
         "consumer `{consumer}` reads key `{key}`, but declares no token that produces it; \
@@ -258,7 +258,7 @@ pub enum CompileWarning {
         consumer: String,
     },
 
-    /// This key is only ever tested by value, never read or bagged, so its
+    /// This key is only ever tested by value, never read, so its
     /// values are dictionary-encoded and the bytes are not retained.
     MatchOnlyKey {
         /// The key whose bytes are not retained.

@@ -115,17 +115,6 @@ pub(crate) struct ReadDeclaration {
     pub(crate) field: MetadataField,
 }
 
-/// A pre-encoded OTLP attribute region a consumer wants to copy out whole.
-#[derive(Debug)]
-pub(crate) struct BagDeclaration {
-    pub(crate) consumer: ConsumerId,
-    /// The protobuf field number of the repeated `KeyValue` field the bytes are
-    /// destined for, so that the region is a valid fragment of the consumer's
-    /// own message and needs no re-tagging.
-    pub(crate) attributes_field_number: u32,
-    pub(crate) fields: Vec<MetadataField>,
-}
-
 /// A node's admission contract for one token.
 #[derive(Debug)]
 pub(crate) struct RequirementDeclaration {
@@ -144,7 +133,6 @@ pub(crate) struct Declarations {
     pub(crate) consumers: Vec<SiteDeclaration>,
     pub(crate) condition_sets: Vec<ConditionSetDeclaration>,
     pub(crate) reads: Vec<ReadDeclaration>,
-    pub(crate) bags: Vec<BagDeclaration>,
     pub(crate) requirements: Vec<RequirementDeclaration>,
     /// Which consumers each producer can reach.
     ///

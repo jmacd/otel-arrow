@@ -37,10 +37,9 @@
 //!   0       epoch                 4
 //!           resolved tokens       ceil(live tokens / 8)
 //!           symbol field          ceil(sum of symbol widths / 8)
-//!           matched names         one per name-preserving value slot
 //!           region index          2 x (regions + 1)
 //!   ------  --------------------  ----------------------------------------
-//!           data                  retained values, then attribute bags
+//!           data                  retained values
 //! ```
 //!
 //! Every offset is a compile-time constant of the epoch, so reaching any region
@@ -64,27 +63,23 @@
 //! safe. Keys that are only ever read, never tested, have no dictionary and
 //! appear here not at all.
 //!
-//! **matched names.** One byte per value slot whose key preserves which wire
-//! name the sender used. The candidate names are compile-time constants of the
-//! extractor, so an ordinal suffices and the name itself never travels.
-//!
 //! **region index.** Where each variable-length region begins, relative to the
-//! start of the data area. Regions are the value slots in slot order, then the
-//! attribute bags. There is one more offset than there are regions, so region
-//! `i` is `data[index[i]..index[i + 1]]` and an absent value is two equal
-//! offsets costing no bytes. Offsets are `u16`, which is what bounds a context
-//! to 64 KiB.
+//! start of the data area. Regions are the value slots, in slot order. There is
+//! one more offset than there are regions, so region `i` is
+//! `data[index[i]..index[i + 1]]` and an absent value is two equal offsets
+//! costing no bytes. Offsets are `u16`, which is what bounds a context to
+//! 64 KiB.
 //!
-//! **data.** Retained values, then bags. A repeated key's values are each
-//! preceded by a `u16` length so the reader can walk them. A bag is a valid
-//! fragment of the consumer's own repeated `KeyValue` field, so it is copied
-//! out rather than encoded.
+//! **data.** The retained values. A repeated key's values are each preceded by a
+//! `u16` length so the reader can walk them. No key name travels: a name is
+//! compiled state of the extractor, and the resolved-token bitmap says which
+//! extractor supplied a value.
 //!
 //! # A worked context
 //!
 //! Tokens `edge{tenant_id, project_id}` and `auth{user_id, role}`; conditions
 //! testing `tenant_id` against two literals and `role` against one; an exporter
-//! reading `tenant_id` and `project_id` and bagging both. For a request carrying
+//! reading `tenant_id` and `project_id`. For a request carrying
 //! `x-tenant-id: acme`, `x-project-id: p1`, `sub=u9`, `role=admin`:
 //!
 //! ```text
@@ -92,9 +87,8 @@
 //!   4..12   layout fingerprint    ...
 //!   12..13  resolved tokens       03            edge and auth resolved
 //!   13..14  symbol field          0a            tenant=2 (bits 0..2), role=2 (bits 2..4)
-//!   14..16  matched names         00 00         both matched their first name
-//!   16..24  region index          0000 0004 0006 002f
-//!   24..    data                  "acme" "p1" <41 bytes of encoded KeyValue>
+//!   14..20  region index          0000 0004 0006
+//!   20..    data                  "acme" "p1"
 //! ```
 //!
 //! The consumer then assembles the PairSlot word for
@@ -124,11 +118,9 @@ pub(crate) struct ContextLayout {
     pub(crate) symbol_field_offset: usize,
     /// Bytes of symbol field.
     pub(crate) symbol_field_bytes: usize,
-    /// Byte offset of the matched-name ordinals.
-    pub(crate) name_ordinals_offset: usize,
     /// Byte offset of the region index.
     pub(crate) region_index_offset: usize,
-    /// How many regions the index addresses: value slots, then bags.
+    /// How many regions the index addresses, one per retained value slot.
     pub(crate) regions: usize,
     /// Byte offset of the data region, which is also the header's size.
     pub(crate) data_offset: usize,
@@ -136,23 +128,15 @@ pub(crate) struct ContextLayout {
 
 impl ContextLayout {
     /// Computes the layout for an epoch.
-    pub(crate) fn new(
-        tokens: usize,
-        symbol_bits: u32,
-        name_ordinals: usize,
-        value_slots: usize,
-        bags: usize,
-    ) -> Self {
+    pub(crate) fn new(tokens: usize, symbol_bits: u32, value_slots: usize) -> Self {
         let token_bitmap_bytes = tokens.div_ceil(8);
         let symbol_field_offset = CONTEXT_ID_BYTES + token_bitmap_bytes;
         let symbol_field_bytes = (symbol_bits as usize).div_ceil(8);
-        let name_ordinals_offset = symbol_field_offset + symbol_field_bytes;
-        let region_index_offset = name_ordinals_offset + name_ordinals;
-        let regions = value_slots + bags;
-        let region_index_bytes = if regions == 0 {
+        let region_index_offset = symbol_field_offset + symbol_field_bytes;
+        let region_index_bytes = if value_slots == 0 {
             0
         } else {
-            (regions + 1) * size_of::<u16>()
+            (value_slots + 1) * size_of::<u16>()
         };
 
         let mut layout = Self {
@@ -160,9 +144,8 @@ impl ContextLayout {
             token_bitmap_bytes,
             symbol_field_offset,
             symbol_field_bytes,
-            name_ordinals_offset,
             region_index_offset,
-            regions,
+            regions: value_slots,
             data_offset: region_index_offset + region_index_bytes,
         };
         layout.fingerprint = layout.fingerprint();
@@ -178,7 +161,6 @@ impl ContextLayout {
             self.token_bitmap_bytes,
             self.symbol_field_offset,
             self.symbol_field_bytes,
-            self.name_ordinals_offset,
             self.region_index_offset,
             self.regions,
             self.data_offset,

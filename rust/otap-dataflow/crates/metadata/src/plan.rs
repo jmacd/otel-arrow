@@ -13,7 +13,7 @@
 //! no-match value. That keeps every identifier stable across producers, which is
 //! what lets a context cross node boundaries unchanged.
 
-use crate::ids::{BagId, ExtractorId, SymbolSlotId, TokenId, ValueSlotId};
+use crate::ids::{ExtractorId, SymbolSlotId, TokenId, ValueSlotId};
 
 /// What one producer has to do to build a context.
 #[derive(Debug)]
@@ -30,8 +30,6 @@ pub(crate) struct ExtractionPlan {
     pub(crate) symbol_slots: Box<[SymbolSlotId]>,
     /// The values to retain.
     pub(crate) value_slots: Box<[ValueSlotId]>,
-    /// The attribute bags to encode.
-    pub(crate) bags: Box<[BagId]>,
 }
 
 impl ExtractionPlan {
@@ -42,7 +40,6 @@ impl ExtractionPlan {
         live_tokens: &[TokenId],
         symbol_slots: Box<[SymbolSlotId]>,
         value_slots: Box<[ValueSlotId]>,
-        bags: Box<[BagId]>,
     ) -> Self {
         let mut extractor_bitmap = vec![0u64; extractor_count.div_ceil(64)].into_boxed_slice();
         for extractor in live_extractors {
@@ -59,7 +56,6 @@ impl ExtractionPlan {
             live_tokens: token_bitmap,
             symbol_slots,
             value_slots,
-            bags,
         }
     }
 

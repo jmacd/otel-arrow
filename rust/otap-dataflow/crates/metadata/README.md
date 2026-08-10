@@ -50,12 +50,16 @@ keys. Carriers are different. A value is identified by
 `MetadataFieldId { token, key }`, because distinct tokens may legally produce
 the same key from different sources.
 
-`declare_read` and `declare_bag` accept a bare key when exactly one token
-declared by that consumer produces it. If more than one does, compilation fails
+`declare_read` accepts a bare key when exactly one token declared by that
+consumer produces it. If more than one does, compilation fails
 with an ambiguity error and the caller uses `MetadataFieldId::new(token, key)`.
 This preserves the convenience of unqualified keys without ever falling back to
 declaration order or allowing an untrusted header to shadow an authorized
 claim.
+
+A caller that must re-emit a value under the exact name it arrived on declares
+one extractor per accepted name. The resolved token then identifies the source,
+so every wire name stays compile-time state and no name travels in a context.
 
 ## What is compiled
 
@@ -91,9 +95,8 @@ Contexts carry **matching inputs, not matching answers**:
 | 4      | layout fingerprint | u64 byte-layout identity                    |
 | 12     | token bitmap     | one bit per resolved all-or-nothing token      |
 | ...    | symbol field     | bit-packed symbols for value-matched extractors|
-| ...    | name ordinals    | one byte for each retained preserved wire name |
-| ...    | region index     | u16 offsets for retained values and bags       |
-| ...    | data             | retained values, then pre-encoded OTLP bags    |
+| ...    | region index     | u16 offsets for retained values                |
+| ...    | data             | retained values                               |
 +--------+------------------+-----------------------------------------------+
 ```
 

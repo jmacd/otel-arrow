@@ -7,8 +7,8 @@
 //! observe it, and the cheapest work is the work that is never done. This pass
 //! answers two questions.
 //!
-//! *What does anything observe?* A key survives if a reachable consumer reads,
-//! bags or tests it. A token survives when a reachable consumer declares it
+//! *What does anything observe?* A key survives if a reachable consumer reads or
+//! tests it. A token survives when a reachable consumer declares it
 //! required or optional. The consumer declaration is the only binding rule:
 //! values do not float in from unrelated tokens that happen to produce the same
 //! key. An extractor survives if a surviving token holds it. Everything else is
@@ -138,13 +138,6 @@ fn observed_keys_for(
     for read in &declarations.reads {
         if wanted(read.consumer) {
             let _ = keys.insert(read.field.key().index());
-        }
-    }
-    for bag in &declarations.bags {
-        if wanted(bag.consumer) {
-            for field in &bag.fields {
-                let _ = keys.insert(field.key().index());
-            }
         }
     }
     keys

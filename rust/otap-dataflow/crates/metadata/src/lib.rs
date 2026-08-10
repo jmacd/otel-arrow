@@ -76,7 +76,6 @@
 //! - Every dimension is bounded by [`Limits`]; exceeding one is an error rather
 //!   than an allocation.
 
-mod bag;
 mod branch_table;
 mod compiled;
 mod compiler;
@@ -110,7 +109,7 @@ pub use dictionary::Symbol;
 pub use encoder::ContextEncoder;
 pub use error::{CompileError, CompileProblem, CompileWarning, EncodeError};
 pub use ids::{
-    BagId, BranchIndex, ConditionSetId, ConsumerId, Epoch, ExtractorId, KeyId, MetadataFieldId,
+    BranchIndex, ConditionSetId, ConsumerId, Epoch, ExtractorId, KeyId, MetadataFieldId,
     PairSlotId, ProducerId, SignatureId, SymbolSlotId, TokenId, ValueSlotId,
 };
 pub use limits::Limits;
