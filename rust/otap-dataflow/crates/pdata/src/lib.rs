@@ -18,6 +18,9 @@ pub mod otap;
 pub mod schema;
 
 pub mod arrays;
+/// Prototype: pdata context entries, a config-time compiler producing
+/// dense lookup tables for message-time context resolution.
+pub mod context;
 pub(crate) mod decode;
 pub mod encode;
 pub(crate) mod payload;
