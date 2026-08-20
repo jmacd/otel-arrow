@@ -29,7 +29,7 @@ use otap_df_engine::{
 };
 use otap_df_pdata::OtapPayload;
 
-use crate::context_bytes::PdataContextBytes;
+use crate::context_bytes::{ContextBytesError, PdataContextBytes};
 use crate::transport_headers::TransportHeaders;
 
 /// Context for OTAP requests.
@@ -47,12 +47,7 @@ use crate::transport_headers::TransportHeaders;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Context {
     stack: Vec<Frame>,
-    /// Transport headers captured from inbound protocol metadata.
-    ///
-    /// `None` when no headers have been captured (the common case, zero
-    /// additional allocation).
-    transport_headers: Option<TransportHeaders>,
-    /// Staged bytes-backed context built alongside legacy transport headers.
+    /// Packed message context, including captured transport headers.
     pdata_context_bytes: Option<PdataContextBytes>,
     /// Peer address observed by the receiving socket at request acceptance
     /// time. `None` for receivers without a real socket.
@@ -83,7 +78,6 @@ impl Context {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             stack: Vec::with_capacity(capacity),
-            transport_headers: None,
             pdata_context_bytes: None,
             peer_addr: None,
             flow_compute_ns: None,
@@ -366,28 +360,32 @@ impl Context {
 
     /// Returns a reference to the captured transport headers, if any.
     #[must_use]
-    pub fn transport_headers(&self) -> Option<&TransportHeaders> {
-        self.transport_headers.as_ref()
+    pub fn transport_headers(&self) -> Option<&PdataContextBytes> {
+        self.pdata_context_bytes.as_ref()
     }
 
     /// Takes and returns the captured transport headers, if any.
     #[must_use]
-    pub fn take_transport_headers(&mut self) -> Option<TransportHeaders> {
-        self.transport_headers.take()
+    pub fn take_transport_headers(&mut self) -> Option<PdataContextBytes> {
+        self.pdata_context_bytes.take()
     }
 
     /// Set the transport headers for this context.
-    pub fn set_transport_headers(&mut self, headers: TransportHeaders) {
-        self.transport_headers = Some(headers);
+    pub fn set_transport_headers(
+        &mut self,
+        headers: TransportHeaders,
+    ) -> Result<(), ContextBytesError> {
+        self.pdata_context_bytes = PdataContextBytes::from_transport_headers(&headers)?;
+        Ok(())
     }
 
-    /// Returns the staged bytes-backed pdata context, if captured.
+    /// Returns the packed pdata context, if captured.
     #[must_use]
     pub fn pdata_context_bytes(&self) -> Option<&PdataContextBytes> {
         self.pdata_context_bytes.as_ref()
     }
 
-    /// Attaches the staged bytes-backed context without changing legacy headers.
+    /// Attaches a packed pdata context.
     pub fn set_pdata_context_bytes(&mut self, context: PdataContextBytes) {
         self.pdata_context_bytes = Some(context);
     }
@@ -454,7 +452,6 @@ impl Context {
     pub fn clone_detached(&self) -> Self {
         Self {
             stack: Vec::new(),
-            transport_headers: self.transport_headers.clone(),
             pdata_context_bytes: self.pdata_context_bytes.clone(),
             peer_addr: self.peer_addr,
             flow_compute_ns: None,
@@ -804,7 +801,7 @@ impl OtapPdata {
 
     /// Returns a reference to the captured transport headers, if any.
     #[must_use]
-    pub fn transport_headers(&self) -> Option<&TransportHeaders> {
+    pub fn transport_headers(&self) -> Option<&PdataContextBytes> {
         self.context.transport_headers()
     }
 
@@ -815,8 +812,11 @@ impl OtapPdata {
     }
 
     /// Set transport headers on this pdata's context.
-    pub fn set_transport_headers(&mut self, headers: TransportHeaders) {
-        self.context.set_transport_headers(headers);
+    pub fn set_transport_headers(
+        &mut self,
+        headers: TransportHeaders,
+    ) -> Result<(), ContextBytesError> {
+        self.context.set_transport_headers(headers)
     }
 
     /// Attaches the staged bytes-backed context to this pdata.
@@ -825,10 +825,12 @@ impl OtapPdata {
     }
 
     /// Builder-style method to attach transport headers.
-    #[must_use]
-    pub fn with_transport_headers(mut self, headers: TransportHeaders) -> Self {
-        self.context.set_transport_headers(headers);
-        self
+    pub fn with_transport_headers(
+        mut self,
+        headers: TransportHeaders,
+    ) -> Result<Self, ContextBytesError> {
+        self.context.set_transport_headers(headers)?;
+        Ok(self)
     }
 
     /// Returns the peer address observed by the receiving socket, if any.
@@ -2195,7 +2197,8 @@ mod test {
         let mut pdata = pdata
             .test_subscribe_to(Interests::ACKS | Interests::NACKS, test_data.into(), 101)
             .with_peer_addr(addr)
-            .with_transport_headers(headers.clone());
+            .with_transport_headers(headers)
+            .expect("packed context");
         pdata.start_flow_metric();
         pdata.add_flow_compute(42);
 
@@ -2205,7 +2208,13 @@ mod test {
 
         let detached = context.clone_detached();
 
-        assert_eq!(detached.transport_headers(), Some(&headers));
+        let detached_tenant = detached
+            .transport_headers()
+            .expect("detached packed context")
+            .find_by_name("tenant")
+            .next()
+            .expect("tenant header");
+        assert_eq!(detached_tenant.value, b"acme");
         assert_eq!(detached.peer_addr(), Some(addr));
         assert!(
             !detached.has_subscribers(),

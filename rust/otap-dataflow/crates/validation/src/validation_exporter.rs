@@ -10,7 +10,6 @@ use linkme::distributed_slice;
 use otap_df_config::NodeId as NodeName;
 use otap_df_config::error::Error as ConfigError;
 use otap_df_config::node::NodeUserConfig;
-use otap_df_config::transport_headers::TransportHeaders;
 use otap_df_engine::ExporterFactory;
 use otap_df_engine::config::ExporterConfig;
 use otap_df_engine::context::PipelineContext;
@@ -22,6 +21,7 @@ use otap_df_engine::message::{ExporterInbox, Message};
 use otap_df_engine::node::NodeId;
 use otap_df_engine::terminal_state::TerminalState;
 use otap_df_otap::OTAP_EXPORTER_FACTORIES;
+use otap_df_otap::context_bytes::PdataContextBytes;
 use otap_df_otap::pdata::OtapPdata;
 use otap_df_pdata::TryFromWithOptions;
 use otap_df_pdata::otlp::OtlpProtoBytes;
@@ -90,7 +90,7 @@ pub struct ValidationExporter {
     /// Transport headers extracted from each SUV message's pipeline context.
     /// Stored separately from signal data since header validation is
     /// independent of the OTLP payload.
-    suv_transport_headers: Vec<Option<TransportHeaders>>,
+    suv_transport_headers: Vec<Option<PdataContextBytes>>,
     metrics: MetricSet<ValidationExporterMetrics>,
     /// Duration to wait with no incoming messages before declaring the stream
     /// settled and performing the final validation.

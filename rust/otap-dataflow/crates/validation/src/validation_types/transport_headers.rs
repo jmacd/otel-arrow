@@ -3,7 +3,7 @@
 
 //! Transport header validation helpers.
 //!
-//! Given SUV messages with optional [`TransportHeaders`], verify that certain
+//! Given SUV messages with optional [`PdataContextBytes`], verify that certain
 //! header keys or key/value pairs are present (or absent) on every message.
 //!
 //! For **require** checks (`require_keys`, `require_key_values`), every
@@ -13,7 +13,7 @@
 //! For **deny** checks, `None` entries are acceptable -- a signal without
 //! headers cannot contain a forbidden key.
 
-use otap_df_config::transport_headers::TransportHeaders;
+use otap_df_otap::context_bytes::PdataContextBytes;
 use serde::{Deserialize, Serialize};
 
 /// A key/value pair for transport header assertions.
@@ -47,7 +47,7 @@ impl TransportHeaderKeyValue {
 /// Returns `true` when `keys` is empty (nothing to check).
 #[must_use]
 pub fn validate_transport_header_require_keys(
-    suv: &[Option<TransportHeaders>],
+    suv: &[Option<PdataContextBytes>],
     keys: &[String],
 ) -> bool {
     if keys.is_empty() {
@@ -87,7 +87,7 @@ pub fn validate_transport_header_require_keys(
 /// Returns `true` when `pairs` is empty (nothing to check).
 #[must_use]
 pub fn validate_transport_header_require_key_values(
-    suv: &[Option<TransportHeaders>],
+    suv: &[Option<PdataContextBytes>],
     pairs: &[TransportHeaderKeyValue],
 ) -> bool {
     if pairs.is_empty() {
@@ -104,7 +104,7 @@ pub fn validate_transport_header_require_key_values(
         };
         'pairs: for pair in pairs {
             for header in headers.find_by_name(&pair.key) {
-                match std::str::from_utf8(&header.value) {
+                match std::str::from_utf8(header.value) {
                     Ok(value_str) if value_str == pair.value => continue 'pairs,
                     _ => continue,
                 }
@@ -123,7 +123,7 @@ pub fn validate_transport_header_require_key_values(
 /// signal that never received headers cannot contain a forbidden key.
 #[must_use]
 pub fn validate_transport_header_deny_keys(
-    suv: &[Option<TransportHeaders>],
+    suv: &[Option<PdataContextBytes>],
     keys: &[String],
 ) -> bool {
     if keys.is_empty() {
@@ -146,12 +146,14 @@ mod tests {
     use super::*;
     use otap_df_config::transport_headers::{TransportHeader, TransportHeaders};
 
-    fn make_headers(entries: &[(&str, &str)]) -> TransportHeaders {
+    fn make_headers(entries: &[(&str, &str)]) -> PdataContextBytes {
         let mut headers = TransportHeaders::default();
         for (name, value) in entries {
             headers.push(TransportHeader::text(*name, *name, value.as_bytes()));
         }
-        headers
+        PdataContextBytes::from_transport_headers(&headers)
+            .expect("packed context")
+            .expect("nonempty context")
     }
 
     #[test]
@@ -176,7 +178,7 @@ mod tests {
 
     #[test]
     fn require_keys_fails_when_no_messages_have_headers() {
-        let suv: Vec<Option<TransportHeaders>> = vec![None, None];
+        let suv: Vec<Option<PdataContextBytes>> = vec![None, None];
         assert!(!validate_transport_header_require_keys(
             &suv,
             &["x-tenant-id".into()],
@@ -235,7 +237,7 @@ mod tests {
 
     #[test]
     fn deny_keys_passes_on_no_headers() {
-        let suv: Vec<Option<TransportHeaders>> = vec![None];
+        let suv: Vec<Option<PdataContextBytes>> = vec![None];
         assert!(validate_transport_header_deny_keys(
             &suv,
             &["x-tenant-id".into()],
@@ -244,7 +246,7 @@ mod tests {
 
     #[test]
     fn empty_keys_always_passes() {
-        let suv: Vec<Option<TransportHeaders>> = vec![None];
+        let suv: Vec<Option<PdataContextBytes>> = vec![None];
         assert!(validate_transport_header_require_keys(&suv, &[]));
         assert!(validate_transport_header_require_key_values(&suv, &[]));
         assert!(validate_transport_header_deny_keys(&suv, &[]));
@@ -283,7 +285,7 @@ mod tests {
 
     #[test]
     fn require_keys_fails_on_empty_suv() {
-        let suv: Vec<Option<TransportHeaders>> = vec![];
+        let suv: Vec<Option<PdataContextBytes>> = vec![];
         assert!(!validate_transport_header_require_keys(
             &suv,
             &["x-tenant-id".into()],
@@ -292,7 +294,7 @@ mod tests {
 
     #[test]
     fn require_key_values_fails_on_empty_suv() {
-        let suv: Vec<Option<TransportHeaders>> = vec![];
+        let suv: Vec<Option<PdataContextBytes>> = vec![];
         assert!(!validate_transport_header_require_key_values(
             &suv,
             &[TransportHeaderKeyValue::new("x-tenant-id", "acme")],

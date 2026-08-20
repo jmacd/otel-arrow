@@ -75,7 +75,6 @@ pub struct TrafficGeneratorReceiver {
 
 #[derive(Clone)]
 struct TransportContextFixture {
-    legacy: TransportHeaders,
     packed: PdataContextBytes,
 }
 
@@ -374,7 +373,6 @@ impl TrafficGeneratorReceiver {
 
         let mut pdata = OtapPdata::new_todo_context(payload);
         if let Some(context) = transport_context {
-            pdata.set_transport_headers(context.legacy.clone());
             pdata.set_pdata_context_bytes(context.packed.clone());
         }
         if self.config.enable_ack_nack() {
@@ -491,10 +489,7 @@ fn build_transport_headers(
             entry: None,
         }),
     )?;
-    Ok(Some(TransportContextFixture {
-        legacy: headers,
-        packed,
-    }))
+    Ok(Some(TransportContextFixture { packed }))
 }
 
 /// Waits for a terminal control message after the producer has finished.

@@ -11,6 +11,7 @@
 //! allocations.
 
 use bytes::Bytes;
+use otap_df_config::transport_headers::{TransportHeaders, ValueKind as TransportValueKind};
 use otap_df_config::transport_headers_policy::{
     CaptureStats, CompiledHeaderCaptureSchema, HeaderPropagationPolicy, NameStrategy,
     PropagationAction, ValueKindConfig,
@@ -142,6 +143,59 @@ pub struct ContextItems<'a> {
     count: usize,
     item_at: usize,
     blob_at: usize,
+}
+
+/// Borrowed compatibility view of one transport header.
+#[derive(Debug)]
+pub struct ContextHeader<'a> {
+    /// Stored name.
+    pub name: &'a str,
+    /// Original wire name.
+    pub wire_name: &'a str,
+    /// Transport value kind.
+    pub value_kind: TransportValueKind,
+    /// Raw value bytes.
+    pub value: &'a [u8],
+}
+
+impl PartialEq<&otap_df_config::transport_headers::TransportHeader> for ContextHeader<'_> {
+    fn eq(&self, other: &&otap_df_config::transport_headers::TransportHeader) -> bool {
+        self.name == other.name
+            && self.wire_name == other.wire_name
+            && self.value_kind == other.value_kind
+            && self.value == other.value
+    }
+}
+
+impl ContextHeader<'_> {
+    /// Returns the value as UTF-8 when valid.
+    #[must_use]
+    pub fn value_as_str(&self) -> Option<&str> {
+        std::str::from_utf8(self.value).ok()
+    }
+}
+
+/// Iterator of borrowed header views.
+pub struct ContextHeaders<'a> {
+    items: ContextItems<'a>,
+}
+
+impl<'a> Iterator for ContextHeaders<'a> {
+    type Item = ContextHeader<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.items.next()?;
+        let (kind, value) = item.value()?;
+        Some(ContextHeader {
+            name: item.stored_name()?,
+            wire_name: item.wire_name()?,
+            value_kind: match kind {
+                HeaderValueKind::Text => TransportValueKind::Text,
+                HeaderValueKind::Binary => TransportValueKind::Binary,
+            },
+            value,
+        })
+    }
 }
 
 impl<'a> Iterator for ContextItems<'a> {
@@ -286,6 +340,30 @@ impl ContextProjectionAccumulator<'_> {
 }
 
 impl PdataContextBytes {
+    /// Converts the legacy builder collection into the packed carrier.
+    pub fn from_transport_headers(
+        headers: &TransportHeaders,
+    ) -> Result<Option<Self>, ContextBytesError> {
+        if headers.is_empty() {
+            return Ok(None);
+        }
+        Self::build(
+            0,
+            headers.iter().map(|header| HeaderInput {
+                wire_name: &header.wire_name,
+                stored_name: &header.name,
+                value: &header.value,
+                kind: match header.value_kind {
+                    TransportValueKind::Text => HeaderValueKind::Text,
+                    TransportValueKind::Binary => HeaderValueKind::Binary,
+                },
+                rule_id: u16::MAX,
+                entry: None,
+            }),
+        )
+        .map(Some)
+    }
+
     /// Captures headers with a compiled policy.
     pub fn capture<'a>(
         schema: &CompiledHeaderCaptureSchema,
@@ -452,6 +530,30 @@ impl PdataContextBytes {
             item_at: layout.map_or(0, |layout| layout.item_at),
             blob_at: layout.map_or(0, |layout| layout.blob_at),
         }
+    }
+
+    /// Number of packed bag items.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.item_count().unwrap_or(0)
+    }
+
+    /// Whether the packed bag is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterates borrowed transport-header views.
+    pub fn iter(&self) -> ContextHeaders<'_> {
+        ContextHeaders {
+            items: self.items(),
+        }
+    }
+
+    /// Finds headers by stored name.
+    pub fn find_by_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = ContextHeader<'a>> {
+        self.iter().filter(move |header| header.name == name)
     }
 
     /// Applies a transport-header propagation policy to the packed bag.

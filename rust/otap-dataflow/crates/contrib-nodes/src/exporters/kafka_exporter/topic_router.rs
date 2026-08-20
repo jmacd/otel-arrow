@@ -167,11 +167,7 @@ impl TopicRouter {
                     .flatten()
             });
         }
-        context
-            .transport_headers()?
-            .iter()
-            .find(|h| h.name == header_key)
-            .map(|header| header.value.as_slice())
+        None
     }
 }
 
@@ -201,7 +197,7 @@ mod tests {
             th.push(h);
         }
         let mut ctx = Context::default();
-        ctx.set_transport_headers(th);
+        ctx.set_transport_headers(th).expect("packed context");
         ctx
     }
 

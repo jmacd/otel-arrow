@@ -26,7 +26,6 @@ use bytes::{BufMut, Bytes};
 use futures::future::BoxFuture;
 use http::{Request, Response};
 use otap_df_config::SignalType;
-use otap_df_config::transport_headers::TransportHeaders;
 use otap_df_engine::admission::{AdmissionContext, AdmissionDecision, SharedAdmissionGate};
 use otap_df_engine::control::{CallData, NackMsg};
 use otap_df_engine::shared::receiver::EffectHandler;
@@ -456,11 +455,8 @@ impl UnaryService<OtapPdata> for OtapBatchService {
             .take()
             .expect("`OtapBatchService` is not reused for multiple calls");
 
-        // Capture transport headers synchronously before moving the effect handler
-        // into the async block, avoiding a clone of the capture policy.
-        if let Some(policy) = effect_handler.capture_policy() {
-            let mut transport_headers = TransportHeaders::new();
-
+        // Capture context synchronously before moving the effect handler.
+        if let Some(schema) = effect_handler.capture_schema() {
             // Collect all metadata pairs, decoding binary values so we store
             // raw bytes rather than the base64 wire encoding (which would be
             // double-encoded on downstream gRPC propagation).
@@ -477,27 +473,18 @@ impl UnaryService<OtapPdata> for OtapBatchService {
                 })
                 .collect();
 
-            let _stats = policy.capture_from_pairs(
-                pairs.iter().map(|(k, v)| (*k, v.as_slice())),
-                &mut transport_headers,
-            );
-            if !transport_headers.is_empty() {
-                otap_batch.set_transport_headers(transport_headers);
-            }
-            if let Some(schema) = effect_handler.capture_schema() {
-                let (context, _stats) = match PdataContextBytes::capture(
-                    schema,
-                    pairs.iter().map(|(key, value)| (*key, value.as_slice())),
-                ) {
-                    Ok(captured) => captured,
-                    Err(error) => {
-                        let status = Status::internal(error.to_string());
-                        return Box::pin(async move { Err(status) });
-                    }
-                };
-                if let Some(context) = context {
-                    otap_batch.set_pdata_context_bytes(context);
+            let (context, _stats) = match PdataContextBytes::capture(
+                schema,
+                pairs.iter().map(|(key, value)| (*key, value.as_slice())),
+            ) {
+                Ok(captured) => captured,
+                Err(error) => {
+                    let status = Status::internal(error.to_string());
+                    return Box::pin(async move { Err(status) });
                 }
+            };
+            if let Some(context) = context {
+                otap_batch.set_pdata_context_bytes(context);
             }
         }
 

@@ -28,7 +28,6 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use otap_df_config::SignalType;
 use otap_df_config::byte_units;
-use otap_df_config::transport_headers::TransportHeaders;
 use otap_df_engine::memory_limiter::SharedReceiverAdmissionState;
 use otap_df_engine::shared::receiver::EffectHandler;
 use otap_df_engine::{
@@ -792,17 +791,6 @@ impl HttpHandler {
             let mut pdata = OtapPdata::new(context, payload.into());
             pdata.set_peer_addr(self.peer_addr);
 
-            // Capture transport headers from HTTP headers when a capture policy is configured.
-            if let Some(policy) = self.effect_handler.capture_policy() {
-                let mut transport_headers = TransportHeaders::new();
-                let pairs = headers
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), value.as_bytes()));
-                let _stats = policy.capture_from_pairs(pairs, &mut transport_headers);
-                if !transport_headers.is_empty() {
-                    pdata.set_transport_headers(transport_headers);
-                }
-            }
             if let Some(schema) = self.effect_handler.capture_schema() {
                 let pairs = headers
                     .iter()

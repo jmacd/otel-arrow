@@ -28,7 +28,9 @@ use otap_df_engine::{
 use otap_df_otap::OTAP_PROCESSOR_FACTORIES;
 use otap_df_otap::accessory::context::split_contexts::Contexts;
 use otap_df_otap::accessory::slots::Key;
-use otap_df_otap::context_bytes::{ContextBytesError, HeaderInput, HeaderValueKind};
+use otap_df_otap::context_bytes::{
+    ContextBytesError, HeaderInput, HeaderValueKind, PdataContextBytes,
+};
 use otap_df_otap::pdata::{Context, OtapPdata};
 use otap_df_otap::transport_headers::{TransportHeader, ValueKind};
 use otap_df_pdata::{OtapArrowRecords, OtapPayload, TryIntoWithOptions};
@@ -277,9 +279,6 @@ impl Processor<OtapPdata> for PartitionProcessor {
                         // partition so call to `next` will be `Some`
                         let partition = partitions.next().expect("at least one partition");
 
-                        // update the header values
-                        let mut headers =
-                            inbound_context.take_transport_headers().unwrap_or_default();
                         let partition_header = partition_value_to_transport_header(
                             self.header_name.clone(),
                             &self.serialization_strategy,
@@ -293,8 +292,6 @@ impl Processor<OtapPdata> for PartitionProcessor {
                                 source_detail: error.to_string(),
                             },
                         )?;
-                        headers.push(partition_header);
-                        inbound_context.set_transport_headers(headers);
 
                         let pdata = OtapPdata::new(
                             inbound_context,
@@ -348,10 +345,8 @@ impl Processor<OtapPdata> for PartitionProcessor {
                                 }
                             })?;
 
-                            // set the transport header
+                            // Project the partition header into the output context.
                             let mut pdata_context = inbound_context.clone_detached();
-                            let mut headers =
-                                pdata_context.take_transport_headers().unwrap_or_default();
                             let partition_header = partition_value_to_transport_header(
                                 self.header_name.clone(),
                                 &self.serialization_strategy,
@@ -364,8 +359,6 @@ impl Processor<OtapPdata> for PartitionProcessor {
                                     error: "failed to project pdata context".into(),
                                     source_detail: error.to_string(),
                                 })?;
-                            headers.push(partition_header);
-                            pdata_context.set_transport_headers(headers);
 
                             let outbound_batch_num_items = partition.batch.num_items();
                             let mut pdata = OtapPdata::new(pdata_context, partition.batch.into());
@@ -422,21 +415,22 @@ fn project_partition_header(
     context: &mut Context,
     header: &TransportHeader,
 ) -> Result<(), ContextBytesError> {
-    let Some(input) = context.pdata_context_bytes() else {
-        return Ok(());
-    };
     let kind = match header.value_kind {
         ValueKind::Text => HeaderValueKind::Text,
         ValueKind::Binary => HeaderValueKind::Binary,
     };
-    let projected = input.project().append_bag_header(HeaderInput {
+    let input = HeaderInput {
         wire_name: &header.wire_name,
         stored_name: &header.name,
         value: &header.value,
         kind,
         rule_id: u16::MAX,
         entry: None,
-    })?;
+    };
+    let projected = match context.pdata_context_bytes() {
+        Some(context) => context.project().append_bag_header(input)?,
+        None => PdataContextBytes::build(0, [input])?,
+    };
     context.set_pdata_context_bytes(projected);
     Ok(())
 }
@@ -521,7 +515,7 @@ mod test {
     use std::collections::VecDeque;
 
     use super::*;
-    use otap_df_otap::context_bytes::PdataContextBytes;
+    use otap_df_config::transport_headers::TransportHeaders;
 
     use otap_df_engine::{
         capability::registry::Capabilities,
@@ -1058,23 +1052,11 @@ mod test {
                 }));
 
                 let mut context = Context::default();
-                let mut headers = context.take_transport_headers().unwrap_or_default();
+                let mut headers = TransportHeaders::new();
                 headers.push(TransportHeader::text("h1", "header1", "hello world"));
-                context.set_transport_headers(headers);
-                context.set_pdata_context_bytes(
-                    PdataContextBytes::build(
-                        0,
-                        [HeaderInput {
-                            wire_name: "header1",
-                            stored_name: "h1",
-                            value: b"hello world",
-                            kind: HeaderValueKind::Text,
-                            rule_id: 0,
-                            entry: None,
-                        }],
-                    )
-                    .expect("bytes context"),
-                );
+                context
+                    .set_transport_headers(headers)
+                    .expect("packed context");
                 context.set_peer_addr("10.0.0.1:5005".parse().unwrap());
                 let mut pdata = OtapPdata::new(context, OtapPayload::OtapArrowRecords(otap_batch));
                 pdata.start_flow_metric();
@@ -1131,9 +1113,11 @@ mod test {
                     )],
                 }));
                 let mut context = Context::default();
-                let mut headers = context.take_transport_headers().unwrap_or_default();
+                let mut headers = TransportHeaders::new();
                 headers.push(TransportHeader::text("h1", "header1", "hello world"));
-                context.set_transport_headers(headers);
+                context
+                    .set_transport_headers(headers)
+                    .expect("packed context");
                 let pdata = OtapPdata::new(context, OtapPayload::OtapArrowRecords(otap_batch));
                 ctx.process(Message::PData(pdata))
                     .await

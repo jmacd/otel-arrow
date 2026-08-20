@@ -104,8 +104,6 @@ pub fn partition_key_for_signal(
     if signal_config.partition_by_transport_headers() {
         if let Some(context_bytes) = context.pdata_context_bytes() {
             return partition_key_from_context_bytes(context_bytes);
-        } else if let Some(headers) = context.transport_headers() {
-            return partition_key_from_transport_headers(headers);
         }
     }
 
@@ -374,7 +372,9 @@ mod tests {
         ));
 
         let mut context = Context::default();
-        context.set_transport_headers(headers.clone());
+        context
+            .set_transport_headers(headers.clone())
+            .expect("packed context");
         let key = partition_key_for_signal(&config, &context);
 
         // Should match what partition_key_from_transport_headers produces.

@@ -2202,6 +2202,7 @@ mod test {
                     upstream_node_id,
                 )
                 .with_transport_headers(headers.clone())
+                .expect("packed context")
                 .with_peer_addr(peer_addr);
 
                 ctx.process(Message::PData(pdata))
@@ -2218,11 +2219,11 @@ mod test {
                     ("error_port", &error_ctx),
                     ("info_port", &info_ctx),
                 ] {
-                    assert_eq!(
-                        context.transport_headers(),
-                        Some(&headers),
-                        "{port} lost the inbound transport headers"
-                    );
+                    let tenant = context
+                        .transport_headers()
+                        .and_then(|headers| headers.find_by_name("tenant").next())
+                        .unwrap_or_else(|| panic!("{port} lost the inbound transport headers"));
+                    assert_eq!(tenant.value, b"acme");
                     assert_eq!(
                         context.peer_addr(),
                         Some(peer_addr),

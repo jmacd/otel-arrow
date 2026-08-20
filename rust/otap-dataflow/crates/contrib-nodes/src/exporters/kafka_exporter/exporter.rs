@@ -381,17 +381,6 @@ impl KafkaExporter {
                         value: Some(propagated.value),
                     });
                 }
-            } else if let Some(transport_headers) = context.transport_headers() {
-                for propagated in policy.propagate(transport_headers) {
-                    // Skip propagated headers that collide with the format header.
-                    if propagated.header_name == format_header_key {
-                        continue;
-                    }
-                    headers = headers.insert(Header {
-                        key: propagated.header_name,
-                        value: Some(propagated.value),
-                    });
-                }
             }
         }
 
@@ -948,7 +937,9 @@ pub mod test_support {
             value: header_value.as_bytes().to_vec(),
         });
         let mut context = Context::default();
-        context.set_transport_headers(headers);
+        context
+            .set_transport_headers(headers)
+            .expect("packed context");
 
         OtapPdata::new(context, proto.into())
     }
@@ -1580,7 +1571,9 @@ pub mod test_support {
                     value_kind: ValueKind::Text,
                     value: value.as_bytes().to_vec(),
                 });
-                context.set_transport_headers(headers);
+                context
+                    .set_transport_headers(headers)
+                    .expect("packed context");
             }
             OtapPdata::new(context, proto.into())
         }
@@ -4138,7 +4131,9 @@ pub mod test_support {
                 value: b"attacker-override".to_vec(),
             });
             let mut context = Context::default();
-            context.set_transport_headers(transport);
+            context
+                .set_transport_headers(transport)
+                .expect("packed context");
 
             // Propagate all captured headers, preserving wire names.
             let policy = HeaderPropagationPolicy::new(
@@ -4211,7 +4206,9 @@ pub mod test_support {
                 value: b"acme".to_vec(),
             });
             let mut context = Context::default();
-            context.set_transport_headers(transport);
+            context
+                .set_transport_headers(transport)
+                .expect("packed context");
 
             let (_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
             let eh: EffectHandler<OtapPdata> =

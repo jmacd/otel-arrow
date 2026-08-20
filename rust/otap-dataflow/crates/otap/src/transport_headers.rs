@@ -17,6 +17,7 @@ pub use otap_df_config::transport_headers_policy::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context_bytes::HeaderValueKind;
     use otap_df_config::transport_headers_policy::{
         CaptureDefaults, CaptureRule, PropagationAction, PropagationDefault, PropagationMatch,
         PropagationOverride, PropagationSelector, PropagationSelectorType,
@@ -86,7 +87,9 @@ mod tests {
 
         // ========== Step 2: Attach to OtapPdata context ==========
 
-        let pdata = crate::testing::create_test_pdata().with_transport_headers(captured);
+        let pdata = crate::testing::create_test_pdata()
+            .with_transport_headers(captured)
+            .expect("packed context");
 
         assert!(pdata.transport_headers().is_some());
         assert_eq!(pdata.transport_headers().unwrap().len(), 3);
@@ -101,9 +104,11 @@ mod tests {
         );
         let headers_after = pdata_after_processor.transport_headers().unwrap();
         assert_eq!(headers_after.len(), 3);
-        assert_eq!(headers_after.as_slice()[0].name, "tenant_id");
-        assert_eq!(headers_after.as_slice()[1].name, "x-request-id");
-        assert_eq!(headers_after.as_slice()[2].name, "authorization");
+        let stored_names: Vec<_> = headers_after.iter().map(|header| header.name).collect();
+        assert_eq!(
+            stored_names,
+            vec!["tenant_id", "x-request-id", "authorization"]
+        );
 
         // ========== Step 4: Simulate exporter propagation ==========
 
@@ -125,7 +130,7 @@ mod tests {
             }],
         );
 
-        let propagated: Vec<_> = propagation_policy.propagate(headers_after).collect();
+        let propagated: Vec<_> = headers_after.propagate(&propagation_policy).collect();
 
         assert_eq!(
             propagated.len(),
@@ -164,7 +169,9 @@ mod tests {
             "all duplicate headers should be captured"
         );
 
-        let pdata = crate::testing::create_test_pdata().with_transport_headers(captured);
+        let pdata = crate::testing::create_test_pdata()
+            .with_transport_headers(captured)
+            .expect("packed context");
         let pdata_after = pdata.clone_without_context();
 
         let headers = pdata_after.transport_headers().unwrap();
@@ -184,7 +191,7 @@ mod tests {
             },
             vec![],
         );
-        let propagated: Vec<_> = propagation_policy.propagate(headers).collect();
+        let propagated: Vec<_> = headers.propagate(&propagation_policy).collect();
         assert_eq!(propagated.len(), 3, "duplicates must survive propagation");
 
         let values: Vec<&[u8]> = propagated.iter().map(|h| h.value).collect();
@@ -207,7 +214,9 @@ mod tests {
         assert_eq!(captured.as_slice()[0].value_kind, ValueKind::Binary);
         assert_eq!(captured.as_slice()[0].value, binary_value);
 
-        let pdata = crate::testing::create_test_pdata().with_transport_headers(captured);
+        let pdata = crate::testing::create_test_pdata()
+            .with_transport_headers(captured)
+            .expect("packed context");
         let pdata_after = pdata.clone_without_context();
 
         let headers = pdata_after.transport_headers().unwrap();
@@ -221,9 +230,9 @@ mod tests {
             },
             vec![],
         );
-        let propagated: Vec<_> = propagation_policy.propagate(headers).collect();
+        let propagated: Vec<_> = headers.propagate(&propagation_policy).collect();
 
-        assert_eq!(*propagated[0].value_kind, ValueKind::Binary);
+        assert_eq!(propagated[0].value_kind, HeaderValueKind::Binary);
         assert_eq!(propagated[0].value, binary_value.as_slice());
     }
 }

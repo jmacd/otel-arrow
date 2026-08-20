@@ -36,7 +36,6 @@ use otap_df_otap::otap_grpc::otlp::client::{
     LogsServiceClient, MetricsServiceClient, TraceServiceClient,
 };
 use otap_df_otap::pdata::{Context, OtapPdata};
-use otap_df_otap::transport_headers::ValueKind;
 use otap_df_pdata::otlp::logs::LogsProtoBytesEncoder;
 use otap_df_pdata::otlp::metrics::MetricsProtoBytesEncoder;
 use otap_df_pdata::otlp::traces::TracesProtoBytesEncoder;
@@ -1084,8 +1083,7 @@ fn build_grpc_metadata(
     auth_header: Option<HeaderValue>,
 ) -> Option<MetadataMap> {
     let propagation_policy = effect_handler.propagation_policy();
-    let has_propagation_source =
-        context.pdata_context_bytes().is_some() || context.transport_headers().is_some();
+    let has_propagation_source = context.pdata_context_bytes().is_some();
 
     // Zero-alloc fast path: nothing static configured, nothing to propagate, no token.
     if static_metadata.is_none()
@@ -1108,16 +1106,6 @@ fn build_grpc_metadata(
                     static_metadata,
                     header.header_name,
                     header.value_kind == otap_df_otap::context_bytes::HeaderValueKind::Binary,
-                    header.value,
-                );
-            }
-        } else if let Some(transport_headers) = context.transport_headers() {
-            for header in policy.propagate(transport_headers) {
-                append_propagated_metadata(
-                    &mut metadata,
-                    static_metadata,
-                    header.header_name,
-                    *header.value_kind == ValueKind::Binary,
                     header.value,
                 );
             }
@@ -3035,7 +3023,8 @@ mod tests {
     /// Helper: Creates a [`Context`] that carries the given transport headers.
     fn context_with_headers(headers: TransportHeaders) -> Context {
         let pdata = OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(Bytes::new()).into())
-            .with_transport_headers(headers);
+            .with_transport_headers(headers)
+            .expect("packed context");
         let (context, _) = pdata.into_parts();
         context
     }

@@ -135,9 +135,7 @@ pub struct EffectHandler<PData> {
     pub(crate) core: EffectHandlerCore<PData>,
     /// Output-port router.
     pub router: OutputRouter<Sender<PData>>,
-    /// Capture policy for extracting transport headers from inbound metadata.
-    /// `None` when no capture policy is configured (zero overhead).
-    capture_policy: Option<HeaderCapturePolicy>,
+    /// Compiled context capture schema.
     capture_schema: Option<CompiledHeaderCaptureSchema>,
 }
 
@@ -158,7 +156,6 @@ impl<PData> EffectHandler<PData> {
         EffectHandler {
             core,
             router,
-            capture_policy: None,
             capture_schema: None,
         }
     }
@@ -193,14 +190,6 @@ impl<PData> EffectHandler<PData> {
         self.core.node_interests()
     }
 
-    /// Returns the capture policy if a header capture policy is configured.
-    ///
-    /// Returns `None` when no capture policy is active (zero overhead).
-    #[must_use]
-    pub fn capture_policy(&self) -> Option<&HeaderCapturePolicy> {
-        self.capture_policy.as_ref()
-    }
-
     /// Returns the capture schema compiled during receiver construction.
     #[must_use]
     pub fn capture_schema(&self) -> Option<&CompiledHeaderCaptureSchema> {
@@ -210,7 +199,6 @@ impl<PData> EffectHandler<PData> {
     /// Sets the capture policy for transport header extraction.
     pub fn set_capture_policy(&mut self, policy: Option<HeaderCapturePolicy>) {
         self.capture_schema = policy.as_ref().map(HeaderCapturePolicy::compile);
-        self.capture_policy = policy;
     }
 
     /// Sends a message to the next node(s) in the pipeline using the default port.

@@ -13,7 +13,7 @@ use attributes::{
     validate_require_key_values, validate_require_keys,
 };
 use batch::{validate_batch_bytes, validate_batch_items};
-use otap_df_config::transport_headers::TransportHeaders;
+use otap_df_otap::context_bytes::PdataContextBytes;
 use otap_df_pdata::proto::OtlpProtoMessage;
 use otap_df_pdata::testing::equiv::validate_equivalent;
 use serde::{Deserialize, Serialize};
@@ -109,7 +109,7 @@ impl ValidationInstructions {
         control: &[OtlpProtoMessage],
         suv_msgs: &[OtlpProtoMessage],
         suv_with_duration: &[(OtlpProtoMessage, Duration)],
-        transport_headers: &[Option<TransportHeaders>],
+        transport_headers: &[Option<PdataContextBytes>],
     ) -> bool {
         match self {
             ValidationInstructions::Equivalence => validate_equivalent(control, suv_msgs),
@@ -183,7 +183,7 @@ mod tests {
             .collect()
     }
 
-    fn no_headers(count: usize) -> Vec<Option<TransportHeaders>> {
+    fn no_headers(count: usize) -> Vec<Option<PdataContextBytes>> {
         vec![None; count]
     }
 
@@ -437,7 +437,8 @@ mod tests {
         // produce identical results when executed.
         let mut headers = TransportHeaders::default();
         headers.push(TransportHeader::text("x-tenant-id", "x-tenant-id", b"acme"));
-        let transport = vec![Some(headers)];
+        let transport =
+            vec![PdataContextBytes::from_transport_headers(&headers).expect("packed context")];
         let control: Vec<OtlpProtoMessage> = vec![];
         let suv_msgs: Vec<OtlpProtoMessage> = vec![];
         let suv_with_dur: Vec<(OtlpProtoMessage, Duration)> = vec![];
