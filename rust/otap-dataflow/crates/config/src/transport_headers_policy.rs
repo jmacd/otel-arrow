@@ -251,9 +251,11 @@ impl CompiledHeaderCaptureSchema {
     /// Finds the first capture rule matching `wire_name`.
     #[must_use]
     pub fn match_header(&self, wire_name: &str) -> Option<CompiledHeaderMatch<'_>> {
-        let normalized = wire_name.to_ascii_lowercase();
         self.rules.iter().find_map(|rule| {
-            let matched_name = rule.match_names.iter().find(|name| *name == &normalized)?;
+            let matched_name = rule
+                .match_names
+                .iter()
+                .find(|name| wire_name.eq_ignore_ascii_case(name))?;
             Some(CompiledHeaderMatch {
                 rule_id: rule.rule_id,
                 entry: rule.entry,
