@@ -13,6 +13,8 @@ pub mod otap_grpc;
 /// Common component accessories (e.g., context-state management).
 pub mod accessory;
 
+/// Staged replacement for the legacy transport-header carrier.
+pub mod context_bytes;
 pub mod pdata;
 
 mod pdata_conversions;
