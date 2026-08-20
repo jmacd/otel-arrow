@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::accessory::slots::{Key as SlotKey, State as SlotsState};
+use crate::context_bytes::PdataContextBytes;
 use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
 use crate::pdata::{Context, OtapPdata};
 use crate::rate_limit_layer::{
@@ -482,6 +483,21 @@ impl UnaryService<OtapPdata> for OtapBatchService {
             );
             if !transport_headers.is_empty() {
                 otap_batch.set_transport_headers(transport_headers);
+            }
+            if let Some(schema) = effect_handler.capture_schema() {
+                let (context, _stats) = match PdataContextBytes::capture(
+                    schema,
+                    pairs.iter().map(|(key, value)| (*key, value.as_slice())),
+                ) {
+                    Ok(captured) => captured,
+                    Err(error) => {
+                        let status = Status::internal(error.to_string());
+                        return Box::pin(async move { Err(status) });
+                    }
+                };
+                if let Some(context) = context {
+                    otap_batch.set_pdata_context_bytes(context);
+                }
             }
         }
 

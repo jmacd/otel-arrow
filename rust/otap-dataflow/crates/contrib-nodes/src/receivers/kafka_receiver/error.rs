@@ -40,6 +40,13 @@ pub enum KafkaReceiverError {
     #[error("logs decode failed: {0}")]
     LogsDecode(#[source] EngineError),
 
+    /// Packed pdata context capture failed.
+    #[error("transport context capture failed: {message}")]
+    ContextCapture {
+        /// Context encoder failure.
+        message: String,
+    },
+
     // ==================== Configuration Errors ====================
     /// A required string field was left empty.
     #[error("invalid kafka receiver configuration: {field} can't be empty")]

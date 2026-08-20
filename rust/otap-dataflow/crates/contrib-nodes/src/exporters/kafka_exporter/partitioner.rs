@@ -146,7 +146,7 @@ mod tests {
         legacy.push(TransportHeader::binary(
             "trace-bin",
             "Trace-Bin",
-            &[0x01, 0x02],
+            [0x01, 0x02],
         ));
         let packed = PdataContextBytes::build(
             0,

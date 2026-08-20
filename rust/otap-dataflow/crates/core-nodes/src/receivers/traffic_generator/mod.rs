@@ -25,6 +25,9 @@ use otap_df_engine::{
     Interests, ProducerEffectHandlerExtension, ReceiverFactory, control::NodeControlMsg,
 };
 use otap_df_otap::OTAP_RECEIVER_FACTORIES;
+use otap_df_otap::context_bytes::{
+    ContextBytesError, HeaderInput, HeaderValueKind, PdataContextBytes,
+};
 use otap_df_otap::pdata::OtapPdata;
 use otap_df_pdata::OtapPayload;
 #[cfg(test)]
@@ -68,6 +71,12 @@ pub struct TrafficGeneratorReceiver {
 
     /// Metrics for the traffic generator
     metrics: MetricSet<TrafficGeneratorReceiverMetrics>,
+}
+
+#[derive(Clone)]
+struct TransportContextFixture {
+    legacy: TransportHeaders,
+    packed: PdataContextBytes,
 }
 
 fn smooth_batch_interval(run_len: usize) -> Option<Duration> {
@@ -142,7 +151,7 @@ impl TrafficGeneratorReceiver {
         mut producer: TrafficProducer,
         mut run_ticker: Interval,
         mut batch_ticker: Interval,
-        transport_headers: Option<TransportHeaders>,
+        transport_context: Option<TransportContextFixture>,
     ) -> Result<TerminalState, Error> {
         let mut run_produced: u64 = 0;
         let mut next_pdata: Option<OtapPdata> = None;
@@ -231,7 +240,7 @@ impl TrafficGeneratorReceiver {
                                     .record(elapsed_nanos(generate_start));
 
                                 let send_start = StdInstant::now();
-                                let result = self.handle_payload(handler, payload, &transport_headers)?;
+                                let result = self.handle_payload(handler, payload, &transport_context)?;
                                 self.metrics
                                     .smooth_payload_send_duration_ns
                                     .record(elapsed_nanos(send_start));
@@ -260,7 +269,7 @@ impl TrafficGeneratorReceiver {
         handler: &local::EffectHandler<OtapPdata>,
         mut producer: TrafficProducer,
         mut run_ticker: Interval,
-        transport_headers: Option<TransportHeaders>,
+        transport_context: Option<TransportContextFixture>,
     ) -> Result<TerminalState, Error> {
         let mut run_produced: u64 = 0;
         'start: loop {
@@ -306,7 +315,7 @@ impl TrafficGeneratorReceiver {
                                     break;
                                 };
 
-                               self.handle_payload(handler, payload, &transport_headers)?
+                               self.handle_payload(handler, payload, &transport_context)?
                             }
                         };
 
@@ -349,7 +358,7 @@ impl TrafficGeneratorReceiver {
         &mut self,
         handler: &local::EffectHandler<OtapPdata>,
         payload: Result<OtapPayload, GenerateError>,
-        transport_headers: &Option<TransportHeaders>,
+        transport_context: &Option<TransportContextFixture>,
     ) -> Result<Result<u64, OtapPdata>, Error> {
         let payload = match payload {
             Ok(payload) => payload,
@@ -364,8 +373,9 @@ impl TrafficGeneratorReceiver {
         };
 
         let mut pdata = OtapPdata::new_todo_context(payload);
-        if let Some(headers) = transport_headers {
-            pdata.set_transport_headers(headers.clone());
+        if let Some(context) = transport_context {
+            pdata.set_transport_headers(context.legacy.clone());
+            pdata.set_pdata_context_bytes(context.packed.clone());
         }
         if self.config.enable_ack_nack() {
             handler.subscribe_to(
@@ -426,9 +436,9 @@ impl TrafficGeneratorReceiver {
 /// Returns `None` when the config map is empty (zero overhead).
 fn build_transport_headers(
     config_headers: &HashMap<String, Option<String>>,
-) -> Option<TransportHeaders> {
+) -> Result<Option<TransportContextFixture>, ContextBytesError> {
     if config_headers.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut headers = TransportHeaders::with_capacity(config_headers.len());
     for (key, value) in config_headers {
@@ -467,7 +477,24 @@ fn build_transport_headers(
             ));
         }
     }
-    Some(headers)
+    let packed = PdataContextBytes::build(
+        0,
+        headers.iter().map(|header| HeaderInput {
+            wire_name: &header.wire_name,
+            stored_name: &header.name,
+            value: &header.value,
+            kind: match header.value_kind {
+                otap_df_config::transport_headers::ValueKind::Text => HeaderValueKind::Text,
+                otap_df_config::transport_headers::ValueKind::Binary => HeaderValueKind::Binary,
+            },
+            rule_id: u16::MAX,
+            entry: None,
+        }),
+    )?;
+    Ok(Some(TransportContextFixture {
+        legacy: headers,
+        packed,
+    }))
 }
 
 /// Waits for a terminal control message after the producer has finished.
@@ -534,7 +561,15 @@ impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
                 source_detail: String::new(),
             })?;
 
-        let transport_headers = build_transport_headers(self.config.transport_headers());
+        let transport_context =
+            build_transport_headers(self.config.transport_headers()).map_err(|error| {
+                Error::ReceiverError {
+                    receiver: effect_handler.receiver_id(),
+                    kind: ReceiverErrorKind::Configuration,
+                    error: "Failed to encode transport context".into(),
+                    source_detail: error.to_string(),
+                }
+            })?;
 
         let run_len = producer.run_len();
 
@@ -573,7 +608,7 @@ impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
                         producer,
                         run_ticker,
                         batch_ticker,
-                        transport_headers,
+                        transport_context,
                     )
                     .await
                 } else {
@@ -586,7 +621,7 @@ impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
                         &effect_handler,
                         producer,
                         run_ticker,
-                        transport_headers,
+                        transport_context,
                     )
                     .await
                 }
@@ -597,7 +632,7 @@ impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
                     &effect_handler,
                     producer,
                     run_ticker,
-                    transport_headers,
+                    transport_context,
                 )
                 .await
             }
@@ -1406,6 +1441,15 @@ mod tests {
                     tenant[0].value_as_str(),
                     Some("acme"),
                     "fixed header value should be 'acme'"
+                );
+                let packed = pdata
+                    .pdata_context_bytes()
+                    .expect("pdata should have packed context");
+                let packed_tenant = packed.item(0).expect("packed tenant header");
+                assert_eq!(packed_tenant.stored_name(), Some("x-tenant-id"));
+                assert_eq!(
+                    packed_tenant.value().map(|(_, value)| value),
+                    Some(b"acme".as_slice())
                 );
             }) as Pin<Box<dyn Future<Output = ()>>>
         };

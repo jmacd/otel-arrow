@@ -21,7 +21,7 @@ use linkme::distributed_slice;
 use otap_df_config::error::Error as ConfigError;
 use otap_df_config::node::NodeUserConfig;
 use otap_df_config::transport_headers::TransportHeaders;
-use otap_df_config::transport_headers_policy::HeaderCapturePolicy;
+use otap_df_config::transport_headers_policy::{CompiledHeaderCaptureSchema, HeaderCapturePolicy};
 use otap_df_config::validation::validate_typed_config;
 use otap_df_engine::config::ReceiverConfig;
 use otap_df_engine::context::PipelineContext;
@@ -33,6 +33,7 @@ use otap_df_engine::receiver::ReceiverWrapper;
 use otap_df_engine::terminal_state::TerminalState;
 use otap_df_engine::{Interests, ProducerEffectHandlerExtension, ReceiverFactory};
 use otap_df_otap::OTAP_RECEIVER_FACTORIES;
+use otap_df_otap::context_bytes::PdataContextBytes;
 use otap_df_otap::pdata::{Context, OtapPdata};
 use otap_df_pdata::Consumer as PdataConsumer;
 use otap_df_pdata::OtlpProtoBytes;
@@ -325,6 +326,7 @@ impl KafkaReceiver {
         &mut self,
         kafka_message: BorrowedMessage<'_>,
         capture_policy: Option<&HeaderCapturePolicy>,
+        capture_schema: Option<&CompiledHeaderCaptureSchema>,
     ) -> Result<OtapPdata, KafkaReceiverError> {
         let topic = kafka_message.topic();
 
@@ -410,7 +412,7 @@ impl KafkaReceiver {
             ))
         }?;
 
-        capture_transport_headers(&kafka_message, capture_policy, &mut pdata);
+        capture_transport_headers(&kafka_message, capture_policy, capture_schema, &mut pdata)?;
 
         Ok(pdata)
     }
@@ -712,6 +714,7 @@ impl KafkaReceiver {
         // Retrieve the capture policy (if configured) for extracting Kafka
         // headers into the OtapPdata context as TransportHeaders.
         let capture_policy = effect_handler.capture_policy();
+        let capture_schema = effect_handler.capture_schema();
 
         // Safety-net timer: periodically commit offsets even if no acks
         // arrive for a while. Only started when manual commit is active
@@ -1024,7 +1027,7 @@ impl KafkaReceiver {
                                 continue;
                             }
 
-                            match self.process_kafka(data, capture_policy) {
+                            match self.process_kafka(data, capture_policy, capture_schema) {
                                 Ok(mut otap_data) => {
                                     if manual_commit {
                                         // Stamp the record with this partition's
@@ -1543,8 +1546,9 @@ fn decode_with_extractions(
 fn capture_transport_headers(
     kafka_message: &BorrowedMessage<'_>,
     capture_policy: Option<&HeaderCapturePolicy>,
+    capture_schema: Option<&CompiledHeaderCaptureSchema>,
     pdata: &mut OtapPdata,
-) {
+) -> Result<(), KafkaReceiverError> {
     if let Some(policy) = capture_policy {
         if let Some(headers) = kafka_message.headers() {
             let pairs = headers.iter().filter_map(|h| h.value.map(|v| (h.key, v)));
@@ -1561,6 +1565,22 @@ fn capture_transport_headers(
             }
         }
     }
+    if let Some(schema) = capture_schema
+        && let Some(headers) = kafka_message.headers()
+    {
+        let pairs = headers
+            .iter()
+            .filter_map(|header| header.value.map(|value| (header.key, value)));
+        let (context, _stats) = PdataContextBytes::capture(schema, pairs).map_err(|error| {
+            KafkaReceiverError::ContextCapture {
+                message: error.to_string(),
+            }
+        })?;
+        if let Some(context) = context {
+            pdata.set_pdata_context_bytes(context);
+        }
+    }
+    Ok(())
 }
 
 #[async_trait(?Send)]

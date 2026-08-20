@@ -808,6 +808,12 @@ impl OtapPdata {
         self.context.transport_headers()
     }
 
+    /// Returns the staged packed pdata context, if present.
+    #[must_use]
+    pub fn pdata_context_bytes(&self) -> Option<&PdataContextBytes> {
+        self.context.pdata_context_bytes()
+    }
+
     /// Set transport headers on this pdata's context.
     pub fn set_transport_headers(&mut self, headers: TransportHeaders) {
         self.context.set_transport_headers(headers);
