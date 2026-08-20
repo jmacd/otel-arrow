@@ -45,7 +45,7 @@ use crate::terminal_state::TerminalState;
 use async_trait::async_trait;
 use otap_df_channel::error::RecvError;
 use otap_df_config::PortName;
-use otap_df_config::transport_headers_policy::HeaderCapturePolicy;
+use otap_df_config::transport_headers_policy::{CompiledHeaderCaptureSchema, HeaderCapturePolicy};
 use otap_df_telemetry::error::Error as TelemetryError;
 use otap_df_telemetry::metrics::{MetricSet, MetricSetHandler};
 use otap_df_telemetry::reporter::MetricsReporter;
@@ -138,6 +138,7 @@ pub struct EffectHandler<PData> {
     /// Capture policy for extracting transport headers from inbound metadata.
     /// `None` when no capture policy is configured (zero overhead).
     capture_policy: Option<HeaderCapturePolicy>,
+    capture_schema: Option<CompiledHeaderCaptureSchema>,
 }
 
 /// Implementation for the `!Send` effect handler.
@@ -158,6 +159,7 @@ impl<PData> EffectHandler<PData> {
             core,
             router,
             capture_policy: None,
+            capture_schema: None,
         }
     }
 
@@ -199,8 +201,15 @@ impl<PData> EffectHandler<PData> {
         self.capture_policy.as_ref()
     }
 
+    /// Returns the capture schema compiled during receiver construction.
+    #[must_use]
+    pub fn capture_schema(&self) -> Option<&CompiledHeaderCaptureSchema> {
+        self.capture_schema.as_ref()
+    }
+
     /// Sets the capture policy for transport header extraction.
     pub fn set_capture_policy(&mut self, policy: Option<HeaderCapturePolicy>) {
+        self.capture_schema = policy.as_ref().map(HeaderCapturePolicy::compile);
         self.capture_policy = policy;
     }
 

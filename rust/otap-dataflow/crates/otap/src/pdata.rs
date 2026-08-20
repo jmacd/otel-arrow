@@ -29,6 +29,7 @@ use otap_df_engine::{
 };
 use otap_df_pdata::OtapPayload;
 
+use crate::context_bytes::PdataContextBytes;
 use crate::transport_headers::TransportHeaders;
 
 /// Context for OTAP requests.
@@ -51,6 +52,8 @@ pub struct Context {
     /// `None` when no headers have been captured (the common case, zero
     /// additional allocation).
     transport_headers: Option<TransportHeaders>,
+    /// Staged bytes-backed context built alongside legacy transport headers.
+    pdata_context_bytes: Option<PdataContextBytes>,
     /// Peer address observed by the receiving socket at request acceptance
     /// time. `None` for receivers without a real socket.
     peer_addr: Option<SocketAddr>,
@@ -81,6 +84,7 @@ impl Context {
         Self {
             stack: Vec::with_capacity(capacity),
             transport_headers: None,
+            pdata_context_bytes: None,
             peer_addr: None,
             flow_compute_ns: None,
             signal: None,
@@ -377,6 +381,17 @@ impl Context {
         self.transport_headers = Some(headers);
     }
 
+    /// Returns the staged bytes-backed pdata context, if captured.
+    #[must_use]
+    pub fn pdata_context_bytes(&self) -> Option<&PdataContextBytes> {
+        self.pdata_context_bytes.as_ref()
+    }
+
+    /// Attaches the staged bytes-backed context without changing legacy headers.
+    pub fn set_pdata_context_bytes(&mut self, context: PdataContextBytes) {
+        self.pdata_context_bytes = Some(context);
+    }
+
     /// Returns the peer address observed by the receiving socket, if any.
     #[must_use]
     pub fn peer_addr(&self) -> Option<SocketAddr> {
@@ -440,6 +455,7 @@ impl Context {
         Self {
             stack: Vec::new(),
             transport_headers: self.transport_headers.clone(),
+            pdata_context_bytes: self.pdata_context_bytes.clone(),
             peer_addr: self.peer_addr,
             flow_compute_ns: None,
             signal: None,
@@ -795,6 +811,11 @@ impl OtapPdata {
     /// Set transport headers on this pdata's context.
     pub fn set_transport_headers(&mut self, headers: TransportHeaders) {
         self.context.set_transport_headers(headers);
+    }
+
+    /// Attaches the staged bytes-backed context to this pdata.
+    pub fn set_pdata_context_bytes(&mut self, context: PdataContextBytes) {
+        self.context.set_pdata_context_bytes(context);
     }
 
     /// Builder-style method to attach transport headers.

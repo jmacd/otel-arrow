@@ -11,6 +11,7 @@
 //! The receiver keeps request payloads in their serialized protobuf form and forwards them into
 //! the pipeline as `OtapPdata`, matching the OTLP/gRPC receiver's lazy-decoding strategy.
 
+use crate::context_bytes::PdataContextBytes;
 use crate::otap_grpc::common::AckRegistry;
 use crate::otap_grpc::otlp::server_new::AckSlot;
 use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
@@ -800,6 +801,16 @@ impl HttpHandler {
                 let _stats = policy.capture_from_pairs(pairs, &mut transport_headers);
                 if !transport_headers.is_empty() {
                     pdata.set_transport_headers(transport_headers);
+                }
+            }
+            if let Some(schema) = self.effect_handler.capture_schema() {
+                let pairs = headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_bytes()));
+                let (context, _stats) =
+                    PdataContextBytes::capture(schema, pairs).map_err(|_| internal_error())?;
+                if let Some(context) = context {
+                    pdata.set_pdata_context_bytes(context);
                 }
             }
 

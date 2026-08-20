@@ -168,16 +168,6 @@ pub struct RawSpan<'a> {
     bytes_parser: ProtoBytesParser<'a, SpanFieldRanges>,
 }
 
-impl<'a> RawSpan<'a> {
-    /// Creates a span view over one serialized OTLP `Span` message.
-    #[must_use]
-    pub fn new(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes_parser: ProtoBytesParser::new(bytes),
-        }
-    }
-}
-
 /// Known field offsets within byte buffer for fields in `Span` message
 pub struct SpanFieldRanges {
     scalar_fields: [Cell<Option<(NonZeroUsize, NonZeroUsize)>>; 17],

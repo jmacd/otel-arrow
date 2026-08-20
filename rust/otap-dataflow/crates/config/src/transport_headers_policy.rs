@@ -253,15 +253,13 @@ impl CompiledHeaderCaptureSchema {
     pub fn match_header(&self, wire_name: &str) -> Option<CompiledHeaderMatch<'_>> {
         let normalized = wire_name.to_ascii_lowercase();
         self.rules.iter().find_map(|rule| {
-            rule.match_names
-                .iter()
-                .any(|name| name == &normalized)
-                .then_some(CompiledHeaderMatch {
-                    rule_id: rule.rule_id,
-                    entry: rule.entry,
-                    stored_name: rule.store_as.as_deref(),
-                    value_kind: rule.value_kind,
-                })
+            let matched_name = rule.match_names.iter().find(|name| *name == &normalized)?;
+            Some(CompiledHeaderMatch {
+                rule_id: rule.rule_id,
+                entry: rule.entry,
+                stored_name: rule.store_as.as_deref().unwrap_or(matched_name),
+                value_kind: rule.value_kind,
+            })
         })
     }
 
@@ -288,8 +286,9 @@ pub struct CompiledHeaderMatch<'a> {
     pub rule_id: u16,
     /// Optional `store_as` entry slot.
     pub entry: Option<u16>,
-    /// Configured stored name when this is an entry.
-    pub stored_name: Option<&'a str>,
+    /// Stored name: `store_as` when configured, otherwise the normalized
+    /// matched wire name.
+    pub stored_name: &'a str,
     /// Explicit value kind override, if configured.
     pub value_kind: Option<ValueKindConfig>,
 }

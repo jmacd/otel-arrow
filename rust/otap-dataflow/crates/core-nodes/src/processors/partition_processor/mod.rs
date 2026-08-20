@@ -28,7 +28,8 @@ use otap_df_engine::{
 use otap_df_otap::OTAP_PROCESSOR_FACTORIES;
 use otap_df_otap::accessory::context::split_contexts::Contexts;
 use otap_df_otap::accessory::slots::Key;
-use otap_df_otap::pdata::OtapPdata;
+use otap_df_otap::context_bytes::{ContextBytesError, HeaderInput, HeaderValueKind};
+use otap_df_otap::pdata::{Context, OtapPdata};
 use otap_df_otap::transport_headers::{TransportHeader, ValueKind};
 use otap_df_pdata::{OtapArrowRecords, OtapPayload, TryIntoWithOptions};
 use otap_df_query_engine::parser::default_parser_options;
@@ -279,11 +280,20 @@ impl Processor<OtapPdata> for PartitionProcessor {
                         // update the header values
                         let mut headers =
                             inbound_context.take_transport_headers().unwrap_or_default();
-                        headers.push(partition_value_to_transport_header(
+                        let partition_header = partition_value_to_transport_header(
                             self.header_name.clone(),
                             &self.serialization_strategy,
                             partition.value,
-                        ));
+                        );
+                        project_partition_header(&mut inbound_context, &partition_header).map_err(
+                            |error| otap_df_engine::error::Error::ProcessorError {
+                                processor: effect_handler.processor_id(),
+                                kind: ProcessorErrorKind::Other,
+                                error: "failed to project pdata context".into(),
+                                source_detail: error.to_string(),
+                            },
+                        )?;
+                        headers.push(partition_header);
                         inbound_context.set_transport_headers(headers);
 
                         let pdata = OtapPdata::new(
@@ -342,11 +352,19 @@ impl Processor<OtapPdata> for PartitionProcessor {
                             let mut pdata_context = inbound_context.clone_detached();
                             let mut headers =
                                 pdata_context.take_transport_headers().unwrap_or_default();
-                            headers.push(partition_value_to_transport_header(
+                            let partition_header = partition_value_to_transport_header(
                                 self.header_name.clone(),
                                 &self.serialization_strategy,
                                 partition.value,
-                            ));
+                            );
+                            project_partition_header(&mut pdata_context, &partition_header)
+                                .map_err(|error| otap_df_engine::error::Error::ProcessorError {
+                                    processor: effect_handler.processor_id(),
+                                    kind: ProcessorErrorKind::Other,
+                                    error: "failed to project pdata context".into(),
+                                    source_detail: error.to_string(),
+                                })?;
+                            headers.push(partition_header);
                             pdata_context.set_transport_headers(headers);
 
                             let outbound_batch_num_items = partition.batch.num_items();
@@ -398,6 +416,29 @@ impl Processor<OtapPdata> for PartitionProcessor {
 
         Ok(())
     }
+}
+
+fn project_partition_header(
+    context: &mut Context,
+    header: &TransportHeader,
+) -> Result<(), ContextBytesError> {
+    let Some(input) = context.pdata_context_bytes() else {
+        return Ok(());
+    };
+    let kind = match header.value_kind {
+        ValueKind::Text => HeaderValueKind::Text,
+        ValueKind::Binary => HeaderValueKind::Binary,
+    };
+    let projected = input.project().append_bag_header(HeaderInput {
+        wire_name: &header.wire_name,
+        stored_name: &header.name,
+        value: &header.value,
+        kind,
+        rule_id: u16::MAX,
+        entry: None,
+    })?;
+    context.set_pdata_context_bytes(projected);
+    Ok(())
 }
 
 fn partition_value_to_transport_header(
@@ -480,6 +521,7 @@ mod test {
     use std::collections::VecDeque;
 
     use super::*;
+    use otap_df_otap::context_bytes::PdataContextBytes;
 
     use otap_df_engine::{
         capability::registry::Capabilities,
@@ -1019,6 +1061,20 @@ mod test {
                 let mut headers = context.take_transport_headers().unwrap_or_default();
                 headers.push(TransportHeader::text("h1", "header1", "hello world"));
                 context.set_transport_headers(headers);
+                context.set_pdata_context_bytes(
+                    PdataContextBytes::build(
+                        0,
+                        [HeaderInput {
+                            wire_name: "header1",
+                            stored_name: "h1",
+                            value: b"hello world",
+                            kind: HeaderValueKind::Text,
+                            rule_id: 0,
+                            entry: None,
+                        }],
+                    )
+                    .expect("bytes context"),
+                );
                 context.set_peer_addr("10.0.0.1:5005".parse().unwrap());
                 let mut pdata = OtapPdata::new(context, OtapPayload::OtapArrowRecords(otap_batch));
                 pdata.start_flow_metric();
@@ -1037,6 +1093,12 @@ mod test {
                     // assert the flow counter is distributed outbound batches in proportion
                     // to their size relative to the input
                     let partition_header = headers.find_by_name(header_name).next().unwrap();
+                    let context_partition = context
+                        .pdata_context_bytes()
+                        .expect("parallel bytes context")
+                        .value(1)
+                        .expect("projected partition header");
+                    assert_eq!(context_partition.1, partition_header.value);
                     if partition_header.value == "0".as_bytes().to_vec() {
                         assert_eq!(flow_counter, Some(4));
                     }

@@ -7681,6 +7681,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "cfg-if",
+ "criterion",
  "flate2",
  "futures",
  "http 1.5.0",
