@@ -102,6 +102,44 @@ impl HeaderCapturePolicy {
         self.headers.is_empty()
     }
 
+    /// Compiles capture rules for a receiver-local context builder.
+    ///
+    /// The existing capture implementation remains authoritative while the
+    /// bytes-backed pdata context is staged. This schema supplies stable rule
+    /// and entry slots to that builder without changing capture behavior.
+    #[must_use]
+    pub fn compile(&self) -> CompiledHeaderCaptureSchema {
+        let mut entries = Vec::new();
+        let mut rules = Vec::with_capacity(self.headers.len());
+        for (rule_id, rule) in self.headers.iter().enumerate() {
+            let entry = rule.store_as.as_ref().map(|name| {
+                entries
+                    .iter()
+                    .position(|entry: &String| entry.eq_ignore_ascii_case(name))
+                    .unwrap_or_else(|| {
+                        entries.push(name.clone());
+                        entries.len() - 1
+                    })
+            });
+            rules.push(CompiledCaptureRule {
+                rule_id: rule_id as u16,
+                match_names: rule
+                    .match_names
+                    .iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect(),
+                entry: entry.map(|entry| entry as u16),
+                store_as: rule.store_as.clone(),
+                value_kind: rule.value_kind,
+            });
+        }
+        CompiledHeaderCaptureSchema {
+            defaults: self.defaults.clone(),
+            rules,
+            entries,
+        }
+    }
+
     /// Capture headers from an iterator of `(wire_name, value)` pairs.
     ///
     /// Each pair is matched against the capture rules. Only headers
@@ -193,6 +231,67 @@ impl HeaderCapturePolicy {
                 .any(|m| wire_name.eq_ignore_ascii_case(m))
         })
     }
+}
+
+/// Immutable capture schema used by the staged bytes-backed context builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledHeaderCaptureSchema {
+    defaults: CaptureDefaults,
+    rules: Vec<CompiledCaptureRule>,
+    entries: Vec<String>,
+}
+
+impl CompiledHeaderCaptureSchema {
+    /// Number of compiled `store_as` entries.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Finds the first capture rule matching `wire_name`.
+    #[must_use]
+    pub fn match_header(&self, wire_name: &str) -> Option<CompiledHeaderMatch<'_>> {
+        let normalized = wire_name.to_ascii_lowercase();
+        self.rules.iter().find_map(|rule| {
+            rule.match_names
+                .iter()
+                .any(|name| name == &normalized)
+                .then_some(CompiledHeaderMatch {
+                    rule_id: rule.rule_id,
+                    entry: rule.entry,
+                    stored_name: rule.store_as.as_deref(),
+                    value_kind: rule.value_kind,
+                })
+        })
+    }
+
+    /// Returns the configured capture limits.
+    #[must_use]
+    pub const fn defaults(&self) -> &CaptureDefaults {
+        &self.defaults
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompiledCaptureRule {
+    rule_id: u16,
+    match_names: Vec<String>,
+    entry: Option<u16>,
+    store_as: Option<String>,
+    value_kind: Option<ValueKindConfig>,
+}
+
+/// A receiver-facing result of matching one inbound header.
+#[derive(Debug, Clone, Copy)]
+pub struct CompiledHeaderMatch<'a> {
+    /// First-match capture rule identifier.
+    pub rule_id: u16,
+    /// Optional `store_as` entry slot.
+    pub entry: Option<u16>,
+    /// Configured stored name when this is an entry.
+    pub stored_name: Option<&'a str>,
+    /// Explicit value kind override, if configured.
+    pub value_kind: Option<ValueKindConfig>,
 }
 
 /// Default limits for header capture.
