@@ -11,6 +11,7 @@
 //!
 //! [`PartitionerStrategy`]: super::config::PartitionerStrategy
 
+use otap_df_otap::context_bytes::PdataContextBytes;
 use otap_df_otap::transport_headers::TransportHeaders;
 use std::hash::{Hash, Hasher};
 use xxhash_rust::xxh64::Xxh64;
@@ -60,6 +61,25 @@ pub fn partition_key_from_transport_headers(headers: &TransportHeaders) -> Optio
     Some(hex::encode(hash.to_be_bytes()))
 }
 
+/// Builds the same deterministic key from the packed context bag.
+#[must_use]
+pub fn partition_key_from_context_bytes(context: &PdataContextBytes) -> Option<String> {
+    let mut sorted: Vec<_> = context
+        .items()
+        .filter_map(|item| Some((item.stored_name()?, item.value()?.1)))
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_unstable();
+    let mut hasher = Xxh64::new(0);
+    for (name, value) in sorted {
+        name.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    Some(hex::encode(hasher.finish().to_be_bytes()))
+}
+
 /// Determine the partition key for a signal based on its per-signal config and
 /// the pdata context.
 ///
@@ -82,7 +102,9 @@ pub fn partition_key_for_signal(
     context: &otap_df_otap::pdata::Context,
 ) -> Option<String> {
     if signal_config.partition_by_transport_headers() {
-        if let Some(headers) = context.transport_headers() {
+        if let Some(context_bytes) = context.pdata_context_bytes() {
+            return partition_key_from_context_bytes(context_bytes);
+        } else if let Some(headers) = context.transport_headers() {
             return partition_key_from_transport_headers(headers);
         }
     }
@@ -101,6 +123,7 @@ pub fn partition_key_for_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otap_df_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
     use otap_df_otap::transport_headers::TransportHeader;
 
     // ---- Transport header partition key tests ----
@@ -110,6 +133,48 @@ mod tests {
         let headers = TransportHeaders::new();
         let key = partition_key_from_transport_headers(&headers);
         assert!(key.is_none());
+    }
+
+    /// Scenario: legacy and packed bags contain identical stored names and
+    /// values in the same logical set.
+    /// Guarantees: Kafka partition-key hashing is representation-independent
+    /// during migration.
+    #[test]
+    fn packed_partition_key_matches_legacy_key() {
+        let mut legacy = TransportHeaders::new();
+        legacy.push(TransportHeader::text("tenant", "X-Tenant", b"acme"));
+        legacy.push(TransportHeader::binary(
+            "trace-bin",
+            "Trace-Bin",
+            &[0x01, 0x02],
+        ));
+        let packed = PdataContextBytes::build(
+            0,
+            [
+                HeaderInput {
+                    wire_name: "X-Tenant",
+                    stored_name: "tenant",
+                    value: b"acme",
+                    kind: HeaderValueKind::Text,
+                    rule_id: 0,
+                    entry: None,
+                },
+                HeaderInput {
+                    wire_name: "Trace-Bin",
+                    stored_name: "trace-bin",
+                    value: &[0x01, 0x02],
+                    kind: HeaderValueKind::Binary,
+                    rule_id: 1,
+                    entry: None,
+                },
+            ],
+        )
+        .expect("packed context");
+
+        assert_eq!(
+            partition_key_from_context_bytes(&packed),
+            partition_key_from_transport_headers(&legacy)
+        );
     }
 
     #[test]

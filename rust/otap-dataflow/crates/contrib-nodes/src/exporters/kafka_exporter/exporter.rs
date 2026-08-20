@@ -371,7 +371,17 @@ impl KafkaExporter {
         // Propagate transport headers onto the Kafka record if a propagation
         // policy is configured and the pdata context carries transport headers.
         if let Some(policy) = effect_handler.and_then(|eh| eh.propagation_policy()) {
-            if let Some(transport_headers) = context.transport_headers() {
+            if let Some(context_bytes) = context.pdata_context_bytes() {
+                for propagated in context_bytes.propagate(policy) {
+                    if propagated.header_name == format_header_key {
+                        continue;
+                    }
+                    headers = headers.insert(Header {
+                        key: propagated.header_name,
+                        value: Some(propagated.value),
+                    });
+                }
+            } else if let Some(transport_headers) = context.transport_headers() {
                 for propagated in policy.propagate(transport_headers) {
                     // Skip propagated headers that collide with the format header.
                     if propagated.header_name == format_header_key {

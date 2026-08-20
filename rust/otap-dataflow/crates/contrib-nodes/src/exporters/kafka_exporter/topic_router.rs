@@ -38,7 +38,6 @@ use super::config::SignalConfig;
 use super::error::KafkaExporterError;
 use super::metrics::KafkaExporterMetrics;
 use crate::common::kafka::validate_kafka_topic;
-use otap_df_config::transport_headers::TransportHeader;
 use otap_df_otap::pdata::Context;
 use regex::Regex;
 use std::borrow::Cow;
@@ -91,15 +90,15 @@ impl TopicRouter {
         metrics: &mut KafkaExporterMetrics,
     ) -> Result<Cow<'a, str>, KafkaExporterError> {
         // Priority 1: topic from a transport header, if configured and present.
-        if let Some(header) = Self::header_topic(signal_config, context) {
+        if let Some(value) = Self::header_topic_value(signal_config, context) {
             // A present routing header must be a usable Kafka topic. If it is
             // not (non-UTF-8 value, or a value that fails Kafka topic
             // validation) this is non-retryable: surface an error so the batch
             // is permanently nacked rather than silently falling back to the
             // static topic, which would misdeliver the data.
-            let topic = header.value_as_str().ok_or_else(|| {
+            let topic = std::str::from_utf8(value).map_err(|_| {
                 KafkaExporterError::invalid_header_topic(
-                    String::from_utf8_lossy(&header.value),
+                    String::from_utf8_lossy(value),
                     "value is not valid UTF-8",
                 )
             })?;
@@ -153,18 +152,26 @@ impl TopicRouter {
     /// topic-routing key, or `None` if routing-by-header is not configured for
     /// the signal or no matching header is present. The first matching header
     /// wins.
-    fn header_topic<'a>(
+    fn header_topic_value<'a>(
         signal_config: &SignalConfig,
         context: &'a Context,
-    ) -> Option<&'a TransportHeader> {
+    ) -> Option<&'a [u8]> {
         // `topic_from_transport_header` is pre-normalized (lowercased) in
         // `KafkaExporterConfig::try_from`, matching how transport headers store
         // their logical names, so a plain equality check is sufficient here.
         let header_key = signal_config.topic_from_transport_header()?;
+        if let Some(context_bytes) = context.pdata_context_bytes() {
+            return context_bytes.items().find_map(|item| {
+                (item.stored_name()? == header_key)
+                    .then(|| item.value().map(|(_, value)| value))
+                    .flatten()
+            });
+        }
         context
             .transport_headers()?
             .iter()
-            .find(|h| h.name == *header_key)
+            .find(|h| h.name == header_key)
+            .map(|header| header.value.as_slice())
     }
 }
 
@@ -173,6 +180,7 @@ mod tests {
     use super::*;
     use crate::common::kafka::MessageFormat;
     use otap_df_config::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
+    use otap_df_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
     use otap_df_otap::pdata::Context;
 
     // ---- Test helpers ----
@@ -228,6 +236,38 @@ mod tests {
             metrics.operational_metrics.topic_from_static_config.get(),
             0
         );
+    }
+
+    /// Scenario: the dynamic Kafka topic is carried only by the packed
+    /// context bag.
+    /// Guarantees: topic routing resolves stored names and UTF-8 values
+    /// without constructing legacy transport headers.
+    #[test]
+    fn resolve_topic_from_packed_context() {
+        let config = make_signal_config("fallback-logs", Some("x-target-topic"));
+        let mut ctx = Context::default();
+        ctx.set_pdata_context_bytes(
+            PdataContextBytes::build(
+                0,
+                [HeaderInput {
+                    wire_name: "X-Target-Topic",
+                    stored_name: "x-target-topic",
+                    value: b"tenant-a-logs",
+                    kind: HeaderValueKind::Text,
+                    rule_id: 0,
+                    entry: None,
+                }],
+            )
+            .expect("packed context"),
+        );
+        let mut metrics = KafkaExporterMetrics::register(
+            &crate::exporters::kafka_exporter::exporter::test_support::pipeline_context(),
+        );
+
+        let topic = TopicRouter::resolve(&config, None, &ctx, &mut metrics).expect("valid topic");
+
+        assert_eq!(&*topic, "tenant-a-logs");
+        assert_eq!(metrics.operational_metrics.topic_from_header.get(), 1);
     }
 
     /// Scenario: Target topic header is absent but another header exists.
