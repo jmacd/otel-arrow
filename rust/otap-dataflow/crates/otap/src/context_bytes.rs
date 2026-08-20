@@ -293,19 +293,71 @@ fn patch_prefix(
             at += 2;
         }
     }
+}
 
-    fn entry_hash(slot: usize, members: &[u16], headers: &[HeaderInput<'_>]) -> u64 {
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in (slot as u64).to_le_bytes() {
-            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+fn entry_hash(slot: usize, members: &[u16], headers: &[HeaderInput<'_>]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in (slot as u64).to_le_bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for member in members {
+        let header = &headers[*member as usize];
+        hash = (hash ^ u64::from(header.kind as u8)).wrapping_mul(0x0000_0100_0000_01b3);
+        for byte in header.value {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
-        for member in members {
-            let header = &headers[*member as usize];
-            hash = (hash ^ u64::from(header.kind as u8)).wrapping_mul(0x0000_0100_0000_01b3);
-            for byte in header.value {
-                hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-        hash
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: an entry has duplicate header values interleaved with a
+    /// bag-only header.
+    /// Guarantees: the entry range preserves its values' arrival order while
+    /// the encoded carrier remains one reference-counted `Bytes` value.
+    #[test]
+    fn entry_range_indexes_typed_header_values() {
+        let context = PdataContextBytes::build(
+            1,
+            [
+                HeaderInput {
+                    wire_name: "x-tenant",
+                    value: b"acme",
+                    kind: HeaderValueKind::Text,
+                    rule_id: 0,
+                    entry: Some(0),
+                },
+                HeaderInput {
+                    wire_name: "x-request-id",
+                    value: b"request-1",
+                    kind: HeaderValueKind::Text,
+                    rule_id: 1,
+                    entry: None,
+                },
+                HeaderInput {
+                    wire_name: "x-tenant",
+                    value: &[0x01, 0x02],
+                    kind: HeaderValueKind::Binary,
+                    rule_id: 0,
+                    entry: Some(0),
+                },
+            ],
+        )
+        .expect("context encodes");
+
+        let entry = context.entry(0).expect("entry is present");
+        assert_ne!(entry.hash(), 0);
+        let values: Vec<_> = entry.values().collect();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], (HeaderValueKind::Text, b"acme".as_slice()));
+        assert_eq!(values[1], (HeaderValueKind::Binary, &[0x01u8, 0x02][..]));
+        assert_eq!(
+            context.value(1),
+            Some((HeaderValueKind::Text, b"request-1".as_slice()))
+        );
+        assert!(!context.bytes().is_empty());
     }
 }
