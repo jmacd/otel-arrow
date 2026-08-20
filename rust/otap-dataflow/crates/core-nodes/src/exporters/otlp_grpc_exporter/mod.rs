@@ -1110,13 +1110,20 @@ fn build_grpc_metadata(
     if let Some(policy) = propagation_policy {
         if let Some(context_bytes) = context.pdata_context_bytes() {
             for header in context_bytes.propagate(policy) {
-                append_propagated_metadata(
+                let error = append_propagated_metadata(
                     &mut metadata,
                     static_metadata,
                     header.header_name,
                     header.value_kind == otap_df_otap::context_bytes::HeaderValueKind::Binary,
                     header.value,
                 );
+                if let Err(reason) = error {
+                    otel_debug!(
+                        "otlp.exporter.grpc.header_skip",
+                        reason,
+                        header_name = header.header_name
+                    );
+                }
             }
         }
     }
@@ -1137,50 +1144,29 @@ fn build_grpc_metadata(
         header_name: &str,
         binary: bool,
         value: &[u8],
-    ) {
+    ) -> Result<(), &'static str> {
         if binary {
             let key_name = if header_name.ends_with("-bin") {
                 header_name.to_string()
             } else {
                 format!("{header_name}-bin")
             };
-            let Ok(key) = key_name.parse::<MetadataKey<tonic::metadata::Binary>>() else {
-                otel_debug!(
-                    "otlp.exporter.grpc.header_skip",
-                    reason = "invalid binary metadata key",
-                    header_name
-                );
-                return;
-            };
+            let key = key_name
+                .parse::<MetadataKey<tonic::metadata::Binary>>()
+                .map_err(|_| "invalid binary metadata key")?;
             let _ = metadata.append_bin(key, MetadataValue::from_bytes(value));
-            return;
+            return Ok(());
         }
 
-        let Ok(key) = header_name.parse::<MetadataKey<tonic::metadata::Ascii>>() else {
-            otel_debug!(
-                "otlp.exporter.grpc.header_skip",
-                reason = "invalid ascii metadata key",
-                header_name
-            );
-            return;
-        };
-        let Ok(value) = MetadataValue::try_from(value) else {
-            otel_debug!(
-                "otlp.exporter.grpc.header_skip",
-                reason = "invalid ascii metadata value",
-                header_name
-            );
-            return;
-        };
+        let key = header_name
+            .parse::<MetadataKey<tonic::metadata::Ascii>>()
+            .map_err(|_| "invalid ascii metadata key")?;
+        let value = MetadataValue::try_from(value).map_err(|_| "invalid ascii metadata value")?;
         if static_metadata.is_some_and(|metadata| metadata.contains_key(key.as_str())) {
-            otel_debug!(
-                "otlp.exporter.grpc.header_skip",
-                reason = "static header takes precedence over propagated header",
-                header_name
-            );
-            return;
+            return Err("static header takes precedence over propagated header");
         }
         let _ = metadata.append(key, value);
+        Ok(())
     }
 
     if metadata.is_empty() {
