@@ -13,7 +13,7 @@
 use bytes::Bytes;
 use otap_df_config::transport_headers::{TransportHeaders, ValueKind as TransportValueKind};
 use otap_df_config::transport_headers_policy::{
-    CaptureStats, CompiledHeaderCaptureSchema, HeaderPropagationPolicy, NameStrategy,
+    CaptureStats, CompiledHeaderCapturePolicy, HeaderPropagationPolicy, NameStrategy,
     PropagationAction, ValueKindConfig,
 };
 
@@ -366,17 +366,17 @@ impl PdataContextBytes {
 
     /// Captures headers with a compiled policy.
     pub fn capture<'a>(
-        schema: &CompiledHeaderCaptureSchema,
+        policy: &CompiledHeaderCapturePolicy,
         pairs: impl IntoIterator<Item = (&'a str, &'a [u8])>,
     ) -> Result<(Option<Self>, Option<CaptureStats>), ContextBytesError> {
-        let defaults = schema.defaults();
+        let defaults = policy.defaults();
         let mut headers = smallvec::SmallVec::<[HeaderInput<'_>; 32]>::new();
         let mut skipped_max_entries = 0;
         let mut skipped_name_too_long = 0;
         let mut skipped_value_too_long = 0;
 
         for (wire_name, value) in pairs {
-            let Some(matched) = schema.match_header(wire_name) else {
+            let Some(matched) = policy.match_header(wire_name) else {
                 continue;
             };
             if headers.len() >= defaults.max_entries {
@@ -415,7 +415,7 @@ impl PdataContextBytes {
                     skipped_value_too_long,
                 });
         let context = (!headers.is_empty())
-            .then(|| Self::build(schema.entry_count(), headers))
+            .then(|| Self::build(policy.entry_count(), headers))
             .transpose()?;
         Ok((context, stats))
     }

@@ -108,7 +108,7 @@ impl HeaderCapturePolicy {
     /// bytes-backed pdata context is staged. This schema supplies stable rule
     /// and entry slots to that builder without changing capture behavior.
     #[must_use]
-    pub fn compile(&self) -> CompiledHeaderCaptureSchema {
+    pub fn compile(&self) -> CompiledHeaderCapturePolicy {
         let mut entries = Vec::new();
         let mut rules = Vec::with_capacity(self.headers.len());
         for (rule_id, rule) in self.headers.iter().enumerate() {
@@ -133,7 +133,7 @@ impl HeaderCapturePolicy {
                 value_kind: rule.value_kind,
             });
         }
-        CompiledHeaderCaptureSchema {
+        CompiledHeaderCapturePolicy {
             defaults: self.defaults.clone(),
             rules,
             entries,
@@ -235,13 +235,13 @@ impl HeaderCapturePolicy {
 
 /// Immutable capture schema used by the staged bytes-backed context builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledHeaderCaptureSchema {
+pub struct CompiledHeaderCapturePolicy {
     defaults: CaptureDefaults,
     rules: Vec<CompiledCaptureRule>,
     entries: Vec<String>,
 }
 
-impl CompiledHeaderCaptureSchema {
+impl CompiledHeaderCapturePolicy {
     /// Number of compiled `store_as` entries.
     #[must_use]
     pub fn entry_count(&self) -> usize {

@@ -456,7 +456,7 @@ impl UnaryService<OtapPdata> for OtapBatchService {
             .expect("`OtapBatchService` is not reused for multiple calls");
 
         // Capture context synchronously before moving the effect handler.
-        if let Some(schema) = effect_handler.capture_schema() {
+        if let Some(policy) = effect_handler.capture_policy() {
             // Collect all metadata pairs, decoding binary values so we store
             // raw bytes rather than the base64 wire encoding (which would be
             // double-encoded on downstream gRPC propagation).
@@ -474,7 +474,7 @@ impl UnaryService<OtapPdata> for OtapBatchService {
                 .collect();
 
             let (context, _stats) = match PdataContextBytes::capture(
-                schema,
+                policy,
                 pairs.iter().map(|(key, value)| (*key, value.as_slice())),
             ) {
                 Ok(captured) => captured,

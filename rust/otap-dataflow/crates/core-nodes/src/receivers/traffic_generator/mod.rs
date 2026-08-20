@@ -77,11 +77,6 @@ pub struct TrafficGeneratorReceiver {
     metrics: MetricSet<TrafficGeneratorReceiverMetrics>,
 }
 
-#[derive(Clone)]
-struct TransportContextFixture {
-    packed: PdataContextBytes,
-}
-
 fn smooth_batch_interval(run_len: usize) -> Option<Duration> {
     if run_len == 0 {
         return None;
@@ -154,7 +149,7 @@ impl TrafficGeneratorReceiver {
         mut producer: TrafficProducer,
         mut run_ticker: Interval,
         mut batch_ticker: Interval,
-        transport_context: Option<TransportContextFixture>,
+        transport_context: Option<PdataContextBytes>,
     ) -> Result<TerminalState, Error> {
         let mut run_produced: u64 = 0;
         let mut next_pdata: Option<OtapPdata> = None;
@@ -272,7 +267,7 @@ impl TrafficGeneratorReceiver {
         handler: &local::EffectHandler<OtapPdata>,
         mut producer: TrafficProducer,
         mut run_ticker: Interval,
-        transport_context: Option<TransportContextFixture>,
+        transport_context: Option<PdataContextBytes>,
     ) -> Result<TerminalState, Error> {
         let mut run_produced: u64 = 0;
         'start: loop {
@@ -361,7 +356,7 @@ impl TrafficGeneratorReceiver {
         &mut self,
         handler: &local::EffectHandler<OtapPdata>,
         payload: Result<OtapPayload, GenerateError>,
-        transport_context: &Option<TransportContextFixture>,
+        transport_context: &Option<PdataContextBytes>,
     ) -> Result<Result<u64, OtapPdata>, Error> {
         let payload = match payload {
             Ok(payload) => payload,
@@ -377,7 +372,7 @@ impl TrafficGeneratorReceiver {
 
         let mut pdata = OtapPdata::new_todo_context(payload);
         if let Some(context) = transport_context {
-            pdata.set_pdata_context_bytes(context.packed.clone());
+            pdata.set_pdata_context_bytes(context.clone());
         }
         if self.config.enable_ack_nack() {
             handler.subscribe_to(
@@ -436,9 +431,9 @@ impl TrafficGeneratorReceiver {
 /// for binary headers (keys ending in `-bin`).
 ///
 /// Returns `None` when the config map is empty (zero overhead).
-fn build_transport_headers(
+fn build_transport_context(
     config_headers: &HashMap<String, Option<String>>,
-) -> Result<Option<TransportContextFixture>, ContextBytesError> {
+) -> Result<Option<PdataContextBytes>, ContextBytesError> {
     if config_headers.is_empty() {
         return Ok(None);
     }
@@ -493,7 +488,7 @@ fn build_transport_headers(
             entry: None,
         }),
     )?;
-    Ok(Some(TransportContextFixture { packed }))
+    Ok(Some(packed))
 }
 
 /// Waits for a terminal control message after the producer has finished.
@@ -561,7 +556,7 @@ impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
             })?;
 
         let transport_context =
-            build_transport_headers(self.config.transport_headers()).map_err(|error| {
+            build_transport_context(self.config.transport_headers()).map_err(|error| {
                 Error::ReceiverError {
                     receiver: effect_handler.receiver_id(),
                     kind: ReceiverErrorKind::Configuration,

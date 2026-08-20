@@ -17,16 +17,16 @@ criterion_main!(benches);
 
 fn bench_context_bytes(c: &mut Criterion) {
     let policy = policy();
-    let schema = policy.compile();
+    let compiled_policy = policy.compile();
     let pairs = pairs();
     let legacy = capture_legacy(&policy, &pairs);
-    let bytes = capture_bytes(&schema, &pairs);
+    let bytes = capture_bytes(&compiled_policy, &pairs);
 
     let _ = c.bench_function("context_headers/capture/legacy", |b| {
         b.iter(|| black_box(capture_legacy(&policy, &pairs)));
     });
     let _ = c.bench_function("context_headers/capture/bytes", |b| {
-        b.iter(|| black_box(capture_bytes(&schema, &pairs)));
+        b.iter(|| black_box(capture_bytes(&compiled_policy, &pairs)));
     });
     let _ = c.bench_function("context_headers/lookup/legacy-linear", |b| {
         b.iter(|| black_box(&legacy).find_by_name("tenant").count());
@@ -57,7 +57,7 @@ fn bench_context_bytes(c: &mut Criterion) {
     });
     let _ = c.bench_function("context_headers/capture_then_clone/bytes", |b| {
         b.iter(|| {
-            let captured = capture_bytes(&schema, &pairs);
+            let captured = capture_bytes(&compiled_policy, &pairs);
             black_box(captured.clone())
         });
     });
@@ -166,11 +166,11 @@ fn capture_legacy(policy: &HeaderCapturePolicy, pairs: &[(String, Vec<u8>)]) -> 
 }
 
 fn capture_bytes(
-    schema: &otap_df_config::transport_headers_policy::CompiledHeaderCaptureSchema,
+    policy: &otap_df_config::transport_headers_policy::CompiledHeaderCapturePolicy,
     pairs: &[(String, Vec<u8>)],
 ) -> PdataContextBytes {
     PdataContextBytes::capture(
-        schema,
+        policy,
         pairs
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_slice())),

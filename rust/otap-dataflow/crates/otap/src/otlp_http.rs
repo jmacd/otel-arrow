@@ -791,12 +791,12 @@ impl HttpHandler {
             let mut pdata = OtapPdata::new(context, payload.into());
             pdata.set_peer_addr(self.peer_addr);
 
-            if let Some(schema) = self.effect_handler.capture_schema() {
+            if let Some(policy) = self.effect_handler.capture_policy() {
                 let pairs = headers
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.as_bytes()));
                 let (context, _stats) =
-                    PdataContextBytes::capture(schema, pairs).map_err(|_| internal_error())?;
+                    PdataContextBytes::capture(policy, pairs).map_err(|_| internal_error())?;
                 if let Some(context) = context {
                     pdata.set_pdata_context_bytes(context);
                 }

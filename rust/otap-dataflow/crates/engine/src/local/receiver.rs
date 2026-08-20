@@ -45,7 +45,7 @@ use crate::terminal_state::TerminalState;
 use async_trait::async_trait;
 use otap_df_channel::error::RecvError;
 use otap_df_config::PortName;
-use otap_df_config::transport_headers_policy::{CompiledHeaderCaptureSchema, HeaderCapturePolicy};
+use otap_df_config::transport_headers_policy::{CompiledHeaderCapturePolicy, HeaderCapturePolicy};
 use otap_df_telemetry::error::Error as TelemetryError;
 use otap_df_telemetry::metrics::{MetricSet, MetricSetHandler};
 use otap_df_telemetry::reporter::MetricsReporter;
@@ -135,8 +135,8 @@ pub struct EffectHandler<PData> {
     pub(crate) core: EffectHandlerCore<PData>,
     /// Output-port router.
     pub router: OutputRouter<Sender<PData>>,
-    /// Compiled context capture schema.
-    capture_schema: Option<CompiledHeaderCaptureSchema>,
+    /// Compiled context capture policy.
+    capture_policy: Option<CompiledHeaderCapturePolicy>,
 }
 
 /// Implementation for the `!Send` effect handler.
@@ -156,7 +156,7 @@ impl<PData> EffectHandler<PData> {
         EffectHandler {
             core,
             router,
-            capture_schema: None,
+            capture_policy: None,
         }
     }
 
@@ -190,15 +190,15 @@ impl<PData> EffectHandler<PData> {
         self.core.node_interests()
     }
 
-    /// Returns the capture schema compiled during receiver construction.
+    /// Returns the capture policy compiled during receiver construction.
     #[must_use]
-    pub fn capture_schema(&self) -> Option<&CompiledHeaderCaptureSchema> {
-        self.capture_schema.as_ref()
+    pub fn capture_policy(&self) -> Option<&CompiledHeaderCapturePolicy> {
+        self.capture_policy.as_ref()
     }
 
     /// Sets the capture policy for transport header extraction.
     pub fn set_capture_policy(&mut self, policy: Option<HeaderCapturePolicy>) {
-        self.capture_schema = policy.as_ref().map(HeaderCapturePolicy::compile);
+        self.capture_policy = policy.as_ref().map(HeaderCapturePolicy::compile);
     }
 
     /// Sends a message to the next node(s) in the pipeline using the default port.
