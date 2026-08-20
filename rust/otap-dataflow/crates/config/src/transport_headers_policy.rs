@@ -415,7 +415,7 @@ impl HeaderPropagationPolicy {
         headers: &'a TransportHeaders,
     ) -> impl Iterator<Item = PropagatedHeader<'a>> {
         headers.iter().filter_map(move |header| {
-            let (action, name_strategy) = self.resolve_action(header);
+            let (action, name_strategy) = self.resolve_stored_name(&header.name);
             if action == PropagationAction::Drop {
                 return None;
             }
@@ -431,16 +431,19 @@ impl HeaderPropagationPolicy {
         })
     }
 
-    /// Determine the action and name strategy for a single header by
-    /// checking overrides first, then falling back to the default.
-    fn resolve_action(&self, header: &TransportHeader) -> (PropagationAction, NameStrategy) {
+    /// Resolves propagation behavior from a stored context name.
+    ///
+    /// Runtime carriers use this policy-only method without constructing a
+    /// legacy [`TransportHeader`].
+    #[must_use]
+    pub fn resolve_stored_name(&self, stored_name: &str) -> (PropagationAction, NameStrategy) {
         // Check overrides first.
         for ov in &self.overrides {
             if ov
                 .match_rule
                 .stored_names
                 .iter()
-                .any(|s| header.name.eq_ignore_ascii_case(s))
+                .any(|s| stored_name.eq_ignore_ascii_case(s))
             {
                 let name_strategy = ov.name.unwrap_or(self.default.name);
                 return (ov.action, name_strategy);
@@ -448,7 +451,7 @@ impl HeaderPropagationPolicy {
         }
 
         // Check whether the header passes the default selector.
-        let selected = self.default.selector.selects(&header.name);
+        let selected = self.default.selector.selects(stored_name);
 
         if selected {
             (self.default.action, self.default.name)

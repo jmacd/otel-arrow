@@ -12,7 +12,8 @@
 
 use bytes::Bytes;
 use otap_df_config::transport_headers_policy::{
-    CaptureStats, CompiledHeaderCaptureSchema, ValueKindConfig,
+    CaptureStats, CompiledHeaderCaptureSchema, HeaderPropagationPolicy, NameStrategy,
+    PropagationAction, ValueKindConfig,
 };
 
 const MAGIC: u32 = 0x4354_5832; // CTX2
@@ -157,6 +158,47 @@ impl<'a> Iterator for ContextItems<'a> {
         };
         self.next += 1;
         Some(item)
+    }
+}
+
+/// One packed header selected for propagation.
+pub struct PropagatedContextItem<'a> {
+    /// Egress wire name selected by the policy.
+    pub header_name: &'a str,
+    /// Text or binary transport semantics.
+    pub value_kind: HeaderValueKind,
+    /// Raw header bytes.
+    pub value: &'a [u8],
+}
+
+/// Zero-allocation propagation iterator over packed context items.
+pub struct ContextPropagation<'a> {
+    items: ContextItems<'a>,
+    policy: &'a HeaderPropagationPolicy,
+}
+
+impl<'a> Iterator for ContextPropagation<'a> {
+    type Item = PropagatedContextItem<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for item in self.items.by_ref() {
+            let stored_name = item.stored_name()?;
+            let (action, name_strategy) = self.policy.resolve_stored_name(stored_name);
+            if action == PropagationAction::Drop {
+                continue;
+            }
+            let header_name = match name_strategy {
+                NameStrategy::Preserve => item.wire_name()?,
+                NameStrategy::StoredName => stored_name,
+            };
+            let (value_kind, value) = item.value()?;
+            return Some(PropagatedContextItem {
+                header_name,
+                value_kind,
+                value,
+            });
+        }
+        None
     }
 }
 
@@ -409,6 +451,14 @@ impl PdataContextBytes {
             count: layout.map_or(0, |layout| layout.item_count),
             item_at: layout.map_or(0, |layout| layout.item_at),
             blob_at: layout.map_or(0, |layout| layout.blob_at),
+        }
+    }
+
+    /// Applies a transport-header propagation policy to the packed bag.
+    pub fn propagate<'a>(&'a self, policy: &'a HeaderPropagationPolicy) -> ContextPropagation<'a> {
+        ContextPropagation {
+            items: self.items(),
+            policy,
         }
     }
 
@@ -757,6 +807,10 @@ fn write_u64(bytes: &mut [u8], at: usize, value: u64) -> Result<(), ContextBytes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otap_df_config::transport_headers_policy::{
+        PropagationDefault, PropagationMatch, PropagationOverride, PropagationSelector,
+        PropagationSelectorType,
+    };
 
     /// Scenario: an entry has duplicate typed values interleaved with a
     /// bag-only header.
@@ -874,5 +928,59 @@ mod tests {
             output.value(2),
             Some((HeaderValueKind::Text, b"west".as_slice()))
         );
+    }
+
+    /// Scenario: named propagation selects a stored entry, renames it to the
+    /// stored name, and an override drops another bag item.
+    /// Guarantees: packed propagation matches legacy selector, override, and
+    /// name-strategy semantics without materializing header objects.
+    #[test]
+    fn packed_propagation_applies_named_selector_and_override() {
+        let context = PdataContextBytes::build(
+            1,
+            [
+                HeaderInput {
+                    wire_name: "X-Tenant",
+                    stored_name: "tenant",
+                    value: b"acme",
+                    kind: HeaderValueKind::Text,
+                    rule_id: 0,
+                    entry: Some(0),
+                },
+                HeaderInput {
+                    wire_name: "Authorization",
+                    stored_name: "authorization",
+                    value: b"secret",
+                    kind: HeaderValueKind::Text,
+                    rule_id: 1,
+                    entry: None,
+                },
+            ],
+        )
+        .expect("context");
+        let policy = HeaderPropagationPolicy::new(
+            PropagationDefault {
+                selector: PropagationSelector {
+                    selector_type: PropagationSelectorType::Named,
+                    named: Some(vec!["tenant".to_string(), "authorization".to_string()]),
+                },
+                name: NameStrategy::StoredName,
+                ..PropagationDefault::default()
+            },
+            vec![PropagationOverride {
+                match_rule: PropagationMatch {
+                    stored_names: vec!["authorization".to_string()],
+                },
+                action: PropagationAction::Drop,
+                name: None,
+                on_error: None,
+            }],
+        );
+
+        let propagated: Vec<_> = context.propagate(&policy).collect();
+        assert_eq!(propagated.len(), 1);
+        assert_eq!(propagated[0].header_name, "tenant");
+        assert_eq!(propagated[0].value, b"acme");
+        assert_eq!(propagated[0].value_kind, HeaderValueKind::Text);
     }
 }

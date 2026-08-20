@@ -1083,12 +1083,15 @@ fn build_grpc_metadata(
     static_metadata: Option<&MetadataMap>,
     auth_header: Option<HeaderValue>,
 ) -> Option<MetadataMap> {
-    let propagation = effect_handler
-        .propagation_policy()
-        .zip(context.transport_headers());
+    let propagation_policy = effect_handler.propagation_policy();
+    let has_propagation_source =
+        context.pdata_context_bytes().is_some() || context.transport_headers().is_some();
 
     // Zero-alloc fast path: nothing static configured, nothing to propagate, no token.
-    if static_metadata.is_none() && propagation.is_none() && auth_header.is_none() {
+    if static_metadata.is_none()
+        && !(propagation_policy.is_some() && has_propagation_source)
+        && auth_header.is_none()
+    {
         return None;
     }
 
@@ -1097,63 +1100,26 @@ fn build_grpc_metadata(
         None => MetadataMap::new(),
     };
 
-    if let Some((policy, transport_headers)) = propagation {
-        for header in policy.propagate(transport_headers) {
-            match header.value_kind {
-                ValueKind::Text => {
-                    // ASCII metadata: parse the header name and value.
-                    let Ok(key) = header
-                        .header_name
-                        .parse::<MetadataKey<tonic::metadata::Ascii>>()
-                    else {
-                        otel_debug!(
-                            "otlp.exporter.grpc.header_skip",
-                            reason = "invalid ascii metadata key",
-                            header_name = header.header_name
-                        );
-                        continue;
-                    };
-                    let Ok(value) = MetadataValue::try_from(header.value) else {
-                        otel_debug!(
-                            "otlp.exporter.grpc.header_skip",
-                            reason = "invalid ascii metadata value",
-                            header_name = header.header_name
-                        );
-                        continue;
-                    };
-                    // Static config wins: a statically configured header (e.g. an
-                    // `authorization` backend credential) must not be duplicated or
-                    // overridden by a propagated header with the same key. Static
-                    // metadata is ASCII-only, so only text headers can collide.
-                    if static_metadata.is_some_and(|s| s.contains_key(key.as_str())) {
-                        otel_debug!(
-                            "otlp.exporter.grpc.header_skip",
-                            reason = "static header takes precedence over propagated header",
-                            header_name = header.header_name
-                        );
-                        continue;
-                    }
-                    let _ = metadata.append(key, value);
-                }
-                ValueKind::Binary => {
-                    // Binary metadata: gRPC binary metadata keys must end with `-bin`.
-                    // Metadata map will error if attempting to insert key without `-bin`.
-                    let key_name = if header.header_name.ends_with("-bin") {
-                        header.header_name.to_string()
-                    } else {
-                        format!("{}-bin", header.header_name)
-                    };
-                    let Ok(key) = key_name.parse::<MetadataKey<tonic::metadata::Binary>>() else {
-                        otel_debug!(
-                            "otlp.exporter.grpc.header_skip",
-                            reason = "invalid binary metadata key",
-                            header_name = header.header_name
-                        );
-                        continue;
-                    };
-                    let value = MetadataValue::from_bytes(header.value);
-                    let _ = metadata.append_bin(key, value);
-                }
+    if let Some(policy) = propagation_policy {
+        if let Some(context_bytes) = context.pdata_context_bytes() {
+            for header in context_bytes.propagate(policy) {
+                append_propagated_metadata(
+                    &mut metadata,
+                    static_metadata,
+                    header.header_name,
+                    header.value_kind == otap_df_otap::context_bytes::HeaderValueKind::Binary,
+                    header.value,
+                );
+            }
+        } else if let Some(transport_headers) = context.transport_headers() {
+            for header in policy.propagate(transport_headers) {
+                append_propagated_metadata(
+                    &mut metadata,
+                    static_metadata,
+                    header.header_name,
+                    *header.value_kind == ValueKind::Binary,
+                    header.value,
+                );
             }
         }
     }
@@ -1166,6 +1132,58 @@ fn build_grpc_metadata(
         let mut headers = metadata.into_headers();
         let _ = headers.insert(http::header::AUTHORIZATION, auth_header);
         metadata = MetadataMap::from_headers(headers);
+    }
+
+    fn append_propagated_metadata(
+        metadata: &mut MetadataMap,
+        static_metadata: Option<&MetadataMap>,
+        header_name: &str,
+        binary: bool,
+        value: &[u8],
+    ) {
+        if binary {
+            let key_name = if header_name.ends_with("-bin") {
+                header_name.to_string()
+            } else {
+                format!("{header_name}-bin")
+            };
+            let Ok(key) = key_name.parse::<MetadataKey<tonic::metadata::Binary>>() else {
+                otel_debug!(
+                    "otlp.exporter.grpc.header_skip",
+                    reason = "invalid binary metadata key",
+                    header_name
+                );
+                return;
+            };
+            let _ = metadata.append_bin(key, MetadataValue::from_bytes(value));
+            return;
+        }
+
+        let Ok(key) = header_name.parse::<MetadataKey<tonic::metadata::Ascii>>() else {
+            otel_debug!(
+                "otlp.exporter.grpc.header_skip",
+                reason = "invalid ascii metadata key",
+                header_name
+            );
+            return;
+        };
+        let Ok(value) = MetadataValue::try_from(value) else {
+            otel_debug!(
+                "otlp.exporter.grpc.header_skip",
+                reason = "invalid ascii metadata value",
+                header_name
+            );
+            return;
+        };
+        if static_metadata.is_some_and(|metadata| metadata.contains_key(key.as_str())) {
+            otel_debug!(
+                "otlp.exporter.grpc.header_skip",
+                reason = "static header takes precedence over propagated header",
+                header_name
+            );
+            return;
+        }
+        let _ = metadata.append(key, value);
     }
 
     if metadata.is_empty() {
@@ -1410,6 +1428,7 @@ mod tests {
 
     use otap_df_config::node::NodeUserConfig;
     use otap_df_otap::bearer_auth::test_support::MockTokenProvider;
+    use otap_df_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
     use std::collections::HashMap;
 
     use otap_df_config::transport_headers::{TransportHeader, TransportHeaders};
@@ -3094,6 +3113,47 @@ mod tests {
             .get("x-request-id")
             .expect("x-request-id should be present");
         assert_eq!(request_id.to_str().unwrap(), "req-xyz-789");
+    }
+
+    /// Scenario: a context carries both staged packed headers and conflicting
+    /// legacy headers during migration.
+    /// Guarantees: OTLP gRPC propagation selects the packed context and emits
+    /// its wire name, value kind, and bytes.
+    #[test]
+    fn build_grpc_metadata_prefers_packed_context() {
+        let handler = make_effect_handler_with_policy(Some(propagate_all_policy()));
+        let mut legacy = TransportHeaders::new();
+        legacy.push(TransportHeader::text(
+            "x-tenant-id",
+            "X-Tenant-Id",
+            b"legacy",
+        ));
+        let mut context = context_with_headers(legacy);
+        context.set_pdata_context_bytes(
+            PdataContextBytes::build(
+                0,
+                [HeaderInput {
+                    wire_name: "X-Tenant-Id",
+                    stored_name: "x-tenant-id",
+                    value: b"packed",
+                    kind: HeaderValueKind::Text,
+                    rule_id: 0,
+                    entry: None,
+                }],
+            )
+            .expect("packed context"),
+        );
+
+        let metadata = build_grpc_metadata(&handler, &context, None, None).expect("metadata");
+
+        assert_eq!(
+            metadata
+                .get("x-tenant-id")
+                .expect("tenant metadata")
+                .to_str()
+                .expect("ASCII value"),
+            "packed"
+        );
     }
 
     #[test]
