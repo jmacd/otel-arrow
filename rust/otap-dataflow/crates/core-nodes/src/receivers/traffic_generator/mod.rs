@@ -16,7 +16,6 @@ use linkme::distributed_slice;
 use metrics::TrafficGeneratorReceiverMetrics;
 use otap_df_channel::error::{RecvError, SendError};
 use otap_df_config::node::NodeUserConfig;
-use otap_df_config::transport_headers::{TransportHeader, TransportHeaders};
 use otap_df_engine::MessageSourceLocalEffectHandlerExtension;
 use otap_df_engine::config::ReceiverConfig;
 use otap_df_engine::context::PipelineContext;
@@ -437,7 +436,7 @@ fn build_transport_context(
     if config_headers.is_empty() {
         return Ok(None);
     }
-    let mut headers = TransportHeaders::with_capacity(config_headers.len());
+    let mut headers = Vec::with_capacity(config_headers.len());
     for (key, value) in config_headers {
         // Infer the value kind from the key name, matching the convention
         // used by the header capture policy: keys ending in `-bin` are
@@ -451,11 +450,7 @@ fn build_transport_context(
                     buf.to_vec()
                 }
             };
-            headers.push(TransportHeader::binary(
-                key.clone(),
-                key.clone(),
-                resolved_value,
-            ));
+            headers.push((key, resolved_value, HeaderValueKind::Binary));
         } else {
             let resolved_value = match value {
                 Some(v) => v.as_bytes().to_vec(),
@@ -467,23 +462,16 @@ fn build_transport_context(
                         .collect()
                 }
             };
-            headers.push(TransportHeader::text(
-                key.clone(),
-                key.clone(),
-                resolved_value,
-            ));
+            headers.push((key, resolved_value, HeaderValueKind::Text));
         }
     }
     let packed = PdataContextBytes::build(
         0,
-        headers.iter().map(|header| HeaderInput {
-            wire_name: &header.wire_name,
-            stored_name: &header.name,
-            value: &header.value,
-            kind: match header.value_kind {
-                otap_df_config::transport_headers::ValueKind::Text => HeaderValueKind::Text,
-                otap_df_config::transport_headers::ValueKind::Binary => HeaderValueKind::Binary,
-            },
+        headers.iter().map(|(name, value, kind)| HeaderInput {
+            wire_name: name,
+            stored_name: name,
+            value,
+            kind: *kind,
             rule_id: u16::MAX,
             entry: None,
         }),
@@ -1422,7 +1410,7 @@ mod tests {
                 let pdata = ctx.recv().await.expect("should receive at least one pdata");
 
                 let headers = pdata
-                    .transport_headers()
+                    .pdata_context_bytes()
                     .expect("pdata should have transport headers");
                 let tenant: Vec<_> = headers.find_by_name("x-tenant-id").collect();
                 assert_eq!(
@@ -1507,7 +1495,7 @@ mod tests {
                 let pdata = ctx.recv().await.expect("should receive at least one pdata");
 
                 let headers = pdata
-                    .transport_headers()
+                    .pdata_context_bytes()
                     .expect("pdata should have transport headers");
                 let request_id: Vec<_> = headers.find_by_name("x-request-id").collect();
                 assert_eq!(
@@ -1593,7 +1581,7 @@ mod tests {
                 let pdata = ctx.recv().await.expect("should receive at least one pdata");
 
                 let headers = pdata
-                    .transport_headers()
+                    .pdata_context_bytes()
                     .expect("pdata should have transport headers");
                 let trace_bin: Vec<_> = headers.find_by_name("x-trace-bin").collect();
                 assert_eq!(
@@ -1673,7 +1661,7 @@ mod tests {
                 let pdata = ctx.recv().await.expect("should receive at least one pdata");
 
                 assert!(
-                    pdata.transport_headers().is_none(),
+                    pdata.pdata_context_bytes().is_none(),
                     "pdata should NOT have transport headers when config has no transport_headers"
                 );
             }) as Pin<Box<dyn Future<Output = ()>>>

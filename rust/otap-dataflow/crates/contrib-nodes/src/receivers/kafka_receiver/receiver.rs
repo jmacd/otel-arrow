@@ -348,8 +348,8 @@ impl KafkaReceiver {
     /// allows the caller to track the offset even when decoding fails (poison
     /// pill handling).
     ///
-    /// When a [`HeaderCapturePolicy`] is provided, matching Kafka message
-    /// headers are captured into [`TransportHeaders`] and attached to the
+    /// When a [`CompiledHeaderCapturePolicy`] is provided, matching Kafka message
+    /// headers are captured into [`PdataContextBytes`] and attached to the
     /// returned [`OtapPdata`] context. This is independent of the
     /// `resource_attrs_from_headers` config which injects headers into resource attributes.
     fn process_kafka(
@@ -734,7 +734,7 @@ impl KafkaReceiver {
         let idempotent = manual_commit && self.config.is_idempotent();
 
         // Retrieve the capture policy (if configured) for extracting Kafka
-        // headers into the OtapPdata context as TransportHeaders.
+        // headers into the packed OtapPdata context.
         let capture_policy = effect_handler.capture_policy();
 
         // Safety-net timer: periodically commit offsets even if no acks
@@ -1603,7 +1603,7 @@ fn decode_with_extractions(
 }
 
 /// Apply the capture policy (if configured) to extract Kafka message headers
-/// into [`TransportHeaders`] on the [`OtapPdata`] context.
+/// into [`PdataContextBytes`] on the [`OtapPdata`] context.
 ///
 /// This is independent of the `resource_attrs_from_headers` mechanism which injects
 /// headers into resource attributes.
@@ -1618,11 +1618,17 @@ fn capture_transport_headers(
         let pairs = headers
             .iter()
             .filter_map(|header| header.value.map(|value| (header.key, value)));
-        let (context, _stats) = PdataContextBytes::capture(policy, pairs).map_err(|error| {
+        let (context, stats) = PdataContextBytes::capture(policy, pairs).map_err(|error| {
             KafkaReceiverError::ContextCapture {
                 message: error.to_string(),
             }
         })?;
+        if let Some(stats) = stats {
+            otel_error!(
+                "kafka.capture_policy.limits_exceeded",
+                stats = %stats,
+            );
+        }
         if let Some(context) = context {
             pdata.set_pdata_context_bytes(context);
         }
@@ -1693,7 +1699,9 @@ mod tests {
     use crate::common::kafka::test::producer::SendRecord;
     use crate::common::kafka::test::wait::poll_until;
     use crate::common::kafka::test::with_cluster;
-    use otap_df_config::transport_headers_policy::{CaptureDefaults, CaptureRule};
+    use otap_df_config::transport_headers_policy::{
+        CaptureDefaults, CaptureRule, HeaderCapturePolicy,
+    };
     use otap_df_engine::context::ControllerContext;
     use otap_df_engine::control::RuntimeControlMsg;
     use otap_df_pdata::OtlpProtoBytes;
@@ -6799,7 +6807,7 @@ mod tests {
 
                 // Verify transport headers were captured.
                 let transport_headers = pdata
-                    .transport_headers()
+                    .pdata_context_bytes()
                     .expect("transport_headers should be set");
 
                 // Two headers should be captured (X-Tenant-Id and X-Request-Id).
@@ -6819,7 +6827,8 @@ mod tests {
                     "tenant_id value mismatch"
                 );
                 assert_eq!(
-                    tenant_headers[0].wire_name, "X-Tenant-Id",
+                    tenant_headers[0].wire_name(),
+                    Some("X-Tenant-Id"),
                     "wire_name should be preserved"
                 );
 
@@ -6885,7 +6894,7 @@ mod tests {
 
                 // Transport headers should NOT be set when no capture policy is configured.
                 assert!(
-                    pdata.transport_headers().is_none(),
+                    pdata.pdata_context_bytes().is_none(),
                     "transport_headers should be None when no capture policy is configured"
                 );
 
@@ -6960,7 +6969,7 @@ mod tests {
 
                 // 1. Verify transport headers were captured (capture policy).
                 let transport_headers = pdata
-                    .transport_headers()
+                    .pdata_context_bytes()
                     .expect("transport_headers should be set");
                 let tenant_headers: Vec<_> = transport_headers.find_by_name("tenant_id").collect();
                 assert_eq!(tenant_headers.len(), 1);
@@ -7053,7 +7062,7 @@ mod tests {
 
                 // Verify transport headers were captured for OTAP format.
                 let transport_headers = pdata
-                    .transport_headers()
+                    .pdata_context_bytes()
                     .expect("transport_headers should be set for OTAP messages");
                 let tenant_headers: Vec<_> = transport_headers.find_by_name("tenant_id").collect();
                 assert_eq!(tenant_headers.len(), 1);

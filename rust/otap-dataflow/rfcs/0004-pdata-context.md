@@ -441,9 +441,11 @@ pub trait PdataContextArrivalSource {
 }
 
 /// Argument to the context arrival function.
+pub type HeaderPair<'a> = (&'a str, &'a [u8]);
+
 pub struct PdataArrival<'a> {
     pub peer_addr: Option<SocketAddr>,
-    pub headers: &'a TransportHeaders,
+    pub headers: &'a [HeaderPair<'a>],
     pub identity: Option<&'a AuthorizedIdentity>,
 }
 ```
@@ -465,7 +467,10 @@ fn create_otlp_receiver(
 }
 
 impl OtlpReceiver {
-    fn accept(&mut self, request: Request<ExportRequest>) -> Result<OtapPdata, Error> {
+    fn accept(
+        &mut self,
+        request: Request<ExportRequest>,
+    ) -> Result<OtapPdata, Error> {
         let identity = request.auth_extension.authorize(request)?;
         let context = self.context_binding.from_arrival(PdataArrival {
             peer_addr: request.remote_addr(),
@@ -534,12 +539,19 @@ pub trait PdataContextSink {
 /// Adapter implemented by an HTTP or gRPC request builder.
 pub trait ContextOutput {
     /// Sets an individual context entry with its typed value reference.
-    fn set(&mut self, name: &str, value: ContextValueRef<'_>) -> Result<(), ContextError>;
+    fn set(
+        &mut self,
+        name: &str,
+        value: ContextValueRef<'_>,
+    ) -> Result<(), ContextError>;
 }
 
 impl OtlpExporter {
     /// Encodes a request and injects the context into HTTP headers.
-    fn encode(&mut self, pdata: OtapPdata) -> Result<Request<ExportRequest>, Error> {
+    fn encode(
+        &mut self,
+        pdata: OtapPdata,
+    ) -> Result<Request<ExportRequest>, Error> {
         let mut request = Request::new(encode(pdata.payload())?);
         self.context.write_to(
             pdata.context(),

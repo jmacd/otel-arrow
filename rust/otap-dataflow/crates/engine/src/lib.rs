@@ -1915,7 +1915,16 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
-        let capture_policy = resolve_capture_policy(&node_config, transport_headers_policy);
+        let capture_policy = resolve_capture_policy(&node_config, transport_headers_policy)
+            .map(|policy| policy.compile())
+            .transpose()
+            .map_err(|error| {
+                Error::ConfigError(Box::new(otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "receiver `{name}` has an invalid header capture policy: {error}"
+                    ),
+                }))
+            })?;
 
         let receiver = create(
             (*pipeline_ctx).clone(),
@@ -2779,20 +2788,10 @@ mod test {
         let policy = resolve_capture_policy(&node_config, &transport_headers_policy);
         assert!(policy.is_some(), "should resolve a policy");
 
-        // Verify the node-level policy was used by checking that a
-        // "x-node-header" is captured while "x-pipeline-header" is not.
-        let policy = policy.unwrap();
-        let mut captured = otap_df_config::transport_headers::TransportHeaders::new();
-        let _ = policy.capture_from_pairs(
-            [("x-node-header", b"val" as &[u8])].into_iter(),
-            &mut captured,
-        );
-        assert_eq!(captured.len(), 1);
-        let _ = policy.capture_from_pairs(
-            [("x-pipeline-header", b"val" as &[u8])].into_iter(),
-            &mut captured,
-        );
-        assert_eq!(captured.len(), 0);
+        // Verify the node-level policy was used.
+        let policy = policy.unwrap().compile().expect("valid capture policy");
+        assert!(policy.match_header("x-node-header").is_some());
+        assert!(policy.match_header("x-pipeline-header").is_none());
     }
 
     #[test]
@@ -2810,13 +2809,8 @@ mod test {
         let policy = resolve_capture_policy(&node_config, &transport_headers_policy);
         assert!(policy.is_some(), "should fall back to pipeline policy");
 
-        let policy = policy.unwrap();
-        let mut captured = otap_df_config::transport_headers::TransportHeaders::new();
-        let _ = policy.capture_from_pairs(
-            [("x-pipeline-header", b"val" as &[u8])].into_iter(),
-            &mut captured,
-        );
-        assert_eq!(captured.len(), 1);
+        let policy = policy.unwrap().compile().expect("valid capture policy");
+        assert!(policy.match_header("x-pipeline-header").is_some());
     }
 
     #[test]
@@ -2862,12 +2856,10 @@ mod test {
 
         // Verify node-level policy (Propagate) was used, not pipeline (Drop).
         let policy = policy.unwrap();
-        let mut headers = otap_df_config::transport_headers::TransportHeaders::new();
-        headers.push(otap_df_config::transport_headers::TransportHeader::text(
-            "x-test", "x-test", b"val",
-        ));
-        let propagated: Vec<_> = policy.propagate(&headers).collect();
-        assert_eq!(propagated.len(), 1, "node policy should propagate");
+        assert_eq!(
+            policy.resolve_stored_name("x-test").0,
+            PropagationAction::Propagate
+        );
     }
 
     #[test]
@@ -2886,12 +2878,10 @@ mod test {
         assert!(policy.is_some(), "should fall back to pipeline policy");
 
         let policy = policy.unwrap();
-        let mut headers = otap_df_config::transport_headers::TransportHeaders::new();
-        headers.push(otap_df_config::transport_headers::TransportHeader::text(
-            "x-test", "x-test", b"val",
-        ));
-        let propagated: Vec<_> = policy.propagate(&headers).collect();
-        assert_eq!(propagated.len(), 1, "pipeline policy should propagate");
+        assert_eq!(
+            policy.resolve_stored_name("x-test").0,
+            PropagationAction::Propagate
+        );
     }
 
     #[test]

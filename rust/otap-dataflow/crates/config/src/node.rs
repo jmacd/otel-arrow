@@ -335,6 +335,14 @@ impl NodeUserConfig {
                 ),
             });
         }
+        if kind == NodeKind::Receiver
+            && let Some(header_capture) = &self.header_capture
+            && let Err(error) = header_capture.validate()
+        {
+            errors.push(Error::InvalidUserConfig {
+                error: format!("node `{node_name}`: invalid `header_capture`: {error}"),
+            });
+        }
 
         if self.header_propagation.is_some() && kind != NodeKind::Exporter {
             errors.push(Error::InvalidUserConfig {

@@ -1242,6 +1242,7 @@ pub mod test_support {
     use bytes::Bytes;
     use otap_df_engine::context::ControllerContext;
     use otap_df_otap::pdata::Context;
+    use otap_df_otap::testing::{TestContextHeader, test_pdata_context};
     use otap_df_telemetry::registry::TelemetryRegistryHandle;
     use std::sync::{Arc, Mutex};
 
@@ -1308,8 +1309,6 @@ pub mod test_support {
         header_wire_name: &str,
         header_value: &str,
     ) -> OtapPdata {
-        use otap_df_config::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
-
         let bytes = Bytes::from_static(b"payload");
         let proto = match signal_type {
             SignalType::Traces => otap_df_pdata::OtlpProtoBytes::ExportTracesRequest(bytes.clone()),
@@ -1319,17 +1318,13 @@ pub mod test_support {
             SignalType::Logs => otap_df_pdata::OtlpProtoBytes::ExportLogsRequest(bytes),
         };
 
-        let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader {
-            name: header_wire_name.to_ascii_lowercase(),
-            wire_name: header_wire_name.to_string(),
-            value_kind: ValueKind::Text,
-            value: header_value.as_bytes().to_vec(),
-        });
         let mut context = Context::default();
-        context
-            .set_transport_headers(headers)
-            .expect("packed context");
+        let stored_name = header_wire_name.to_ascii_lowercase();
+        context.set_pdata_context_bytes(test_pdata_context([TestContextHeader::text(
+            header_wire_name,
+            &stored_name,
+            header_value.as_bytes(),
+        )]));
 
         OtapPdata::new(context, proto.into())
     }
@@ -1482,7 +1477,6 @@ pub mod test_support {
         use crate::exporters::kafka_exporter::config::{CompressionType, RequiredAcks};
         use crate::exporters::kafka_exporter::partitioner::partition_key_from_context_bytes;
         use bytes::Bytes;
-        use otap_df_config::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
         use otap_df_config::transport_headers_policy::{
             HeaderPropagationPolicy, PropagationDefault, PropagationSelector,
             PropagationSelectorType,
@@ -2067,16 +2061,12 @@ pub mod test_support {
             let proto = OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes));
             let mut context = Context::default();
             if let Some((wire_name, value)) = header {
-                let mut headers = TransportHeaders::new();
-                headers.push(TransportHeader {
-                    name: wire_name.to_ascii_lowercase(),
-                    wire_name: wire_name.to_string(),
-                    value_kind: ValueKind::Text,
-                    value: value.as_bytes().to_vec(),
-                });
-                context
-                    .set_transport_headers(headers)
-                    .expect("packed context");
+                let stored_name = wire_name.to_ascii_lowercase();
+                context.set_pdata_context_bytes(test_pdata_context([TestContextHeader::text(
+                    wire_name,
+                    &stored_name,
+                    value.as_bytes(),
+                )]));
             }
             OtapPdata::new(context, proto.into())
         }
@@ -4510,7 +4500,7 @@ pub mod test_support {
                             logs_pdata(logs_request_bytes(), Some(("X-Tenant-Id", "tenant-42")));
                         let (context, _payload) = pdata.into_parts();
                         partition_key_from_context_bytes(
-                            context.transport_headers().expect("headers"),
+                            context.pdata_context_bytes().expect("headers"),
                         )
                         .expect("headers produce a key")
                     };
@@ -5520,9 +5510,9 @@ pub mod test_support {
         /// Scenario (Kafka integration: encodings and routing): derive the record partition key from transport headers with
         /// a Murmur2Random partitioner.
         /// Guarantees: the produced record's key matches the key computed by
-        /// `partition_key_from_transport_headers` for the same headers.
+        /// `partition_key_from_context_bytes` for the same headers.
         #[tokio::test]
-        async fn sets_partition_key_from_transport_headers() {
+        async fn sets_partition_key_from_pdata_context() {
             let topic = "it-partition-key";
             with_cluster(
                 KafkaTestCluster::builder().topic(topic),
@@ -5544,7 +5534,7 @@ pub mod test_support {
                     let expected_key = {
                         let (context, _payload) = pdata.clone().into_parts();
                         let headers = context
-                            .transport_headers()
+                            .pdata_context_bytes()
                             .expect("pdata should carry transport headers");
                         partition_key_from_context_bytes(headers)
                             .expect("headers should produce a partition key")
@@ -5574,23 +5564,11 @@ pub mod test_support {
         fn build_kafka_headers_propagates_transport_headers_under_policy() {
             // Context with two transport headers, one of which collides with the
             // format-header key and must be skipped.
-            let mut transport = TransportHeaders::new();
-            transport.push(TransportHeader {
-                name: "x-tenant-id".to_string(),
-                wire_name: "X-Tenant-Id".to_string(),
-                value_kind: ValueKind::Text,
-                value: b"acme".to_vec(),
-            });
-            transport.push(TransportHeader {
-                name: MSG_FORMAT_HEADER.to_string(),
-                wire_name: MSG_FORMAT_HEADER.to_string(),
-                value_kind: ValueKind::Text,
-                value: b"attacker-override".to_vec(),
-            });
             let mut context = Context::default();
-            context
-                .set_transport_headers(transport)
-                .expect("packed context");
+            context.set_pdata_context_bytes(test_pdata_context([
+                TestContextHeader::text("X-Tenant-Id", "x-tenant-id", b"acme"),
+                TestContextHeader::text(MSG_FORMAT_HEADER, MSG_FORMAT_HEADER, b"attacker-override"),
+            ]));
 
             // Propagate all captured headers, preserving wire names.
             let policy = HeaderPropagationPolicy::new(
@@ -5655,17 +5633,12 @@ pub mod test_support {
         /// no-propagation behavior.
         #[test]
         fn build_kafka_headers_writes_only_format_header_without_policy() {
-            let mut transport = TransportHeaders::new();
-            transport.push(TransportHeader {
-                name: "x-tenant-id".to_string(),
-                wire_name: "X-Tenant-Id".to_string(),
-                value_kind: ValueKind::Text,
-                value: b"acme".to_vec(),
-            });
             let mut context = Context::default();
-            context
-                .set_transport_headers(transport)
-                .expect("packed context");
+            context.set_pdata_context_bytes(test_pdata_context([TestContextHeader::text(
+                "X-Tenant-Id",
+                "x-tenant-id",
+                b"acme",
+            )]));
 
             let (_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
             let eh: EffectHandler<OtapPdata> =

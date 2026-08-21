@@ -228,6 +228,11 @@ impl Policies {
             errors.extend(telemetry.validation_errors(&format!("{path_prefix}.telemetry")));
         }
         if let Some(transport_headers) = &self.transport_headers {
+            if let Err(e) = transport_headers.header_capture.validate() {
+                errors.push(format!(
+                    "{path_prefix}.transport_headers.header_capture: {e}"
+                ));
+            }
             if let Err(e) = transport_headers.header_propagation.validate() {
                 errors.push(format!(
                     "{path_prefix}.transport_headers.header_propagation.default.selector: {e}"

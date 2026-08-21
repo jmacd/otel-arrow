@@ -473,7 +473,7 @@ impl UnaryService<OtapPdata> for OtapBatchService {
                 })
                 .collect();
 
-            let (context, _stats) = match PdataContextBytes::capture(
+            let (context, stats) = match PdataContextBytes::capture(
                 policy,
                 pairs.iter().map(|(key, value)| (*key, value.as_slice())),
             ) {
@@ -483,6 +483,12 @@ impl UnaryService<OtapPdata> for OtapBatchService {
                     return Box::pin(async move { Err(status) });
                 }
             };
+            if let Some(stats) = stats {
+                otap_df_telemetry::otel_error!(
+                    "otlp_grpc.capture_policy.limits_exceeded",
+                    stats = %stats,
+                );
+            }
             if let Some(context) = context {
                 otap_batch.set_pdata_context_bytes(context);
             }

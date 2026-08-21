@@ -29,8 +29,7 @@ use otap_df_engine::{
 };
 use otap_df_pdata::OtapPayload;
 
-use crate::context_bytes::{ContextBytesError, PdataContextBytes};
-use crate::transport_headers::TransportHeaders;
+use crate::context_bytes::PdataContextBytes;
 
 /// Context for OTAP requests.
 ///
@@ -360,25 +359,10 @@ impl Context {
         });
     }
 
-    /// Returns a reference to the captured transport headers, if any.
+    /// Takes and returns the packed pdata context, if any.
     #[must_use]
-    pub fn transport_headers(&self) -> Option<&PdataContextBytes> {
-        self.pdata_context_bytes.as_ref()
-    }
-
-    /// Takes and returns the captured transport headers, if any.
-    #[must_use]
-    pub fn take_transport_headers(&mut self) -> Option<PdataContextBytes> {
+    pub fn take_pdata_context_bytes(&mut self) -> Option<PdataContextBytes> {
         self.pdata_context_bytes.take()
-    }
-
-    /// Set the transport headers for this context.
-    pub fn set_transport_headers(
-        &mut self,
-        headers: TransportHeaders,
-    ) -> Result<(), ContextBytesError> {
-        self.pdata_context_bytes = PdataContextBytes::from_transport_headers(&headers)?;
-        Ok(())
     }
 
     /// Returns the packed pdata context, if captured.
@@ -805,38 +789,22 @@ impl OtapPdata {
         self.context.has_ack_or_nack_subscribers()
     }
 
-    /// Returns a reference to the captured transport headers, if any.
-    #[must_use]
-    pub fn transport_headers(&self) -> Option<&PdataContextBytes> {
-        self.context.transport_headers()
-    }
-
-    /// Returns the staged packed pdata context, if present.
+    /// Returns the packed pdata context, if present.
     #[must_use]
     pub fn pdata_context_bytes(&self) -> Option<&PdataContextBytes> {
         self.context.pdata_context_bytes()
     }
 
-    /// Set transport headers on this pdata's context.
-    pub fn set_transport_headers(
-        &mut self,
-        headers: TransportHeaders,
-    ) -> Result<(), ContextBytesError> {
-        self.context.set_transport_headers(headers)
-    }
-
-    /// Attaches the staged bytes-backed context to this pdata.
+    /// Attaches a packed context to this pdata.
     pub fn set_pdata_context_bytes(&mut self, context: PdataContextBytes) {
         self.context.set_pdata_context_bytes(context);
     }
 
-    /// Builder-style method to attach transport headers.
-    pub fn with_transport_headers(
-        mut self,
-        headers: TransportHeaders,
-    ) -> Result<Self, ContextBytesError> {
-        self.context.set_transport_headers(headers)?;
-        Ok(self)
+    /// Builder-style method to attach a packed context.
+    #[must_use]
+    pub fn with_pdata_context_bytes(mut self, context: PdataContextBytes) -> Self {
+        self.context.set_pdata_context_bytes(context);
+        self
     }
 
     /// Returns the peer address observed by the receiving socket, if any.
@@ -1106,10 +1074,10 @@ impl otap_df_engine::ReceivedAtNode for OtapPdata {
 mod test {
     use super::*;
 
+    use crate::context_bytes::{HeaderInput, HeaderValueKind};
     use crate::testing::{
         TestCallData, create_empty_test_pdata, create_test_pdata, next_ack, next_nack,
     };
-    use crate::transport_headers::TransportHeader;
     use otap_df_channel::mpsc::Channel as LocalChannel;
     use otap_df_engine::ConsumerEffectHandlerExtension;
     use otap_df_engine::control::{
@@ -2221,15 +2189,24 @@ mod test {
     #[test]
     fn clone_detached_keeps_request_metadata_and_drops_routing_state() {
         let addr: SocketAddr = "10.0.0.1:5005".parse().unwrap();
-        let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader::text("tenant", "x-tenant", "acme"));
+        let pdata_context = PdataContextBytes::build(
+            0,
+            [HeaderInput {
+                wire_name: "x-tenant",
+                stored_name: "tenant",
+                value: b"acme",
+                kind: HeaderValueKind::Text,
+                rule_id: 0,
+                entry: None,
+            }],
+        )
+        .expect("packed context");
 
         let (test_data, pdata) = create_test();
         let mut pdata = pdata
             .test_subscribe_to(Interests::ACKS | Interests::NACKS, test_data.into(), 101)
             .with_peer_addr(addr)
-            .with_transport_headers(headers)
-            .expect("packed context");
+            .with_pdata_context_bytes(pdata_context);
         pdata.start_flow_metric();
         pdata.add_flow_compute(42);
 
@@ -2243,7 +2220,7 @@ mod test {
         let detached = context.clone_detached();
 
         let detached_tenant = detached
-            .transport_headers()
+            .pdata_context_bytes()
             .expect("detached packed context")
             .find_by_name("tenant")
             .next()

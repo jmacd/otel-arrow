@@ -3,6 +3,7 @@
 
 //! Ultra-minimal test utilities for OTAP components
 
+use crate::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
 use crate::pdata::OtapPdata;
 use bytes::Bytes;
 use otap_df_engine::control::{AckMsg, NackMsg, UnwindData, nanos_since_birth};
@@ -16,6 +17,61 @@ use prost::Message;
 use serde_json::Value;
 use std::ops::Add;
 use std::time::Instant;
+
+/// Header fixture used to build packed pdata contexts in tests.
+#[derive(Clone, Copy)]
+pub struct TestContextHeader<'a> {
+    wire_name: &'a str,
+    stored_name: &'a str,
+    value: &'a [u8],
+    kind: HeaderValueKind,
+}
+
+impl<'a> TestContextHeader<'a> {
+    /// Creates a text header fixture.
+    #[must_use]
+    pub const fn text(wire_name: &'a str, stored_name: &'a str, value: &'a [u8]) -> Self {
+        Self {
+            wire_name,
+            stored_name,
+            value,
+            kind: HeaderValueKind::Text,
+        }
+    }
+
+    /// Creates a binary header fixture.
+    #[must_use]
+    pub const fn binary(wire_name: &'a str, stored_name: &'a str, value: &'a [u8]) -> Self {
+        Self {
+            wire_name,
+            stored_name,
+            value,
+            kind: HeaderValueKind::Binary,
+        }
+    }
+}
+
+/// Builds a packed pdata context from test header fixtures.
+#[must_use]
+pub fn test_pdata_context<'a>(
+    headers: impl IntoIterator<Item = TestContextHeader<'a>>,
+) -> PdataContextBytes {
+    PdataContextBytes::build(
+        0,
+        headers
+            .into_iter()
+            .enumerate()
+            .map(|(rule_id, header)| HeaderInput {
+                wire_name: header.wire_name,
+                stored_name: header.stored_name,
+                value: header.value,
+                kind: header.kind,
+                rule_id: u16::try_from(rule_id).expect("test header rule id fits in u16"),
+                entry: None,
+            }),
+    )
+    .expect("valid test pdata context")
+}
 
 /// Consume frames to locate the most recent subscriber with ACKS
 /// interest in test scenarios, simulating the runtime control manager.

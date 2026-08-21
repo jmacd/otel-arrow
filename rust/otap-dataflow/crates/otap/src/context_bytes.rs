@@ -1,17 +1,9 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! One-allocation, packed pdata context prototype.
-//!
-//! The representation is a versioned descriptor envelope followed by one
-//! byte blob. Descriptors contain blob-relative ranges for wire names, stored
-//! names, and typed values. Entry descriptors contain presence, member ranges,
-//! and precomputed hashes. The format is independent of transport headers so
-//! future context sources can add source and value kinds without new retained
-//! allocations.
+//! Packed pdata context.
 
 use bytes::Bytes;
-use otap_df_config::transport_headers::TransportHeaders;
 use otap_df_config::transport_headers_policy::{
     CaptureStats, CompiledHeaderCapturePolicy, HeaderPropagationPolicy, NameStrategy,
     PropagationAction, ValueKindConfig,
@@ -45,7 +37,7 @@ pub enum HeaderValueKind {
 /// One borrowed header supplied by a receiver or projector.
 #[derive(Clone, Copy, Debug)]
 pub struct HeaderInput<'a> {
-    /// Original wire name.
+    /// Input name preserved
     pub wire_name: &'a str,
     /// Stored name used by selectors and overrides.
     pub stored_name: &'a str,
@@ -303,30 +295,6 @@ impl ContextProjectionAccumulator<'_> {
 }
 
 impl PdataContextBytes {
-    /// Converts the legacy builder collection into the packed carrier.
-    pub fn from_transport_headers(
-        headers: &TransportHeaders,
-    ) -> Result<Option<Self>, ContextBytesError> {
-        if headers.is_empty() {
-            return Ok(None);
-        }
-        Self::build(
-            0,
-            headers.iter().map(|header| HeaderInput {
-                wire_name: &header.wire_name,
-                stored_name: &header.name,
-                value: &header.value,
-                kind: match header.value_kind {
-                    otap_df_config::transport_headers::ValueKind::Text => HeaderValueKind::Text,
-                    otap_df_config::transport_headers::ValueKind::Binary => HeaderValueKind::Binary,
-                },
-                rule_id: u16::MAX,
-                entry: None,
-            }),
-        )
-        .map(Some)
-    }
-
     /// Captures headers with a compiled policy.
     pub fn capture<'a>(
         policy: &CompiledHeaderCapturePolicy,

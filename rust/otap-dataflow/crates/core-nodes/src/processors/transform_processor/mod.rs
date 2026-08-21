@@ -744,8 +744,7 @@ mod test {
 
     use otap_df_otap::{
         pdata::{Context, OtapPdata},
-        testing::{TestCallData, next_ack, next_nack},
-        transport_headers::{TransportHeader, TransportHeaders},
+        testing::{TestCallData, TestContextHeader, next_ack, next_nack, test_pdata_context},
     };
     use otap_df_telemetry::registry::TelemetryRegistryHandle;
     use std::net::SocketAddr;
@@ -2200,8 +2199,8 @@ mod test {
             .set_processor(processor)
             .run_test(|mut ctx| async move {
                 let peer_addr: SocketAddr = "10.0.0.1:5005".parse().unwrap();
-                let mut headers = TransportHeaders::new();
-                headers.push(TransportHeader::text("tenant", "x-tenant", "acme"));
+                let pdata_context =
+                    test_pdata_context([TestContextHeader::text("x-tenant", "tenant", b"acme")]);
 
                 let upstream_node_id = 999;
                 let pdata = create_pdata_with_subscriber(
@@ -2210,8 +2209,7 @@ mod test {
                     1,
                     upstream_node_id,
                 )
-                .with_transport_headers(headers.clone())
-                .expect("packed context")
+                .with_pdata_context_bytes(pdata_context)
                 .with_peer_addr(peer_addr);
 
                 ctx.process(Message::PData(pdata))
@@ -2229,7 +2227,7 @@ mod test {
                     ("info_port", &info_ctx),
                 ] {
                     let tenant = context
-                        .transport_headers()
+                        .pdata_context_bytes()
                         .and_then(|headers| headers.find_by_name("tenant").next())
                         .unwrap_or_else(|| panic!("{port} lost the inbound transport headers"));
                     assert_eq!(tenant.value().expect("tenant value").1, b"acme");

@@ -1416,10 +1416,9 @@ mod tests {
 
     use otap_df_config::node::NodeUserConfig;
     use otap_df_otap::bearer_auth::test_support::MockTokenProvider;
-    use otap_df_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
+    use otap_df_otap::testing::{TestContextHeader, test_pdata_context};
     use std::collections::HashMap;
 
-    use otap_df_config::transport_headers::{TransportHeader, TransportHeaders};
     use otap_df_config::transport_headers_policy::PropagationSelectorType;
     use otap_df_config::transport_headers_policy::{
         HeaderPropagationPolicy, PropagationAction, PropagationDefault, PropagationMatch,
@@ -3032,10 +3031,11 @@ mod tests {
     }
 
     /// Helper: Creates a [`Context`] that carries the given transport headers.
-    fn context_with_headers(headers: TransportHeaders) -> Context {
+    fn context_with_headers<'a>(
+        headers: impl IntoIterator<Item = TestContextHeader<'a>>,
+    ) -> Context {
         let pdata = OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(Bytes::new()).into())
-            .with_transport_headers(headers)
-            .expect("packed context");
+            .with_pdata_context_bytes(test_pdata_context(headers));
         let (context, _) = pdata.into_parts();
         context
     }
@@ -3064,9 +3064,11 @@ mod tests {
     #[test]
     fn test_build_grpc_metadata_returns_none_without_policy() {
         let handler = make_effect_handler_with_policy(None);
-        let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader::text("x-tenant-id", "x-tenant-id", b"acme"));
-        let context = context_with_headers(headers);
+        let context = context_with_headers([TestContextHeader::text(
+            "x-tenant-id",
+            "x-tenant-id",
+            b"acme",
+        )]);
 
         let result = build_grpc_metadata(&handler, &context, None, None);
         assert!(result.is_none(), "should return None when no policy is set");
@@ -3088,18 +3090,10 @@ mod tests {
     fn test_build_grpc_metadata_propagates_text_headers() {
         let handler = make_effect_handler_with_policy(Some(propagate_all_policy()));
 
-        let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader::text(
-            "x-tenant-id",
-            "X-Tenant-Id",
-            b"tenant-abc-123",
-        ));
-        headers.push(TransportHeader::text(
-            "x-request-id",
-            "X-Request-Id",
-            b"req-xyz-789",
-        ));
-        let context = context_with_headers(headers);
+        let context = context_with_headers([
+            TestContextHeader::text("X-Tenant-Id", "x-tenant-id", b"tenant-abc-123"),
+            TestContextHeader::text("X-Request-Id", "x-request-id", b"req-xyz-789"),
+        ]);
 
         let metadata = build_grpc_metadata(&handler, &context, None, None)
             .expect("should produce metadata for text headers");
@@ -3115,34 +3109,16 @@ mod tests {
         assert_eq!(request_id.to_str().unwrap(), "req-xyz-789");
     }
 
-    /// Scenario: a context carries both staged packed headers and conflicting
-    /// legacy headers during migration.
-    /// Guarantees: OTLP gRPC propagation selects the packed context and emits
-    /// its wire name, value kind, and bytes.
+    /// Scenario: a context carries a packed transport header.
+    /// Guarantees: OTLP gRPC propagation emits its wire name, value kind, and bytes.
     #[test]
-    fn build_grpc_metadata_prefers_packed_context() {
+    fn build_grpc_metadata_reads_packed_context() {
         let handler = make_effect_handler_with_policy(Some(propagate_all_policy()));
-        let mut legacy = TransportHeaders::new();
-        legacy.push(TransportHeader::text(
-            "x-tenant-id",
+        let context = context_with_headers([TestContextHeader::text(
             "X-Tenant-Id",
-            b"legacy",
-        ));
-        let mut context = context_with_headers(legacy);
-        context.set_pdata_context_bytes(
-            PdataContextBytes::build(
-                0,
-                [HeaderInput {
-                    wire_name: "X-Tenant-Id",
-                    stored_name: "x-tenant-id",
-                    value: b"packed",
-                    kind: HeaderValueKind::Text,
-                    rule_id: 0,
-                    entry: None,
-                }],
-            )
-            .expect("packed context"),
-        );
+            "x-tenant-id",
+            b"packed",
+        )]);
 
         let metadata = build_grpc_metadata(&handler, &context, None, None).expect("metadata");
 
@@ -3177,13 +3153,10 @@ mod tests {
         );
         let handler = make_effect_handler_with_policy(Some(policy));
 
-        let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader::text("x-tenant-id", "X-Tenant-Id", b"acme"));
-        headers.push(TransportHeader::text(
-            "authorization",
-            "Authorization",
-            b"Bearer secret-token",
-        ));
+        let headers = [
+            TestContextHeader::text("X-Tenant-Id", "x-tenant-id", b"acme"),
+            TestContextHeader::text("Authorization", "authorization", b"Bearer secret-token"),
+        ];
         let context = context_with_headers(headers);
 
         let metadata = build_grpc_metadata(&handler, &context, None, None)
@@ -3204,12 +3177,11 @@ mod tests {
         let handler = make_effect_handler_with_policy(Some(propagate_all_policy()));
 
         let binary_value: Vec<u8> = vec![0x00, 0x01, 0xFF, 0xFE, 0x80, 0x7F];
-        let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader::binary(
+        let headers = [TestContextHeader::binary(
             "trace-context-bin",
             "trace-context-bin",
-            binary_value.clone(),
-        ));
+            &binary_value,
+        )];
         let context = context_with_headers(headers);
 
         let metadata = build_grpc_metadata(&handler, &context, None, None)
@@ -3230,13 +3202,12 @@ mod tests {
         let handler = make_effect_handler_with_policy(Some(propagate_all_policy()));
 
         let binary_value: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let mut headers = TransportHeaders::new();
         // Wire name does NOT end with -bin; build_grpc_metadata should add the suffix.
-        headers.push(TransportHeader::binary(
+        let headers = [TestContextHeader::binary(
             "custom-binary",
             "custom-binary",
-            binary_value.clone(),
-        ));
+            &binary_value,
+        )];
         let context = context_with_headers(headers);
 
         let metadata = build_grpc_metadata(&handler, &context, None, None)
@@ -3252,22 +3223,11 @@ mod tests {
     fn test_build_grpc_metadata_preserves_duplicate_headers() {
         let handler = make_effect_handler_with_policy(Some(propagate_all_policy()));
 
-        let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader::text(
-            "x-forwarded-for",
-            "X-Forwarded-For",
-            b"10.0.0.1",
-        ));
-        headers.push(TransportHeader::text(
-            "x-forwarded-for",
-            "X-Forwarded-For",
-            b"192.168.1.1",
-        ));
-        headers.push(TransportHeader::text(
-            "x-forwarded-for",
-            "X-Forwarded-For",
-            b"172.16.0.1",
-        ));
+        let headers = [
+            TestContextHeader::text("X-Forwarded-For", "x-forwarded-for", b"10.0.0.1"),
+            TestContextHeader::text("X-Forwarded-For", "x-forwarded-for", b"192.168.1.1"),
+            TestContextHeader::text("X-Forwarded-For", "x-forwarded-for", b"172.16.0.1"),
+        ];
         let context = context_with_headers(headers);
 
         let metadata = build_grpc_metadata(&handler, &context, None, None)
@@ -3300,8 +3260,11 @@ mod tests {
         );
         let handler = make_effect_handler_with_policy(Some(policy));
 
-        let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader::text("x-tenant-id", "X-Tenant-Id", b"acme"));
+        let headers = [TestContextHeader::text(
+            "X-Tenant-Id",
+            "x-tenant-id",
+            b"acme",
+        )];
         let context = context_with_headers(headers);
 
         let result = build_grpc_metadata(&handler, &context, None, None);
@@ -3340,12 +3303,11 @@ mod tests {
         // Static headers and propagated transport headers must both appear.
         let handler = make_effect_handler_with_policy(Some(propagate_all_policy()));
 
-        let mut transport = TransportHeaders::new();
-        transport.push(TransportHeader::text(
-            "x-tenant-id",
+        let transport = [TestContextHeader::text(
             "X-Tenant-Id",
+            "x-tenant-id",
             b"tenant-abc",
-        ));
+        )];
         let context = context_with_headers(transport);
 
         let mut static_headers = HashMap::new();
@@ -3378,12 +3340,11 @@ mod tests {
         // so we never send two `authorization` values on the wire.
         let handler = make_effect_handler_with_policy(Some(propagate_all_policy()));
 
-        let mut transport = TransportHeaders::new();
-        transport.push(TransportHeader::text(
-            "authorization",
+        let transport = [TestContextHeader::text(
             "Authorization",
+            "authorization",
             b"Bearer propagated",
-        ));
+        )];
         let context = context_with_headers(transport);
 
         let mut static_headers = HashMap::new();
@@ -3444,12 +3405,11 @@ mod tests {
     fn build_grpc_metadata_bearer_token_replaces_other_authorization_headers() {
         let handler = make_effect_handler_with_policy(Some(propagate_all_policy()));
 
-        let mut transport = TransportHeaders::new();
-        transport.push(TransportHeader::text(
-            "authorization",
+        let transport = [TestContextHeader::text(
             "Authorization",
+            "authorization",
             b"Bearer propagated",
-        ));
+        )];
         let context = context_with_headers(transport);
 
         let mut static_headers = HashMap::new();

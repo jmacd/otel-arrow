@@ -45,7 +45,7 @@ use crate::terminal_state::TerminalState;
 use async_trait::async_trait;
 use otap_df_channel::error::RecvError;
 use otap_df_config::PortName;
-use otap_df_config::transport_headers_policy::{CompiledHeaderCapturePolicy, HeaderCapturePolicy};
+use otap_df_config::transport_headers_policy::CompiledHeaderCapturePolicy;
 use otap_df_telemetry::error::Error as TelemetryError;
 use otap_df_telemetry::metrics::{MetricSet, MetricSetHandler};
 use otap_df_telemetry::reporter::MetricsReporter;
@@ -168,8 +168,8 @@ impl<PData> EffectHandler<PData> {
     }
 
     /// Sets the capture policy for transport header extraction.
-    pub fn set_capture_policy(&mut self, policy: Option<HeaderCapturePolicy>) {
-        self.capture_policy = policy.as_ref().map(HeaderCapturePolicy::compile);
+    pub fn set_capture_policy(&mut self, policy: Option<CompiledHeaderCapturePolicy>) {
+        self.capture_policy = policy;
     }
 
     /// Sends a message to the next node(s) in the pipeline.

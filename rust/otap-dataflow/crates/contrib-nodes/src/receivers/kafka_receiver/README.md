@@ -597,7 +597,7 @@ Header values are always read as raw bytes, decoded as UTF-8, and then parsed ac
 
 ### Transport Header Capture
 
-In addition to `resource_attrs_from_headers` (which injects header values into resource attributes), the Kafka receiver supports the framework's **transport header capture policy**. When a `header_capture` policy is configured at the pipeline or node level, the receiver extracts matching Kafka message headers and stores them in the `OtapPdata` context as `TransportHeaders`. These headers flow through the pipeline and can be propagated by exporters using a corresponding `header_propagation` policy.
+In addition to `resource_attrs_from_headers` (which injects header values into resource attributes), the Kafka receiver supports the framework's **transport header capture policy**. When a `header_capture` policy is configured at the pipeline or node level, the receiver extracts matching Kafka message headers and stores them in the packed `OtapPdata` context. These headers flow through the pipeline and can be propagated by exporters using a corresponding `header_propagation` policy.
 
 The two mechanisms are independent and can be used simultaneously:
 

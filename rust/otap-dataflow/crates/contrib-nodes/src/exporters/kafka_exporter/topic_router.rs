@@ -177,29 +177,44 @@ impl TopicRouter {
 mod tests {
     use super::*;
     use crate::common::kafka::MessageFormat;
-    use otap_df_config::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
     use otap_df_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
     use otap_df_otap::pdata::Context;
 
     // ---- Test helpers ----
 
-    fn make_transport_header(wire_name: &str, value: &str) -> TransportHeader {
-        TransportHeader {
-            // Mirror capture-time normalization: lowercase, dashes preserved.
-            name: wire_name.to_ascii_lowercase(),
-            wire_name: wire_name.to_string(),
-            value_kind: ValueKind::Text,
-            value: value.as_bytes().to_vec(),
+    struct TestHeader<'a> {
+        wire_name: &'a str,
+        value: &'a [u8],
+    }
+
+    fn make_transport_header<'a>(wire_name: &'a str, value: &'a str) -> TestHeader<'a> {
+        TestHeader {
+            wire_name,
+            value: value.as_bytes(),
         }
     }
 
-    fn context_with_headers(headers: Vec<TransportHeader>) -> Context {
-        let mut th = TransportHeaders::new();
-        for h in headers {
-            th.push(h);
-        }
+    fn context_with_headers(headers: Vec<TestHeader<'_>>) -> Context {
+        let stored_names: Vec<_> = headers
+            .iter()
+            .map(|header| header.wire_name.to_ascii_lowercase())
+            .collect();
+        let packed = PdataContextBytes::build(
+            0,
+            headers.iter().zip(&stored_names).enumerate().map(
+                |(rule_id, (header, stored_name))| HeaderInput {
+                    wire_name: header.wire_name,
+                    stored_name,
+                    value: header.value,
+                    kind: HeaderValueKind::Text,
+                    rule_id: u16::try_from(rule_id).expect("test rule id fits in u16"),
+                    entry: None,
+                },
+            ),
+        )
+        .expect("packed context");
         let mut ctx = Context::default();
-        ctx.set_transport_headers(th).expect("packed context");
+        ctx.set_pdata_context_bytes(packed);
         ctx
     }
 
@@ -250,8 +265,7 @@ mod tests {
 
     /// Scenario: the dynamic Kafka topic is carried only by the packed
     /// context bag.
-    /// Guarantees: topic routing resolves stored names and UTF-8 values
-    /// without constructing legacy transport headers.
+    /// Guarantees: topic routing resolves stored names and UTF-8 values directly.
     #[test]
     fn resolve_topic_from_packed_context() {
         let config = make_signal_config("fallback-logs", Some("x-target-topic"));
@@ -621,11 +635,9 @@ mod tests {
         // A matching routing header whose value is not valid UTF-8. This must be
         // treated as a routing error (permanent nack), not as a missing header
         // that falls back to the static topic.
-        let header = TransportHeader {
-            name: "x-topic".to_string(),
-            wire_name: "X-Topic".to_string(),
-            value_kind: ValueKind::Binary,
-            value: vec![0xff, 0xfe, 0xfd],
+        let header = TestHeader {
+            wire_name: "X-Topic",
+            value: &[0xff, 0xfe, 0xfd],
         };
         let ctx = context_with_headers(vec![header]);
         let mut metrics = KafkaExporterMetrics::register(

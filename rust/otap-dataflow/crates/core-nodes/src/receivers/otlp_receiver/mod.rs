@@ -4362,7 +4362,7 @@ mod tests {
 
                 // Verify transport headers were captured.
                 let headers = pdata
-                    .transport_headers()
+                    .pdata_context_bytes()
                     .expect("pdata should have transport headers when capture policy is set");
                 let tenant_headers: Vec<_> = headers.find_by_name("x-tenant-id").collect();
                 assert_eq!(
@@ -4480,7 +4480,7 @@ mod tests {
                 // Verify transport headers contain the raw decoded bytes,
                 // not the base64 wire encoding.
                 let headers = pdata
-                    .transport_headers()
+                    .pdata_context_bytes()
                     .expect("pdata should have transport headers when capture policy is set");
                 let trace_headers: Vec<_> = headers.find_by_name("x-trace-bin").collect();
                 assert_eq!(
@@ -4589,7 +4589,7 @@ mod tests {
 
                 // Without a capture policy, transport headers should be absent.
                 assert!(
-                    pdata.transport_headers().is_none(),
+                    pdata.pdata_context_bytes().is_none(),
                     "pdata should NOT have transport headers when no capture policy is set"
                 );
 
@@ -4684,7 +4684,7 @@ mod tests {
 
                 // Verify transport headers were captured from HTTP headers.
                 let headers = pdata
-                    .transport_headers()
+                    .pdata_context_bytes()
                     .expect("pdata should have transport headers when capture policy is set");
                 let tenant_headers: Vec<_> = headers.find_by_name("x-tenant-id").collect();
                 assert_eq!(
@@ -4776,7 +4776,7 @@ mod tests {
 
                 // Without a capture policy, transport headers should be absent.
                 assert!(
-                    pdata.transport_headers().is_none(),
+                    pdata.pdata_context_bytes().is_none(),
                     "pdata should NOT have transport headers when no capture policy is set"
                 );
 

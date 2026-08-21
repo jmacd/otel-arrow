@@ -42,7 +42,7 @@ impl TransportHeaderKeyValue {
 /// Returns `false` when:
 /// - `suv` is empty (no messages to validate),
 /// - any entry is `None` (a signal arrived without transport headers), or
-/// - any `Some(TransportHeaders)` is missing a required key.
+/// - any packed context is missing a required key.
 ///
 /// Returns `true` when `keys` is empty (nothing to check).
 #[must_use]
@@ -81,7 +81,7 @@ pub fn validate_transport_header_require_keys(
 /// Returns `false` when:
 /// - `suv` is empty (no messages to validate),
 /// - any entry is `None` (a signal arrived without transport headers), or
-/// - any `Some(TransportHeaders)` is missing a required key or has a
+/// - any packed context is missing a required key or has a
 ///   mismatched value.
 ///
 /// Returns `true` when `pairs` is empty (nothing to check).
@@ -147,16 +147,24 @@ pub fn validate_transport_header_deny_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otap_df_config::transport_headers::{TransportHeader, TransportHeaders};
+    use otap_df_otap::context_bytes::{HeaderInput, HeaderValueKind};
 
     fn make_headers(entries: &[(&str, &str)]) -> PdataContextBytes {
-        let mut headers = TransportHeaders::default();
-        for (name, value) in entries {
-            headers.push(TransportHeader::text(*name, *name, value.as_bytes()));
-        }
-        PdataContextBytes::from_transport_headers(&headers)
-            .expect("packed context")
-            .expect("nonempty context")
+        PdataContextBytes::build(
+            0,
+            entries
+                .iter()
+                .enumerate()
+                .map(|(rule_id, (name, value))| HeaderInput {
+                    wire_name: name,
+                    stored_name: name,
+                    value: value.as_bytes(),
+                    kind: HeaderValueKind::Text,
+                    rule_id: u16::try_from(rule_id).expect("test rule id fits in u16"),
+                    entry: None,
+                }),
+        )
+        .expect("packed context")
     }
 
     #[test]

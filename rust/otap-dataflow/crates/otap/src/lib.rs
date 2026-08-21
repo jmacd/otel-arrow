@@ -13,7 +13,7 @@ pub mod otap_grpc;
 /// Common component accessories (e.g., context-state management).
 pub mod accessory;
 
-/// Staged replacement for the legacy transport-header carrier.
+/// Packed per-message context described by RFC 0004.
 pub mod context_bytes;
 pub mod pdata;
 
@@ -69,10 +69,6 @@ pub mod object_store;
 
 /// Cryptographic provider initialization (see [`crypto::install_crypto_provider`]).
 pub mod crypto;
-
-/// Protocol-neutral transport header abstraction for end-to-end header
-/// propagation through the pipeline.
-pub mod transport_headers;
 
 /// TLS utilities
 pub mod tls_utils;

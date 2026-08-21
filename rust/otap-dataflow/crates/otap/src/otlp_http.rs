@@ -795,8 +795,14 @@ impl HttpHandler {
                 let pairs = headers
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.as_bytes()));
-                let (context, _stats) =
+                let (context, stats) =
                     PdataContextBytes::capture(policy, pairs).map_err(|_| internal_error())?;
+                if let Some(stats) = stats {
+                    otap_df_telemetry::otel_error!(
+                        "otlp_http.capture_policy.limits_exceeded",
+                        stats = %stats,
+                    );
+                }
                 if let Some(context) = context {
                     pdata.set_pdata_context_bytes(context);
                 }

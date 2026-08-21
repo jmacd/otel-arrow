@@ -37,7 +37,6 @@ use otap_df_otap::context_bytes::{
     ContextBytesError, HeaderInput, HeaderValueKind, PdataContextBytes,
 };
 use otap_df_otap::pdata::{Context, OtapPdata};
-use otap_df_otap::transport_headers::{TransportHeader, ValueKind};
 use otap_df_pdata::{OtapArrowRecords, OtapPayload, TryIntoWithOptions};
 use otap_df_query_engine::parser::default_parser_options;
 use otap_df_query_engine::pipeline::partition::{PartitionValue, Partitioner};
@@ -417,17 +416,13 @@ impl Processor<OtapPdata> for PartitionProcessor {
 
 fn project_partition_header(
     context: &mut Context,
-    header: &TransportHeader,
+    header: &PartitionContextHeader,
 ) -> Result<(), ContextBytesError> {
-    let kind = match header.value_kind {
-        ValueKind::Text => HeaderValueKind::Text,
-        ValueKind::Binary => HeaderValueKind::Binary,
-    };
     let input = HeaderInput {
-        wire_name: &header.wire_name,
+        wire_name: &header.name,
         stored_name: &header.name,
         value: &header.value,
-        kind,
+        kind: header.kind,
         rule_id: u16::MAX,
         entry: None,
     };
@@ -439,11 +434,18 @@ fn project_partition_header(
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
+struct PartitionContextHeader {
+    name: String,
+    kind: HeaderValueKind,
+    value: Vec<u8>,
+}
+
 fn partition_value_to_transport_header(
     name: String,
     strategy: &PartitionValueSerializeStrategy,
     partition_value: PartitionValue,
-) -> TransportHeader {
+) -> PartitionContextHeader {
     match strategy {
         PartitionValueSerializeStrategy::ToBytesLossy {
             text_as_binary_header,
@@ -451,9 +453,9 @@ fn partition_value_to_transport_header(
             let value_kind = if matches!(partition_value, PartitionValue::String(_))
                 && !*text_as_binary_header
             {
-                ValueKind::Text
+                HeaderValueKind::Text
             } else {
-                ValueKind::Binary
+                HeaderValueKind::Binary
             };
 
             let header_bytes = match partition_value {
@@ -466,10 +468,9 @@ fn partition_value_to_transport_header(
                 PartitionValue::Null => Vec::new(),
             };
 
-            TransportHeader {
-                wire_name: name.clone(),
+            PartitionContextHeader {
                 name,
-                value_kind,
+                kind: value_kind,
                 value: header_bytes,
             }
         }
@@ -504,10 +505,9 @@ fn partition_value_to_transport_header(
                 }
             };
 
-            TransportHeader {
-                wire_name: name.clone(),
+            PartitionContextHeader {
                 name,
-                value_kind: ValueKind::Text,
+                kind: HeaderValueKind::Text,
                 value: header_bytes,
             }
         }
@@ -519,8 +519,6 @@ mod test {
     use std::collections::VecDeque;
 
     use super::*;
-    use otap_df_config::transport_headers::TransportHeaders;
-
     use otap_df_engine::{
         capability::registry::Capabilities,
         context::ControllerContext,
@@ -534,7 +532,7 @@ mod test {
     };
     use otap_df_otap::{
         pdata::Context,
-        testing::{TestCallData, next_ack, next_nack},
+        testing::{TestCallData, TestContextHeader, next_ack, next_nack, test_pdata_context},
     };
     use otap_df_pdata::{
         OtlpProtoBytes, TryFromWithOptions,
@@ -719,7 +717,7 @@ mod test {
                 for (partition_value, expected_log_records) in expected {
                     let emitted_batch = out.pop_front().unwrap();
                     let (context, payload) = emitted_batch.into_parts();
-                    let headers = context.transport_headers().unwrap();
+                    let headers = context.pdata_context_bytes().unwrap();
                     let header = headers.find_by_name(header_name).next().unwrap();
                     assert_eq!(header.name(), Some(header_name));
                     assert_eq!(header.wire_name(), Some(header_name));
@@ -845,7 +843,7 @@ mod test {
 
                 let emitted_batch = out.pop_front().unwrap();
                 let (context, payload) = emitted_batch.into_parts();
-                let headers = context.transport_headers().unwrap();
+                let headers = context.pdata_context_bytes().unwrap();
                 let header = headers.find_by_name(header_name).next().unwrap();
                 assert_eq!(header.name(), Some(header_name));
                 assert_eq!(header.wire_name(), Some(header_name));
@@ -1052,11 +1050,11 @@ mod test {
                 }));
 
                 let mut context = Context::default();
-                let mut headers = TransportHeaders::new();
-                headers.push(TransportHeader::text("h1", "header1", "hello world"));
-                context
-                    .set_transport_headers(headers)
-                    .expect("packed context");
+                context.set_pdata_context_bytes(test_pdata_context([TestContextHeader::text(
+                    "header1",
+                    "h1",
+                    b"hello world",
+                )]));
                 context.set_peer_addr("10.0.0.1:5005".parse().unwrap());
                 let mut pdata = OtapPdata::new(context, OtapPayload::from(otap_batch));
                 pdata.start_flow_metric();
@@ -1067,19 +1065,15 @@ mod test {
 
                 for mut out in ctx.drain_pdata().await {
                     let flow_counter = out.take_flow_compute();
-                    let (mut context, _) = out.into_parts();
-                    let headers = context.take_transport_headers().unwrap();
+                    let (context, _) = out.into_parts();
+                    let headers = context.pdata_context_bytes().unwrap();
                     assert!(headers.find_by_name("h1").next().is_some());
                     assert_eq!(context.peer_addr(), Some("10.0.0.1:5005".parse().unwrap()));
 
                     // assert the flow counter is distributed outbound batches in proportion
                     // to their size relative to the input
                     let partition_header = headers.find_by_name(header_name).next().unwrap();
-                    let context_partition = context
-                        .pdata_context_bytes()
-                        .expect("parallel bytes context")
-                        .value(1)
-                        .expect("projected partition header");
+                    let context_partition = headers.value(1).expect("projected partition header");
                     let partition_value = partition_header.value().expect("partition value").1;
                     assert_eq!(context_partition.1, partition_value);
                     if partition_value == b"0" {
@@ -1114,11 +1108,11 @@ mod test {
                     )],
                 }));
                 let mut context = Context::default();
-                let mut headers = TransportHeaders::new();
-                headers.push(TransportHeader::text("h1", "header1", "hello world"));
-                context
-                    .set_transport_headers(headers)
-                    .expect("packed context");
+                context.set_pdata_context_bytes(test_pdata_context([TestContextHeader::text(
+                    "header1",
+                    "h1",
+                    b"hello world",
+                )]));
                 let pdata = OtapPdata::new(context, OtapPayload::from(otap_batch));
                 ctx.process(Message::PData(pdata))
                     .await
@@ -1126,8 +1120,8 @@ mod test {
                 let out = ctx.drain_pdata().await.into_iter().collect::<Vec<_>>();
                 assert_eq!(out.len(), 1);
                 let out = out.into_iter().next().unwrap();
-                let (mut context, _) = out.into_parts();
-                let headers = context.take_transport_headers().unwrap();
+                let (context, _) = out.into_parts();
+                let headers = context.pdata_context_bytes().unwrap();
                 assert!(headers.find_by_name("h1").next().is_some());
             })
             .validate(|_ctx| async move {})
@@ -1248,10 +1242,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Text,
+                kind: HeaderValueKind::Text,
                 value: "test".as_bytes().to_vec()
             }
         );
@@ -1266,10 +1259,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Binary,
+                kind: HeaderValueKind::Binary,
                 value: "test".as_bytes().to_vec()
             }
         );
@@ -1283,10 +1275,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Binary,
+                kind: HeaderValueKind::Binary,
                 value: 514i64.to_le_bytes().to_vec()
             }
         );
@@ -1298,10 +1289,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Binary,
+                kind: HeaderValueKind::Binary,
                 value: 14.7f64.to_le_bytes().to_vec()
             }
         );
@@ -1313,10 +1303,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Binary,
+                kind: HeaderValueKind::Binary,
                 value: vec![1]
             }
         );
@@ -1328,10 +1317,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Binary,
+                kind: HeaderValueKind::Binary,
                 value: vec![0]
             }
         );
@@ -1343,10 +1331,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Binary,
+                kind: HeaderValueKind::Binary,
                 value: vec![4, 1, 8],
             }
         );
@@ -1358,10 +1345,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Binary,
+                kind: HeaderValueKind::Binary,
                 value: vec![]
             }
         );
@@ -1379,10 +1365,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Text,
+                kind: HeaderValueKind::Text,
                 value: "\"test\"".as_bytes().to_vec()
             }
         );
@@ -1394,10 +1379,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Text,
+                kind: HeaderValueKind::Text,
                 value: "514".as_bytes().to_vec()
             }
         );
@@ -1409,10 +1393,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Text,
+                kind: HeaderValueKind::Text,
                 value: "14.7".as_bytes().to_vec()
             }
         );
@@ -1424,10 +1407,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Text,
+                kind: HeaderValueKind::Text,
                 value: "true".as_bytes().to_vec()
             }
         );
@@ -1439,10 +1421,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Text,
+                kind: HeaderValueKind::Text,
                 value: "false".as_bytes().to_vec()
             }
         );
@@ -1454,10 +1435,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Text,
+                kind: HeaderValueKind::Text,
                 value: "[4,1,8]".as_bytes().to_vec()
             }
         );
@@ -1469,10 +1449,9 @@ mod test {
         );
         assert_eq!(
             header,
-            TransportHeader {
+            PartitionContextHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
-                value_kind: ValueKind::Text,
+                kind: HeaderValueKind::Text,
                 value: "null".as_bytes().to_vec()
             }
         );

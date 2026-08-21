@@ -11,17 +11,16 @@
 //!
 //! TODO: Implement the sensitive capability for headers
 
+use std::collections::HashMap;
 use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
-
 // -- Stats types --------------------------------------------------------------
 
-/// Statistics returned by [`HeaderCapturePolicy::capture_from_pairs`] when
-/// one or more matching headers could not be captured due to policy limits.
+/// Statistics returned when one or more matching headers cannot be captured
+/// due to policy limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureStats {
     /// Matching headers skipped because `max_entries` was already reached.
@@ -43,21 +42,6 @@ impl fmt::Display for CaptureStats {
 }
 
 impl std::error::Error for CaptureStats {}
-
-/// A single header selected for propagation
-#[derive(Debug)]
-pub struct PropagatedHeader<'a> {
-    /// The wire name to use on the outbound request.
-    ///
-    /// Points to `TransportHeader::wire_name` when the name strategy
-    /// is [`NameStrategy::Preserve`], or `TransportHeader::name` when
-    /// [`NameStrategy::StoredName`].
-    pub header_name: &'a str,
-    /// Whether the value is text or binary.
-    pub value_kind: &'a ValueKind,
-    /// Raw value bytes.
-    pub value: &'a [u8],
-}
 
 /// Transport headers policy controlling capture at receivers and
 /// propagation at exporters.
@@ -102,138 +86,81 @@ impl HeaderCapturePolicy {
         self.headers.is_empty()
     }
 
-    /// Compiles capture rules for a receiver-local context builder.
+    /// Compiles capture rules into the bounded schema used by pdata context builders.
     ///
-    /// The existing capture implementation remains authoritative while the
-    /// bytes-backed pdata context is staged. This schema supplies stable rule
-    /// and entry slots to that builder without changing capture behavior.
-    #[must_use]
-    pub fn compile(&self) -> CompiledHeaderCapturePolicy {
+    /// Returns an error when the rule or named-entry counts cannot be represented
+    /// by the packed context format.
+    pub fn compile(&self) -> Result<CompiledHeaderCapturePolicy, String> {
+        if self.defaults.max_entries > usize::from(u16::MAX) {
+            return Err(format!(
+                "header capture max_entries must not exceed {}",
+                u16::MAX
+            ));
+        }
+        if self.headers.len() > usize::from(u16::MAX) + 1 {
+            return Err(format!(
+                "header capture supports at most {} rules",
+                usize::from(u16::MAX) + 1
+            ));
+        }
+
         let mut entries = Vec::new();
+        let mut entry_ids = HashMap::new();
         let mut rules = Vec::with_capacity(self.headers.len());
         for (rule_id, rule) in self.headers.iter().enumerate() {
-            let entry = rule.store_as.as_ref().map(|name| {
-                entries
-                    .iter()
-                    .position(|entry: &String| entry.eq_ignore_ascii_case(name))
-                    .unwrap_or_else(|| {
-                        entries.push(name.clone());
-                        entries.len() - 1
-                    })
-            });
+            let entry = match rule.store_as.as_ref() {
+                Some(name) => {
+                    let normalized = name.to_ascii_lowercase();
+                    match entry_ids.get(&normalized) {
+                        Some(entry) => Some(*entry),
+                        None => {
+                            if entries.len() >= usize::from(u16::MAX) {
+                                return Err(format!(
+                                    "header capture supports at most {} named entries",
+                                    u16::MAX
+                                ));
+                            }
+                            let entry = u16::try_from(entries.len()).map_err(|_| {
+                                format!(
+                                    "header capture supports at most {} named entries",
+                                    u16::MAX
+                                )
+                            })?;
+                            entries.push(name.clone());
+                            let _ = entry_ids.insert(normalized, entry);
+                            Some(entry)
+                        }
+                    }
+                }
+                None => None,
+            };
             rules.push(CompiledCaptureRule {
-                rule_id: rule_id as u16,
+                rule_id: u16::try_from(rule_id)
+                    .map_err(|_| "header capture rule identifier overflow".to_string())?,
                 match_names: rule
                     .match_names
                     .iter()
                     .map(|name| name.to_ascii_lowercase())
                     .collect(),
-                entry: entry.map(|entry| entry as u16),
+                entry,
                 store_as: rule.store_as.clone(),
                 value_kind: rule.value_kind,
             });
         }
-        CompiledHeaderCapturePolicy {
+        Ok(CompiledHeaderCapturePolicy {
             defaults: self.defaults.clone(),
             rules,
             entries,
-        }
-    }
-
-    /// Capture headers from an iterator of `(wire_name, value)` pairs.
-    ///
-    /// Each pair is matched against the capture rules. Only headers
-    /// matching at least one rule are captured, subject to the configured
-    /// limits. The `result` collection is cleared before populating.
-    ///
-    /// Returns `None` when all matching headers were captured successfully,
-    /// or `Some(CaptureStats)` when one or more matching headers had to be
-    /// skipped due to policy limits.
-    pub fn capture_from_pairs<'a>(
-        &self,
-        pairs: impl Iterator<Item = (&'a str, &'a [u8])>,
-        result: &mut TransportHeaders,
-    ) -> Option<CaptureStats> {
-        result.clear();
-
-        if self.is_empty() {
-            return None;
-        }
-
-        let defaults = &self.defaults;
-        let mut skipped_max_entries: usize = 0;
-        let mut skipped_name_too_long: usize = 0;
-        let mut skipped_value_too_long: usize = 0;
-
-        for (wire_name, value) in pairs {
-            if let Some(matched_rule) = self.find_matching_rule(wire_name) {
-                // Enforce entry count limit.
-                if result.len() >= defaults.max_entries {
-                    skipped_max_entries += 1;
-                    continue;
-                }
-
-                // Enforce name length limit -- drop oversized names.
-                if wire_name.len() > defaults.max_name_bytes {
-                    skipped_name_too_long += 1;
-                    continue;
-                }
-
-                // Enforce value length limit -- drop oversized values.
-                if value.len() > defaults.max_value_bytes {
-                    skipped_value_too_long += 1;
-                    continue;
-                }
-
-                let name = matched_rule
-                    .store_as
-                    .clone()
-                    .unwrap_or_else(|| wire_name.to_ascii_lowercase());
-
-                let value_kind = match matched_rule.value_kind {
-                    Some(ValueKindConfig::Text) => ValueKind::Text,
-                    Some(ValueKindConfig::Binary) => ValueKind::Binary,
-                    None => {
-                        if wire_name.ends_with("-bin") {
-                            ValueKind::Binary
-                        } else {
-                            ValueKind::Text
-                        }
-                    }
-                };
-
-                result.push(TransportHeader {
-                    name,
-                    wire_name: wire_name.to_string(),
-                    value_kind,
-                    value: value.to_vec(),
-                });
-            }
-        }
-
-        if skipped_max_entries > 0 || skipped_name_too_long > 0 || skipped_value_too_long > 0 {
-            Some(CaptureStats {
-                skipped_max_entries,
-                skipped_name_too_long,
-                skipped_value_too_long,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Find the first capture rule whose `match_names` contains the given
-    /// wire name (case-insensitive comparison).
-    fn find_matching_rule(&self, wire_name: &str) -> Option<&CaptureRule> {
-        self.headers.iter().find(|rule| {
-            rule.match_names
-                .iter()
-                .any(|m| wire_name.eq_ignore_ascii_case(m))
         })
+    }
+
+    /// Validates that this policy can be represented by the packed context schema.
+    pub fn validate(&self) -> Result<(), String> {
+        self.compile().map(|_| ())
     }
 }
 
-/// Immutable capture schema used by the staged bytes-backed context builder.
+/// Immutable capture schema used by packed pdata context builders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledHeaderCapturePolicy {
     defaults: CaptureDefaults,
@@ -404,39 +331,9 @@ impl HeaderPropagationPolicy {
         self.default.selector.validate()
     }
 
-    /// Returns an iterator over headers that should be propagated on
-    /// egress. Each [`PropagatedHeader`] borrows from the captured
-    /// headers
-    ///
-    /// Headers whose policy action is [`PropagationAction::Drop`] are
-    /// silently skipped. The [`PropagatedHeader::egress_name`] field
-    /// points to either the original wire name or the stored name,
-    /// depending on the resolved [`NameStrategy`].
-    pub fn propagate<'a>(
-        &'a self,
-        headers: &'a TransportHeaders,
-    ) -> impl Iterator<Item = PropagatedHeader<'a>> {
-        headers.iter().filter_map(move |header| {
-            let (action, name_strategy) = self.resolve_stored_name(&header.name);
-            if action == PropagationAction::Drop {
-                return None;
-            }
-            let header_name = match name_strategy {
-                NameStrategy::Preserve => &header.wire_name,
-                NameStrategy::StoredName => &header.name,
-            };
-            Some(PropagatedHeader {
-                header_name,
-                value_kind: &header.value_kind,
-                value: &header.value,
-            })
-        })
-    }
-
     /// Resolves propagation behavior from a stored context name.
     ///
-    /// Runtime carriers use this policy-only method without constructing a
-    /// legacy [`TransportHeader`].
+    /// Packed context carriers use this policy-only method during egress.
     #[must_use]
     pub fn resolve_stored_name(&self, stored_name: &str) -> (PropagationAction, NameStrategy) {
         // Check overrides first.
@@ -816,5 +713,55 @@ named:
             vec![],
         );
         assert!(policy.validate().is_ok());
+    }
+
+    /// Scenario: a capture policy declares more rules than a u16 identifier can represent.
+    /// Guarantees: policy compilation rejects the configuration instead of aliasing rule IDs.
+    #[test]
+    fn capture_policy_rejects_too_many_rules() {
+        let rule = CaptureRule {
+            match_names: vec!["x-test".to_string()],
+            store_as: None,
+            sensitive: false,
+            value_kind: None,
+        };
+        let policy = HeaderCapturePolicy::new(
+            CaptureDefaults::default(),
+            vec![rule; usize::from(u16::MAX) + 2],
+        );
+
+        assert!(policy.compile().is_err());
+    }
+
+    /// Scenario: a capture policy declares more named entries than the packed schema supports.
+    /// Guarantees: compilation fails rather than truncating entry indexes to overlapping values.
+    #[test]
+    fn capture_policy_rejects_too_many_named_entries() {
+        let rules = (0..=u16::MAX)
+            .map(|index| CaptureRule {
+                match_names: vec![format!("x-test-{index}")],
+                store_as: Some(format!("entry-{index}")),
+                sensitive: false,
+                value_kind: None,
+            })
+            .collect();
+        let policy = HeaderCapturePolicy::new(CaptureDefaults::default(), rules);
+
+        assert!(policy.compile().is_err());
+    }
+
+    /// Scenario: max_entries exceeds the packed context item-count limit.
+    /// Guarantees: policy compilation rejects requests that the runtime format cannot encode.
+    #[test]
+    fn capture_policy_rejects_unrepresentable_max_entries() {
+        let policy = HeaderCapturePolicy::new(
+            CaptureDefaults {
+                max_entries: usize::from(u16::MAX) + 1,
+                ..CaptureDefaults::default()
+            },
+            vec![],
+        );
+
+        assert!(policy.compile().is_err());
     }
 }
