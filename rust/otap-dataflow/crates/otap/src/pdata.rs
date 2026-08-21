@@ -2248,7 +2248,7 @@ mod test {
             .find_by_name("tenant")
             .next()
             .expect("tenant header");
-        assert_eq!(detached_tenant.value, b"acme");
+        assert_eq!(detached_tenant.value().expect("tenant value").1, b"acme");
         assert_eq!(detached.peer_addr(), Some(addr));
         assert!(
             !detached.has_ack_or_nack_subscribers(),

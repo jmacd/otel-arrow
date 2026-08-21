@@ -641,7 +641,6 @@ mod tests {
 
     use crate::receivers::traffic_generator::config::{Config, TrafficConfig};
     use otap_df_config::node::NodeUserConfig;
-    use otap_df_config::transport_headers::ValueKind;
     use otap_df_engine::context::ControllerContext;
     use otap_df_engine::receiver::ReceiverWrapper;
     use otap_df_engine::testing::{
@@ -1517,13 +1516,13 @@ mod tests {
                     "should have exactly one x-request-id header"
                 );
                 assert_eq!(
-                    request_id[0].value.len(),
+                    request_id[0].value().expect("header value").1.len(),
                     16,
                     "random value should be 16 bytes"
                 );
                 assert_eq!(
-                    request_id[0].value_kind,
-                    ValueKind::Text,
+                    request_id[0].value().expect("header value").0,
+                    HeaderValueKind::Text,
                     "non-bin key should produce a Text header"
                 );
                 assert!(
@@ -1603,13 +1602,13 @@ mod tests {
                     "should have exactly one x-trace-bin header"
                 );
                 assert_eq!(
-                    trace_bin[0].value.len(),
+                    trace_bin[0].value().expect("header value").1.len(),
                     16,
                     "random binary value should be 16 bytes"
                 );
                 assert_eq!(
-                    trace_bin[0].value_kind,
-                    ValueKind::Binary,
+                    trace_bin[0].value().expect("header value").0,
+                    HeaderValueKind::Binary,
                     "-bin key should produce a Binary header"
                 );
             }) as Pin<Box<dyn Future<Output = ()>>>

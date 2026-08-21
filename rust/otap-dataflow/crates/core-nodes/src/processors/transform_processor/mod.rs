@@ -2232,7 +2232,7 @@ mod test {
                         .transport_headers()
                         .and_then(|headers| headers.find_by_name("tenant").next())
                         .unwrap_or_else(|| panic!("{port} lost the inbound transport headers"));
-                    assert_eq!(tenant.value, b"acme");
+                    assert_eq!(tenant.value().expect("tenant value").1, b"acme");
                     assert_eq!(
                         context.peer_addr(),
                         Some(peer_addr),

@@ -104,7 +104,10 @@ mod tests {
         );
         let headers_after = pdata_after_processor.transport_headers().unwrap();
         assert_eq!(headers_after.len(), 3);
-        let stored_names: Vec<_> = headers_after.iter().map(|header| header.name).collect();
+        let stored_names: Vec<_> = headers_after
+            .iter()
+            .filter_map(|item| item.name())
+            .collect();
         assert_eq!(
             stored_names,
             vec!["tenant_id", "x-request-id", "authorization"]

@@ -721,14 +721,11 @@ mod test {
                     let (context, payload) = emitted_batch.into_parts();
                     let headers = context.transport_headers().unwrap();
                     let header = headers.find_by_name(header_name).next().unwrap();
+                    assert_eq!(header.name(), Some(header_name));
+                    assert_eq!(header.wire_name(), Some(header_name));
                     assert_eq!(
-                        header,
-                        &TransportHeader {
-                            name: header_name.to_string(),
-                            wire_name: header_name.to_string(),
-                            value_kind: ValueKind::Text,
-                            value: partition_value.as_bytes().to_vec()
-                        }
+                        header.value(),
+                        Some((HeaderValueKind::Text, partition_value.as_bytes()))
                     );
                     outbound_contexts.push(context);
 
@@ -850,14 +847,11 @@ mod test {
                 let (context, payload) = emitted_batch.into_parts();
                 let headers = context.transport_headers().unwrap();
                 let header = headers.find_by_name(header_name).next().unwrap();
+                assert_eq!(header.name(), Some(header_name));
+                assert_eq!(header.wire_name(), Some(header_name));
                 assert_eq!(
-                    header,
-                    &TransportHeader {
-                        name: header_name.to_string(),
-                        wire_name: header_name.to_string(),
-                        value_kind: ValueKind::Text,
-                        value: "0".as_bytes().to_vec()
-                    }
+                    header.value(),
+                    Some((HeaderValueKind::Text, "0".as_bytes()))
                 );
 
                 let proto_bytes = OtlpProtoBytes::try_from_with_default(payload).unwrap();
@@ -1086,14 +1080,15 @@ mod test {
                         .expect("parallel bytes context")
                         .value(1)
                         .expect("projected partition header");
-                    assert_eq!(context_partition.1, partition_header.value);
-                    if partition_header.value == "0".as_bytes().to_vec() {
+                    let partition_value = partition_header.value().expect("partition value").1;
+                    assert_eq!(context_partition.1, partition_value);
+                    if partition_value == b"0" {
                         assert_eq!(flow_counter, Some(4));
                     }
-                    if partition_header.value == "1".as_bytes().to_vec() {
+                    if partition_value == b"1" {
                         assert_eq!(flow_counter, Some(2));
                     }
-                    if partition_header.value == "2".as_bytes().to_vec() {
+                    if partition_value == b"2" {
                         assert_eq!(flow_counter, Some(2));
                     }
                 }

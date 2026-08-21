@@ -104,8 +104,11 @@ pub fn validate_transport_header_require_key_values(
         };
         'pairs: for pair in pairs {
             for header in headers.find_by_name(&pair.key) {
-                match std::str::from_utf8(header.value) {
-                    Ok(value_str) if value_str == pair.value => continue 'pairs,
+                match header
+                    .value()
+                    .and_then(|(_, value)| std::str::from_utf8(value).ok())
+                {
+                    Some(value_str) if value_str == pair.value => continue 'pairs,
                     _ => continue,
                 }
             }
