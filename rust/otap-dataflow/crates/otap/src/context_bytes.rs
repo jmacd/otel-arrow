@@ -679,27 +679,7 @@ impl ContextProjectionAccumulator<'_> {
                 .ok_or(ContextBytesError::TooLarge)?,
         )?;
         let mut encoder = Encoder::new(layout)?;
-        encoder.copy_section(
-            layout.index_section(),
-            &self.input.bytes,
-            old.index_section(),
-        )?;
-        encoder.copy_section(
-            layout.items_prefix(old.item_count),
-            &self.input.bytes,
-            old.items_section(),
-        )?;
-        encoder.copy_section(
-            layout.members_section(),
-            &self.input.bytes,
-            old.members_section(),
-        )?;
-        encoder.copy_section(
-            layout.blob_prefix(old.blob_len),
-            &self.input.bytes,
-            old.blob_section(),
-        )?;
-        encoder.blob_cursor = old.blob_len;
+        encoder.copy_existing(self.input, old)?;
         encoder.write_item(old.item_count, &header)?;
         encoder.finish()
     }
@@ -878,7 +858,7 @@ impl Encoder {
             len: value.len(),
         };
         let target = range
-            .absolute(self.layout.blob_at)
+            .absolute(self.layout.offsets.blob_at)
             .ok_or(ContextBytesError::TooLarge)?;
         self.bytes
             .get_mut(target)
@@ -902,6 +882,29 @@ impl Encoder {
             .zip(source.get(source_range))
             .ok_or(ContextBytesError::InvalidEnvelope)
             .map(|(target, source)| target.copy_from_slice(source))
+    }
+
+    fn copy_existing(
+        &mut self,
+        input: &PdataContextBytes,
+        source: Layout,
+    ) -> Result<(), ContextBytesError> {
+        for (target, source_range) in [
+            (self.layout.index_section(), source.index_section()),
+            (
+                self.layout.items_prefix(source.item_count),
+                source.items_section(),
+            ),
+            (self.layout.members_section(), source.members_section()),
+            (
+                self.layout.blob_prefix(source.blob_len),
+                source.blob_section(),
+            ),
+        ] {
+            self.copy_section(target, &input.bytes, source_range)?;
+        }
+        self.blob_cursor = source.blob_len;
+        Ok(())
     }
 
     fn finish(self) -> Result<PdataContextBytes, ContextBytesError> {
@@ -943,11 +946,7 @@ struct Layout {
     entry_count: usize,
     item_count: usize,
     member_count: usize,
-    presence_words: usize,
-    entry_at: usize,
-    item_at: usize,
-    member_at: usize,
-    blob_at: usize,
+    offsets: TableOffsets,
     blob_len: usize,
     total_len: usize,
 }
@@ -991,8 +990,8 @@ impl Layout {
             .map(usize::from)
             .ok_or(ContextBytesError::InvalidEnvelope)?;
         let layout = Self::read(bytes).ok_or(ContextBytesError::InvalidEnvelope)?;
-        if presence_words != layout.presence_words
-            || blob_at != layout.blob_at
+        if presence_words != layout.offsets.presence_words
+            || blob_at != layout.offsets.blob_at
             || bytes.len() != layout.total_len
         {
             return Err(ContextBytesError::InvalidEnvelope);
@@ -1040,11 +1039,7 @@ impl Layout {
             entry_count,
             item_count,
             member_count,
-            presence_words: offsets.presence_words,
-            entry_at: offsets.entry_at,
-            item_at: offsets.item_at,
-            member_at: offsets.member_at,
-            blob_at: offsets.blob_at,
+            offsets,
             blob_len,
             total_len: offsets.blob_at.checked_add(blob_len)?,
         })
@@ -1052,23 +1047,38 @@ impl Layout {
 
     fn write_header(self, bytes: &mut [u8]) -> Result<(), ContextBytesError> {
         HeaderFields::VERSION.write(bytes, 0, VERSION)?;
-        HeaderFields::ENTRY_COUNT.write_usize(bytes, 0, self.entry_count)?;
-        HeaderFields::ITEM_COUNT.write_usize(bytes, 0, self.item_count)?;
-        HeaderFields::PRESENCE_WORDS.write_usize(bytes, 0, self.presence_words)?;
-        HeaderFields::MEMBER_COUNT.write_usize(bytes, 0, self.member_count)?;
-        HeaderFields::BLOB_OFFSET.write_usize(bytes, 0, self.blob_at)
+        for (field, value) in [
+            (HeaderFields::ENTRY_COUNT, self.entry_count),
+            (HeaderFields::ITEM_COUNT, self.item_count),
+            (HeaderFields::PRESENCE_WORDS, self.offsets.presence_words),
+            (HeaderFields::MEMBER_COUNT, self.member_count),
+            (HeaderFields::BLOB_OFFSET, self.offsets.blob_at),
+        ] {
+            field.write_usize(bytes, 0, value)?;
+        }
+        Ok(())
     }
 
     fn entry_offset(self, slot: usize) -> Result<usize, ContextBytesError> {
-        table_offset(self.entry_at, slot, self.entry_count, EntryFields::LEN)
+        table_offset(
+            self.offsets.entry_at,
+            slot,
+            self.entry_count,
+            EntryFields::LEN,
+        )
     }
 
     fn item_offset(self, index: usize) -> Result<usize, ContextBytesError> {
-        table_offset(self.item_at, index, self.item_count, ItemFields::LEN)
+        table_offset(
+            self.offsets.item_at,
+            index,
+            self.item_count,
+            ItemFields::LEN,
+        )
     }
 
     fn member_offset(self, index: usize) -> Option<usize> {
-        (index < self.member_count).then(|| self.member_at + index * size_of::<u16>())
+        (index < self.member_count).then(|| self.offsets.member_at + index * size_of::<u16>())
     }
 
     fn item_descriptor(self, bytes: &[u8], index: usize) -> Option<ItemDescriptor> {
@@ -1092,27 +1102,27 @@ impl Layout {
     }
 
     fn index_section(self) -> Range<usize> {
-        HeaderFields::LEN..self.item_at
+        HeaderFields::LEN..self.offsets.item_at
     }
 
     fn items_section(self) -> Range<usize> {
-        self.item_at..self.member_at
+        self.offsets.item_at..self.offsets.member_at
     }
 
     fn items_prefix(self, count: usize) -> Range<usize> {
-        self.item_at..self.item_at + count * ItemFields::LEN
+        self.offsets.item_at..self.offsets.item_at + count * ItemFields::LEN
     }
 
     fn members_section(self) -> Range<usize> {
-        self.member_at..self.blob_at
+        self.offsets.member_at..self.offsets.blob_at
     }
 
     fn blob_section(self) -> Range<usize> {
-        self.blob_at..self.total_len
+        self.offsets.blob_at..self.total_len
     }
 
     fn blob_prefix(self, len: usize) -> Range<usize> {
-        self.blob_at..self.blob_at + len
+        self.offsets.blob_at..self.offsets.blob_at + len
     }
 }
 
@@ -1285,12 +1295,12 @@ fn validate(bytes: &[u8]) -> Result<(), ContextBytesError> {
 
 fn validate_unused_presence_bits(bytes: &[u8], layout: Layout) -> Result<(), ContextBytesError> {
     let used_bits = layout.entry_count % 64;
-    if used_bits == 0 || layout.presence_words == 0 {
+    if used_bits == 0 || layout.offsets.presence_words == 0 {
         return Ok(());
     }
     let last_word = read_u64(
         bytes,
-        HeaderFields::LEN + (layout.presence_words - 1) * size_of::<u64>(),
+        HeaderFields::LEN + (layout.offsets.presence_words - 1) * size_of::<u64>(),
     )
     .ok_or(ContextBytesError::InvalidEnvelope)?;
     let unused_mask = !((1u64 << used_bits) - 1);
@@ -1743,20 +1753,20 @@ mod tests {
         let mut bad_range = context.bytes.to_vec();
         ItemFields::WIRE_NAME
             .offset
-            .write(&mut bad_range, layout.item_at, u16::MAX)
+            .write(&mut bad_range, layout.offsets.item_at, u16::MAX)
             .expect("corrupt range");
         corruptions.push(bad_range);
 
         let mut bad_name = context.bytes.to_vec();
-        bad_name[layout.blob_at] = 0xff;
+        bad_name[layout.offsets.blob_at] = 0xff;
         corruptions.push(bad_name);
 
         let mut bad_member = context.bytes.to_vec();
-        write_u16(&mut bad_member, layout.member_at, u16::MAX).expect("corrupt member");
+        write_u16(&mut bad_member, layout.offsets.member_at, u16::MAX).expect("corrupt member");
         corruptions.push(bad_member);
 
         let mut bad_hash = context.bytes.to_vec();
-        bad_hash[EntryFields::HASH.at(layout.entry_at)] ^= 1;
+        bad_hash[EntryFields::HASH.at(layout.offsets.entry_at)] ^= 1;
         corruptions.push(bad_hash);
 
         for bytes in corruptions {
