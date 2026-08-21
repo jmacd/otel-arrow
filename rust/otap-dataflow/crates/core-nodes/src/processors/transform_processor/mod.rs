@@ -2228,7 +2228,11 @@ mod test {
                 ] {
                     let tenant = context
                         .pdata_context_bytes()
-                        .and_then(|headers| headers.find_by_name("tenant").next())
+                        .and_then(|headers| {
+                            headers
+                                .items()
+                                .find(|item| item.stored_name() == Some("tenant"))
+                        })
                         .unwrap_or_else(|| panic!("{port} lost the inbound transport headers"));
                     assert_eq!(tenant.value().expect("tenant value").1, b"acme");
                     assert_eq!(

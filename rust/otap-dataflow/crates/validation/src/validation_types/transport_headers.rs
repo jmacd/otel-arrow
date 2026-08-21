@@ -62,11 +62,18 @@ pub fn validate_transport_header_require_keys(
             Some(h) => h,
             None => return false,
         };
-        for key in keys {
-            // check that key exists
-            if headers.find_by_name(key).next().is_none() {
-                return false;
+        let mut found = vec![false; keys.len()];
+        for header in headers.items() {
+            if let Some(name) = header.stored_name() {
+                for (index, key) in keys.iter().enumerate() {
+                    if !found[index] && name == key {
+                        found[index] = true;
+                    }
+                }
             }
+        }
+        if found.iter().any(|found| !found) {
+            return false;
         }
     }
 
@@ -102,16 +109,24 @@ pub fn validate_transport_header_require_key_values(
             Some(h) => h,
             None => return false,
         };
-        'pairs: for pair in pairs {
-            for header in headers.find_by_name(&pair.key) {
-                match header
-                    .value()
-                    .and_then(|(_, value)| std::str::from_utf8(value).ok())
-                {
-                    Some(value_str) if value_str == pair.value => continue 'pairs,
-                    _ => continue,
+        let mut found = vec![false; pairs.len()];
+        for header in headers.items() {
+            let Some(name) = header.stored_name() else {
+                continue;
+            };
+            let Some(value) = header
+                .value()
+                .and_then(|(_, value)| std::str::from_utf8(value).ok())
+            else {
+                continue;
+            };
+            for (index, pair) in pairs.iter().enumerate() {
+                if !found[index] && name == pair.key && value == pair.value {
+                    found[index] = true;
                 }
             }
+        }
+        if found.iter().any(|found| !found) {
             return false;
         }
     }
@@ -134,10 +149,12 @@ pub fn validate_transport_header_deny_keys(
     }
 
     for headers in suv.iter().flatten() {
-        for key in keys {
-            if headers.find_by_name(key).next().is_some() {
-                return false;
-            }
+        if headers.items().any(|header| {
+            header
+                .stored_name()
+                .is_some_and(|name| keys.iter().any(|key| name == key))
+        }) {
+            return false;
         }
     }
 

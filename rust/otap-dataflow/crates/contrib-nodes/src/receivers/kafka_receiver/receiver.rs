@@ -6811,15 +6811,17 @@ mod tests {
                     .expect("transport_headers should be set");
 
                 // Two headers should be captured (X-Tenant-Id and X-Request-Id).
+                let captured_count = transport_headers.items().count();
                 assert_eq!(
-                    transport_headers.len(),
-                    2,
-                    "expected 2 captured headers, got {}",
-                    transport_headers.len()
+                    captured_count, 2,
+                    "expected 2 captured headers, got {captured_count}"
                 );
 
                 // Check X-Tenant-Id was stored as "tenant_id".
-                let tenant_headers: Vec<_> = transport_headers.find_by_name("tenant_id").collect();
+                let tenant_headers: Vec<_> = transport_headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("tenant_id"))
+                    .collect();
                 assert_eq!(tenant_headers.len(), 1, "expected one tenant_id header");
                 assert_eq!(
                     tenant_headers[0].value_as_str(),
@@ -6833,8 +6835,10 @@ mod tests {
                 );
 
                 // Check X-Request-Id was stored as "x-request-id" (lowercased).
-                let request_headers: Vec<_> =
-                    transport_headers.find_by_name("x-request-id").collect();
+                let request_headers: Vec<_> = transport_headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-request-id"))
+                    .collect();
                 assert_eq!(request_headers.len(), 1, "expected one x-request-id header");
                 assert_eq!(
                     request_headers[0].value_as_str(),
@@ -6843,7 +6847,10 @@ mod tests {
                 );
 
                 // X-Unrelated should NOT be captured (not in the policy).
-                let unrelated: Vec<_> = transport_headers.find_by_name("x-unrelated").collect();
+                let unrelated: Vec<_> = transport_headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-unrelated"))
+                    .collect();
                 assert!(unrelated.is_empty(), "X-Unrelated should not be captured");
 
                 receiver.shutdown(Duration::from_secs(5));
@@ -6971,7 +6978,10 @@ mod tests {
                 let transport_headers = pdata
                     .pdata_context_bytes()
                     .expect("transport_headers should be set");
-                let tenant_headers: Vec<_> = transport_headers.find_by_name("tenant_id").collect();
+                let tenant_headers: Vec<_> = transport_headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("tenant_id"))
+                    .collect();
                 assert_eq!(tenant_headers.len(), 1);
                 assert_eq!(tenant_headers[0].value_as_str(), Some("acme-corp"));
 
@@ -7064,13 +7074,18 @@ mod tests {
                 let transport_headers = pdata
                     .pdata_context_bytes()
                     .expect("transport_headers should be set for OTAP messages");
-                let tenant_headers: Vec<_> = transport_headers.find_by_name("tenant_id").collect();
+                let tenant_headers: Vec<_> = transport_headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("tenant_id"))
+                    .collect();
                 assert_eq!(tenant_headers.len(), 1);
                 assert_eq!(tenant_headers[0].value_as_str(), Some("acme-corp"));
 
                 // The MessageFormat header should NOT be captured (not in policy).
-                let format_headers: Vec<_> =
-                    transport_headers.find_by_name("messageformat").collect();
+                let format_headers: Vec<_> = transport_headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("messageformat"))
+                    .collect();
                 assert!(
                     format_headers.is_empty(),
                     "MessageFormat header should not be captured"

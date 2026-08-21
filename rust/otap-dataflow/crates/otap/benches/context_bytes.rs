@@ -36,7 +36,12 @@ fn bench_context_bytes(c: &mut Criterion) {
         });
     });
     let _ = c.bench_function("pdata_context/lookup/stored_name", |b| {
-        b.iter(|| black_box(&context).find_by_name("x-header-30").count());
+        b.iter(|| {
+            black_box(&context)
+                .items()
+                .filter(|item| item.stored_name() == Some("x-header-30"))
+                .count()
+        });
     });
     let _ = c.bench_function("pdata_context/clone", |b| {
         b.iter(|| black_box(context.clone()));

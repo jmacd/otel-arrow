@@ -718,8 +718,11 @@ mod test {
                     let emitted_batch = out.pop_front().unwrap();
                     let (context, payload) = emitted_batch.into_parts();
                     let headers = context.pdata_context_bytes().unwrap();
-                    let header = headers.find_by_name(header_name).next().unwrap();
-                    assert_eq!(header.name(), Some(header_name));
+                    let header = headers
+                        .items()
+                        .find(|item| item.stored_name() == Some(header_name))
+                        .unwrap();
+                    assert_eq!(header.stored_name(), Some(header_name));
                     assert_eq!(header.wire_name(), Some(header_name));
                     assert_eq!(
                         header.value(),
@@ -844,8 +847,11 @@ mod test {
                 let emitted_batch = out.pop_front().unwrap();
                 let (context, payload) = emitted_batch.into_parts();
                 let headers = context.pdata_context_bytes().unwrap();
-                let header = headers.find_by_name(header_name).next().unwrap();
-                assert_eq!(header.name(), Some(header_name));
+                let header = headers
+                    .items()
+                    .find(|item| item.stored_name() == Some(header_name))
+                    .unwrap();
+                assert_eq!(header.stored_name(), Some(header_name));
                 assert_eq!(header.wire_name(), Some(header_name));
                 assert_eq!(
                     header.value(),
@@ -1067,13 +1073,20 @@ mod test {
                     let flow_counter = out.take_flow_compute();
                     let (context, _) = out.into_parts();
                     let headers = context.pdata_context_bytes().unwrap();
-                    assert!(headers.find_by_name("h1").next().is_some());
+                    assert!(headers.items().any(|item| item.stored_name() == Some("h1")));
                     assert_eq!(context.peer_addr(), Some("10.0.0.1:5005".parse().unwrap()));
 
                     // assert the flow counter is distributed outbound batches in proportion
                     // to their size relative to the input
-                    let partition_header = headers.find_by_name(header_name).next().unwrap();
-                    let context_partition = headers.value(1).expect("projected partition header");
+                    let partition_header = headers
+                        .items()
+                        .find(|item| item.stored_name() == Some(header_name))
+                        .unwrap();
+                    let context_partition = headers
+                        .items()
+                        .nth(1)
+                        .and_then(|item| item.value())
+                        .expect("projected partition header");
                     let partition_value = partition_header.value().expect("partition value").1;
                     assert_eq!(context_partition.1, partition_value);
                     if partition_value == b"0" {
@@ -1122,7 +1135,7 @@ mod test {
                 let out = out.into_iter().next().unwrap();
                 let (context, _) = out.into_parts();
                 let headers = context.pdata_context_bytes().unwrap();
-                assert!(headers.find_by_name("h1").next().is_some());
+                assert!(headers.items().any(|item| item.stored_name() == Some("h1")));
             })
             .validate(|_ctx| async move {})
     }

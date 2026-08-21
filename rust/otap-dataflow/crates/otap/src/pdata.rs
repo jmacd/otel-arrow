@@ -2222,8 +2222,8 @@ mod test {
         let detached_tenant = detached
             .pdata_context_bytes()
             .expect("detached packed context")
-            .find_by_name("tenant")
-            .next()
+            .items()
+            .find(|item| item.stored_name() == Some("tenant"))
             .expect("tenant header");
         assert_eq!(detached_tenant.value().expect("tenant value").1, b"acme");
         assert_eq!(detached.peer_addr(), Some(addr));

@@ -1412,7 +1412,10 @@ mod tests {
                 let headers = pdata
                     .pdata_context_bytes()
                     .expect("pdata should have transport headers");
-                let tenant: Vec<_> = headers.find_by_name("x-tenant-id").collect();
+                let tenant: Vec<_> = headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-tenant-id"))
+                    .collect();
                 assert_eq!(
                     tenant.len(),
                     1,
@@ -1426,7 +1429,7 @@ mod tests {
                 let packed = pdata
                     .pdata_context_bytes()
                     .expect("pdata should have packed context");
-                let packed_tenant = packed.item(0).expect("packed tenant header");
+                let packed_tenant = packed.items().next().expect("packed tenant header");
                 assert_eq!(packed_tenant.stored_name(), Some("x-tenant-id"));
                 assert_eq!(
                     packed_tenant.value().map(|(_, value)| value),
@@ -1497,7 +1500,10 @@ mod tests {
                 let headers = pdata
                     .pdata_context_bytes()
                     .expect("pdata should have transport headers");
-                let request_id: Vec<_> = headers.find_by_name("x-request-id").collect();
+                let request_id: Vec<_> = headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-request-id"))
+                    .collect();
                 assert_eq!(
                     request_id.len(),
                     1,
@@ -1583,7 +1589,10 @@ mod tests {
                 let headers = pdata
                     .pdata_context_bytes()
                     .expect("pdata should have transport headers");
-                let trace_bin: Vec<_> = headers.find_by_name("x-trace-bin").collect();
+                let trace_bin: Vec<_> = headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-trace-bin"))
+                    .collect();
                 assert_eq!(
                     trace_bin.len(),
                     1,

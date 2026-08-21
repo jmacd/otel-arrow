@@ -4364,7 +4364,10 @@ mod tests {
                 let headers = pdata
                     .pdata_context_bytes()
                     .expect("pdata should have transport headers when capture policy is set");
-                let tenant_headers: Vec<_> = headers.find_by_name("x-tenant-id").collect();
+                let tenant_headers: Vec<_> = headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-tenant-id"))
+                    .collect();
                 assert_eq!(
                     tenant_headers.len(),
                     1,
@@ -4482,7 +4485,10 @@ mod tests {
                 let headers = pdata
                     .pdata_context_bytes()
                     .expect("pdata should have transport headers when capture policy is set");
-                let trace_headers: Vec<_> = headers.find_by_name("x-trace-bin").collect();
+                let trace_headers: Vec<_> = headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-trace-bin"))
+                    .collect();
                 assert_eq!(
                     trace_headers.len(),
                     1,
@@ -4686,7 +4692,10 @@ mod tests {
                 let headers = pdata
                     .pdata_context_bytes()
                     .expect("pdata should have transport headers when capture policy is set");
-                let tenant_headers: Vec<_> = headers.find_by_name("x-tenant-id").collect();
+                let tenant_headers: Vec<_> = headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-tenant-id"))
+                    .collect();
                 assert_eq!(
                     tenant_headers.len(),
                     1,
