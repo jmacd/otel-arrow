@@ -28,7 +28,7 @@ use crate::terminal_state::TerminalState;
 use otap_df_channel::error::SendError;
 use otap_df_channel::mpsc;
 use otap_df_config::node::NodeUserConfig;
-use otap_df_config::transport_headers_policy::HeaderPropagationPolicy;
+use otap_df_config::transport_headers_policy::CompiledHeaderPropagationPolicy;
 use otap_df_telemetry::reporter::MetricsReporter;
 use std::sync::Arc;
 
@@ -56,7 +56,7 @@ pub enum ExporterWrapper<PData> {
         /// Telemetry guard for node lifecycle cleanup.
         telemetry: Option<NodeTelemetryGuard>,
         /// Pre-resolved propagation policy for transport header forwarding.
-        propagation_policy: Option<HeaderPropagationPolicy>,
+        propagation_policy: Option<CompiledHeaderPropagationPolicy>,
     },
     /// An exporter with a `Send` implementation.
     Shared {
@@ -77,7 +77,7 @@ pub enum ExporterWrapper<PData> {
         /// Telemetry guard for node lifecycle cleanup.
         telemetry: Option<NodeTelemetryGuard>,
         /// Pre-resolved propagation policy for transport header forwarding.
-        propagation_policy: Option<HeaderPropagationPolicy>,
+        propagation_policy: Option<CompiledHeaderPropagationPolicy>,
     },
 }
 
@@ -391,7 +391,10 @@ impl<PData> ExporterWrapper<PData> {
 
     /// Returns the wrapper with the given pre-resolved propagation policy for
     /// transport header forwarding.
-    pub(crate) fn with_propagation_policy(self, policy: Option<HeaderPropagationPolicy>) -> Self {
+    pub(crate) fn with_propagation_policy(
+        self,
+        policy: Option<CompiledHeaderPropagationPolicy>,
+    ) -> Self {
         match self {
             ExporterWrapper::Local {
                 node_id,
@@ -1427,7 +1430,11 @@ mod tests {
             Arc::new(NodeUserConfig::new_exporter_config("test")),
             test_runtime.config(),
         )
-        .with_propagation_policy(Some(HeaderPropagationPolicy::default()));
+        .with_propagation_policy(Some(
+            HeaderPropagationPolicy::default()
+                .compile()
+                .expect("valid propagation policy"),
+        ));
 
         match wrapper {
             ExporterWrapper::Local {
@@ -1449,7 +1456,11 @@ mod tests {
             Arc::new(NodeUserConfig::new_exporter_config("test")),
             test_runtime.config(),
         )
-        .with_propagation_policy(Some(HeaderPropagationPolicy::default()));
+        .with_propagation_policy(Some(
+            HeaderPropagationPolicy::default()
+                .compile()
+                .expect("valid propagation policy"),
+        ));
 
         match wrapper {
             ExporterWrapper::Shared {

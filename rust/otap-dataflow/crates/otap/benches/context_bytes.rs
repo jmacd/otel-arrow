@@ -24,7 +24,9 @@ fn bench_context_bytes(c: &mut Criterion) {
     let compiled = policy.compile().expect("valid capture policy");
     let pairs = pairs(32);
     let context = capture_context(&compiled, &pairs);
-    let propagation = propagation_policy();
+    let propagation = propagation_policy()
+        .compile()
+        .expect("valid propagation policy");
 
     let _ = c.bench_function("pdata_context/lookup/entry", |b| {
         b.iter(|| {
@@ -67,7 +69,7 @@ fn bench_context_bytes(c: &mut Criterion) {
             for value in &partition_values {
                 let projected = black_box(&context)
                     .project()
-                    .append_bag_header(HeaderInput {
+                    .copy_and_append_bag_header(HeaderInput {
                         wire_name: "partition",
                         stored_name: "partition",
                         value,

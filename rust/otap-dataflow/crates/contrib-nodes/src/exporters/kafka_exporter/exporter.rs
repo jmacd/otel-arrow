@@ -5584,7 +5584,7 @@ pub mod test_support {
             let (_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
             let mut eh: EffectHandler<OtapPdata> =
                 EffectHandler::new(test_node("hdr-test"), reporter);
-            eh.set_propagation_policy(Some(policy));
+            eh.set_propagation_policy(Some(policy.compile().expect("valid propagation policy")));
 
             let headers = KafkaExporter::build_kafka_headers(
                 MessageFormat::OtlpProto,

@@ -3026,7 +3026,9 @@ mod tests {
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let node_id = test_node("test-exporter");
         let mut handler = EffectHandler::new(node_id, metrics_reporter);
-        handler.set_propagation_policy(policy);
+        handler.set_propagation_policy(
+            policy.map(|policy| policy.compile().expect("valid propagation policy")),
+        );
         handler
     }
 

@@ -2072,7 +2072,16 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
-        let propagation_policy = resolve_propagation_policy(&node_config, transport_headers_policy);
+        let propagation_policy = resolve_propagation_policy(&node_config, transport_headers_policy)
+            .map(|policy| policy.compile())
+            .transpose()
+            .map_err(|error| {
+                Error::ConfigError(Box::new(otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "exporter `{name}` has an invalid header propagation policy: {error}"
+                    ),
+                }))
+            })?;
 
         let exporter = create(
             (*pipeline_ctx).clone(),
@@ -2855,7 +2864,7 @@ mod test {
         assert!(policy.is_some(), "should resolve a policy");
 
         // Verify node-level policy (Propagate) was used, not pipeline (Drop).
-        let policy = policy.unwrap();
+        let policy = policy.unwrap().compile().expect("valid propagation policy");
         assert_eq!(
             policy.resolve_stored_name("x-test").0,
             PropagationAction::Propagate
@@ -2877,7 +2886,7 @@ mod test {
         let policy = resolve_propagation_policy(&node_config, &transport_headers_policy);
         assert!(policy.is_some(), "should fall back to pipeline policy");
 
-        let policy = policy.unwrap();
+        let policy = policy.unwrap().compile().expect("valid propagation policy");
         assert_eq!(
             policy.resolve_stored_name("x-test").0,
             PropagationAction::Propagate

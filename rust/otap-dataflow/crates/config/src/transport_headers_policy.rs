@@ -11,7 +11,7 @@
 //!
 //! TODO: Implement the sensitive capability for headers
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use schemars::JsonSchema;
@@ -29,14 +29,19 @@ pub struct CaptureStats {
     pub skipped_name_too_long: usize,
     /// Matching headers skipped because the value exceeded `max_value_bytes`.
     pub skipped_value_too_long: usize,
+    /// Matching headers skipped because the packed context would exceed 64 KiB.
+    pub skipped_context_too_large: usize,
 }
 
 impl fmt::Display for CaptureStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "capture limits exceeded: {} skipped (max_entries), {} skipped (name too long), {} skipped (value too long)",
-            self.skipped_max_entries, self.skipped_name_too_long, self.skipped_value_too_long
+            "capture limits exceeded: {} skipped (max_entries), {} skipped (name too long), {} skipped (value too long), {} skipped (context too large)",
+            self.skipped_max_entries,
+            self.skipped_name_too_long,
+            self.skipped_value_too_long,
+            self.skipped_context_too_large
         )
     }
 }
@@ -104,9 +109,8 @@ impl HeaderCapturePolicy {
             ));
         }
 
-        let mut entries = Vec::new();
         let mut entry_ids = HashMap::new();
-        let mut rules = Vec::with_capacity(self.headers.len());
+        let mut matches = HashMap::new();
         for (rule_id, rule) in self.headers.iter().enumerate() {
             let entry = match rule.store_as.as_ref() {
                 Some(name) => {
@@ -114,19 +118,18 @@ impl HeaderCapturePolicy {
                     match entry_ids.get(&normalized) {
                         Some(entry) => Some(*entry),
                         None => {
-                            if entries.len() >= usize::from(u16::MAX) {
+                            if entry_ids.len() >= usize::from(u16::MAX) {
                                 return Err(format!(
                                     "header capture supports at most {} named entries",
                                     u16::MAX
                                 ));
                             }
-                            let entry = u16::try_from(entries.len()).map_err(|_| {
+                            let entry = u16::try_from(entry_ids.len()).map_err(|_| {
                                 format!(
                                     "header capture supports at most {} named entries",
                                     u16::MAX
                                 )
                             })?;
-                            entries.push(name.clone());
                             let _ = entry_ids.insert(normalized, entry);
                             Some(entry)
                         }
@@ -134,23 +137,25 @@ impl HeaderCapturePolicy {
                 }
                 None => None,
             };
-            rules.push(CompiledCaptureRule {
-                rule_id: u16::try_from(rule_id)
-                    .map_err(|_| "header capture rule identifier overflow".to_string())?,
-                match_names: rule
-                    .match_names
-                    .iter()
-                    .map(|name| name.to_ascii_lowercase())
-                    .collect(),
-                entry,
-                store_as: rule.store_as.clone(),
-                value_kind: rule.value_kind,
-            });
+            let rule_id = u16::try_from(rule_id)
+                .map_err(|_| "header capture rule identifier overflow".to_string())?;
+            for match_name in &rule.match_names {
+                let normalized = match_name.to_ascii_lowercase();
+                if let std::collections::hash_map::Entry::Vacant(slot) = matches.entry(normalized) {
+                    let stored_name = rule.store_as.clone().unwrap_or_else(|| slot.key().clone());
+                    let _ = slot.insert(CompiledCaptureMatch {
+                        rule_id,
+                        entry,
+                        stored_name,
+                        value_kind: rule.value_kind,
+                    });
+                }
+            }
         }
         Ok(CompiledHeaderCapturePolicy {
             defaults: self.defaults.clone(),
-            rules,
-            entries,
+            matches,
+            entry_count: entry_ids.len(),
         })
     }
 
@@ -164,31 +169,25 @@ impl HeaderCapturePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledHeaderCapturePolicy {
     defaults: CaptureDefaults,
-    rules: Vec<CompiledCaptureRule>,
-    entries: Vec<String>,
+    matches: HashMap<String, CompiledCaptureMatch>,
+    entry_count: usize,
 }
 
 impl CompiledHeaderCapturePolicy {
     /// Number of compiled `store_as` entries.
     #[must_use]
-    pub fn entry_count(&self) -> usize {
-        self.entries.len()
+    pub const fn entry_count(&self) -> usize {
+        self.entry_count
     }
 
     /// Finds the first capture rule matching `wire_name`.
     #[must_use]
     pub fn match_header(&self, wire_name: &str) -> Option<CompiledHeaderMatch<'_>> {
-        self.rules.iter().find_map(|rule| {
-            let matched_name = rule
-                .match_names
-                .iter()
-                .find(|name| wire_name.eq_ignore_ascii_case(name))?;
-            Some(CompiledHeaderMatch {
-                rule_id: rule.rule_id,
-                entry: rule.entry,
-                stored_name: rule.store_as.as_deref().unwrap_or(matched_name),
-                value_kind: rule.value_kind,
-            })
+        lookup_ascii_case_insensitive(&self.matches, wire_name).map(|matched| CompiledHeaderMatch {
+            rule_id: matched.rule_id,
+            entry: matched.entry,
+            stored_name: &matched.stored_name,
+            value_kind: matched.value_kind,
         })
     }
 
@@ -200,11 +199,10 @@ impl CompiledHeaderCapturePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CompiledCaptureRule {
+struct CompiledCaptureMatch {
     rule_id: u16,
-    match_names: Vec<String>,
     entry: Option<u16>,
-    store_as: Option<String>,
+    stored_name: String,
     value_kind: Option<ValueKindConfig>,
 }
 
@@ -331,33 +329,99 @@ impl HeaderPropagationPolicy {
         self.default.selector.validate()
     }
 
-    /// Resolves propagation behavior from a stored context name.
-    ///
-    /// Packed context carriers use this policy-only method during egress.
-    #[must_use]
-    pub fn resolve_stored_name(&self, stored_name: &str) -> (PropagationAction, NameStrategy) {
-        // Check overrides first.
-        for ov in &self.overrides {
-            if ov
-                .match_rule
-                .stored_names
-                .iter()
-                .any(|s| stored_name.eq_ignore_ascii_case(s))
-            {
-                let name_strategy = ov.name.unwrap_or(self.default.name);
-                return (ov.action, name_strategy);
+    /// Compiles selectors and overrides for constant-time egress lookup.
+    pub fn compile(&self) -> Result<CompiledHeaderPropagationPolicy, String> {
+        self.default.selector.validate()?;
+        let selected_names = match self.default.selector.selector_type {
+            PropagationSelectorType::Named => self
+                .default
+                .selector
+                .named
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|name| name.to_ascii_lowercase())
+                .collect(),
+            PropagationSelectorType::AllCaptured | PropagationSelectorType::None => HashSet::new(),
+        };
+        let mut overrides = HashMap::new();
+        for rule in &self.overrides {
+            for stored_name in &rule.match_rule.stored_names {
+                let _ = overrides.entry(stored_name.to_ascii_lowercase()).or_insert(
+                    CompiledPropagationOverride {
+                        action: rule.action,
+                        name: rule.name.unwrap_or(self.default.name),
+                    },
+                );
             }
         }
-
-        // Check whether the header passes the default selector.
-        let selected = self.default.selector.selects(stored_name);
-
-        if selected {
-            (self.default.action, self.default.name)
-        } else {
-            (PropagationAction::Drop, self.default.name)
-        }
+        Ok(CompiledHeaderPropagationPolicy {
+            selector_type: self.default.selector.selector_type,
+            selected_names,
+            default_action: self.default.action,
+            default_name: self.default.name,
+            overrides,
+        })
     }
+}
+
+/// Propagation policy compiled for constant-time stored-name lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledHeaderPropagationPolicy {
+    selector_type: PropagationSelectorType,
+    selected_names: HashSet<String>,
+    default_action: PropagationAction,
+    default_name: NameStrategy,
+    overrides: HashMap<String, CompiledPropagationOverride>,
+}
+
+impl CompiledHeaderPropagationPolicy {
+    /// Resolves propagation behavior from a stored context name.
+    #[must_use]
+    pub fn resolve_stored_name(&self, stored_name: &str) -> (PropagationAction, NameStrategy) {
+        if let Some(override_rule) = lookup_ascii_case_insensitive(&self.overrides, stored_name) {
+            return (override_rule.action, override_rule.name);
+        }
+        let selected = match self.selector_type {
+            PropagationSelectorType::AllCaptured => true,
+            PropagationSelectorType::None => false,
+            PropagationSelectorType::Named => {
+                contains_ascii_case_insensitive(&self.selected_names, stored_name)
+            }
+        };
+        (
+            if selected {
+                self.default_action
+            } else {
+                PropagationAction::Drop
+            },
+            self.default_name,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompiledPropagationOverride {
+    action: PropagationAction,
+    name: NameStrategy,
+}
+
+fn lookup_ascii_case_insensitive<'a, T>(
+    values: &'a HashMap<String, T>,
+    name: &str,
+) -> Option<&'a T> {
+    values.get(name).or_else(|| {
+        name.bytes()
+            .any(|byte| byte.is_ascii_uppercase())
+            .then(|| values.get(&name.to_ascii_lowercase()))
+            .flatten()
+    })
+}
+
+fn contains_ascii_case_insensitive(values: &HashSet<String>, name: &str) -> bool {
+    values.contains(name)
+        || (name.bytes().any(|byte| byte.is_ascii_uppercase())
+            && values.contains(&name.to_ascii_lowercase()))
 }
 
 /// Default propagation behavior.
@@ -379,7 +443,7 @@ pub struct PropagationDefault {
 }
 
 /// Selects which captured headers are candidates for propagation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PropagationSelectorType {
     /// Propagate all captured headers (subject to overrides).
@@ -421,19 +485,6 @@ impl PropagationSelector {
                 Err("'named' must not be set when type is not 'named'".into())
             }
             _ => Ok(()),
-        }
-    }
-    /// Returns true if the given header name is selected for propagation.
-    #[must_use]
-    pub fn selects(&self, header_name: &str) -> bool {
-        match &self.selector_type {
-            PropagationSelectorType::AllCaptured => true,
-            PropagationSelectorType::None => false,
-            PropagationSelectorType::Named => self
-                .named
-                .as_ref()
-                .map(|names| names.iter().any(|n| header_name.eq_ignore_ascii_case(n)))
-                .unwrap_or(false),
         }
     }
 }
@@ -763,5 +814,83 @@ named:
         );
 
         assert!(policy.compile().is_err());
+    }
+
+    /// Scenario: multiple case variants and rules declare the same wire header.
+    /// Guarantees: compiled capture lookup remains case-insensitive and preserves first-rule wins.
+    #[test]
+    fn compiled_capture_preserves_first_match_semantics() {
+        let policy = HeaderCapturePolicy::new(
+            CaptureDefaults::default(),
+            vec![
+                CaptureRule {
+                    match_names: vec!["x-tenant".to_string()],
+                    store_as: Some("tenant".to_string()),
+                    sensitive: false,
+                    value_kind: None,
+                },
+                CaptureRule {
+                    match_names: vec!["X-TENANT".to_string()],
+                    store_as: Some("ignored".to_string()),
+                    sensitive: false,
+                    value_kind: Some(ValueKindConfig::Binary),
+                },
+            ],
+        )
+        .compile()
+        .expect("capture policy");
+
+        let matched = policy.match_header("X-Tenant").expect("matched header");
+        assert_eq!(matched.rule_id, 0);
+        assert_eq!(matched.stored_name, "tenant");
+        assert_eq!(matched.value_kind, None);
+    }
+
+    /// Scenario: named selection and duplicate overrides use mixed-case stored names.
+    /// Guarantees: compiled propagation is case-insensitive and preserves first-override wins.
+    #[test]
+    fn compiled_propagation_preserves_policy_precedence() {
+        let policy = HeaderPropagationPolicy::new(
+            PropagationDefault {
+                selector: PropagationSelector {
+                    selector_type: PropagationSelectorType::Named,
+                    named: Some(vec!["Tenant".to_string()]),
+                },
+                ..PropagationDefault::default()
+            },
+            vec![
+                PropagationOverride {
+                    match_rule: PropagationMatch {
+                        stored_names: vec!["Authorization".to_string()],
+                    },
+                    action: PropagationAction::Drop,
+                    name: Some(NameStrategy::StoredName),
+                    on_error: None,
+                },
+                PropagationOverride {
+                    match_rule: PropagationMatch {
+                        stored_names: vec!["authorization".to_string()],
+                    },
+                    action: PropagationAction::Propagate,
+                    name: None,
+                    on_error: None,
+                },
+            ],
+        )
+        .compile()
+        .expect("propagation policy");
+
+        assert_eq!(
+            policy.resolve_stored_name("TENANT"),
+            (PropagationAction::Propagate, NameStrategy::Preserve)
+        );
+        assert_eq!(
+            policy.resolve_stored_name("AUTHORIZATION"),
+            (PropagationAction::Drop, NameStrategy::StoredName)
+        );
+        assert_eq!(
+            policy.resolve_stored_name("other"),
+            (PropagationAction::Drop, NameStrategy::Preserve)
+        );
     }
 }

@@ -6824,7 +6824,9 @@ mod tests {
                     .collect();
                 assert_eq!(tenant_headers.len(), 1, "expected one tenant_id header");
                 assert_eq!(
-                    tenant_headers[0].value_as_str(),
+                    tenant_headers[0]
+                        .value()
+                        .and_then(|(_, value)| std::str::from_utf8(value).ok()),
                     Some("acme-corp"),
                     "tenant_id value mismatch"
                 );
@@ -6841,7 +6843,9 @@ mod tests {
                     .collect();
                 assert_eq!(request_headers.len(), 1, "expected one x-request-id header");
                 assert_eq!(
-                    request_headers[0].value_as_str(),
+                    request_headers[0]
+                        .value()
+                        .and_then(|(_, value)| std::str::from_utf8(value).ok()),
                     Some("req-12345"),
                     "x-request-id value mismatch"
                 );
@@ -6983,7 +6987,12 @@ mod tests {
                     .filter(|item| item.stored_name() == Some("tenant_id"))
                     .collect();
                 assert_eq!(tenant_headers.len(), 1);
-                assert_eq!(tenant_headers[0].value_as_str(), Some("acme-corp"));
+                assert_eq!(
+                    tenant_headers[0]
+                        .value()
+                        .and_then(|(_, value)| std::str::from_utf8(value).ok()),
+                    Some("acme-corp")
+                );
 
                 // 2. Verify resource attributes were injected (resource_attrs_from_headers).
                 let proto: OtlpProtoBytes = pdata
@@ -7079,7 +7088,12 @@ mod tests {
                     .filter(|item| item.stored_name() == Some("tenant_id"))
                     .collect();
                 assert_eq!(tenant_headers.len(), 1);
-                assert_eq!(tenant_headers[0].value_as_str(), Some("acme-corp"));
+                assert_eq!(
+                    tenant_headers[0]
+                        .value()
+                        .and_then(|(_, value)| std::str::from_utf8(value).ok()),
+                    Some("acme-corp")
+                );
 
                 // The MessageFormat header should NOT be captured (not in policy).
                 let format_headers: Vec<_> = transport_headers

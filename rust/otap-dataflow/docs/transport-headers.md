@@ -151,7 +151,8 @@ in a single request.
 
 When any matching header is skipped due to a limit, the runtime
 reports statistics indicating how many headers were skipped and
-why (max entries reached, name too long, or value too long).
+why (max entries reached, name too long, value too long, or the packed
+request context reaching its 64 KiB limit).
 
 ## Header Propagation
 
@@ -198,7 +199,7 @@ header_propagation:
 | --- | --- |
 | `all_captured` | Propagate all captured headers. |
 | `none` | Propagate nothing by default (default). |
-| `named` | Propagate only headers whose stored names appear in the `named` list. |
+| `named` | Propagate headers whose stored names appear in `named`. |
 
 When `none` is used, only headers explicitly matched by an override
 with `action: propagate` are included on egress.

@@ -41,7 +41,7 @@ use crate::message::ExporterInbox;
 use crate::node::NodeId;
 use crate::terminal_state::TerminalState;
 use async_trait::async_trait;
-use otap_df_config::transport_headers_policy::HeaderPropagationPolicy;
+use otap_df_config::transport_headers_policy::CompiledHeaderPropagationPolicy;
 use otap_df_telemetry::error::Error as TelemetryError;
 use otap_df_telemetry::metrics::{MetricSet, MetricSetHandler};
 use otap_df_telemetry::reporter::MetricsReporter;
@@ -99,7 +99,7 @@ pub struct EffectHandler<PData> {
     _pd: PhantomData<PData>,
     /// Propagation policy for filtering captured headers on egress.
     /// `None` when no propagation policy is configured (zero overhead).
-    propagation_policy: Option<HeaderPropagationPolicy>,
+    propagation_policy: Option<CompiledHeaderPropagationPolicy>,
 }
 
 impl<PData> EffectHandler<PData> {
@@ -130,12 +130,12 @@ impl<PData> EffectHandler<PData> {
     ///
     /// Returns `None` when no propagation policy is active (zero overhead).
     #[must_use]
-    pub fn propagation_policy(&self) -> Option<&HeaderPropagationPolicy> {
+    pub fn propagation_policy(&self) -> Option<&CompiledHeaderPropagationPolicy> {
         self.propagation_policy.as_ref()
     }
 
     /// Sets the propagation policy for transport header filtering.
-    pub fn set_propagation_policy(&mut self, policy: Option<HeaderPropagationPolicy>) {
+    pub fn set_propagation_policy(&mut self, policy: Option<CompiledHeaderPropagationPolicy>) {
         self.propagation_policy = policy;
     }
 

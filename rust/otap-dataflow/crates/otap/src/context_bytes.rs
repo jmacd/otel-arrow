@@ -2,42 +2,271 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Packed pdata context.
+//!
+//! - An item is one captured header: its names, value, kind, capture rule,
+//!   and optional entry slot.
+//! - An entry is a compiled logical slot, such as `tenant`, that groups the
+//!   values of zero or more items.
+//! - Presence is one bit per entry indicating whether that entry has any
+//!   members, allowing absent entries to be rejected without scanning items.
+//! - A member is an item-table index belonging to an entry.
+//! - Counts determine the length of each fixed-size table.
+//! - An offset locates bytes. The header's blob offset is envelope-relative;
+//!   item name and value offsets are blob-relative.
+//! - Padding aligns the item's u16 blob ranges after its one-byte kind.
+//!
+//! The envelope keeps fixed-size indexes before one variable-size blob:
+//!
+//! ```text
+//! +------------------------------------------------------------------------------+
+//! | envelope header (12 bytes)                                                   |
+//! +------------------------------------------------------------------------------+
+//! | version u16 | entries u16 | items u16 | presence words u16                   |
+//! | member count u16 | blob offset u16                                            |
+//! +------------------------------------------------------------------------------+
+//! | entry presence bitmap (presence words * 8 bytes)                             |
+//! +------------------------------------------------------------------------------+
+//! | entry descriptors (entry count * 12 bytes)                                   |
+//! +------------------------------------------------------------------------------+
+//! | item descriptors (item count * 18 bytes, in arrival order)                   |
+//! +------------------------------------------------------------------------------+
+//! | entry members (member count * 2-byte item indexes)                           |
+//! +------------------------------------------------------------------------------+
+//! | blob: wire names, stored names, and values                                   |
+//! +------------------------------------------------------------------------------+
+//! ```
+//!
+//! Each present entry selects an ordered range from the member table. Each
+//! member is an item-table index, so entries reuse the canonical item values:
+//!
+//! ```text
+//! entry descriptor (12 bytes)
+//! +------------------+------------------+----------------------------------------+
+//! | first member u16 | member count u16 | typed value hash u64                   |
+//! +------------------+------------------+----------------------------------------+
+//!
+//! item descriptor (18 bytes)
+//! fixed fields (6 bytes)
+//! +-------------+-----------+---------+------------------------------------------+
+//! | rule id u16 | entry u16 | kind u8 | padding u8                               |
+//! +-------------+-----------+---------+------------------------------------------+
+//! blob ranges (3 * 4 bytes)
+//! +----------------+---------------------------+---------------------------------+
+//! | wire name      | blob offset u16           | byte length u16                 |
+//! | stored name    | blob offset u16           | byte length u16                 |
+//! | value          | blob offset u16           | byte length u16                 |
+//! +----------------+---------------------------+---------------------------------+
+//! ```
+//!
+//! Item ranges are relative to `blob offset`. `NO_ENTRY` marks bag-only items;
+//! the presence bitmap makes absent entry lookup constant-time.
 
-use std::ops::Range;
+use std::{fmt, marker::PhantomData, ops::Range};
 
 use bytes::Bytes;
 use otap_df_config::transport_headers_policy::{
-    CaptureStats, CompiledHeaderCapturePolicy, HeaderPropagationPolicy, NameStrategy,
+    CaptureStats, CompiledHeaderCapturePolicy, CompiledHeaderPropagationPolicy, NameStrategy,
     PropagationAction, ValueKindConfig,
 };
 
-const MAGIC: u32 = 0x4354_5832; // CTX2
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const NO_ENTRY: u16 = u16::MAX;
+const MAX_CONTEXT_LEN: usize = u16::MAX as usize;
 
-const HEADER_LEN: usize = 24;
-const HEADER_MAGIC_AT: usize = 0;
-const HEADER_VERSION_AT: usize = 4;
-const HEADER_ENTRY_COUNT_AT: usize = 6;
-const HEADER_ITEM_COUNT_AT: usize = 8;
-const HEADER_PRESENCE_WORDS_AT: usize = 10;
-const HEADER_MEMBER_COUNT_AT: usize = 12;
-const HEADER_BLOB_OFFSET_AT: usize = 16;
-const HEADER_RESERVED_AT: usize = 20;
+trait Scalar: Copy {
+    const WIDTH: usize;
 
-const ENTRY_DESCRIPTOR_LEN: usize = 16;
-const ENTRY_FIRST_MEMBER_AT: usize = 0;
-const ENTRY_MEMBER_COUNT_AT: usize = 4;
-const ENTRY_HASH_AT: usize = 8;
+    fn read(bytes: &[u8], at: usize) -> Option<Self>;
+    fn write(self, bytes: &mut [u8], at: usize) -> Result<(), ContextBytesError>;
+}
 
-const ITEM_DESCRIPTOR_LEN: usize = 32;
-const ITEM_RULE_ID_AT: usize = 0;
-const ITEM_ENTRY_AT: usize = 2;
-const ITEM_KIND_AT: usize = 4;
-const ITEM_RESERVED_AT: usize = 5;
-const ITEM_WIRE_NAME_AT: usize = 8;
-const ITEM_STORED_NAME_AT: usize = 16;
-const ITEM_VALUE_AT: usize = 24;
+impl Scalar for u8 {
+    const WIDTH: usize = size_of::<Self>();
+
+    fn read(bytes: &[u8], at: usize) -> Option<Self> {
+        bytes.get(at).copied()
+    }
+
+    fn write(self, bytes: &mut [u8], at: usize) -> Result<(), ContextBytesError> {
+        write_slice(bytes, at, &[self])
+    }
+}
+
+impl Scalar for u16 {
+    const WIDTH: usize = size_of::<Self>();
+
+    fn read(bytes: &[u8], at: usize) -> Option<Self> {
+        read_u16(bytes, at)
+    }
+
+    fn write(self, bytes: &mut [u8], at: usize) -> Result<(), ContextBytesError> {
+        write_u16(bytes, at, self)
+    }
+}
+
+impl Scalar for u64 {
+    const WIDTH: usize = size_of::<Self>();
+
+    fn read(bytes: &[u8], at: usize) -> Option<Self> {
+        read_u64(bytes, at)
+    }
+
+    fn write(self, bytes: &mut [u8], at: usize) -> Result<(), ContextBytesError> {
+        write_u64(bytes, at, self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Field<T> {
+    offset: usize,
+    value: PhantomData<fn() -> T>,
+}
+
+impl<T: Scalar> Field<T> {
+    const fn new(offset: usize) -> Self {
+        Self {
+            offset,
+            value: PhantomData,
+        }
+    }
+
+    const fn end(self) -> usize {
+        self.offset + T::WIDTH
+    }
+
+    const fn at(self, base: usize) -> usize {
+        base + self.offset
+    }
+
+    fn read(self, bytes: &[u8], base: usize) -> Option<T> {
+        T::read(bytes, self.at(base))
+    }
+
+    fn write(self, bytes: &mut [u8], base: usize, value: T) -> Result<(), ContextBytesError> {
+        value.write(bytes, self.at(base))
+    }
+}
+
+impl Field<u16> {
+    fn write_usize(
+        self,
+        bytes: &mut [u8],
+        base: usize,
+        value: usize,
+    ) -> Result<(), ContextBytesError> {
+        self.write(
+            bytes,
+            base,
+            u16::try_from(value).map_err(|_| ContextBytesError::TooLarge)?,
+        )
+    }
+}
+
+type U8Field = Field<u8>;
+type U16Field = Field<u16>;
+type U64Field = Field<u64>;
+
+#[derive(Clone, Copy)]
+struct ByteSpan {
+    offset: usize,
+    len: usize,
+}
+
+impl ByteSpan {
+    const fn new(offset: usize, len: usize) -> Self {
+        Self { offset, len }
+    }
+
+    const fn end(self) -> usize {
+        self.offset + self.len
+    }
+
+    fn is_zero(self, bytes: &[u8], base: usize) -> Option<bool> {
+        Some(
+            bytes
+                .get(base + self.offset..base + self.end())?
+                .iter()
+                .all(|byte| *byte == 0),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BlobRangeField {
+    offset: U16Field,
+    len: U16Field,
+}
+
+impl BlobRangeField {
+    const fn new(offset: usize) -> Self {
+        let offset = U16Field::new(offset);
+        Self {
+            len: U16Field::new(offset.end()),
+            offset,
+        }
+    }
+
+    const fn end(self) -> usize {
+        self.len.end()
+    }
+
+    fn read(self, bytes: &[u8], base: usize) -> Option<BlobRange> {
+        Some(BlobRange {
+            offset: usize::from(self.offset.read(bytes, base)?),
+            len: usize::from(self.len.read(bytes, base)?),
+        })
+    }
+
+    fn write(
+        self,
+        bytes: &mut [u8],
+        base: usize,
+        range: BlobRange,
+    ) -> Result<(), ContextBytesError> {
+        self.offset.write_usize(bytes, base, range.offset)?;
+        self.len.write_usize(bytes, base, range.len)
+    }
+}
+
+struct HeaderFields;
+
+impl HeaderFields {
+    const VERSION: U16Field = U16Field::new(0);
+    const ENTRY_COUNT: U16Field = U16Field::new(Self::VERSION.end());
+    const ITEM_COUNT: U16Field = U16Field::new(Self::ENTRY_COUNT.end());
+    const PRESENCE_WORDS: U16Field = U16Field::new(Self::ITEM_COUNT.end());
+    const MEMBER_COUNT: U16Field = U16Field::new(Self::PRESENCE_WORDS.end());
+    const BLOB_OFFSET: U16Field = U16Field::new(Self::MEMBER_COUNT.end());
+    const LEN: usize = Self::BLOB_OFFSET.end();
+}
+
+struct EntryFields;
+
+impl EntryFields {
+    const FIRST_MEMBER: U16Field = U16Field::new(0);
+    const MEMBER_COUNT: U16Field = U16Field::new(Self::FIRST_MEMBER.end());
+    const HASH: U64Field = U64Field::new(Self::MEMBER_COUNT.end());
+    const LEN: usize = Self::HASH.end();
+}
+
+struct ItemFields;
+
+impl ItemFields {
+    const RULE_ID: U16Field = U16Field::new(0);
+    const ENTRY: U16Field = U16Field::new(Self::RULE_ID.end());
+    const KIND: U8Field = U8Field::new(Self::ENTRY.end());
+    const PADDING: ByteSpan = ByteSpan::new(Self::KIND.end(), 1);
+    const WIRE_NAME: BlobRangeField = BlobRangeField::new(Self::PADDING.end());
+    const STORED_NAME: BlobRangeField = BlobRangeField::new(Self::WIRE_NAME.end());
+    const VALUE: BlobRangeField = BlobRangeField::new(Self::STORED_NAME.end());
+    const LEN: usize = Self::VALUE.end();
+}
+
+const _: () = {
+    assert!(HeaderFields::LEN == 12);
+    assert!(EntryFields::LEN == 12);
+    assert!(ItemFields::LEN == 18);
+};
 
 /// Header value kind preserved in the item descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,7 +298,7 @@ impl HeaderValueKind {
 }
 
 /// One borrowed header supplied by a receiver or projector.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct HeaderInput<'a> {
     /// Original transport wire name.
     pub wire_name: &'a str,
@@ -83,6 +312,20 @@ pub struct HeaderInput<'a> {
     pub rule_id: u16,
     /// Optional compiled `store_as` entry slot.
     pub entry: Option<u16>,
+}
+
+impl fmt::Debug for HeaderInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HeaderInput")
+            .field("wire_name", &self.wire_name)
+            .field("stored_name", &self.stored_name)
+            .field("value_len", &self.value.len())
+            .field("kind", &self.kind)
+            .field("rule_id", &self.rule_id)
+            .field("entry", &self.entry)
+            .finish()
+    }
 }
 
 /// Failure while constructing or validating a context envelope.
@@ -103,9 +346,18 @@ pub enum ContextBytesError {
 }
 
 /// Immutable encoded pdata context.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PdataContextBytes {
     bytes: Bytes,
+}
+
+impl fmt::Debug for PdataContextBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PdataContextBytes")
+            .field("byte_len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PdataContextBytes {
@@ -117,6 +369,9 @@ impl PdataContextBytes {
         let defaults = policy.defaults();
         let mut headers = smallvec::SmallVec::<[HeaderInput<'_>; 32]>::new();
         let mut skipped = SkippedHeaders::default();
+        let mut encoded_len = HeaderFields::LEN
+            + policy.entry_count().div_ceil(64) * size_of::<u64>()
+            + policy.entry_count() * EntryFields::LEN;
 
         for (wire_name, value) in pairs {
             let Some(matched) = policy.match_header(wire_name) else {
@@ -134,14 +389,26 @@ impl PdataContextBytes {
                 skipped.value_too_long += 1;
                 continue;
             }
-            headers.push(HeaderInput {
+            let header = HeaderInput {
                 wire_name,
                 stored_name: matched.stored_name,
                 value,
                 kind: HeaderValueKind::captured(matched.value_kind, wire_name),
                 rule_id: matched.rule_id,
                 entry: matched.entry,
-            });
+            };
+            let added_len = ItemFields::LEN
+                + usize::from(header.entry.is_some()) * size_of::<u16>()
+                + header.encoded_len()?;
+            if encoded_len
+                .checked_add(added_len)
+                .is_none_or(|len| len > MAX_CONTEXT_LEN)
+            {
+                skipped.context_too_large += 1;
+                continue;
+            }
+            encoded_len += added_len;
+            headers.push(header);
         }
 
         let context = (!headers.is_empty())
@@ -183,12 +450,6 @@ impl PdataContextBytes {
         }
     }
 
-    /// Returns the single reference-counted allocation.
-    #[must_use]
-    pub const fn bytes(&self) -> &Bytes {
-        &self.bytes
-    }
-
     /// Starts a projection accumulator that preserves this context.
     #[must_use]
     pub fn project(&self) -> ContextProjectionAccumulator<'_> {
@@ -204,8 +465,11 @@ impl PdataContextBytes {
         }
     }
 
-    /// Applies a transport-header propagation policy to the packed bag.
-    pub fn propagate<'a>(&'a self, policy: &'a HeaderPropagationPolicy) -> ContextPropagation<'a> {
+    /// Scans the bag and applies a transport-header propagation policy.
+    pub fn propagate<'a>(
+        &'a self,
+        policy: &'a CompiledHeaderPropagationPolicy,
+    ) -> ContextPropagation<'a> {
         ContextPropagation {
             items: self.items(),
             policy,
@@ -241,10 +505,6 @@ impl PdataContextBytes {
     fn blob_bytes(&self, layout: Layout, range: BlobRange) -> Option<&[u8]> {
         range.slice(layout.blob(&self.bytes)?)
     }
-
-    fn blob_text(&self, layout: Layout, range: BlobRange) -> Option<&str> {
-        std::str::from_utf8(self.blob_bytes(layout, range)?).ok()
-    }
 }
 
 /// Borrowed view of one packed context item.
@@ -259,56 +519,48 @@ impl<'a> ContextItem<'a> {
     /// Original transport wire name.
     #[must_use]
     pub fn wire_name(&self) -> Option<&'a str> {
-        self.context.blob_text(
-            self.layout,
-            BlobRange::read(&self.context.bytes, self.descriptor_at + ITEM_WIRE_NAME_AT)?,
-        )
+        self.text(ItemFields::WIRE_NAME)
     }
 
     /// Stored name used by propagation selectors and overrides.
     #[must_use]
     pub fn stored_name(&self) -> Option<&'a str> {
-        self.context.blob_text(
-            self.layout,
-            BlobRange::read(
-                &self.context.bytes,
-                self.descriptor_at + ITEM_STORED_NAME_AT,
-            )?,
-        )
+        self.text(ItemFields::STORED_NAME)
     }
 
     /// Typed raw value.
     #[must_use]
     pub fn value(&self) -> Option<(HeaderValueKind, &'a [u8])> {
         Some((
-            HeaderValueKind::decode(*self.context.bytes.get(self.descriptor_at + ITEM_KIND_AT)?)?,
-            self.context.blob_bytes(
-                self.layout,
-                BlobRange::read(&self.context.bytes, self.descriptor_at + ITEM_VALUE_AT)?,
+            HeaderValueKind::decode(
+                ItemFields::KIND.read(&self.context.bytes, self.descriptor_at)?,
             )?,
+            self.bytes(ItemFields::VALUE)?,
         ))
-    }
-
-    /// Returns a text value as UTF-8.
-    #[must_use]
-    pub fn value_as_str(&self) -> Option<&'a str> {
-        let (kind, value) = self.value()?;
-        (kind == HeaderValueKind::Text)
-            .then(|| std::str::from_utf8(value).ok())
-            .flatten()
     }
 
     /// Compiled capture-rule identifier.
     #[must_use]
     pub fn rule_id(&self) -> Option<u16> {
-        read_u16(&self.context.bytes, self.descriptor_at + ITEM_RULE_ID_AT)
+        ItemFields::RULE_ID.read(&self.context.bytes, self.descriptor_at)
     }
 
     /// Optional context-entry slot.
     #[must_use]
     pub fn entry_slot(&self) -> Option<u16> {
-        let entry = read_u16(&self.context.bytes, self.descriptor_at + ITEM_ENTRY_AT)?;
+        let entry = ItemFields::ENTRY.read(&self.context.bytes, self.descriptor_at)?;
         (entry != NO_ENTRY).then_some(entry)
+    }
+
+    fn bytes(&self, field: BlobRangeField) -> Option<&'a [u8]> {
+        self.context.blob_bytes(
+            self.layout,
+            field.read(&self.context.bytes, self.descriptor_at)?,
+        )
+    }
+
+    fn text(&self, field: BlobRangeField) -> Option<&'a str> {
+        std::str::from_utf8(self.bytes(field)?).ok()
     }
 }
 
@@ -343,7 +595,7 @@ pub struct PropagatedContextItem<'a> {
 /// Zero-allocation propagation iterator over packed context items.
 pub struct ContextPropagation<'a> {
     items: ContextItems<'a>,
-    policy: &'a HeaderPropagationPolicy,
+    policy: &'a CompiledHeaderPropagationPolicy,
 }
 
 impl<'a> Iterator for ContextPropagation<'a> {
@@ -402,8 +654,8 @@ pub struct ContextProjectionAccumulator<'a> {
 }
 
 impl ContextProjectionAccumulator<'_> {
-    /// Appends one bag-only header in one new allocation.
-    pub fn append_bag_header(
+    /// Copies the envelope and appends one bag-only header in one new allocation.
+    pub fn copy_and_append_bag_header(
         self,
         header: HeaderInput<'_>,
     ) -> Result<PdataContextBytes, ContextBytesError> {
@@ -458,27 +710,40 @@ struct SkippedHeaders {
     max_entries: usize,
     name_too_long: usize,
     value_too_long: usize,
+    context_too_large: usize,
 }
 
 impl SkippedHeaders {
     fn into_stats(self) -> Option<CaptureStats> {
-        (self.max_entries > 0 || self.name_too_long > 0 || self.value_too_long > 0).then_some(
-            CaptureStats {
+        (self.max_entries > 0
+            || self.name_too_long > 0
+            || self.value_too_long > 0
+            || self.context_too_large > 0)
+            .then_some(CaptureStats {
                 skipped_max_entries: self.max_entries,
                 skipped_name_too_long: self.name_too_long,
                 skipped_value_too_long: self.value_too_long,
-            },
-        )
+                skipped_context_too_large: self.context_too_large,
+            })
     }
 }
 
 impl HeaderInput<'_> {
     fn encoded_len(&self) -> Result<usize, ContextBytesError> {
+        let stored_name_len = if self.names_share_blob() {
+            0
+        } else {
+            self.stored_name.len()
+        };
         self.wire_name
             .len()
-            .checked_add(self.stored_name.len())
+            .checked_add(stored_name_len)
             .and_then(|len| len.checked_add(self.value.len()))
             .ok_or(ContextBytesError::TooLarge)
+    }
+
+    fn names_share_blob(&self) -> bool {
+        self.wire_name == self.stored_name
     }
 }
 
@@ -528,7 +793,7 @@ impl EntryIndex {
         for (index, word) in self.presence.iter().copied().enumerate() {
             write_u64(
                 &mut encoder.bytes,
-                HEADER_LEN + index * size_of::<u64>(),
+                HeaderFields::LEN + index * size_of::<u64>(),
                 word,
             )?;
         }
@@ -590,12 +855,18 @@ impl Encoder {
         index: usize,
         input: &HeaderInput<'_>,
     ) -> Result<(), ContextBytesError> {
+        let wire_name = self.append_blob(input.wire_name.as_bytes())?;
+        let stored_name = if input.names_share_blob() {
+            wire_name
+        } else {
+            self.append_blob(input.stored_name.as_bytes())?
+        };
         let descriptor = ItemDescriptor {
             rule_id: input.rule_id,
             entry: input.entry,
             kind: input.kind,
-            wire_name: self.append_blob(input.wire_name.as_bytes())?,
-            stored_name: self.append_blob(input.stored_name.as_bytes())?,
+            wire_name,
+            stored_name,
             value: self.append_blob(input.value)?,
         };
         descriptor.write(&mut self.bytes, self.layout.item_offset(index)?)
@@ -642,6 +913,32 @@ impl Encoder {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct TableOffsets {
+    presence_words: usize,
+    entry_at: usize,
+    item_at: usize,
+    member_at: usize,
+    blob_at: usize,
+}
+
+impl TableOffsets {
+    fn calculate(entry_count: usize, item_count: usize, member_count: usize) -> Option<Self> {
+        let presence_words = entry_count.div_ceil(64);
+        let entry_at = table_end(HeaderFields::LEN, presence_words, size_of::<u64>()).ok()?;
+        let item_at = table_end(entry_at, entry_count, EntryFields::LEN).ok()?;
+        let member_at = table_end(item_at, item_count, ItemFields::LEN).ok()?;
+        let blob_at = table_end(member_at, member_count, size_of::<u16>()).ok()?;
+        Some(Self {
+            presence_words,
+            entry_at,
+            item_at,
+            member_at,
+            blob_at,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Layout {
     entry_count: usize,
     item_count: usize,
@@ -668,50 +965,30 @@ impl Layout {
         if item_count > usize::from(u16::MAX) {
             return Err(ContextBytesError::TooMany { what: "items" });
         }
-        if u32::try_from(member_count).is_err() {
+        if u16::try_from(member_count).is_err() {
             return Err(ContextBytesError::TooMany { what: "members" });
         }
 
-        let presence_words = entry_count.div_ceil(64);
-        let entry_at = table_end(HEADER_LEN, presence_words, size_of::<u64>())?;
-        let item_at = table_end(entry_at, entry_count, ENTRY_DESCRIPTOR_LEN)?;
-        let member_at = table_end(item_at, item_count, ITEM_DESCRIPTOR_LEN)?;
-        let blob_at = table_end(member_at, member_count, size_of::<u16>())?;
-        let total_len = blob_at
-            .checked_add(blob_len)
+        let layout = Self::calculate(entry_count, item_count, member_count, blob_len)
             .ok_or(ContextBytesError::TooLarge)?;
-        if u32::try_from(total_len).is_err() {
+        if layout.total_len > MAX_CONTEXT_LEN {
             return Err(ContextBytesError::TooLarge);
         }
-        Ok(Self {
-            entry_count,
-            item_count,
-            member_count,
-            presence_words,
-            entry_at,
-            item_at,
-            member_at,
-            blob_at,
-            blob_len,
-            total_len,
-        })
+        Ok(layout)
     }
 
     fn parse(bytes: &[u8]) -> Result<Self, ContextBytesError> {
-        if read_u32(bytes, HEADER_MAGIC_AT) != Some(MAGIC)
-            || read_u16(bytes, HEADER_VERSION_AT) != Some(VERSION)
-            || bytes
-                .get(HEADER_RESERVED_AT..HEADER_LEN)
-                .is_none_or(|reserved| reserved.iter().any(|byte| *byte != 0))
-        {
+        if HeaderFields::VERSION.read(bytes, 0) != Some(VERSION) {
             return Err(ContextBytesError::InvalidEnvelope);
         }
 
-        let presence_words = read_u16(bytes, HEADER_PRESENCE_WORDS_AT)
+        let presence_words = HeaderFields::PRESENCE_WORDS
+            .read(bytes, 0)
             .map(usize::from)
             .ok_or(ContextBytesError::InvalidEnvelope)?;
-        let blob_at = read_u32(bytes, HEADER_BLOB_OFFSET_AT)
-            .and_then(|offset| usize::try_from(offset).ok())
+        let blob_at = HeaderFields::BLOB_OFFSET
+            .read(bytes, 0)
+            .map(usize::from)
             .ok_or(ContextBytesError::InvalidEnvelope)?;
         let layout = Self::read(bytes).ok_or(ContextBytesError::InvalidEnvelope)?;
         if presence_words != layout.presence_words
@@ -724,60 +1001,70 @@ impl Layout {
     }
 
     fn read(bytes: &[u8]) -> Option<Self> {
-        let entry_count = usize::from(read_u16(bytes, HEADER_ENTRY_COUNT_AT)?);
-        let item_count = usize::from(read_u16(bytes, HEADER_ITEM_COUNT_AT)?);
-        let member_count = usize::try_from(read_u32(bytes, HEADER_MEMBER_COUNT_AT)?).ok()?;
-        let presence_words = entry_count.div_ceil(64);
-        let entry_at = table_end(HEADER_LEN, presence_words, size_of::<u64>()).ok()?;
-        let item_at = table_end(entry_at, entry_count, ENTRY_DESCRIPTOR_LEN).ok()?;
-        let member_at = table_end(item_at, item_count, ITEM_DESCRIPTOR_LEN).ok()?;
-        let blob_at = table_end(member_at, member_count, size_of::<u16>()).ok()?;
+        let entry_count = usize::from(HeaderFields::ENTRY_COUNT.read(bytes, 0)?);
+        let item_count = usize::from(HeaderFields::ITEM_COUNT.read(bytes, 0)?);
+        let member_count = usize::from(HeaderFields::MEMBER_COUNT.read(bytes, 0)?);
+        let offsets = TableOffsets::calculate(entry_count, item_count, member_count)?;
+        Self::from_offsets(
+            entry_count,
+            item_count,
+            member_count,
+            bytes.len().checked_sub(offsets.blob_at)?,
+            offsets,
+        )
+    }
+
+    fn calculate(
+        entry_count: usize,
+        item_count: usize,
+        member_count: usize,
+        blob_len: usize,
+    ) -> Option<Self> {
+        Self::from_offsets(
+            entry_count,
+            item_count,
+            member_count,
+            blob_len,
+            TableOffsets::calculate(entry_count, item_count, member_count)?,
+        )
+    }
+
+    fn from_offsets(
+        entry_count: usize,
+        item_count: usize,
+        member_count: usize,
+        blob_len: usize,
+        offsets: TableOffsets,
+    ) -> Option<Self> {
         Some(Self {
             entry_count,
             item_count,
             member_count,
-            presence_words,
-            entry_at,
-            item_at,
-            member_at,
-            blob_at,
-            blob_len: bytes.len().checked_sub(blob_at)?,
-            total_len: bytes.len(),
+            presence_words: offsets.presence_words,
+            entry_at: offsets.entry_at,
+            item_at: offsets.item_at,
+            member_at: offsets.member_at,
+            blob_at: offsets.blob_at,
+            blob_len,
+            total_len: offsets.blob_at.checked_add(blob_len)?,
         })
     }
 
     fn write_header(self, bytes: &mut [u8]) -> Result<(), ContextBytesError> {
-        write_u32(bytes, HEADER_MAGIC_AT, MAGIC)?;
-        write_u16(bytes, HEADER_VERSION_AT, VERSION)?;
-        write_u16(
-            bytes,
-            HEADER_ENTRY_COUNT_AT,
-            u16::try_from(self.entry_count)
-                .map_err(|_| ContextBytesError::TooMany { what: "entries" })?,
-        )?;
-        write_u16(
-            bytes,
-            HEADER_ITEM_COUNT_AT,
-            u16::try_from(self.item_count)
-                .map_err(|_| ContextBytesError::TooMany { what: "items" })?,
-        )?;
-        write_u16(
-            bytes,
-            HEADER_PRESENCE_WORDS_AT,
-            u16::try_from(self.presence_words).map_err(|_| ContextBytesError::TooMany {
-                what: "presence words",
-            })?,
-        )?;
-        write_usize_u32(bytes, HEADER_MEMBER_COUNT_AT, self.member_count)?;
-        write_usize_u32(bytes, HEADER_BLOB_OFFSET_AT, self.blob_at)
+        HeaderFields::VERSION.write(bytes, 0, VERSION)?;
+        HeaderFields::ENTRY_COUNT.write_usize(bytes, 0, self.entry_count)?;
+        HeaderFields::ITEM_COUNT.write_usize(bytes, 0, self.item_count)?;
+        HeaderFields::PRESENCE_WORDS.write_usize(bytes, 0, self.presence_words)?;
+        HeaderFields::MEMBER_COUNT.write_usize(bytes, 0, self.member_count)?;
+        HeaderFields::BLOB_OFFSET.write_usize(bytes, 0, self.blob_at)
     }
 
     fn entry_offset(self, slot: usize) -> Result<usize, ContextBytesError> {
-        table_offset(self.entry_at, slot, self.entry_count, ENTRY_DESCRIPTOR_LEN)
+        table_offset(self.entry_at, slot, self.entry_count, EntryFields::LEN)
     }
 
     fn item_offset(self, index: usize) -> Result<usize, ContextBytesError> {
-        table_offset(self.item_at, index, self.item_count, ITEM_DESCRIPTOR_LEN)
+        table_offset(self.item_at, index, self.item_count, ItemFields::LEN)
     }
 
     fn member_offset(self, index: usize) -> Option<usize> {
@@ -796,7 +1083,7 @@ impl Layout {
         if slot >= self.entry_count {
             return None;
         }
-        let word = read_u64(bytes, HEADER_LEN + (slot / 64) * size_of::<u64>())?;
+        let word = read_u64(bytes, HeaderFields::LEN + (slot / 64) * size_of::<u64>())?;
         Some(word & (1u64 << (slot % 64)) != 0)
     }
 
@@ -805,7 +1092,7 @@ impl Layout {
     }
 
     fn index_section(self) -> Range<usize> {
-        HEADER_LEN..self.item_at
+        HeaderFields::LEN..self.item_at
     }
 
     fn items_section(self) -> Range<usize> {
@@ -813,7 +1100,7 @@ impl Layout {
     }
 
     fn items_prefix(self, count: usize) -> Range<usize> {
-        self.item_at..self.item_at + count * ITEM_DESCRIPTOR_LEN
+        self.item_at..self.item_at + count * ItemFields::LEN
     }
 
     fn members_section(self) -> Range<usize> {
@@ -839,20 +1126,16 @@ struct EntryDescriptor {
 impl EntryDescriptor {
     fn read(bytes: &[u8], at: usize) -> Option<Self> {
         Some(Self {
-            first_member: read_u32(bytes, at + ENTRY_FIRST_MEMBER_AT)?
-                .try_into()
-                .ok()?,
-            member_count: read_u32(bytes, at + ENTRY_MEMBER_COUNT_AT)?
-                .try_into()
-                .ok()?,
-            hash: read_u64(bytes, at + ENTRY_HASH_AT)?,
+            first_member: usize::from(EntryFields::FIRST_MEMBER.read(bytes, at)?),
+            member_count: usize::from(EntryFields::MEMBER_COUNT.read(bytes, at)?),
+            hash: EntryFields::HASH.read(bytes, at)?,
         })
     }
 
     fn write(self, bytes: &mut [u8], at: usize) -> Result<(), ContextBytesError> {
-        write_usize_u32(bytes, at + ENTRY_FIRST_MEMBER_AT, self.first_member)?;
-        write_usize_u32(bytes, at + ENTRY_MEMBER_COUNT_AT, self.member_count)?;
-        write_u64(bytes, at + ENTRY_HASH_AT, self.hash)
+        EntryFields::FIRST_MEMBER.write_usize(bytes, at, self.first_member)?;
+        EntryFields::MEMBER_COUNT.write_usize(bytes, at, self.member_count)?;
+        EntryFields::HASH.write(bytes, at, self.hash)
     }
 
     fn members(self) -> Range<usize> {
@@ -878,31 +1161,27 @@ struct ItemDescriptor {
 
 impl ItemDescriptor {
     fn read(bytes: &[u8], at: usize) -> Option<Self> {
-        if bytes
-            .get(at + ITEM_RESERVED_AT..at + ITEM_WIRE_NAME_AT)?
-            .iter()
-            .any(|byte| *byte != 0)
-        {
+        if !ItemFields::PADDING.is_zero(bytes, at)? {
             return None;
         }
-        let entry = read_u16(bytes, at + ITEM_ENTRY_AT)?;
+        let entry = ItemFields::ENTRY.read(bytes, at)?;
         Some(Self {
-            rule_id: read_u16(bytes, at + ITEM_RULE_ID_AT)?,
+            rule_id: ItemFields::RULE_ID.read(bytes, at)?,
             entry: (entry != NO_ENTRY).then_some(entry),
-            kind: HeaderValueKind::decode(*bytes.get(at + ITEM_KIND_AT)?)?,
-            wire_name: BlobRange::read(bytes, at + ITEM_WIRE_NAME_AT)?,
-            stored_name: BlobRange::read(bytes, at + ITEM_STORED_NAME_AT)?,
-            value: BlobRange::read(bytes, at + ITEM_VALUE_AT)?,
+            kind: HeaderValueKind::decode(ItemFields::KIND.read(bytes, at)?)?,
+            wire_name: ItemFields::WIRE_NAME.read(bytes, at)?,
+            stored_name: ItemFields::STORED_NAME.read(bytes, at)?,
+            value: ItemFields::VALUE.read(bytes, at)?,
         })
     }
 
     fn write(self, bytes: &mut [u8], at: usize) -> Result<(), ContextBytesError> {
-        write_u16(bytes, at + ITEM_RULE_ID_AT, self.rule_id)?;
-        write_u16(bytes, at + ITEM_ENTRY_AT, self.entry.unwrap_or(NO_ENTRY))?;
-        write_slice(bytes, at + ITEM_KIND_AT, &[self.kind as u8])?;
-        self.wire_name.write(bytes, at + ITEM_WIRE_NAME_AT)?;
-        self.stored_name.write(bytes, at + ITEM_STORED_NAME_AT)?;
-        self.value.write(bytes, at + ITEM_VALUE_AT)
+        ItemFields::RULE_ID.write(bytes, at, self.rule_id)?;
+        ItemFields::ENTRY.write(bytes, at, self.entry.unwrap_or(NO_ENTRY))?;
+        ItemFields::KIND.write(bytes, at, self.kind as u8)?;
+        ItemFields::WIRE_NAME.write(bytes, at, self.wire_name)?;
+        ItemFields::STORED_NAME.write(bytes, at, self.stored_name)?;
+        ItemFields::VALUE.write(bytes, at, self.value)
     }
 
     fn valid_for(self, layout: Layout, blob: &[u8]) -> bool {
@@ -914,25 +1193,13 @@ impl ItemDescriptor {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BlobRange {
     offset: usize,
     len: usize,
 }
 
 impl BlobRange {
-    fn read(bytes: &[u8], at: usize) -> Option<Self> {
-        Some(Self {
-            offset: read_u32(bytes, at)?.try_into().ok()?,
-            len: read_u32(bytes, at + size_of::<u32>())?.try_into().ok()?,
-        })
-    }
-
-    fn write(self, bytes: &mut [u8], at: usize) -> Result<(), ContextBytesError> {
-        write_usize_u32(bytes, at, self.offset)?;
-        write_usize_u32(bytes, at + size_of::<u32>(), self.len)
-    }
-
     fn end(self) -> Option<usize> {
         self.offset.checked_add(self.len)
     }
@@ -1023,7 +1290,7 @@ fn validate_unused_presence_bits(bytes: &[u8], layout: Layout) -> Result<(), Con
     }
     let last_word = read_u64(
         bytes,
-        HEADER_LEN + (layout.presence_words - 1) * size_of::<u64>(),
+        HeaderFields::LEN + (layout.presence_words - 1) * size_of::<u64>(),
     )
     .ok_or(ContextBytesError::InvalidEnvelope)?;
     let unused_mask = !((1u64 << used_bits) - 1);
@@ -1048,7 +1315,7 @@ fn entry_hash<'a>(
         hash_bytes(&mut hash, &[kind as u8]);
         hash_bytes(
             &mut hash,
-            &u32::try_from(value.len())
+            &u16::try_from(value.len())
                 .map_err(|_| ContextBytesError::TooLarge)?
                 .to_le_bytes(),
         );
@@ -1086,10 +1353,6 @@ fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(read_array(bytes, at)?))
 }
 
-fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(read_array(bytes, at)?))
-}
-
 fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(read_array(bytes, at)?))
 }
@@ -1102,20 +1365,8 @@ fn write_u16(bytes: &mut [u8], at: usize, value: u16) -> Result<(), ContextBytes
     write_slice(bytes, at, &value.to_le_bytes())
 }
 
-fn write_u32(bytes: &mut [u8], at: usize, value: u32) -> Result<(), ContextBytesError> {
-    write_slice(bytes, at, &value.to_le_bytes())
-}
-
 fn write_u64(bytes: &mut [u8], at: usize, value: u64) -> Result<(), ContextBytesError> {
     write_slice(bytes, at, &value.to_le_bytes())
-}
-
-fn write_usize_u32(bytes: &mut [u8], at: usize, value: usize) -> Result<(), ContextBytesError> {
-    write_u32(
-        bytes,
-        at,
-        u32::try_from(value).map_err(|_| ContextBytesError::TooLarge)?,
-    )
 }
 
 fn write_slice(bytes: &mut [u8], at: usize, value: &[u8]) -> Result<(), ContextBytesError> {
@@ -1134,8 +1385,9 @@ fn write_slice(bytes: &mut [u8], at: usize, value: &[u8]) -> Result<(), ContextB
 mod tests {
     use super::*;
     use otap_df_config::transport_headers_policy::{
-        CaptureDefaults, CaptureRule, HeaderCapturePolicy, PropagationDefault, PropagationMatch,
-        PropagationOverride, PropagationSelector, PropagationSelectorType,
+        CaptureDefaults, CaptureRule, HeaderCapturePolicy, HeaderPropagationPolicy,
+        PropagationDefault, PropagationMatch, PropagationOverride, PropagationSelector,
+        PropagationSelectorType,
     };
 
     /// Scenario: an entry has duplicate typed values interleaved with a bag-only header.
@@ -1192,8 +1444,39 @@ mod tests {
             ]
         );
         assert_eq!(
-            context.bytes().len(),
-            Layout::parse(context.bytes()).unwrap().total_len
+            context.bytes.len(),
+            Layout::parse(&context.bytes).unwrap().total_len
+        );
+    }
+
+    /// Scenario: an arriving header already uses its normalized stored name.
+    /// Guarantees: wire and stored descriptors share one blob range and one name copy.
+    #[test]
+    fn normalized_names_share_blob_storage() {
+        let policy = HeaderCapturePolicy::new(
+            CaptureDefaults::default(),
+            vec![CaptureRule {
+                match_names: vec!["x-tenant".to_string()],
+                store_as: None,
+                sensitive: false,
+                value_kind: None,
+            }],
+        )
+        .compile()
+        .expect("capture policy");
+        let context = PdataContextBytes::capture(&policy, [("x-tenant", b"acme".as_slice())])
+            .expect("capture")
+            .0
+            .expect("context");
+        let layout = context.layout().expect("layout");
+        let item = layout
+            .item_descriptor(&context.bytes, 0)
+            .expect("item descriptor");
+
+        assert_eq!(item.wire_name, item.stored_name);
+        assert_eq!(
+            context.bytes.len(),
+            HeaderFields::LEN + ItemFields::LEN + "x-tenant".len() + b"acme".len()
         );
     }
 
@@ -1256,6 +1539,75 @@ mod tests {
                 skipped_max_entries: 1,
                 skipped_name_too_long: 1,
                 skipped_value_too_long: 1,
+                skipped_context_too_large: 0,
+            })
+        );
+    }
+
+    /// Scenario: a direct build exactly fills the 65,535-byte context envelope.
+    /// Guarantees: the u16 format accepts its boundary and rejects one additional byte.
+    #[test]
+    fn build_enforces_u16_context_size() {
+        let value = vec![0; MAX_CONTEXT_LEN - HeaderFields::LEN - ItemFields::LEN - 2];
+        let context = PdataContextBytes::build(
+            0,
+            [HeaderInput {
+                wire_name: "w",
+                stored_name: "s",
+                value: &value,
+                kind: HeaderValueKind::Binary,
+                rule_id: 0,
+                entry: None,
+            }],
+        )
+        .expect("maximum-size context");
+        assert_eq!(context.bytes.len(), MAX_CONTEXT_LEN);
+
+        let oversized = vec![0; value.len() + 1];
+        assert!(matches!(
+            PdataContextBytes::build(
+                0,
+                [HeaderInput {
+                    wire_name: "w",
+                    stored_name: "s",
+                    value: &oversized,
+                    kind: HeaderValueKind::Binary,
+                    rule_id: 0,
+                    entry: None,
+                }]
+            ),
+            Err(ContextBytesError::TooLarge)
+        ));
+    }
+
+    /// Scenario: individually valid captured headers would exceed the 64 KiB envelope.
+    /// Guarantees: capture drops only the overflowing header and reports the aggregate limit.
+    #[test]
+    fn capture_drops_header_that_exceeds_context_size() {
+        let policy = HeaderCapturePolicy::new(
+            CaptureDefaults::default(),
+            vec![CaptureRule {
+                match_names: vec!["x".to_string()],
+                store_as: None,
+                sensitive: false,
+                value_kind: None,
+            }],
+        )
+        .compile()
+        .expect("capture policy");
+        let value = vec![0; CaptureDefaults::default().max_value_bytes];
+        let pairs = (0..16).map(|_| ("x", value.as_slice()));
+
+        let (context, stats) = PdataContextBytes::capture(&policy, pairs).expect("capture");
+
+        assert_eq!(context.expect("context").items().count(), 15);
+        assert_eq!(
+            stats,
+            Some(CaptureStats {
+                skipped_max_entries: 0,
+                skipped_name_too_long: 0,
+                skipped_value_too_long: 0,
+                skipped_context_too_large: 1,
             })
         );
     }
@@ -1290,7 +1642,7 @@ mod tests {
 
         let output = input
             .project()
-            .append_bag_header(HeaderInput {
+            .copy_and_append_bag_header(HeaderInput {
                 wire_name: "Partition",
                 stored_name: "partition",
                 value: b"west",
@@ -1354,7 +1706,9 @@ mod tests {
                 name: None,
                 on_error: None,
             }],
-        );
+        )
+        .compile()
+        .expect("propagation policy");
 
         let propagated: Vec<_> = context.propagate(&policy).collect();
         assert_eq!(propagated.len(), 1);
@@ -1382,25 +1736,27 @@ mod tests {
         let layout = context.layout().expect("layout");
 
         let mut corruptions = Vec::new();
-        let mut bad_magic = context.bytes().to_vec();
-        bad_magic[HEADER_MAGIC_AT] = 0;
-        corruptions.push(bad_magic);
+        let mut bad_version = context.bytes.to_vec();
+        bad_version[HeaderFields::VERSION.at(0)] = 0;
+        corruptions.push(bad_version);
 
-        let mut bad_range = context.bytes().to_vec();
-        write_u32(&mut bad_range, layout.item_at + ITEM_WIRE_NAME_AT, u32::MAX)
+        let mut bad_range = context.bytes.to_vec();
+        ItemFields::WIRE_NAME
+            .offset
+            .write(&mut bad_range, layout.item_at, u16::MAX)
             .expect("corrupt range");
         corruptions.push(bad_range);
 
-        let mut bad_name = context.bytes().to_vec();
+        let mut bad_name = context.bytes.to_vec();
         bad_name[layout.blob_at] = 0xff;
         corruptions.push(bad_name);
 
-        let mut bad_member = context.bytes().to_vec();
+        let mut bad_member = context.bytes.to_vec();
         write_u16(&mut bad_member, layout.member_at, u16::MAX).expect("corrupt member");
         corruptions.push(bad_member);
 
-        let mut bad_hash = context.bytes().to_vec();
-        bad_hash[layout.entry_at + ENTRY_HASH_AT] ^= 1;
+        let mut bad_hash = context.bytes.to_vec();
+        bad_hash[EntryFields::HASH.at(layout.entry_at)] ^= 1;
         corruptions.push(bad_hash);
 
         for bytes in corruptions {

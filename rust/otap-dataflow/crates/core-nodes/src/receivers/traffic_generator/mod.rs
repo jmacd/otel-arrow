@@ -1422,7 +1422,9 @@ mod tests {
                     "should have exactly one x-tenant-id header"
                 );
                 assert_eq!(
-                    tenant[0].value_as_str(),
+                    tenant[0]
+                        .value()
+                        .and_then(|(_, value)| std::str::from_utf8(value).ok()),
                     Some("acme"),
                     "fixed header value should be 'acme'"
                 );
@@ -1520,7 +1522,10 @@ mod tests {
                     "non-bin key should produce a Text header"
                 );
                 assert!(
-                    request_id[0].value_as_str().is_some(),
+                    request_id[0]
+                        .value()
+                        .and_then(|(_, value)| std::str::from_utf8(value).ok())
+                        .is_some(),
                     "text header random value should be valid UTF-8 (printable)"
                 );
             }) as Pin<Box<dyn Future<Output = ()>>>

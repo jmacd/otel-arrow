@@ -427,7 +427,7 @@ fn project_partition_header(
         entry: None,
     };
     let projected = match context.pdata_context_bytes() {
-        Some(context) => context.project().append_bag_header(input)?,
+        Some(context) => context.project().copy_and_append_bag_header(input)?,
         None => PdataContextBytes::build(0, [input])?,
     };
     context.set_pdata_context_bytes(projected);

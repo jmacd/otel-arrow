@@ -4374,7 +4374,9 @@ mod tests {
                     "should capture exactly one x-tenant-id header"
                 );
                 assert_eq!(
-                    tenant_headers[0].value_as_str(),
+                    tenant_headers[0]
+                        .value()
+                        .and_then(|(_, value)| std::str::from_utf8(value).ok()),
                     Some("acme"),
                     "captured header value should match"
                 );
@@ -4702,7 +4704,9 @@ mod tests {
                     "should capture exactly one x-tenant-id header"
                 );
                 assert_eq!(
-                    tenant_headers[0].value_as_str(),
+                    tenant_headers[0]
+                        .value()
+                        .and_then(|(_, value)| std::str::from_utf8(value).ok()),
                     Some("acme"),
                     "captured header value should match"
                 );
