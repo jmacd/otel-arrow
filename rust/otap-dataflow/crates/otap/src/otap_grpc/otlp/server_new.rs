@@ -457,26 +457,8 @@ impl UnaryService<OtapPdata> for OtapBatchService {
 
         // Capture context synchronously before moving the effect handler.
         if let Some(policy) = effect_handler.capture_policy() {
-            // Collect all metadata pairs, decoding binary values so we store
-            // raw bytes rather than the base64 wire encoding (which would be
-            // double-encoded on downstream gRPC propagation).
-            let pairs: Vec<(&str, Vec<u8>)> = metadata
-                .iter()
-                .filter_map(|kv| match kv {
-                    tonic::metadata::KeyAndValueRef::Ascii(key, value) => {
-                        Some((key.as_str(), value.as_bytes().to_vec()))
-                    }
-                    tonic::metadata::KeyAndValueRef::Binary(key, value) => value
-                        .to_bytes()
-                        .ok()
-                        .map(|decoded| (key.as_str(), decoded.to_vec())),
-                })
-                .collect();
-
-            let (context, stats) = match PdataContextBytes::capture(
-                policy,
-                pairs.iter().map(|(key, value)| (*key, value.as_slice())),
-            ) {
+            let (context, stats) = match PdataContextBytes::capture_grpc_metadata(policy, &metadata)
+            {
                 Ok(captured) => captured,
                 Err(error) => {
                     let status = Status::internal(error.to_string());

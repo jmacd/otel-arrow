@@ -1,0 +1,7 @@
+change_type: enhancement
+component: otap
+note: "Improve transport header context capture performance by screening metadata before copying values."
+issues: [3863]
+subtext: >
+  Compiled capture policies now avoid materializing unmatched gRPC metadata
+  and use compact indexed context construction across header counts.

@@ -61,13 +61,14 @@
 //! Item ranges are relative to `blob offset`. `NO_ENTRY` marks bag-only items;
 //! the presence bitmap makes absent entry lookup constant-time.
 
-use std::{fmt, marker::PhantomData, ops::Range};
+use std::{fmt, marker::PhantomData, ops::Range, sync::Arc};
 
 use bytes::Bytes;
 use otap_df_config::transport_headers_policy::{
     CaptureStats, CompiledHeaderCapturePolicy, CompiledHeaderPropagationPolicy, NameStrategy,
     PropagationAction, ValueKindConfig,
 };
+use tonic::metadata::{KeyAndValueRef, MetadataMap};
 
 const VERSION: u16 = 3;
 const NO_ENTRY: u16 = u16::MAX;
@@ -328,6 +329,42 @@ impl fmt::Debug for HeaderInput<'_> {
     }
 }
 
+enum CapturedGrpcValue<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Bytes),
+}
+
+impl AsRef<[u8]> for CapturedGrpcValue<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+struct CapturedGrpcHeader<'a> {
+    wire_name: &'a str,
+    stored_name: &'a str,
+    value: CapturedGrpcValue<'a>,
+    kind: HeaderValueKind,
+    rule_id: u16,
+    entry: Option<u16>,
+}
+
+impl CapturedGrpcHeader<'_> {
+    fn as_input(&self) -> HeaderInput<'_> {
+        HeaderInput {
+            wire_name: self.wire_name,
+            stored_name: self.stored_name,
+            value: self.value.as_ref(),
+            kind: self.kind,
+            rule_id: self.rule_id,
+            entry: self.entry,
+        }
+    }
+}
+
 /// Failure while constructing or validating a context envelope.
 #[derive(Debug, thiserror::Error)]
 pub enum ContextBytesError {
@@ -348,7 +385,7 @@ pub enum ContextBytesError {
 /// Immutable encoded pdata context.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PdataContextBytes {
-    bytes: Bytes,
+    bytes: Arc<Vec<u8>>,
 }
 
 impl fmt::Debug for PdataContextBytes {
@@ -369,6 +406,7 @@ impl PdataContextBytes {
         let defaults = policy.defaults();
         let mut headers = smallvec::SmallVec::<[HeaderInput<'_>; 32]>::new();
         let mut skipped = SkippedHeaders::default();
+        let mut blob_len = 0;
         let mut encoded_len = HeaderFields::LEN
             + policy.entry_count().div_ceil(64) * size_of::<u64>()
             + policy.entry_count() * EntryFields::LEN;
@@ -397,9 +435,10 @@ impl PdataContextBytes {
                 rule_id: matched.rule_id,
                 entry: matched.entry,
             };
+            let header_blob_len = header.encoded_len()?;
             let added_len = ItemFields::LEN
                 + usize::from(header.entry.is_some()) * size_of::<u16>()
-                + header.encoded_len()?;
+                + header_blob_len;
             if encoded_len
                 .checked_add(added_len)
                 .is_none_or(|len| len > MAX_CONTEXT_LEN)
@@ -408,12 +447,104 @@ impl PdataContextBytes {
                 continue;
             }
             encoded_len += added_len;
+            blob_len += header_blob_len;
             headers.push(header);
         }
 
         let context = (!headers.is_empty())
-            .then(|| Self::build(policy.entry_count(), headers))
+            .then(|| Self::build_headers(policy.entry_count(), &headers, blob_len))
             .transpose()?;
+        Ok((context, skipped.into_stats()))
+    }
+
+    /// Captures gRPC metadata after screening names with the compiled policy.
+    pub fn capture_grpc_metadata(
+        policy: &CompiledHeaderCapturePolicy,
+        metadata: &MetadataMap,
+    ) -> Result<(Option<Self>, Option<CaptureStats>), ContextBytesError> {
+        let defaults = policy.defaults();
+        let mut captured = smallvec::SmallVec::<[CapturedGrpcHeader<'_>; 32]>::new();
+        let mut skipped = SkippedHeaders::default();
+        let mut blob_len = 0;
+        let mut encoded_len = HeaderFields::LEN
+            + policy.entry_count().div_ceil(64) * size_of::<u64>()
+            + policy.entry_count() * EntryFields::LEN;
+
+        for metadata_entry in metadata.iter() {
+            let value = match metadata_entry {
+                KeyAndValueRef::Ascii(key, value) => {
+                    let wire_name = key.as_str();
+                    let Some(matched) = policy.match_header(wire_name) else {
+                        continue;
+                    };
+                    CapturedGrpcHeader {
+                        wire_name,
+                        stored_name: matched.stored_name,
+                        value: CapturedGrpcValue::Borrowed(value.as_bytes()),
+                        kind: HeaderValueKind::captured(matched.value_kind, wire_name),
+                        rule_id: matched.rule_id,
+                        entry: matched.entry,
+                    }
+                }
+                KeyAndValueRef::Binary(key, value) => {
+                    let wire_name = key.as_str();
+                    let Some(matched) = policy.match_header(wire_name) else {
+                        continue;
+                    };
+                    let Ok(decoded) = value.to_bytes() else {
+                        continue;
+                    };
+                    CapturedGrpcHeader {
+                        wire_name,
+                        stored_name: matched.stored_name,
+                        value: CapturedGrpcValue::Owned(decoded),
+                        kind: HeaderValueKind::captured(matched.value_kind, wire_name),
+                        rule_id: matched.rule_id,
+                        entry: matched.entry,
+                    }
+                }
+            };
+            let wire_name = value.wire_name;
+            if captured.len() >= defaults.max_entries {
+                skipped.max_entries += 1;
+                continue;
+            }
+            if wire_name.len() > defaults.max_name_bytes {
+                skipped.name_too_long += 1;
+                continue;
+            }
+            let value_len = value.value.as_ref().len();
+            if value_len > defaults.max_value_bytes {
+                skipped.value_too_long += 1;
+                continue;
+            }
+            let header_blob_len = value.as_input().encoded_len()?;
+            let added_len = ItemFields::LEN
+                + usize::from(value.entry.is_some()) * size_of::<u16>()
+                + header_blob_len;
+            if encoded_len
+                .checked_add(added_len)
+                .is_none_or(|len| len > MAX_CONTEXT_LEN)
+            {
+                skipped.context_too_large += 1;
+                continue;
+            }
+            encoded_len += added_len;
+            blob_len += header_blob_len;
+            captured.push(value);
+        }
+
+        let context = if captured.is_empty() {
+            None
+        } else {
+            let headers: smallvec::SmallVec<[HeaderInput<'_>; 32]> =
+                captured.iter().map(CapturedGrpcHeader::as_input).collect();
+            Some(Self::build_headers(
+                policy.entry_count(),
+                &headers,
+                blob_len,
+            )?)
+        };
         Ok((context, skipped.into_stats()))
     }
 
@@ -423,30 +554,90 @@ impl PdataContextBytes {
         headers: impl IntoIterator<Item = HeaderInput<'a>>,
     ) -> Result<Self, ContextBytesError> {
         let headers: smallvec::SmallVec<[HeaderInput<'_>; 32]> = headers.into_iter().collect();
-        let entries = EntryIndex::new(entry_count, &headers)?;
         let blob_len = headers.iter().try_fold(0usize, |total, header| {
             total
                 .checked_add(header.encoded_len()?)
                 .ok_or(ContextBytesError::TooLarge)
         })?;
+        Self::build_headers(entry_count, &headers, blob_len)
+    }
+
+    fn build_headers(
+        entry_count: usize,
+        headers: &[HeaderInput<'_>],
+        blob_len: usize,
+    ) -> Result<Self, ContextBytesError> {
+        if let [header] = headers {
+            return Self::build_single(entry_count, header, blob_len);
+        }
+
+        let entries = EntryIndex::new(entry_count, headers)?;
         let layout = Layout::new(entry_count, headers.len(), entries.member_count(), blob_len)?;
         let mut encoder = Encoder::new(layout)?;
-        entries.write_to(&mut encoder, &headers)?;
+        entries.write_to(&mut encoder)?;
         for (index, header) in headers.iter().enumerate() {
             encoder.write_item(index, header)?;
         }
         encoder.finish()
     }
 
+    fn build_single(
+        entry_count: usize,
+        header: &HeaderInput<'_>,
+        blob_len: usize,
+    ) -> Result<Self, ContextBytesError> {
+        if entry_count > usize::from(u16::MAX) {
+            return Err(ContextBytesError::TooMany { what: "entries" });
+        }
+        let entry = header.entry.map(usize::from);
+        if entry.is_some_and(|slot| slot >= entry_count) {
+            return Err(ContextBytesError::InvalidEnvelope);
+        }
+
+        let layout = Layout::new(entry_count, 1, usize::from(entry.is_some()), blob_len)?;
+        let mut encoder = Encoder::new(layout)?;
+        if let Some(slot) = entry {
+            let presence_at = HeaderFields::LEN + (slot / 64) * size_of::<u64>();
+            let mut presence =
+                read_u64(&encoder.bytes, presence_at).ok_or(ContextBytesError::InvalidEnvelope)?;
+            presence |= 1u64 << (slot % 64);
+            write_u64(&mut encoder.bytes, presence_at, presence)?;
+            write_u16(
+                &mut encoder.bytes,
+                layout
+                    .member_offset(0)
+                    .ok_or(ContextBytesError::InvalidEnvelope)?,
+                0,
+            )?;
+        }
+        for slot in 0..entry_count {
+            let present = entry == Some(slot);
+            EntryDescriptor {
+                first_member: usize::from(entry.is_some_and(|entry| entry < slot)),
+                member_count: usize::from(present),
+                hash: if present {
+                    entry_hash(slot, [(header.kind, header.value)])?
+                } else {
+                    entry_hash(slot, [])?
+                },
+            }
+            .write(&mut encoder.bytes, layout.entry_offset(slot)?)?;
+        }
+        encoder.write_item(0, header)?;
+        encoder.finish()
+    }
+
     /// Validates and adopts an encoded context.
     pub fn from_bytes(bytes: Bytes) -> Result<Self, ContextBytesError> {
         validate(&bytes)?;
-        Ok(Self { bytes })
+        Ok(Self {
+            bytes: Arc::new(bytes.to_vec()),
+        })
     }
 
     fn from_vec(bytes: Vec<u8>) -> Self {
         Self {
-            bytes: Bytes::from(bytes),
+            bytes: Arc::new(bytes),
         }
     }
 
@@ -457,6 +648,7 @@ impl PdataContextBytes {
     }
 
     /// Iterates all bag items in arrival order.
+    #[must_use]
     pub fn items(&self) -> ContextItems<'_> {
         ContextItems {
             context: self,
@@ -466,6 +658,7 @@ impl PdataContextBytes {
     }
 
     /// Scans the bag and applies a transport-header propagation policy.
+    #[must_use]
     pub fn propagate<'a>(
         &'a self,
         policy: &'a CompiledHeaderPropagationPolicy,
@@ -473,6 +666,7 @@ impl PdataContextBytes {
         ContextPropagation {
             items: self.items(),
             policy,
+            uniform: policy.uniform_decision(),
         }
     }
 
@@ -596,21 +790,30 @@ pub struct PropagatedContextItem<'a> {
 pub struct ContextPropagation<'a> {
     items: ContextItems<'a>,
     policy: &'a CompiledHeaderPropagationPolicy,
+    uniform: Option<(PropagationAction, NameStrategy)>,
 }
 
 impl<'a> Iterator for ContextPropagation<'a> {
     type Item = PropagatedContextItem<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self
+            .uniform
+            .is_some_and(|(action, _)| action == PropagationAction::Drop)
+        {
+            return None;
+        }
         for item in self.items.by_ref() {
-            let stored_name = item.stored_name()?;
-            let (action, name_strategy) = self.policy.resolve_stored_name(stored_name);
+            let (action, name_strategy) = match self.uniform {
+                Some(decision) => decision,
+                None => self.policy.resolve_stored_name(item.stored_name()?),
+            };
             if action == PropagationAction::Drop {
                 continue;
             }
             let header_name = match name_strategy {
                 NameStrategy::Preserve => item.wire_name()?,
-                NameStrategy::StoredName => stored_name,
+                NameStrategy::StoredName => item.stored_name()?,
             };
             let (value_kind, value) = item.value()?;
             return Some(PropagatedContextItem {
@@ -729,7 +932,16 @@ impl HeaderInput<'_> {
 
 struct EntryIndex {
     presence: smallvec::SmallVec<[u64; 2]>,
-    members: smallvec::SmallVec<[smallvec::SmallVec<[u16; 4]>; 16]>,
+    entries: smallvec::SmallVec<[EntryBuild; 16]>,
+    members: smallvec::SmallVec<[u16; 32]>,
+}
+
+#[derive(Clone, Copy)]
+struct EntryBuild {
+    first_member: usize,
+    member_count: usize,
+    next_member: usize,
+    hash: u64,
 }
 
 impl EntryIndex {
@@ -742,11 +954,17 @@ impl EntryIndex {
         }
 
         let mut presence = smallvec::SmallVec::<[u64; 2]>::from_elem(0, entry_count.div_ceil(64));
-        let mut members =
-            smallvec::SmallVec::<[smallvec::SmallVec<[u16; 4]>; 16]>::with_capacity(entry_count);
-        members.resize_with(entry_count, smallvec::SmallVec::new);
+        let mut entries = smallvec::SmallVec::<[EntryBuild; 16]>::with_capacity(entry_count);
+        for slot in 0..entry_count {
+            entries.push(EntryBuild {
+                first_member: 0,
+                member_count: 0,
+                next_member: 0,
+                hash: entry_hash_seed(slot)?,
+            });
+        }
 
-        for (item, header) in headers.iter().enumerate() {
+        for header in headers {
             let Some(entry) = header.entry.map(usize::from) else {
                 continue;
             };
@@ -754,22 +972,38 @@ impl EntryIndex {
                 return Err(ContextBytesError::InvalidEnvelope);
             }
             presence[entry / 64] |= 1u64 << (entry % 64);
-            members[entry].push(
-                u16::try_from(item).map_err(|_| ContextBytesError::TooMany { what: "items" })?,
-            );
+            entries[entry].member_count += 1;
+            entry_hash_value(&mut entries[entry].hash, header.kind, header.value)?;
         }
-        Ok(Self { presence, members })
+
+        let mut member_count = 0;
+        for entry in &mut entries {
+            entry.first_member = member_count;
+            entry.next_member = member_count;
+            member_count += entry.member_count;
+        }
+        let mut members = smallvec::SmallVec::<[u16; 32]>::from_elem(0, member_count);
+        for (item, header) in headers.iter().enumerate() {
+            let Some(entry) = header.entry.map(usize::from) else {
+                continue;
+            };
+            let next = entries[entry].next_member;
+            members[next] =
+                u16::try_from(item).map_err(|_| ContextBytesError::TooMany { what: "items" })?;
+            entries[entry].next_member += 1;
+        }
+        Ok(Self {
+            presence,
+            entries,
+            members,
+        })
     }
 
     fn member_count(&self) -> usize {
-        self.members.iter().map(smallvec::SmallVec::len).sum()
+        self.members.len()
     }
 
-    fn write_to(
-        &self,
-        encoder: &mut Encoder,
-        headers: &[HeaderInput<'_>],
-    ) -> Result<(), ContextBytesError> {
+    fn write_to(&self, encoder: &mut Encoder) -> Result<(), ContextBytesError> {
         for (index, word) in self.presence.iter().copied().enumerate() {
             write_u64(
                 &mut encoder.bytes,
@@ -778,36 +1012,24 @@ impl EntryIndex {
             )?;
         }
 
-        let mut first_member = 0;
-        for (slot, members) in self.members.iter().enumerate() {
+        for (slot, entry) in self.entries.iter().enumerate() {
             EntryDescriptor {
-                first_member,
-                member_count: members.len(),
-                hash: entry_hash(
-                    slot,
-                    members.iter().map(|member| {
-                        let header = &headers[usize::from(*member)];
-                        (header.kind, header.value)
-                    }),
-                )?,
+                first_member: entry.first_member,
+                member_count: entry.member_count,
+                hash: entry.hash,
             }
             .write(&mut encoder.bytes, encoder.layout.entry_offset(slot)?)?;
-            first_member += members.len();
         }
 
-        let mut member = 0;
-        for members in &self.members {
-            for item in members {
-                write_u16(
-                    &mut encoder.bytes,
-                    encoder
-                        .layout
-                        .member_offset(member)
-                        .ok_or(ContextBytesError::InvalidEnvelope)?,
-                    *item,
-                )?;
-                member += 1;
-            }
+        for (member, item) in self.members.iter().copied().enumerate() {
+            write_u16(
+                &mut encoder.bytes,
+                encoder
+                    .layout
+                    .member_offset(member)
+                    .ok_or(ContextBytesError::InvalidEnvelope)?,
+                item,
+            )?;
         }
         Ok(())
     }
@@ -1314,6 +1536,14 @@ fn entry_hash<'a>(
     slot: usize,
     values: impl IntoIterator<Item = (HeaderValueKind, &'a [u8])>,
 ) -> Result<u64, ContextBytesError> {
+    let mut hash = entry_hash_seed(slot)?;
+    for (kind, value) in values {
+        entry_hash_value(&mut hash, kind, value)?;
+    }
+    Ok(hash)
+}
+
+fn entry_hash_seed(slot: usize) -> Result<u64, ContextBytesError> {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     hash_bytes(
         &mut hash,
@@ -1321,17 +1551,23 @@ fn entry_hash<'a>(
             .map_err(|_| ContextBytesError::TooLarge)?
             .to_le_bytes(),
     );
-    for (kind, value) in values {
-        hash_bytes(&mut hash, &[kind as u8]);
-        hash_bytes(
-            &mut hash,
-            &u16::try_from(value.len())
-                .map_err(|_| ContextBytesError::TooLarge)?
-                .to_le_bytes(),
-        );
-        hash_bytes(&mut hash, value);
-    }
     Ok(hash)
+}
+
+fn entry_hash_value(
+    hash: &mut u64,
+    kind: HeaderValueKind,
+    value: &[u8],
+) -> Result<(), ContextBytesError> {
+    hash_bytes(hash, &[kind as u8]);
+    hash_bytes(
+        hash,
+        &u16::try_from(value.len())
+            .map_err(|_| ContextBytesError::TooLarge)?
+            .to_le_bytes(),
+    );
+    hash_bytes(hash, value);
+    Ok(())
 }
 
 fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
@@ -1459,6 +1695,32 @@ mod tests {
         );
     }
 
+    /// Scenario: one captured item occupies the first of several compiled entry slots.
+    /// Guarantees: the direct single-item encoder produces a valid envelope for trailing absent slots.
+    #[test]
+    fn single_item_context_round_trips_with_trailing_entry_slots() {
+        let context = PdataContextBytes::build(
+            3,
+            [HeaderInput {
+                wire_name: "x-tenant",
+                stored_name: "tenant",
+                value: b"acme",
+                kind: HeaderValueKind::Text,
+                rule_id: 0,
+                entry: Some(0),
+            }],
+        )
+        .expect("context encodes");
+
+        let decoded = PdataContextBytes::from_bytes(Bytes::from(context.bytes.to_vec()))
+            .expect("context validates");
+
+        assert_eq!(decoded, context);
+        assert!(decoded.entry(0).is_some());
+        assert!(decoded.entry(1).is_none());
+        assert!(decoded.entry(2).is_none());
+    }
+
     /// Scenario: an arriving header already uses its normalized stored name.
     /// Guarantees: wire and stored descriptors share one blob range and one name copy.
     #[test]
@@ -1488,6 +1750,67 @@ mod tests {
             context.bytes.len(),
             HeaderFields::LEN + ItemFields::LEN + "x-tenant".len() + b"acme".len()
         );
+    }
+
+    /// Scenario: gRPC metadata contains unmatched ASCII plus matched ASCII and binary values.
+    /// Guarantees: capture screens by name and preserves decoded binary bytes and entry indexing.
+    #[test]
+    fn grpc_capture_screens_names_before_preserving_values() {
+        use tonic::metadata::{Ascii, Binary, MetadataKey, MetadataMap, MetadataValue};
+
+        let policy = HeaderCapturePolicy::new(
+            CaptureDefaults::default(),
+            vec![
+                CaptureRule {
+                    match_names: vec!["x-tenant".to_string()],
+                    store_as: Some("tenant".to_string()),
+                    sensitive: false,
+                    value_kind: None,
+                },
+                CaptureRule {
+                    match_names: vec!["trace-bin".to_string()],
+                    store_as: Some("trace".to_string()),
+                    sensitive: false,
+                    value_kind: None,
+                },
+            ],
+        )
+        .compile()
+        .expect("capture policy");
+        let mut metadata = MetadataMap::new();
+        let _ = metadata.append(
+            "ignored"
+                .parse::<MetadataKey<Ascii>>()
+                .expect("metadata key"),
+            MetadataValue::try_from("skip").expect("metadata value"),
+        );
+        let _ = metadata.append(
+            "x-tenant"
+                .parse::<MetadataKey<Ascii>>()
+                .expect("metadata key"),
+            MetadataValue::try_from("acme").expect("metadata value"),
+        );
+        let _ = metadata.append_bin(
+            "trace-bin"
+                .parse::<MetadataKey<Binary>>()
+                .expect("metadata key"),
+            MetadataValue::from_bytes(&[0x01, 0x02]),
+        );
+
+        let context = PdataContextBytes::capture_grpc_metadata(&policy, &metadata)
+            .expect("capture")
+            .0
+            .expect("context");
+        let items: Vec<_> = context.items().collect();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].stored_name(), Some("tenant"));
+        assert_eq!(
+            items[1].value(),
+            Some((HeaderValueKind::Binary, &[0x01, 0x02][..]))
+        );
+        assert_eq!(context.entry(0).expect("tenant entry").values().count(), 1);
+        assert_eq!(context.entry(1).expect("trace entry").values().count(), 1);
     }
 
     /// Scenario: capture rules match duplicate text and binary headers while limits drop excess.

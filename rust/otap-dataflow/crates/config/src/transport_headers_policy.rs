@@ -11,9 +11,9 @@
 //!
 //! TODO: Implement the sensitive capability for headers
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use ahash::{AHashMap, AHashSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -109,8 +109,8 @@ impl HeaderCapturePolicy {
             ));
         }
 
-        let mut entry_ids = HashMap::new();
-        let mut matches = HashMap::new();
+        let mut entry_ids = AHashMap::new();
+        let mut matches = AHashMap::new();
         for (rule_id, rule) in self.headers.iter().enumerate() {
             let entry = match rule.store_as.as_ref() {
                 Some(name) => {
@@ -154,7 +154,11 @@ impl HeaderCapturePolicy {
         }
         Ok(CompiledHeaderCapturePolicy {
             defaults: self.defaults.clone(),
-            matches,
+            header_probe: matches
+                .keys()
+                .map(|name| 1u64 << header_probe_bit(name.as_bytes()))
+                .fold(0, |probe, bit| probe | bit),
+            matches: CompiledCaptureMatches::new(matches),
             entry_count: entry_ids.len(),
         })
     }
@@ -169,7 +173,8 @@ impl HeaderCapturePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledHeaderCapturePolicy {
     defaults: CaptureDefaults,
-    matches: HashMap<String, CompiledCaptureMatch>,
+    header_probe: u64,
+    matches: CompiledCaptureMatches,
     entry_count: usize,
 }
 
@@ -183,12 +188,17 @@ impl CompiledHeaderCapturePolicy {
     /// Finds the first capture rule matching `wire_name`.
     #[must_use]
     pub fn match_header(&self, wire_name: &str) -> Option<CompiledHeaderMatch<'_>> {
-        lookup_ascii_case_insensitive(&self.matches, wire_name).map(|matched| CompiledHeaderMatch {
-            rule_id: matched.rule_id,
-            entry: matched.entry,
-            stored_name: &matched.stored_name,
-            value_kind: matched.value_kind,
-        })
+        if self.header_probe & (1u64 << header_probe_bit(wire_name.as_bytes())) == 0 {
+            return None;
+        }
+        self.matches
+            .get(wire_name)
+            .map(|matched| CompiledHeaderMatch {
+                rule_id: matched.rule_id,
+                entry: matched.entry,
+                stored_name: &matched.stored_name,
+                value_kind: matched.value_kind,
+            })
     }
 
     /// Returns the configured capture limits.
@@ -204,6 +214,35 @@ struct CompiledCaptureMatch {
     entry: Option<u16>,
     stored_name: String,
     value_kind: Option<ValueKindConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompiledCaptureMatches {
+    Linear(Box<[(String, CompiledCaptureMatch)]>),
+    Hashed(AHashMap<String, CompiledCaptureMatch>),
+}
+
+impl CompiledCaptureMatches {
+    const LINEAR_LIMIT: usize = 8;
+
+    fn new(matches: AHashMap<String, CompiledCaptureMatch>) -> Self {
+        if matches.len() <= Self::LINEAR_LIMIT {
+            let mut matches: Vec<_> = matches.into_iter().collect();
+            matches.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            Self::Linear(matches.into_boxed_slice())
+        } else {
+            Self::Hashed(matches)
+        }
+    }
+
+    fn get(&self, wire_name: &str) -> Option<&CompiledCaptureMatch> {
+        match self {
+            Self::Linear(matches) => matches.iter().find_map(|(name, matched)| {
+                (name == wire_name || name.eq_ignore_ascii_case(wire_name)).then_some(matched)
+            }),
+            Self::Hashed(matches) => lookup_ascii_case_insensitive(matches, wire_name),
+        }
+    }
 }
 
 /// A receiver-facing result of matching one inbound header.
@@ -342,9 +381,9 @@ impl HeaderPropagationPolicy {
                 .flatten()
                 .map(|name| name.to_ascii_lowercase())
                 .collect(),
-            PropagationSelectorType::AllCaptured | PropagationSelectorType::None => HashSet::new(),
+            PropagationSelectorType::AllCaptured | PropagationSelectorType::None => AHashSet::new(),
         };
-        let mut overrides = HashMap::new();
+        let mut overrides = AHashMap::new();
         for rule in &self.overrides {
             for stored_name in &rule.match_rule.stored_names {
                 let _ = overrides.entry(stored_name.to_ascii_lowercase()).or_insert(
@@ -355,7 +394,22 @@ impl HeaderPropagationPolicy {
                 );
             }
         }
+        let uniform = (self.overrides.is_empty()
+            && self.default.selector.selector_type != PropagationSelectorType::Named)
+            .then(|| {
+                let selected =
+                    self.default.selector.selector_type == PropagationSelectorType::AllCaptured;
+                (
+                    if selected {
+                        self.default.action
+                    } else {
+                        PropagationAction::Drop
+                    },
+                    self.default.name,
+                )
+            });
         Ok(CompiledHeaderPropagationPolicy {
+            uniform,
             selector_type: self.default.selector.selector_type,
             selected_names,
             default_action: self.default.action,
@@ -368,14 +422,21 @@ impl HeaderPropagationPolicy {
 /// Propagation policy compiled for constant-time stored-name lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledHeaderPropagationPolicy {
+    uniform: Option<(PropagationAction, NameStrategy)>,
     selector_type: PropagationSelectorType,
-    selected_names: HashSet<String>,
+    selected_names: AHashSet<String>,
     default_action: PropagationAction,
     default_name: NameStrategy,
-    overrides: HashMap<String, CompiledPropagationOverride>,
+    overrides: AHashMap<String, CompiledPropagationOverride>,
 }
 
 impl CompiledHeaderPropagationPolicy {
+    /// Returns the precompiled decision when every stored name has identical behavior.
+    #[must_use]
+    pub const fn uniform_decision(&self) -> Option<(PropagationAction, NameStrategy)> {
+        self.uniform
+    }
+
     /// Resolves propagation behavior from a stored context name.
     #[must_use]
     pub fn resolve_stored_name(&self, stored_name: &str) -> (PropagationAction, NameStrategy) {
@@ -407,7 +468,7 @@ struct CompiledPropagationOverride {
 }
 
 fn lookup_ascii_case_insensitive<'a, T>(
-    values: &'a HashMap<String, T>,
+    values: &'a AHashMap<String, T>,
     name: &str,
 ) -> Option<&'a T> {
     values.get(name).or_else(|| {
@@ -418,10 +479,20 @@ fn lookup_ascii_case_insensitive<'a, T>(
     })
 }
 
-fn contains_ascii_case_insensitive(values: &HashSet<String>, name: &str) -> bool {
+fn contains_ascii_case_insensitive(values: &AHashSet<String>, name: &str) -> bool {
     values.contains(name)
         || (name.bytes().any(|byte| byte.is_ascii_uppercase())
             && values.contains(&name.to_ascii_lowercase()))
+}
+
+/// Cheap discriminator compiled over configured header names.
+fn header_probe_bit(name: &[u8]) -> u32 {
+    let first = name.first().copied().unwrap_or(0).to_ascii_lowercase();
+    let last = name.last().copied().unwrap_or(0).to_ascii_lowercase();
+    ((u32::from(first).wrapping_mul(31))
+        ^ (u32::from(last).wrapping_mul(17))
+        ^ (name.len() as u32).wrapping_mul(7))
+        & 63
 }
 
 /// Default propagation behavior.
@@ -887,6 +958,34 @@ named:
         assert_eq!(
             policy.resolve_stored_name("AUTHORIZATION"),
             (PropagationAction::Drop, NameStrategy::StoredName)
+        );
+        assert_eq!(
+            policy.resolve_stored_name("other"),
+            (PropagationAction::Drop, NameStrategy::Preserve)
+        );
+    }
+
+    /// Scenario: a named selector has no propagation overrides.
+    /// Guarantees: compilation retains per-name selection instead of treating every name uniformly.
+    #[test]
+    fn compiled_named_propagation_is_not_uniform() {
+        let policy = HeaderPropagationPolicy::new(
+            PropagationDefault {
+                selector: PropagationSelector {
+                    selector_type: PropagationSelectorType::Named,
+                    named: Some(vec!["tenant".to_string()]),
+                },
+                ..PropagationDefault::default()
+            },
+            vec![],
+        )
+        .compile()
+        .expect("propagation policy");
+
+        assert_eq!(policy.uniform_decision(), None);
+        assert_eq!(
+            policy.resolve_stored_name("tenant"),
+            (PropagationAction::Propagate, NameStrategy::Preserve)
         );
         assert_eq!(
             policy.resolve_stored_name("other"),
