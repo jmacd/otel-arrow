@@ -12,6 +12,7 @@
 //! TODO: Implement the sensitive capability for headers
 
 use std::fmt;
+use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
 use schemars::JsonSchema;
@@ -111,6 +112,7 @@ impl HeaderCapturePolicy {
 
         let mut entry_ids = AHashMap::new();
         let mut matches = AHashMap::new();
+        let mut schema_matches = Vec::new();
         for (rule_id, rule) in self.headers.iter().enumerate() {
             let entry = match rule.store_as.as_ref() {
                 Some(name) => {
@@ -143,9 +145,24 @@ impl HeaderCapturePolicy {
                 let normalized = match_name.to_ascii_lowercase();
                 if let std::collections::hash_map::Entry::Vacant(slot) = matches.entry(normalized) {
                     let stored_name = rule.store_as.clone().unwrap_or_else(|| slot.key().clone());
-                    let _ = slot.insert(CompiledCaptureMatch {
+                    let schema_item = u16::try_from(schema_matches.len()).map_err(|_| {
+                        format!(
+                            "header capture supports at most {} distinct matches",
+                            u16::MAX
+                        )
+                    })?;
+                    schema_matches.push(CompiledHeaderSchemaItem {
+                        wire_name: slot.key().clone(),
+                        stored_name: stored_name.clone(),
                         rule_id,
                         entry,
+                        value_kind: rule.value_kind,
+                    });
+                    let _ = slot.insert(CompiledCaptureMatch {
+                        schema_item,
+                        rule_id,
+                        entry,
+                        wire_name: match_name.to_ascii_lowercase(),
                         stored_name,
                         value_kind: rule.value_kind,
                     });
@@ -160,6 +177,9 @@ impl HeaderCapturePolicy {
                 .fold(0, |probe, bit| probe | bit),
             matches: CompiledCaptureMatches::new(matches),
             entry_count: entry_ids.len(),
+            schema: Arc::new(CompiledHeaderSchema {
+                items: schema_matches.into_boxed_slice(),
+            }),
         })
     }
 
@@ -176,6 +196,7 @@ pub struct CompiledHeaderCapturePolicy {
     header_probe: u64,
     matches: CompiledCaptureMatches,
     entry_count: usize,
+    schema: Arc<CompiledHeaderSchema>,
 }
 
 impl CompiledHeaderCapturePolicy {
@@ -194,8 +215,10 @@ impl CompiledHeaderCapturePolicy {
         self.matches
             .get(wire_name)
             .map(|matched| CompiledHeaderMatch {
+                schema_item: matched.schema_item,
                 rule_id: matched.rule_id,
                 entry: matched.entry,
+                configured_name: &matched.wire_name,
                 stored_name: &matched.stored_name,
                 value_kind: matched.value_kind,
             })
@@ -206,12 +229,78 @@ impl CompiledHeaderCapturePolicy {
     pub const fn defaults(&self) -> &CaptureDefaults {
         &self.defaults
     }
+
+    /// Returns the immutable schema shared by contexts captured with this policy.
+    #[must_use]
+    pub fn schema(&self) -> &Arc<CompiledHeaderSchema> {
+        &self.schema
+    }
+}
+
+/// Immutable names and capture metadata referenced by packed context items.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompiledHeaderSchema {
+    items: Box<[CompiledHeaderSchemaItem]>,
+}
+
+impl CompiledHeaderSchema {
+    /// Resolves a schema-local captured item.
+    #[must_use]
+    pub fn item(&self, id: u16) -> Option<CompiledHeaderSchemaItemRef<'_>> {
+        self.items
+            .get(usize::from(id))
+            .map(|item| CompiledHeaderSchemaItemRef {
+                wire_name: &item.wire_name,
+                stored_name: &item.stored_name,
+                rule_id: item.rule_id,
+                entry: item.entry,
+                value_kind: item.value_kind,
+            })
+    }
+
+    /// Number of distinct captured header matches in this schema.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether this schema contains no captured matches.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CompiledHeaderSchemaItem {
+    wire_name: String,
+    stored_name: String,
+    rule_id: u16,
+    entry: Option<u16>,
+    value_kind: Option<ValueKindConfig>,
+}
+
+/// Borrowed compiled metadata for one captured header match.
+#[derive(Debug, Clone, Copy)]
+pub struct CompiledHeaderSchemaItemRef<'a> {
+    /// Normalized configured wire name.
+    pub wire_name: &'a str,
+    /// Logical stored name.
+    pub stored_name: &'a str,
+    /// First-match capture rule identifier.
+    pub rule_id: u16,
+    /// Optional logical entry slot.
+    pub entry: Option<u16>,
+    /// Configured value-kind override.
+    pub value_kind: Option<ValueKindConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompiledCaptureMatch {
+    schema_item: u16,
     rule_id: u16,
     entry: Option<u16>,
+    wire_name: String,
     stored_name: String,
     value_kind: Option<ValueKindConfig>,
 }
@@ -248,10 +337,14 @@ impl CompiledCaptureMatches {
 /// A receiver-facing result of matching one inbound header.
 #[derive(Debug, Clone, Copy)]
 pub struct CompiledHeaderMatch<'a> {
+    /// Schema-local captured item identifier.
+    pub schema_item: u16,
     /// First-match capture rule identifier.
     pub rule_id: u16,
     /// Optional `store_as` entry slot.
     pub entry: Option<u16>,
+    /// Normalized configured wire name.
+    pub configured_name: &'a str,
     /// Stored name: `store_as` when configured, otherwise the normalized
     /// matched wire name.
     pub stored_name: &'a str,
@@ -437,12 +530,36 @@ impl CompiledHeaderPropagationPolicy {
         self.uniform
     }
 
+    /// Compiles propagation decisions for every item in a capture schema.
+    #[must_use]
+    pub fn compile_schema(&self, schema: &CompiledHeaderSchema) -> CompiledSchemaPropagation {
+        let decisions = (0..schema.len())
+            .map(|id| {
+                u16::try_from(id)
+                    .ok()
+                    .and_then(|id| schema.item(id))
+                    .map_or(
+                        CompiledPropagationDecision {
+                            action: PropagationAction::Drop,
+                            name: NameStrategy::Preserve,
+                        },
+                        |item| {
+                            let (action, name) = self.resolve_stored_name(item.stored_name);
+                            CompiledPropagationDecision { action, name }
+                        },
+                    )
+            })
+            .collect();
+        CompiledSchemaPropagation { decisions }
+    }
+
     /// Resolves propagation behavior from a stored context name.
     #[must_use]
     pub fn resolve_stored_name(&self, stored_name: &str) -> (PropagationAction, NameStrategy) {
         if let Some(override_rule) = lookup_ascii_case_insensitive(&self.overrides, stored_name) {
             return (override_rule.action, override_rule.name);
         }
+
         let selected = match self.selector_type {
             PropagationSelectorType::AllCaptured => true,
             PropagationSelectorType::None => false,
@@ -459,6 +576,29 @@ impl CompiledHeaderPropagationPolicy {
             self.default_name,
         )
     }
+}
+
+/// Propagation decisions indexed by capture-schema item identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledSchemaPropagation {
+    decisions: Box<[CompiledPropagationDecision]>,
+}
+
+impl CompiledSchemaPropagation {
+    /// Resolves one schema-local item without a name lookup.
+    #[must_use]
+    pub fn decision(&self, item_id: u16) -> Option<CompiledPropagationDecision> {
+        self.decisions.get(usize::from(item_id)).copied()
+    }
+}
+
+/// Pre-resolved propagation behavior for one captured schema item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledPropagationDecision {
+    /// Whether the item is propagated.
+    pub action: PropagationAction,
+    /// Which captured name is emitted.
+    pub name: NameStrategy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

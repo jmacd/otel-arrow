@@ -22,6 +22,9 @@ use http::HeaderValue;
 use linkme::distributed_slice;
 use otap_df_config::SignalType;
 use otap_df_config::node::NodeUserConfig;
+use otap_df_config::transport_headers_policy::{
+    CompiledHeaderPropagationPolicy, NameStrategy, PropagationAction,
+};
 use otap_df_engine::ConsumerEffectHandlerExtension;
 use otap_df_engine::ExporterFactory;
 use otap_df_engine::config::ExporterConfig;
@@ -48,13 +51,13 @@ use otap_df_pdata::{
     OtapArrowRecords, OtapPayload, OtapPayloadHelpers, OtlpProtoBytes, PayloadData,
 };
 use serde::Deserialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::Code;
 use tonic::codec::CompressionEncoding;
-use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
+use tonic::metadata::{Ascii, Binary, MetadataKey, MetadataMap, MetadataValue};
 use tonic::transport::Channel;
 
 use otap_df_otap::bearer_auth::{BearerAuth, BearerAuthEvents, apply_auth_rejection};
@@ -249,6 +252,7 @@ impl Exporter<OtapPdata> for OTLPExporter {
         // Returns `None` when no static headers are configured, which preserves
         // the zero-allocation fast path in `build_grpc_metadata`.
         let static_metadata = self.config.grpc.build_static_metadata();
+        let mut propagation_cache = GrpcPropagationCache::default();
 
         // reuse the encoder and the buffer across pdatas
         let mut logs_proto_encoder = LogsProtoBytesEncoder::new();
@@ -519,11 +523,12 @@ impl Exporter<OtapPdata> for OTLPExporter {
                     // template is cloned only when present so the no-metadata
                     // case stays allocation-free.
                     let metadata = RequestMetadata {
-                        metadata: build_grpc_metadata(
+                        metadata: build_grpc_metadata_cached(
                             &effect_handler,
                             &context,
                             static_metadata.as_ref(),
                             auth_header,
+                            &mut propagation_cache,
                         ),
                         token_generation,
                     };
@@ -1085,11 +1090,95 @@ async fn finalize_completed_export(
 /// (e.g. `authorization`) can never be overridden or duplicated by inbound
 /// transport headers -- and a refreshed bearer token in turn replaces any
 /// `authorization` from either source.
+#[cfg(test)]
 fn build_grpc_metadata(
     effect_handler: &EffectHandler<OtapPdata>,
     context: &Context,
     static_metadata: Option<&MetadataMap>,
     auth_header: Option<HeaderValue>,
+) -> Option<MetadataMap> {
+    build_grpc_metadata_cached(
+        effect_handler,
+        context,
+        static_metadata,
+        auth_header,
+        &mut GrpcPropagationCache::default(),
+    )
+}
+
+#[derive(Default)]
+struct GrpcPropagationCache {
+    schemas: HashMap<usize, GrpcCachedSchema>,
+}
+
+struct GrpcCachedSchema {
+    _schema: Arc<otap_df_config::transport_headers_policy::CompiledHeaderSchema>,
+    decisions: Box<[GrpcSchemaDecision]>,
+}
+
+#[derive(Clone)]
+struct GrpcSchemaDecision {
+    action: PropagationAction,
+    name: NameStrategy,
+    ascii_key: Option<MetadataKey<Ascii>>,
+    binary_key: Option<MetadataKey<Binary>>,
+}
+
+impl GrpcPropagationCache {
+    fn schema_plan<'a>(
+        &'a mut self,
+        schema: &Arc<otap_df_config::transport_headers_policy::CompiledHeaderSchema>,
+        policy: &CompiledHeaderPropagationPolicy,
+    ) -> &'a GrpcCachedSchema {
+        let key = Arc::as_ptr(schema) as usize;
+        self.schemas.entry(key).or_insert_with(|| {
+            let decisions = (0..schema.len())
+                .map(|id| {
+                    u16::try_from(id)
+                        .ok()
+                        .and_then(|id| schema.item(id))
+                        .map_or_else(
+                            || GrpcSchemaDecision {
+                                action: PropagationAction::Drop,
+                                name: NameStrategy::Preserve,
+                                ascii_key: None,
+                                binary_key: None,
+                            },
+                            |item| {
+                                let (action, name) = policy.resolve_stored_name(item.stored_name);
+                                let outbound_name = match name {
+                                    NameStrategy::Preserve => item.wire_name,
+                                    NameStrategy::StoredName => item.stored_name,
+                                };
+                                let binary_name = if outbound_name.ends_with("-bin") {
+                                    outbound_name.to_string()
+                                } else {
+                                    format!("{outbound_name}-bin")
+                                };
+                                GrpcSchemaDecision {
+                                    action,
+                                    name,
+                                    ascii_key: outbound_name.parse().ok(),
+                                    binary_key: binary_name.parse().ok(),
+                                }
+                            },
+                        )
+                })
+                .collect();
+            GrpcCachedSchema {
+                _schema: schema.clone(),
+                decisions,
+            }
+        })
+    }
+}
+
+fn build_grpc_metadata_cached(
+    effect_handler: &EffectHandler<OtapPdata>,
+    context: &Context,
+    static_metadata: Option<&MetadataMap>,
+    auth_header: Option<HeaderValue>,
+    propagation_cache: &mut GrpcPropagationCache,
 ) -> Option<MetadataMap> {
     let propagation_policy = effect_handler.propagation_policy();
     let has_propagation_source = context.pdata_context_bytes().is_some();
@@ -1109,19 +1198,57 @@ fn build_grpc_metadata(
 
     if let Some(policy) = propagation_policy {
         if let Some(context_bytes) = context.pdata_context_bytes() {
-            for header in context_bytes.propagate(policy) {
-                let error = append_propagated_metadata(
-                    &mut metadata,
-                    static_metadata,
-                    header.header_name,
-                    header.value_kind == otap_df_otap::context_bytes::HeaderValueKind::Binary,
-                    header.value,
-                );
+            let uniform = policy.uniform_decision();
+            let schema_plan = context_bytes
+                .schema()
+                .map(|schema| propagation_cache.schema_plan(schema, policy));
+            for item in context_bytes.items().take_while(|_| {
+                !uniform.is_some_and(|(action, _)| action == PropagationAction::Drop)
+            }) {
+                let Some((value_kind, value)) = item.value() else {
+                    continue;
+                };
+                let schema_decision = schema_plan
+                    .zip(item.schema_item_id())
+                    .and_then(|(plan, item_id)| plan.decisions.get(usize::from(item_id)));
+                let error = if let Some(decision) = schema_decision
+                    && (decision.name == NameStrategy::StoredName || item.uses_schema_wire_name())
+                {
+                    append_precompiled_metadata(
+                        &mut metadata,
+                        static_metadata,
+                        decision,
+                        value_kind == otap_df_otap::context_bytes::HeaderValueKind::Binary,
+                        value,
+                    )
+                } else {
+                    let Some(stored_name) = item.stored_name() else {
+                        continue;
+                    };
+                    let (action, name) =
+                        uniform.unwrap_or_else(|| policy.resolve_stored_name(stored_name));
+                    if action == PropagationAction::Drop {
+                        continue;
+                    }
+                    let Some(header_name) = (match name {
+                        NameStrategy::Preserve => item.wire_name(),
+                        NameStrategy::StoredName => Some(stored_name),
+                    }) else {
+                        continue;
+                    };
+                    append_propagated_metadata(
+                        &mut metadata,
+                        static_metadata,
+                        header_name,
+                        value_kind == otap_df_otap::context_bytes::HeaderValueKind::Binary,
+                        value,
+                    )
+                };
                 if let Err(reason) = error {
                     otel_debug!(
                         "otlp.exporter.grpc.header_skip",
                         reason,
-                        header_name = header.header_name
+                        stored_name = item.stored_name().unwrap_or("<invalid>")
                     );
                 }
             }
@@ -1152,15 +1279,45 @@ fn build_grpc_metadata(
                 format!("{header_name}-bin")
             };
             let key = key_name
-                .parse::<MetadataKey<tonic::metadata::Binary>>()
+                .parse::<MetadataKey<Binary>>()
                 .map_err(|_| "invalid binary metadata key")?;
             let _ = metadata.append_bin(key, MetadataValue::from_bytes(value));
             return Ok(());
         }
 
         let key = header_name
-            .parse::<MetadataKey<tonic::metadata::Ascii>>()
+            .parse::<MetadataKey<Ascii>>()
             .map_err(|_| "invalid ascii metadata key")?;
+        let value = MetadataValue::try_from(value).map_err(|_| "invalid ascii metadata value")?;
+        if static_metadata.is_some_and(|metadata| metadata.contains_key(key.as_str())) {
+            return Err("static header takes precedence over propagated header");
+        }
+        let _ = metadata.append(key, value);
+        Ok(())
+    }
+
+    fn append_precompiled_metadata(
+        metadata: &mut MetadataMap,
+        static_metadata: Option<&MetadataMap>,
+        decision: &GrpcSchemaDecision,
+        binary: bool,
+        value: &[u8],
+    ) -> Result<(), &'static str> {
+        if decision.action == PropagationAction::Drop {
+            return Ok(());
+        }
+        if binary {
+            let key = decision
+                .binary_key
+                .clone()
+                .ok_or("invalid binary metadata key")?;
+            let _ = metadata.append_bin(key, MetadataValue::from_bytes(value));
+            return Ok(());
+        }
+        let key = decision
+            .ascii_key
+            .clone()
+            .ok_or("invalid ascii metadata key")?;
         let value = MetadataValue::try_from(value).map_err(|_| "invalid ascii metadata value")?;
         if static_metadata.is_some_and(|metadata| metadata.contains_key(key.as_str())) {
             return Err("static header takes precedence over propagated header");
@@ -1421,8 +1578,9 @@ mod tests {
 
     use otap_df_config::transport_headers_policy::PropagationSelectorType;
     use otap_df_config::transport_headers_policy::{
-        HeaderPropagationPolicy, PropagationAction, PropagationDefault, PropagationMatch,
-        PropagationOverride, PropagationSelector,
+        CaptureDefaults, CaptureRule, HeaderCapturePolicy, HeaderPropagationPolicy,
+        PropagationAction, PropagationDefault, PropagationMatch, PropagationOverride,
+        PropagationSelector,
     };
     use otap_df_engine::Interests;
     use otap_df_engine::context::ControllerContext;
@@ -1441,6 +1599,7 @@ mod tests {
         exporter::{TestContext, TestRuntime},
         test_node,
     };
+    use otap_df_otap::context_bytes::PdataContextBytes;
     use otap_df_otap::otlp_grpc::OTLPData;
     use otap_df_otap::otlp_mock::{LogsServiceMock, MetricsServiceMock, TraceServiceMock};
     use otap_df_otap::pdata::OtapPdata;
@@ -3042,6 +3201,32 @@ mod tests {
         context
     }
 
+    fn context_with_captured_header(
+        match_name: &str,
+        stored_name: &str,
+        observed_name: &str,
+        value: &[u8],
+    ) -> Context {
+        let policy = HeaderCapturePolicy::new(
+            CaptureDefaults::default(),
+            vec![CaptureRule {
+                match_names: vec![match_name.to_string()],
+                store_as: Some(stored_name.to_string()),
+                sensitive: false,
+                value_kind: None,
+            }],
+        )
+        .compile()
+        .expect("capture policy");
+        let captured = PdataContextBytes::capture(&policy, [(observed_name, value)])
+            .expect("capture")
+            .0
+            .expect("captured context");
+        let pdata = OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(Bytes::new()).into())
+            .with_pdata_context_bytes(captured);
+        pdata.into_parts().0
+    }
+
     /// Helper: Creates a [`Context`] without any transport headers.
     fn context_without_headers() -> Context {
         let pdata = OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(Bytes::new()).into());
@@ -3109,6 +3294,39 @@ mod tests {
             .get("x-request-id")
             .expect("x-request-id should be present");
         assert_eq!(request_id.to_str().unwrap(), "req-xyz-789");
+    }
+
+    /// Scenario: cached gRPC propagation sees repeated, distinct, and case-variant capture schemas.
+    /// Guarantees: schema plans are reused without crossing names and preserve fallback uses observed wire names.
+    #[test]
+    fn build_grpc_metadata_cached_isolated_by_capture_schema() {
+        let handler = make_effect_handler_with_policy(Some(propagate_all_policy()));
+        let tenant =
+            context_with_captured_header("x-tenant-id", "tenant", "x-tenant-id", b"tenant-a");
+        let workspace = context_with_captured_header(
+            "x-workspace-id",
+            "workspace",
+            "x-workspace-id",
+            b"workspace-a",
+        );
+        let case_variant =
+            context_with_captured_header("x-tenant-id", "tenant", "X-Tenant-Id", b"tenant-b");
+        let mut cache = GrpcPropagationCache::default();
+
+        for (context, key, value) in [
+            (&tenant, "x-tenant-id", "tenant-a"),
+            (&tenant, "x-tenant-id", "tenant-a"),
+            (&workspace, "x-workspace-id", "workspace-a"),
+            (&case_variant, "x-tenant-id", "tenant-b"),
+        ] {
+            let metadata = build_grpc_metadata_cached(&handler, context, None, None, &mut cache)
+                .expect("metadata");
+            assert_eq!(
+                metadata.get(key).expect("propagated key").to_str().unwrap(),
+                value
+            );
+        }
+        assert_eq!(cache.schemas.len(), 3);
     }
 
     /// Scenario: a context carries a packed transport header.

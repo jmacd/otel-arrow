@@ -37,6 +37,9 @@ use linkme::distributed_slice;
 use otap_df_config::SignalType;
 use otap_df_config::error::Error as ConfigError;
 use otap_df_config::node::NodeUserConfig;
+use otap_df_config::transport_headers_policy::{
+    CompiledHeaderSchema, CompiledSchemaPropagation, NameStrategy, PropagationAction,
+};
 use otap_df_config::validation::validate_typed_config;
 use otap_df_engine::ConsumerEffectHandlerExtension;
 use otap_df_engine::ExporterFactory;
@@ -59,6 +62,7 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::Producer;
 use rdkafka::producer::future_producer::OwnedDeliveryResult;
 use regex::Regex;
+use std::collections::HashMap as SchemaPlanMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -312,6 +316,7 @@ pub struct KafkaExporter {
     traces_allowed_topics_regex: Option<Vec<Regex>>,
     metrics_allowed_topics_regex: Option<Vec<Regex>>,
     logs_allowed_topics_regex: Option<Vec<Regex>>,
+    propagation_cache: SchemaPlanMap<usize, (Arc<CompiledHeaderSchema>, CompiledSchemaPropagation)>,
 }
 
 /// Factory registration for the Kafka exporter.
@@ -398,6 +403,7 @@ impl KafkaExporter {
             traces_allowed_topics_regex,
             metrics_allowed_topics_regex,
             logs_allowed_topics_regex,
+            propagation_cache: SchemaPlanMap::new(),
         })
     }
 
@@ -478,11 +484,31 @@ impl KafkaExporter {
     /// The encoding format (`otlp` or `otap`) is always written under the
     /// `format_header_key`. Any propagated transport header with the same
     /// name is skipped to avoid collision.
+    #[cfg(test)]
     fn build_kafka_headers(
         encoding: MessageFormat,
         format_header_key: &str,
         context: &otap_df_otap::pdata::Context,
         effect_handler: Option<&EffectHandler<OtapPdata>>,
+    ) -> OwnedHeaders {
+        Self::build_kafka_headers_with_cache(
+            encoding,
+            format_header_key,
+            context,
+            effect_handler,
+            &mut SchemaPlanMap::new(),
+        )
+    }
+
+    fn build_kafka_headers_with_cache(
+        encoding: MessageFormat,
+        format_header_key: &str,
+        context: &otap_df_otap::pdata::Context,
+        effect_handler: Option<&EffectHandler<OtapPdata>>,
+        propagation_cache: &mut SchemaPlanMap<
+            usize,
+            (Arc<CompiledHeaderSchema>, CompiledSchemaPropagation),
+        >,
     ) -> OwnedHeaders {
         let mut headers = OwnedHeaders::new();
 
@@ -500,13 +526,47 @@ impl KafkaExporter {
         // policy is configured and the pdata context carries transport headers.
         if let Some(policy) = effect_handler.and_then(|eh| eh.propagation_policy()) {
             if let Some(context_bytes) = context.pdata_context_bytes() {
-                for propagated in context_bytes.propagate(policy) {
-                    if propagated.header_name == format_header_key {
+                let uniform = policy.uniform_decision();
+                let schema_plan = context_bytes.schema().map(|schema| {
+                    let key = Arc::as_ptr(schema) as usize;
+                    &propagation_cache
+                        .entry(key)
+                        .or_insert_with(|| (schema.clone(), policy.compile_schema(schema)))
+                        .1
+                });
+                for item in context_bytes.items().take_while(|_| {
+                    !uniform.is_some_and(|(action, _)| action == PropagationAction::Drop)
+                }) {
+                    let Some((_, value)) = item.value() else {
+                        continue;
+                    };
+                    let schema_decision = schema_plan
+                        .zip(item.schema_item_id())
+                        .and_then(|(plan, item_id)| plan.decision(item_id));
+                    let (action, name) = match schema_decision {
+                        Some(decision) => (decision.action, decision.name),
+                        None => {
+                            let Some(stored_name) = item.stored_name() else {
+                                continue;
+                            };
+                            uniform.unwrap_or_else(|| policy.resolve_stored_name(stored_name))
+                        }
+                    };
+                    if action == PropagationAction::Drop {
+                        continue;
+                    }
+                    let Some(header_name) = (match name {
+                        NameStrategy::Preserve => item.wire_name(),
+                        NameStrategy::StoredName => item.stored_name(),
+                    }) else {
+                        continue;
+                    };
+                    if header_name == format_header_key {
                         continue;
                     }
                     headers = headers.insert(Header {
-                        key: propagated.header_name,
-                        value: Some(propagated.value),
+                        key: header_name,
+                        value: Some(value),
                     });
                 }
             }
@@ -630,8 +690,13 @@ impl KafkaExporter {
 
         // Build Kafka headers (format header + propagated transport headers)
         let format_header_key = self.config.message_format_header();
-        let headers =
-            Self::build_kafka_headers(encoding, format_header_key, &context, effect_handler);
+        let headers = Self::build_kafka_headers_with_cache(
+            encoding,
+            format_header_key,
+            &context,
+            effect_handler,
+            &mut self.propagation_cache,
+        );
 
         // Encode payload to bytes using the per-signal encoding.
         // This block borrows &mut self.pdata_producer so it must complete
