@@ -6,11 +6,11 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use otap_df_config::transport_headers_policy::{
+use otel_arrow_dfe_config::transport_headers_policy::{
     CaptureDefaults, CaptureRule, CompiledHeaderCapturePolicy, HeaderCapturePolicy,
     HeaderPropagationPolicy, PropagationDefault, PropagationSelector, PropagationSelectorType,
 };
-use otap_df_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
+use otel_arrow_dfe_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
 
 const HEADER_COUNTS: [usize; 4] = [1, 4, 16, 32];
 

@@ -17,17 +17,20 @@ use std::net::SocketAddr;
 use std::num::NonZeroU64;
 
 use async_trait::async_trait;
-use otap_df_config::PortName;
-use otap_df_config::{SignalFormat, SignalType};
-use otap_df_engine::control::{AckMsg, CallData, Frame, NackMsg, RouteData, nanos_since_birth};
-use otap_df_engine::error::{Error, TypedError};
-use otap_df_engine::processor::{FlowMetricEffectHandler, FlowMetricHook};
-use otap_df_engine::{
+use otel_arrow_dfe_config::PortName;
+use otel_arrow_dfe_config::{SignalFormat, SignalType};
+use otel_arrow_dfe_engine::_private::AckNackRouting;
+use otel_arrow_dfe_engine::control::{
+    AckMsg, CallData, Frame, NackMsg, RouteData, nanos_since_birth,
+};
+use otel_arrow_dfe_engine::error::{Error, TypedError};
+use otel_arrow_dfe_engine::processor::{FlowMetricEffectHandler, FlowMetricHook};
+use otel_arrow_dfe_engine::{
     ConsumerEffectHandlerExtension, FlowMetricAccumulation, Interests,
     MessageSourceLocalEffectHandlerExtension, MessageSourceSharedEffectHandlerExtension,
     ProducerEffectHandlerExtension,
 };
-use otap_df_pdata::OtapPayload;
+use otel_arrow_dfe_pdata::OtapPayload;
 
 use crate::context_bytes::PdataContextBytes;
 
@@ -145,9 +148,8 @@ impl Context {
             .unwrap_or(false)
     }
 
-    /// Return the current source calldata. This is used with the
-    /// DelayedData message, in which a node delivers a message to
-    /// itself.
+    /// Return the current source calldata. This is used when a node resumes
+    /// retained data back to itself via the local scheduler.
     ///
     /// This is also useful in testing, it indicates the data that was
     /// sent by the source node.
@@ -446,7 +448,7 @@ impl Context {
     }
 }
 
-// Frame is defined in otap_df_engine::control (imported above).
+// Frame is defined in otel_arrow_dfe_engine::control (imported above).
 
 /// Incremental builder applying the same merge rule as
 /// [`Context::merge_peer_addr`] without allocating a `Vec` of intermediate
@@ -501,7 +503,7 @@ impl PeerAddrMerger {
     }
 }
 
-impl otap_df_engine::Unwindable for OtapPdata {
+impl otel_arrow_dfe_engine::Unwindable for OtapPdata {
     fn has_frames(&self) -> bool {
         self.context.has_context_frames()
     }
@@ -519,7 +521,7 @@ impl otap_df_engine::Unwindable for OtapPdata {
     }
 }
 
-impl otap_df_engine::StampOutputPort for OtapPdata {
+impl otel_arrow_dfe_engine::StampOutputPort for OtapPdata {
     fn stamp_output_port_index(&mut self, index: u16) {
         self.context.stamp_output_port_index(index);
     }
@@ -535,7 +537,7 @@ impl FlowMetricAccumulation for OtapPdata {
         // misconfigured pipeline is diagnosable instead of silently producing
         // truncated histograms.
         if self.context.flow_compute_ns.is_some() {
-            otap_df_telemetry::otel_warn!(
+            otel_arrow_dfe_telemetry::otel_warn!(
                 "flow_metrics.overlap",
                 "start_flow_metric called while another flow_metric is active; \
                  overlapping ranges are not supported \u{2014} previous accumulator discarded"
@@ -728,9 +730,8 @@ impl OtapPdata {
     /// Return the source's calldata. Note that after a subscribe_to()
     /// has been called, the current node becomes the source.
     ///
-    /// Return the current source calldata. This is used with the
-    /// DelayedData message, in which a node delivers a message to
-    /// itself.
+    /// Return the current source calldata. This is used when a node resumes
+    /// retained data back to itself via the local scheduler.
     ///
     /// This is also useful in testing, it indicates the data that was
     /// sent by the source node.
@@ -850,19 +851,19 @@ macro_rules! impl_producer_ext {
 }
 
 impl_producer_ext!(
-    otap_df_engine::local::processor::EffectHandler<OtapPdata>,
+    otel_arrow_dfe_engine::local::processor::EffectHandler<OtapPdata>,
     processor_id
 );
 impl_producer_ext!(
-    otap_df_engine::local::receiver::EffectHandler<OtapPdata>,
+    otel_arrow_dfe_engine::local::receiver::EffectHandler<OtapPdata>,
     receiver_id
 );
 impl_producer_ext!(
-    otap_df_engine::shared::processor::EffectHandler<OtapPdata>,
+    otel_arrow_dfe_engine::shared::processor::EffectHandler<OtapPdata>,
     processor_id
 );
 impl_producer_ext!(
-    otap_df_engine::shared::receiver::EffectHandler<OtapPdata>,
+    otel_arrow_dfe_engine::shared::receiver::EffectHandler<OtapPdata>,
     receiver_id
 );
 
@@ -881,7 +882,6 @@ macro_rules! impl_consumer_ext {
         #[async_trait(?Send)]
         impl ConsumerEffectHandlerExtension<OtapPdata> for $handler {
             async fn notify_ack(&self, mut ack: AckMsg<OtapPdata>) -> Result<(), Error> {
-                use otap_df_engine::_private::AckNackRouting;
                 if ack.accepted.has_timing(Interests::ACKS) {
                     ack.unwind.return_time_ns = nanos_since_birth();
                 }
@@ -889,7 +889,6 @@ macro_rules! impl_consumer_ext {
             }
 
             async fn notify_nack(&self, mut nack: NackMsg<OtapPdata>) -> Result<(), Error> {
-                use otap_df_engine::_private::AckNackRouting;
                 if nack.refused.has_timing(Interests::NACKS) {
                     nack.unwind.return_time_ns = nanos_since_birth();
                 }
@@ -899,10 +898,10 @@ macro_rules! impl_consumer_ext {
     };
 }
 
-impl_consumer_ext!(otap_df_engine::local::processor::EffectHandler<OtapPdata>);
-impl_consumer_ext!(otap_df_engine::local::exporter::EffectHandler<OtapPdata>);
-impl_consumer_ext!(otap_df_engine::shared::processor::EffectHandler<OtapPdata>);
-impl_consumer_ext!(otap_df_engine::shared::exporter::EffectHandler<OtapPdata>);
+impl_consumer_ext!(otel_arrow_dfe_engine::local::processor::EffectHandler<OtapPdata>);
+impl_consumer_ext!(otel_arrow_dfe_engine::local::exporter::EffectHandler<OtapPdata>);
+impl_consumer_ext!(otel_arrow_dfe_engine::shared::processor::EffectHandler<OtapPdata>);
+impl_consumer_ext!(otel_arrow_dfe_engine::shared::exporter::EffectHandler<OtapPdata>);
 
 /* --------  effect handler extensions (shared, local) -------- */
 
@@ -1023,35 +1022,35 @@ macro_rules! impl_message_source_ext {
 impl_message_source_ext!(
     async_trait(?Send),
     MessageSourceLocalEffectHandlerExtension,
-    otap_df_engine::local::processor::EffectHandler<OtapPdata>,
+    otel_arrow_dfe_engine::local::processor::EffectHandler<OtapPdata>,
     processor_id,
     with_hook
 );
 impl_message_source_ext!(
     async_trait(?Send),
     MessageSourceLocalEffectHandlerExtension,
-    otap_df_engine::local::receiver::EffectHandler<OtapPdata>,
+    otel_arrow_dfe_engine::local::receiver::EffectHandler<OtapPdata>,
     receiver_id,
     no_hook
 );
 impl_message_source_ext!(
     async_trait,
     MessageSourceSharedEffectHandlerExtension,
-    otap_df_engine::shared::processor::EffectHandler<OtapPdata>,
+    otel_arrow_dfe_engine::shared::processor::EffectHandler<OtapPdata>,
     processor_id,
     with_hook
 );
 impl_message_source_ext!(
     async_trait,
     MessageSourceSharedEffectHandlerExtension,
-    otap_df_engine::shared::receiver::EffectHandler<OtapPdata>,
+    otel_arrow_dfe_engine::shared::receiver::EffectHandler<OtapPdata>,
     receiver_id,
     no_hook
 );
 
 /* -------- ReceivedAtNode implementation -------- */
 
-impl otap_df_engine::ReceivedAtNode for OtapPdata {
+impl otel_arrow_dfe_engine::ReceivedAtNode for OtapPdata {
     fn received_at_node(&mut self, node_id: usize, node_interests: Interests) {
         self.context.push_entry_frame(node_id, node_interests);
         if node_interests.contains(Interests::CONSUMER_METRICS) {
@@ -1078,23 +1077,23 @@ mod test {
     use crate::testing::{
         TestCallData, create_empty_test_pdata, create_test_pdata, next_ack, next_nack,
     };
-    use otap_df_channel::mpsc::Channel as LocalChannel;
-    use otap_df_engine::ConsumerEffectHandlerExtension;
-    use otap_df_engine::control::{
+    use otel_arrow_dfe_channel::mpsc::Channel as LocalChannel;
+    use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
+    use otel_arrow_dfe_engine::control::{
         PipelineCompletionMsg, pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
     };
-    use otap_df_engine::effect_handler::SourceTagging;
-    use otap_df_engine::local::exporter::EffectHandler as LocalExporterEffectHandler;
-    use otap_df_engine::local::message::LocalSender;
-    use otap_df_engine::local::processor::EffectHandler as LocalProcessorEffectHandler;
-    use otap_df_engine::local::receiver::EffectHandler as LocalReceiverEffectHandler;
-    use otap_df_engine::message::Sender;
-    use otap_df_engine::node::NodeId;
-    use otap_df_engine::shared::exporter::EffectHandler as SharedExporterEffectHandler;
-    use otap_df_engine::shared::message::SharedSender;
-    use otap_df_engine::shared::processor::EffectHandler as SharedProcessorEffectHandler;
-    use otap_df_engine::shared::receiver::EffectHandler as SharedReceiverEffectHandler;
-    use otap_df_telemetry::reporter::MetricsReporter;
+    use otel_arrow_dfe_engine::effect_handler::SourceTagging;
+    use otel_arrow_dfe_engine::local::exporter::EffectHandler as LocalExporterEffectHandler;
+    use otel_arrow_dfe_engine::local::message::LocalSender;
+    use otel_arrow_dfe_engine::local::processor::EffectHandler as LocalProcessorEffectHandler;
+    use otel_arrow_dfe_engine::local::receiver::EffectHandler as LocalReceiverEffectHandler;
+    use otel_arrow_dfe_engine::message::Sender;
+    use otel_arrow_dfe_engine::node::NodeId;
+    use otel_arrow_dfe_engine::shared::exporter::EffectHandler as SharedExporterEffectHandler;
+    use otel_arrow_dfe_engine::shared::message::SharedSender;
+    use otel_arrow_dfe_engine::shared::processor::EffectHandler as SharedProcessorEffectHandler;
+    use otel_arrow_dfe_engine::shared::receiver::EffectHandler as SharedReceiverEffectHandler;
+    use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
     use pretty_assertions::assert_eq;
     use std::cell::Cell;
     use std::collections::HashMap;
@@ -1105,7 +1104,7 @@ mod test {
     }
 
     fn create_test_otap_pdata() -> OtapPdata {
-        use otap_df_pdata::{OtapArrowRecords, TryIntoWithOptions};
+        use otel_arrow_dfe_pdata::{OtapArrowRecords, TryIntoWithOptions};
 
         let payload = create_test_pdata().into_parts().1;
         let records: OtapArrowRecords = payload.try_into_with_default().expect("OTAP conversion");
@@ -1771,7 +1770,7 @@ mod test {
     /// Guarantees: the real pdata retains its signal for message metric attribution without parsing item counts.
     #[test]
     fn test_received_at_node_stamps_consumed_items() {
-        use otap_df_engine::{ReceivedAtNode, Unwindable};
+        use otel_arrow_dfe_engine::{ReceivedAtNode, Unwindable};
 
         // CONSUMER_METRICS + item counts: entry frame carries consumed count.
         let mut pdata = create_test_pdata();
@@ -2452,7 +2451,7 @@ mod test {
     /// Helper: build a local processor EffectHandler wired to a completion channel.
     fn create_local_processor_with_completion_channel() -> (
         LocalProcessorEffectHandler<OtapPdata>,
-        otap_df_engine::shared::message::SharedReceiver<PipelineCompletionMsg<OtapPdata>>,
+        otel_arrow_dfe_engine::shared::message::SharedReceiver<PipelineCompletionMsg<OtapPdata>>,
     ) {
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let mut eh = LocalProcessorEffectHandler::new(
@@ -2472,7 +2471,7 @@ mod test {
     /// Helper: build a local exporter EffectHandler wired to a completion channel.
     fn create_local_exporter_with_completion_channel() -> (
         LocalExporterEffectHandler<OtapPdata>,
-        otap_df_engine::shared::message::SharedReceiver<PipelineCompletionMsg<OtapPdata>>,
+        otel_arrow_dfe_engine::shared::message::SharedReceiver<PipelineCompletionMsg<OtapPdata>>,
     ) {
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let mut eh = LocalExporterEffectHandler::new(
@@ -2490,7 +2489,7 @@ mod test {
     /// Helper: build a shared processor EffectHandler wired to a completion channel.
     fn create_shared_processor_with_completion_channel() -> (
         SharedProcessorEffectHandler<OtapPdata>,
-        otap_df_engine::shared::message::SharedReceiver<PipelineCompletionMsg<OtapPdata>>,
+        otel_arrow_dfe_engine::shared::message::SharedReceiver<PipelineCompletionMsg<OtapPdata>>,
     ) {
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let mut eh = SharedProcessorEffectHandler::new(
@@ -2510,7 +2509,7 @@ mod test {
     /// Helper: build a shared exporter EffectHandler wired to a completion channel.
     fn create_shared_exporter_with_completion_channel() -> (
         SharedExporterEffectHandler<OtapPdata>,
-        otap_df_engine::shared::message::SharedReceiver<PipelineCompletionMsg<OtapPdata>>,
+        otel_arrow_dfe_engine::shared::message::SharedReceiver<PipelineCompletionMsg<OtapPdata>>,
     ) {
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let mut eh = SharedExporterEffectHandler::new(

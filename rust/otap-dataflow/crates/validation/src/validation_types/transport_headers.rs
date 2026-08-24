@@ -13,7 +13,7 @@
 //! For **deny** checks, `None` entries are acceptable -- a signal without
 //! headers cannot contain a forbidden key.
 
-use otap_df_otap::context_bytes::PdataContextBytes;
+use otel_arrow_dfe_otap::context_bytes::PdataContextBytes;
 use serde::{Deserialize, Serialize};
 
 /// A key/value pair for transport header assertions.
@@ -164,7 +164,7 @@ pub fn validate_transport_header_deny_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otap_df_otap::context_bytes::{HeaderInput, HeaderValueKind};
+    use otel_arrow_dfe_otap::context_bytes::{HeaderInput, HeaderValueKind};
 
     fn make_headers(entries: &[(&str, &str)]) -> PdataContextBytes {
         PdataContextBytes::build(

@@ -72,7 +72,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use otap_df_config::transport_headers_policy::{
+use otel_arrow_dfe_config::transport_headers_policy::{
     CaptureStats, CompiledHeaderCapturePolicy, CompiledHeaderPropagationPolicy,
     CompiledHeaderSchema, NameStrategy, PropagationAction, ValueKindConfig,
 };
@@ -885,7 +885,8 @@ impl<'a> ContextItem<'a> {
 
     fn schema_item(
         &self,
-    ) -> Option<otap_df_config::transport_headers_policy::CompiledHeaderSchemaItemRef<'a>> {
+    ) -> Option<otel_arrow_dfe_config::transport_headers_policy::CompiledHeaderSchemaItemRef<'a>>
+    {
         let id = ItemFields::RULE_ID.read(&self.context.bytes, self.descriptor_at)?;
         self.context.bytes.schema()?.item(id)
     }
@@ -1829,7 +1830,7 @@ fn write_slice(bytes: &mut [u8], at: usize, value: &[u8]) -> Result<(), ContextB
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otap_df_config::transport_headers_policy::{
+    use otel_arrow_dfe_config::transport_headers_policy::{
         CaptureDefaults, CaptureRule, HeaderCapturePolicy, HeaderPropagationPolicy,
         PropagationDefault, PropagationMatch, PropagationOverride, PropagationSelector,
         PropagationSelectorType,

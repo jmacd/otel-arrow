@@ -38,8 +38,8 @@ use super::config::SignalConfig;
 use super::error::KafkaExporterError;
 use super::metrics::{KafkaExporterMetrics, KafkaTopicSource};
 use crate::common::kafka::validate_kafka_topic;
-use otap_df_config::SignalType;
-use otap_df_otap::pdata::Context;
+use otel_arrow_dfe_config::SignalType;
+use otel_arrow_dfe_otap::pdata::Context;
 use regex::Regex;
 use std::borrow::Cow;
 
@@ -177,8 +177,8 @@ impl TopicRouter {
 mod tests {
     use super::*;
     use crate::common::kafka::MessageFormat;
-    use otap_df_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
-    use otap_df_otap::pdata::Context;
+    use otel_arrow_dfe_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
+    use otel_arrow_dfe_otap::pdata::Context;
 
     // ---- Test helpers ----
 

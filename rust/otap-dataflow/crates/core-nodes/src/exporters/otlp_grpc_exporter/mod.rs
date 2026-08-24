@@ -9,7 +9,7 @@
 //! request finishes we forward the Ack/Nack to the pipeline runtime so the dataflow can make
 //! progress.
 
-otap_df_telemetry::otel_component_scope!(
+otel_arrow_dfe_telemetry::otel_component_scope!(
     urn = OTLP_EXPORTER_URN,
     target = "otel.exporter.otlp_grpc",
 );
@@ -20,34 +20,34 @@ use futures::future::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use http::HeaderValue;
 use linkme::distributed_slice;
-use otap_df_config::SignalType;
-use otap_df_config::node::NodeUserConfig;
-use otap_df_config::transport_headers_policy::{
+use otel_arrow_dfe_config::SignalType;
+use otel_arrow_dfe_config::node::NodeUserConfig;
+use otel_arrow_dfe_config::transport_headers_policy::{
     CompiledHeaderPropagationPolicy, NameStrategy, PropagationAction,
 };
-use otap_df_engine::ConsumerEffectHandlerExtension;
-use otap_df_engine::ExporterFactory;
-use otap_df_engine::config::ExporterConfig;
-use otap_df_engine::context::PipelineContext;
-use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
-use otap_df_engine::error::{Error, ExporterErrorKind, format_error_sources};
-use otap_df_engine::exporter::ExporterWrapper;
-use otap_df_engine::local::capability::auth::bearer_token_provider::BearerTokenProvider;
-use otap_df_engine::local::exporter::{EffectHandler, Exporter};
-use otap_df_engine::message::{ExporterInbox, Message};
-use otap_df_engine::node::NodeId;
-use otap_df_engine::terminal_state::TerminalState;
-use otap_df_otap::OTAP_EXPORTER_FACTORIES;
-use otap_df_otap::otap_grpc::client_settings::GrpcClientSettings;
-use otap_df_otap::otap_grpc::otlp::client::{
+use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
+use otel_arrow_dfe_engine::ExporterFactory;
+use otel_arrow_dfe_engine::config::ExporterConfig;
+use otel_arrow_dfe_engine::context::PipelineContext;
+use otel_arrow_dfe_engine::control::{AckMsg, NackMsg, NodeControlMsg};
+use otel_arrow_dfe_engine::error::{Error, ExporterErrorKind, format_error_sources};
+use otel_arrow_dfe_engine::exporter::ExporterWrapper;
+use otel_arrow_dfe_engine::local::capability::auth::bearer_token_provider::BearerTokenProvider;
+use otel_arrow_dfe_engine::local::exporter::{EffectHandler, Exporter};
+use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
+use otel_arrow_dfe_engine::node::NodeId;
+use otel_arrow_dfe_engine::terminal_state::TerminalState;
+use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
+use otel_arrow_dfe_otap::otap_grpc::client_settings::GrpcClientSettings;
+use otel_arrow_dfe_otap::otap_grpc::otlp::client::{
     LogsServiceClient, MetricsServiceClient, TraceServiceClient,
 };
-use otap_df_otap::pdata::{Context, OtapPdata};
-use otap_df_pdata::otlp::logs::LogsProtoBytesEncoder;
-use otap_df_pdata::otlp::metrics::MetricsProtoBytesEncoder;
-use otap_df_pdata::otlp::traces::TracesProtoBytesEncoder;
-use otap_df_pdata::otlp::{ProtoBuffer, ProtoBytesEncoder};
-use otap_df_pdata::{
+use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
+use otel_arrow_dfe_pdata::otlp::logs::LogsProtoBytesEncoder;
+use otel_arrow_dfe_pdata::otlp::metrics::MetricsProtoBytesEncoder;
+use otel_arrow_dfe_pdata::otlp::traces::TracesProtoBytesEncoder;
+use otel_arrow_dfe_pdata::otlp::{ProtoBuffer, ProtoBytesEncoder};
+use otel_arrow_dfe_pdata::{
     OtapArrowRecords, OtapPayload, OtapPayloadHelpers, OtlpProtoBytes, PayloadData,
 };
 use serde::Deserialize;
@@ -60,7 +60,7 @@ use tonic::codec::CompressionEncoding;
 use tonic::metadata::{Ascii, Binary, MetadataKey, MetadataMap, MetadataValue};
 use tonic::transport::Channel;
 
-use otap_df_otap::bearer_auth::{BearerAuth, BearerAuthEvents, apply_auth_rejection};
+use otel_arrow_dfe_otap::bearer_auth::{BearerAuth, BearerAuthEvents, apply_auth_rejection};
 
 mod metrics;
 
@@ -121,7 +121,7 @@ pub struct OTLPExporter {
 
 /// Declare the OTLP Exporter as a local exporter factory
 #[allow(unsafe_code)]
-#[otap_df_engine::component_inventory(category = Exporter)]
+#[otel_arrow_dfe_engine::component_inventory(category = Exporter)]
 #[distributed_slice(OTAP_EXPORTER_FACTORIES)]
 pub static OTLP_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     name: OTLP_EXPORTER_URN,
@@ -129,13 +129,13 @@ pub static OTLP_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              exporter_config: &ExporterConfig,
-             capabilities: &otap_df_engine::capability::registry::Capabilities| {
+             capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities| {
         // Optionally resolve a bound bearer token provider. Absent binding keeps
         // the default (no-auth) behavior; a bound provider (e.g. the
         // `oauth2_client_auth` extension) supplies refreshed OAuth tokens.
         let token_provider = capabilities
-            .optional_local::<otap_df_engine::capability::auth::bearer_token_provider::BearerTokenProvider>()
-            .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
+            .optional_local::<otel_arrow_dfe_engine::capability::auth::bearer_token_provider::BearerTokenProvider>()
+            .map_err(|e| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
                 error: e.to_string(),
             })?;
         Ok(ExporterWrapper::local(
@@ -145,7 +145,7 @@ pub static OTLP_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
             exporter_config,
         ))
     },
-    wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
+    wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config,
 };
 
@@ -154,15 +154,15 @@ pub static OTLP_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
 /// Runs before any node is started (initial load and live reconfigure), so bad
 /// configuration is rejected fast and attributed to the offending node rather
 /// than surfacing as an opaque client error at startup.
-fn validate_config(config: &serde_json::Value) -> Result<(), otap_df_config::error::Error> {
+fn validate_config(config: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error> {
     let cfg: Config = serde_json::from_value(config.clone()).map_err(|e| {
-        otap_df_config::error::Error::InvalidUserConfig {
+        otel_arrow_dfe_config::error::Error::InvalidUserConfig {
             error: e.to_string(),
         }
     })?;
     cfg.grpc
         .validate()
-        .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
+        .map_err(|e| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
             error: e.to_string(),
         })?;
     Ok(())
@@ -174,11 +174,11 @@ impl OTLPExporter {
         pipeline_ctx: PipelineContext,
         config: &serde_json::Value,
         token_provider: Option<Box<dyn BearerTokenProvider>>,
-    ) -> Result<Self, otap_df_config::error::Error> {
+    ) -> Result<Self, otel_arrow_dfe_config::error::Error> {
         let metrics = OtlpGrpcExporterMetrics::register(&pipeline_ctx);
 
         let config: Config = serde_json::from_value(config.clone()).map_err(|e| {
-            otap_df_config::error::Error::InvalidUserConfig {
+            otel_arrow_dfe_config::error::Error::InvalidUserConfig {
                 error: e.to_string(),
             }
         })?;
@@ -1112,7 +1112,7 @@ struct GrpcPropagationCache {
 }
 
 struct GrpcCachedSchema {
-    _schema: Arc<otap_df_config::transport_headers_policy::CompiledHeaderSchema>,
+    _schema: Arc<otel_arrow_dfe_config::transport_headers_policy::CompiledHeaderSchema>,
     decisions: Box<[GrpcSchemaDecision]>,
 }
 
@@ -1127,7 +1127,7 @@ struct GrpcSchemaDecision {
 impl GrpcPropagationCache {
     fn schema_plan<'a>(
         &'a mut self,
-        schema: &Arc<otap_df_config::transport_headers_policy::CompiledHeaderSchema>,
+        schema: &Arc<otel_arrow_dfe_config::transport_headers_policy::CompiledHeaderSchema>,
         policy: &CompiledHeaderPropagationPolicy,
     ) -> &'a GrpcCachedSchema {
         let key = Arc::as_ptr(schema) as usize;
@@ -1218,7 +1218,7 @@ fn build_grpc_metadata_cached(
                         &mut metadata,
                         static_metadata,
                         decision,
-                        value_kind == otap_df_otap::context_bytes::HeaderValueKind::Binary,
+                        value_kind == otel_arrow_dfe_otap::context_bytes::HeaderValueKind::Binary,
                         value,
                     )
                 } else {
@@ -1240,7 +1240,7 @@ fn build_grpc_metadata_cached(
                         &mut metadata,
                         static_metadata,
                         header_name,
-                        value_kind == otap_df_otap::context_bytes::HeaderValueKind::Binary,
+                        value_kind == otel_arrow_dfe_otap::context_bytes::HeaderValueKind::Binary,
                         value,
                     )
                 };
@@ -1571,48 +1571,48 @@ struct CompletedExport {
 mod tests {
     use super::*;
 
-    use otap_df_config::node::NodeUserConfig;
-    use otap_df_otap::bearer_auth::test_support::MockTokenProvider;
-    use otap_df_otap::testing::{TestContextHeader, test_pdata_context};
+    use otel_arrow_dfe_config::node::NodeUserConfig;
+    use otel_arrow_dfe_otap::bearer_auth::test_support::MockTokenProvider;
+    use otel_arrow_dfe_otap::testing::{TestContextHeader, test_pdata_context};
     use std::collections::HashMap;
 
-    use otap_df_config::transport_headers_policy::PropagationSelectorType;
-    use otap_df_config::transport_headers_policy::{
+    use otel_arrow_dfe_config::transport_headers_policy::PropagationSelectorType;
+    use otel_arrow_dfe_config::transport_headers_policy::{
         CaptureDefaults, CaptureRule, HeaderCapturePolicy, HeaderPropagationPolicy,
         PropagationAction, PropagationDefault, PropagationMatch, PropagationOverride,
         PropagationSelector,
     };
-    use otap_df_engine::Interests;
-    use otap_df_engine::context::ControllerContext;
-    use otap_df_engine::control::PipelineCompletionMsg;
-    use otap_df_engine::control::{
+    use otel_arrow_dfe_engine::Interests;
+    use otel_arrow_dfe_engine::context::ControllerContext;
+    use otel_arrow_dfe_engine::control::PipelineCompletionMsg;
+    use otel_arrow_dfe_engine::control::{
         Controllable, PipelineCompletionMsgSender, RuntimeCtrlMsgSender,
         pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
     };
-    use otap_df_engine::error::Error;
-    use otap_df_engine::exporter::ExporterWrapper;
-    use otap_df_engine::local::message::{LocalReceiver, LocalSender};
-    use otap_df_engine::message::{Receiver, Sender};
-    use otap_df_engine::node::NodeWithPDataReceiver;
-    use otap_df_engine::testing::create_not_send_channel;
-    use otap_df_engine::testing::{
+    use otel_arrow_dfe_engine::error::Error;
+    use otel_arrow_dfe_engine::exporter::ExporterWrapper;
+    use otel_arrow_dfe_engine::local::message::{LocalReceiver, LocalSender};
+    use otel_arrow_dfe_engine::message::{Receiver, Sender};
+    use otel_arrow_dfe_engine::node::NodeWithPDataReceiver;
+    use otel_arrow_dfe_engine::testing::create_not_send_channel;
+    use otel_arrow_dfe_engine::testing::{
         exporter::{TestContext, TestRuntime},
         test_node,
     };
-    use otap_df_otap::context_bytes::PdataContextBytes;
-    use otap_df_otap::otlp_grpc::OTLPData;
-    use otap_df_otap::otlp_mock::{LogsServiceMock, MetricsServiceMock, TraceServiceMock};
-    use otap_df_otap::pdata::OtapPdata;
-    use otap_df_otap::testing::{TestCallData, next_ack, next_nack};
-    use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
-    use otap_df_pdata::proto::opentelemetry::collector::logs::v1::logs_service_server::LogsServiceServer;
-    use otap_df_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
-    use otap_df_pdata::proto::opentelemetry::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
-    use otap_df_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceRequest;
-    use otap_df_pdata::proto::opentelemetry::collector::trace::v1::trace_service_server::TraceServiceServer;
-    use otap_df_telemetry::metrics::MetricSetSnapshot;
-    use otap_df_telemetry::registry::TelemetryRegistryHandle;
-    use otap_df_telemetry::reporter::MetricsReporter;
+    use otel_arrow_dfe_otap::context_bytes::PdataContextBytes;
+    use otel_arrow_dfe_otap::otlp_grpc::OTLPData;
+    use otel_arrow_dfe_otap::otlp_mock::{LogsServiceMock, MetricsServiceMock, TraceServiceMock};
+    use otel_arrow_dfe_otap::pdata::OtapPdata;
+    use otel_arrow_dfe_otap::testing::{TestCallData, next_ack, next_nack};
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::logs_service_server::LogsServiceServer;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::trace_service_server::TraceServiceServer;
+    use otel_arrow_dfe_telemetry::metrics::MetricSetSnapshot;
+    use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
+    use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
     use prost::Message;
     use std::net::SocketAddr;
     use std::pin::Pin;
@@ -1625,7 +1625,7 @@ mod tests {
 
     /// Helper function to wait for and validate an Ack or Nack message with the expected node_id
     async fn wait_for_ack_or_nack(
-        pipeline_completion_rx: &mut otap_df_engine::control::PipelineCompletionMsgReceiver<
+        pipeline_completion_rx: &mut otel_arrow_dfe_engine::control::PipelineCompletionMsgReceiver<
             OtapPdata,
         >,
         expect_ack: bool,
@@ -1775,7 +1775,7 @@ mod tests {
         let (shutdown_sender, shutdown_signal) = tokio::sync::oneshot::channel();
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         let grpc_addr = "127.0.0.1";
-        let grpc_port = otap_df_test_net::pick_unused_loopback_tcp_port();
+        let grpc_port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
         let grpc_endpoint = format!("http://{grpc_addr}:{grpc_port}");
         let listening_addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
         // tokio runtime to run grpc server in the background
@@ -1875,7 +1875,7 @@ mod tests {
         let (shutdown_sender, shutdown_signal) = tokio::sync::oneshot::channel();
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         let grpc_addr = "127.0.0.1";
-        let grpc_port = otap_df_test_net::pick_unused_loopback_tcp_port();
+        let grpc_port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
         let grpc_endpoint = format!("http://{grpc_addr}:{grpc_port}");
         let listening_addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
         let tokio_rt = Runtime::new().unwrap();
@@ -2005,7 +2005,7 @@ mod tests {
         let (shutdown_sender, shutdown_signal) = tokio::sync::oneshot::channel();
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         let grpc_addr = "127.0.0.1";
-        let grpc_port = otap_df_test_net::pick_unused_loopback_tcp_port();
+        let grpc_port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
         let grpc_endpoint = format!("http://{grpc_addr}:{grpc_port}");
         let listening_addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
         let tokio_rt = Runtime::new().unwrap();
@@ -2192,7 +2192,7 @@ mod tests {
         let (shutdown_sender, shutdown_signal) = tokio::sync::oneshot::channel();
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         let grpc_addr = "127.0.0.1";
-        let grpc_port = otap_df_test_net::pick_unused_loopback_tcp_port();
+        let grpc_port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
         let grpc_endpoint = format!("http://{grpc_addr}:{grpc_port}");
         let listening_addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
         let tokio_rt = Runtime::new().unwrap();
@@ -2324,7 +2324,7 @@ mod tests {
         // client will reconnect in the event of a server shutdown
 
         let grpc_addr = "127.0.0.1";
-        let grpc_port = otap_df_test_net::pick_unused_loopback_tcp_port();
+        let grpc_port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
         let grpc_endpoint = format!("http://{grpc_addr}:{grpc_port}");
 
         let tokio_rt = Runtime::new().unwrap();
@@ -2401,7 +2401,7 @@ mod tests {
             server_shutdown_signal2: tokio::sync::oneshot::Sender<bool>,
             pdata_tx: Sender<OtapPdata>,
             control_sender: Sender<NodeControlMsg<OtapPdata>>,
-            mut pipeline_completion_msg_rx: otap_df_engine::control::PipelineCompletionMsgReceiver<
+            mut pipeline_completion_msg_rx: otel_arrow_dfe_engine::control::PipelineCompletionMsgReceiver<
                 OtapPdata,
             >,
             mut req_receiver: tokio::sync::mpsc::Receiver<OTLPData>,
@@ -2867,7 +2867,7 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl otap_df_pdata::proto::opentelemetry::collector::logs::v1::logs_service_server::LogsService
+    impl otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::logs_service_server::LogsService
         for ErrorLogsServiceMock
     {
         async fn export(
@@ -2875,7 +2875,7 @@ mod tests {
             _request: tonic::Request<ExportLogsServiceRequest>,
         ) -> Result<
             tonic::Response<
-                otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceResponse,
+                otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceResponse,
             >,
             tonic::Status,
         > {
@@ -2906,10 +2906,10 @@ mod tests {
         detail_bytes: Option<Bytes>,
         token_provider: Option<Box<dyn BearerTokenProvider>>,
     ) -> bool {
-        use otap_df_pdata::proto::opentelemetry::collector::logs::v1::logs_service_server::LogsServiceServer;
+        use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::logs_service_server::LogsServiceServer;
 
         let grpc_addr = "127.0.0.1";
-        let grpc_port = otap_df_test_net::pick_unused_loopback_tcp_port();
+        let grpc_port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
         let grpc_endpoint = format!("http://{grpc_addr}:{grpc_port}");
 
         let tokio_rt = Runtime::new().unwrap();
@@ -2996,7 +2996,7 @@ mod tests {
         async fn drive_test(
             pdata_tx: Sender<OtapPdata>,
             control_sender: Sender<NodeControlMsg<OtapPdata>>,
-            mut pipeline_completion_msg_rx: otap_df_engine::control::PipelineCompletionMsgReceiver<
+            mut pipeline_completion_msg_rx: otel_arrow_dfe_engine::control::PipelineCompletionMsgReceiver<
                 OtapPdata,
             >,
             shutdown_tx: tokio::sync::oneshot::Sender<()>,

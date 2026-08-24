@@ -11,7 +11,7 @@
 //!
 //! [`PartitionerStrategy`]: super::config::PartitionerStrategy
 
-use otap_df_otap::context_bytes::PdataContextBytes;
+use otel_arrow_dfe_otap::context_bytes::PdataContextBytes;
 use std::hash::{Hash, Hasher};
 use xxhash_rust::xxh64::Xxh64;
 
@@ -39,7 +39,7 @@ pub fn partition_key_from_context_bytes(context: &PdataContextBytes) -> Option<S
 #[must_use]
 pub fn partition_key_for_signal(
     signal_config: &super::config::SignalConfig,
-    context: &otap_df_otap::pdata::Context,
+    context: &otel_arrow_dfe_otap::pdata::Context,
 ) -> Option<String> {
     if signal_config.partition_by_transport_headers() {
         if let Some(context_bytes) = context.pdata_context_bytes() {
@@ -63,9 +63,9 @@ mod tests {
     use super::*;
     use crate::common::kafka::MessageFormat;
     use crate::exporters::kafka_exporter::config::SignalConfig;
-    use otap_df_otap::context_bytes::PdataContextBytes;
-    use otap_df_otap::pdata::Context;
-    use otap_df_otap::testing::{TestContextHeader, test_pdata_context};
+    use otel_arrow_dfe_otap::context_bytes::PdataContextBytes;
+    use otel_arrow_dfe_otap::pdata::Context;
+    use otel_arrow_dfe_otap::testing::{TestContextHeader, test_pdata_context};
 
     /// Scenario: a packed context contains no header items.
     /// Guarantees: no Kafka partition key is generated for an empty context.
