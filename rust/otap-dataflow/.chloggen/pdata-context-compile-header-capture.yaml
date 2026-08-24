@@ -1,7 +1,8 @@
 change_type: enhancement
 component: otap
-note: "Improve transport header context capture performance by screening metadata before copying values."
+note: "Improve transport header context capture performance with compiled, bounded policies."
 issues: [3863]
 subtext: >
-  Compiled capture policies now avoid materializing unmatched gRPC metadata
-  and use compact indexed context construction across header counts.
+  Capture policies now reject max_entries or named-entry schemas above 1,024.
+  Partition header projection failures permanently reject only the affected
+  message instead of stopping the processor.

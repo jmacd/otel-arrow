@@ -18,6 +18,8 @@ use ahash::{AHashMap, AHashSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+const MAX_CAPTURE_ENTRIES: usize = 1024;
+
 // -- Stats types --------------------------------------------------------------
 
 /// Statistics returned when one or more matching headers cannot be captured
@@ -94,13 +96,13 @@ impl HeaderCapturePolicy {
 
     /// Compiles capture rules into the bounded schema used by pdata context builders.
     ///
-    /// Returns an error when the rule or named-entry counts cannot be represented
+    /// Returns an error when the configured capture limits cannot be represented
     /// by the packed context format.
     pub fn compile(&self) -> Result<CompiledHeaderCapturePolicy, String> {
-        if self.defaults.max_entries > usize::from(u16::MAX) {
+        if self.defaults.max_entries > MAX_CAPTURE_ENTRIES {
             return Err(format!(
                 "header capture max_entries must not exceed {}",
-                u16::MAX
+                MAX_CAPTURE_ENTRIES
             ));
         }
         if self.headers.len() > usize::from(u16::MAX) + 1 {
@@ -120,16 +122,16 @@ impl HeaderCapturePolicy {
                     match entry_ids.get(&normalized) {
                         Some(entry) => Some(*entry),
                         None => {
-                            if entry_ids.len() >= usize::from(u16::MAX) {
+                            if entry_ids.len() >= MAX_CAPTURE_ENTRIES {
                                 return Err(format!(
                                     "header capture supports at most {} named entries",
-                                    u16::MAX
+                                    MAX_CAPTURE_ENTRIES
                                 ));
                             }
                             let entry = u16::try_from(entry_ids.len()).map_err(|_| {
                                 format!(
                                     "header capture supports at most {} named entries",
-                                    u16::MAX
+                                    MAX_CAPTURE_ENTRIES
                                 )
                             })?;
                             let _ = entry_ids.insert(normalized, entry);
@@ -995,11 +997,11 @@ named:
         assert!(policy.compile().is_err());
     }
 
-    /// Scenario: a capture policy declares more named entries than the packed schema supports.
-    /// Guarantees: compilation fails rather than truncating entry indexes to overlapping values.
+    /// Scenario: a capture policy declares 1,025 named entries.
+    /// Guarantees: compilation rejects schemas above the 1,024-entry packed-context policy limit.
     #[test]
     fn capture_policy_rejects_too_many_named_entries() {
-        let rules = (0..=u16::MAX)
+        let rules = (0..=MAX_CAPTURE_ENTRIES)
             .map(|index| CaptureRule {
                 match_names: vec![format!("x-test-{index}")],
                 store_as: Some(format!("entry-{index}")),
@@ -1012,19 +1014,43 @@ named:
         assert!(policy.compile().is_err());
     }
 
-    /// Scenario: max_entries exceeds the packed context item-count limit.
-    /// Guarantees: policy compilation rejects requests that the runtime format cannot encode.
+    /// Scenario: max_entries exceeds the 1,024-entry capture policy limit.
+    /// Guarantees: policy compilation rejects an unreasonably large per-message capture bound.
     #[test]
     fn capture_policy_rejects_unrepresentable_max_entries() {
         let policy = HeaderCapturePolicy::new(
             CaptureDefaults {
-                max_entries: usize::from(u16::MAX) + 1,
+                max_entries: MAX_CAPTURE_ENTRIES + 1,
                 ..CaptureDefaults::default()
             },
             vec![],
         );
 
         assert!(policy.compile().is_err());
+    }
+
+    /// Scenario: max_entries and named entries are exactly at the configured policy limit.
+    /// Guarantees: compilation accepts the 1,024-entry boundary supported by packed contexts.
+    #[test]
+    fn capture_policy_accepts_maximum_entries() {
+        let rules = (0..MAX_CAPTURE_ENTRIES)
+            .map(|index| CaptureRule {
+                match_names: vec![format!("x-test-{index}")],
+                store_as: Some(format!("entry-{index}")),
+                sensitive: false,
+                value_kind: None,
+            })
+            .collect();
+        let policy = HeaderCapturePolicy::new(
+            CaptureDefaults {
+                max_entries: MAX_CAPTURE_ENTRIES,
+                ..CaptureDefaults::default()
+            },
+            rules,
+        );
+
+        let compiled = policy.compile().expect("maximum capture entry count");
+        assert_eq!(compiled.entry_count(), MAX_CAPTURE_ENTRIES);
     }
 
     /// Scenario: multiple case variants and rules declare the same wire header.

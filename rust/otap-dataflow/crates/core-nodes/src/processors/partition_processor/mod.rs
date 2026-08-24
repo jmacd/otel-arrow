@@ -240,6 +240,9 @@ impl Processor<OtapPdata> for PartitionProcessor {
                 let mut otap_batch: OtapArrowRecords = payload.try_into_with_default()?;
                 otap_batch.decode_transport_optimized_ids()?;
                 let inbound_batch_num_items = otap_batch.num_items();
+                let return_batch = inbound_context
+                    .may_return_payload()
+                    .then(|| otap_batch.clone());
 
                 let mut partitions = match self.partitioner.partition(otap_batch) {
                     Ok(partitions) => {
@@ -289,14 +292,21 @@ impl Processor<OtapPdata> for PartitionProcessor {
                             &self.serialization_strategy,
                             partition.value,
                         );
-                        project_partition_header(&mut inbound_context, &partition_header).map_err(
-                            |error| otap_df_engine::error::Error::ProcessorError {
-                                processor: effect_handler.processor_id(),
-                                kind: ProcessorErrorKind::Other,
-                                error: "failed to project pdata context".into(),
-                                source_detail: error.to_string(),
-                            },
-                        )?;
+                        if let Err(error) =
+                            project_partition_header(&mut inbound_context, &partition_header)
+                        {
+                            let payload = return_batch
+                                .map_or_else(|| partition.batch.into(), OtapPayload::from);
+                            let pdata = OtapPdata::new(inbound_context, payload);
+                            effect_handler
+                                .notify_nack(NackMsg::new_permanent(
+                                    format!("failed to project partition header: {error}"),
+                                    pdata,
+                                ))
+                                .await?;
+                            return Ok(());
+                        }
+                        drop(return_batch);
 
                         let pdata =
                             OtapPdata::new(inbound_context, OtapPayload::from(partition.batch));
@@ -305,22 +315,58 @@ impl Processor<OtapPdata> for PartitionProcessor {
                     _ => {
                         // there are multiple partitions - need to emit while shuffling contexts..
 
+                        let prepared_partitions = partitions
+                            .map(|partition| {
+                                let partition_header = partition_value_to_transport_header(
+                                    self.header_name.clone(),
+                                    &self.serialization_strategy,
+                                    partition.value,
+                                );
+                                (partition_header, partition.batch)
+                            })
+                            .collect::<Vec<_>>();
+                        let (largest_header_index, (largest_header, _)) = prepared_partitions
+                            .iter()
+                            .enumerate()
+                            .max_by_key(|(_, (header, _))| header.value.len())
+                            .expect("multiple partitions");
+                        let outbound_context = inbound_context.clone_detached();
+                        let mut largest_projected_context = outbound_context.clone();
+                        if let Err(error) =
+                            project_partition_header(&mut largest_projected_context, largest_header)
+                        {
+                            let payload = return_batch
+                                .map_or_else(|| OtapPayload::empty(signal_type), OtapPayload::from);
+                            let pdata = OtapPdata::new(inbound_context, payload);
+                            effect_handler
+                                .notify_nack(NackMsg::new_permanent(
+                                    format!("failed to project partition header: {error}"),
+                                    pdata,
+                                ))
+                                .await?;
+                            return Ok(());
+                        }
+                        drop(return_batch);
+                        let mut largest_projected_context = Some(largest_projected_context);
+
                         // create context key for inbound batch
-                        let inbound_ctx_key = self
-                            .contexts
-                            .insert_inbound(inbound_context.clone(), None)
-                            .ok_or_else(|| otap_df_engine::error::Error::ProcessorError {
-                                processor: effect_handler.processor_id(),
-                                kind: ProcessorErrorKind::Other,
-                                error: "inbound slots not available".into(),
-                                source_detail: "".into(),
-                            })?;
+                        let inbound_ctx_key =
+                            self.contexts
+                                .insert_inbound(inbound_context, None)
+                                .ok_or_else(|| otap_df_engine::error::Error::ProcessorError {
+                                    processor: effect_handler.processor_id(),
+                                    kind: ProcessorErrorKind::Other,
+                                    error: "inbound slots not available".into(),
+                                    source_detail: "".into(),
+                                })?;
 
                         let mut outbound_emitted_subscribed = 0;
 
                         // send each partition with an outbound context and the partition value
                         // populated on the transport headers
-                        for partition in partitions {
+                        for (index, (partition_header, partition_batch)) in
+                            prepared_partitions.into_iter().enumerate()
+                        {
                             let outbound_ctx_key = self
                                 .contexts
                                 .insert_outbound(inbound_ctx_key)
@@ -348,23 +394,20 @@ impl Processor<OtapPdata> for PartitionProcessor {
                                 }
                             })?;
 
-                            // Project the partition header into the output context.
-                            let mut pdata_context = inbound_context.clone_detached();
-                            let partition_header = partition_value_to_transport_header(
-                                self.header_name.clone(),
-                                &self.serialization_strategy,
-                                partition.value,
-                            );
-                            project_partition_header(&mut pdata_context, &partition_header)
-                                .map_err(|error| otap_df_engine::error::Error::ProcessorError {
-                                    processor: effect_handler.processor_id(),
-                                    kind: ProcessorErrorKind::Other,
-                                    error: "failed to project pdata context".into(),
-                                    source_detail: error.to_string(),
-                                })?;
-
-                            let outbound_batch_num_items = partition.batch.num_items();
-                            let mut pdata = OtapPdata::new(pdata_context, partition.batch.into());
+                            let pdata_context = if index == largest_header_index {
+                                largest_projected_context
+                                    .take()
+                                    .expect("largest projected context is used once")
+                            } else {
+                                let mut pdata_context = outbound_context.clone();
+                                // Projection size is monotonic in the value length, so the
+                                // successful largest-header preflight guarantees this succeeds.
+                                project_partition_header(&mut pdata_context, &partition_header)
+                                    .expect("partition header projection was preflighted");
+                                pdata_context
+                            };
+                            let outbound_batch_num_items = partition_batch.num_items();
+                            let mut pdata = OtapPdata::new(pdata_context, partition_batch.into());
                             if let Some(flow_metrics_counter) = flow_metrics_counter {
                                 pdata.start_flow_metric();
 
@@ -643,6 +686,109 @@ mod test {
             TestCallData::new_with(call_data_id, 0).into(),
             node_id,
         )
+    }
+
+    fn create_near_limit_context() -> Context {
+        let value = vec![0; 65_500];
+        let mut context = Context::default();
+        context.set_pdata_context_bytes(test_pdata_context([TestContextHeader::binary(
+            "w", "s", &value,
+        )]));
+        context
+    }
+
+    fn assert_projection_overflow_nacks(partition_values: Vec<&'static str>, return_data: bool) {
+        let runtime = TestRuntime::<OtapPdata>::new();
+        let processor = create_processor_with_config(
+            serde_json::json!({
+                "partition_by": { "opl_expression": "attributes[\"x\"]" },
+                "partition_header_name": "partition-header",
+            }),
+            &runtime,
+        )
+        .expect("create partition processor");
+
+        runtime
+            .set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let upstream_node_id = 999;
+                let expected_items = partition_values.len();
+                let log_records: Vec<LogRecord> = partition_values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        LogRecord::build()
+                            .event_name(format!("event{index}"))
+                            .attributes(vec![KeyValue::new("x", AnyValue::new_string(value))])
+                            .finish()
+                    })
+                    .collect();
+                let otap_batch = otlp_to_otap(&OtlpProtoMessage::Logs(LogsData {
+                    resource_logs: vec![ResourceLogs::new(
+                        Resource::default(),
+                        vec![ScopeLogs::new(InstrumentationScope::default(), log_records)],
+                    )],
+                }));
+                let pdata = OtapPdata::new(create_near_limit_context(), otap_batch.into())
+                    .test_subscribe_to(
+                        Interests::ACKS_OR_NACKS
+                            | if return_data {
+                                Interests::RETURN_DATA
+                            } else {
+                                Interests::empty()
+                            },
+                        TestCallData::new_with(1, 0).into(),
+                        upstream_node_id,
+                    );
+
+                let (runtime_ctrl_tx, _runtime_ctrl_rx) = runtime_ctrl_msg_channel(10);
+                let (pipeline_completion_tx, mut pipeline_completion_rx) =
+                    pipeline_completion_msg_channel(10);
+                ctx.set_runtime_ctrl_sender(runtime_ctrl_tx);
+                ctx.set_pipeline_completion_sender(pipeline_completion_tx);
+
+                ctx.process(Message::PData(pdata))
+                    .await
+                    .expect("projection overflow is a message failure");
+                assert!(
+                    ctx.drain_pdata().await.is_empty(),
+                    "no partition should be emitted"
+                );
+
+                let completion = pipeline_completion_rx.recv().await.expect("permanent nack");
+                match completion {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        let (node_id, mut nack) =
+                            next_nack(nack).expect("expected nack subscriber");
+                        assert_eq!(node_id, upstream_node_id);
+                        assert!(nack.permanent);
+                        assert!(
+                            nack.reason.contains("failed to project partition header"),
+                            "unexpected nack reason: {}",
+                            nack.reason
+                        );
+                        if return_data {
+                            assert_eq!(nack.refused.num_items(), expected_items);
+                        }
+                    }
+                    other => panic!("expected DeliverNack, got {other:?}"),
+                }
+            })
+            .validate(|_ctx| async move {});
+    }
+
+    /// Scenario: a single partition cannot append its header to a near-limit context.
+    /// Guarantees: the message receives a permanent Nack without terminating the processor.
+    #[test]
+    fn test_single_partition_projection_overflow_nacks() {
+        assert_projection_overflow_nacks(vec!["one"], false);
+    }
+
+    /// Scenario: multiple partitions cannot append their headers to a near-limit context.
+    /// Guarantees: the permanent Nack returns the complete payload before any partition is emitted.
+    #[test]
+    fn test_multiple_partition_projection_overflow_nacks() {
+        assert_projection_overflow_nacks(vec!["one", "two"], true);
     }
 
     #[test]
