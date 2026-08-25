@@ -753,11 +753,36 @@ fn encode_any_value(
     Ok(())
 }
 
-/// Encode a LogEvent as a complete ExportLogsServiceRequest.
-///
-/// This version resolves entity keys from the log record's context to populate
-/// the InstrumentationScope.attributes field. The scope cache is used to avoid
-/// re-encoding entity attributes for each log event.
+fn encode_scope_logs(
+    buf: &mut ProtoBuffer,
+    target: &str,
+    context: &[EntityKey],
+    events: &[LogEvent],
+    indices: &[usize],
+    scope_cache: &mut ScopeToBytesMap,
+) -> EncodeResult {
+    buf.encode_len_delimited(RESOURCE_LOGS_SCOPE_LOGS, |buf| {
+        buf.encode_len_delimited(SCOPE_LOG_SCOPE, |buf| {
+            buf.encode_string(INSTRUMENTATION_SCOPE_NAME, target)?;
+            for entity_key in context {
+                let scope_bytes = scope_cache.get_or_encode(*entity_key);
+                buf.extend_from_slice(&scope_bytes)?;
+            }
+            Ok(())
+        })?;
+
+        for &index in indices {
+            buf.encode_len_delimited(SCOPE_LOGS_LOG_RECORDS, |buf| {
+                let mut encoder = DirectLogRecordEncoder::new(buf);
+                let _ = encoder.encode_log_record(events[index].time, &events[index].record);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    })
+}
+
+/// Encode one log event as a complete `ExportLogsServiceRequest`.
 pub fn encode_export_logs_request(
     buf: &mut ProtoBuffer,
     event: &LogEvent,
@@ -765,39 +790,60 @@ pub fn encode_export_logs_request(
     scope_cache: &mut ScopeToBytesMap,
 ) {
     buf.clear();
-
-    // ExportLogsServiceRequest.resource_logs (field 1, repeated ResourceLogs)
     let _: EncodeResult = buf.encode_len_delimited(EXPORT_LOGS_REQUEST_RESOURCE_LOGS, |buf| {
-        // ResourceLogs.resource (field 1, Resource message)
-        // Copy pre-encoded resource bytes directly
         buf.extend_from_slice(resource_bytes)?;
-
-        // ResourceLogs.scope_logs (field 2, repeated ScopeLogs)
-        buf.encode_len_delimited(RESOURCE_LOGS_SCOPE_LOGS, |buf| {
-            // ScopeLogs.scope (field 1, InstrumentationScope message)
-            buf.encode_len_delimited(SCOPE_LOG_SCOPE, |buf| {
-                // InstrumentationScope.name (field 1, string) -- the tracing
-                // target identifying the static logical software unit that
-                // emitted the event. Component-owned events use a
-                // component-aware target; shared code uses its package target.
-                // Pairing scope.name with the bare `event.name` encoded below
-                // keeps `event.name` aligned with the semconv registry.
-                buf.encode_string(INSTRUMENTATION_SCOPE_NAME, event.record.callsite().target())?;
-                for entity_key in event.record.context.iter() {
-                    let scope_bytes = scope_cache.get_or_encode(*entity_key);
-                    buf.extend_from_slice(&scope_bytes)?;
-                }
-                Ok(())
-            })?;
-
-            // ScopeLogs.log_records (field 2, repeated LogRecord)
-            buf.encode_len_delimited(SCOPE_LOGS_LOG_RECORDS, |buf| {
-                let mut encoder = DirectLogRecordEncoder::new(buf);
-                let _ = encoder.encode_log_record(event.time, &event.record);
-                Ok(())
-            })
-        })
+        encode_scope_logs(
+            buf,
+            event.record.callsite().target(),
+            &event.record.context,
+            std::slice::from_ref(event),
+            &[0],
+            scope_cache,
+        )
     });
+}
+
+/// Encode logs as one request, grouping equal target and entity contexts.
+///
+/// Scope groups are emitted in order of first appearance. Records within each
+/// group retain their arrival order.
+pub fn encode_export_logs_request_batch(
+    buf: &mut ProtoBuffer,
+    events: &[LogEvent],
+    resource_bytes: &Bytes,
+    scope_cache: &mut ScopeToBytesMap,
+) {
+    match events {
+        [] => buf.clear(),
+        [event] => encode_export_logs_request(buf, event, resource_bytes, scope_cache),
+        _ => {
+            let mut group_by_scope: HashMap<(&str, &[EntityKey]), usize> = HashMap::new();
+            let mut groups: Vec<(&str, &[EntityKey], Vec<usize>)> = Vec::new();
+            for (index, event) in events.iter().enumerate() {
+                let key = (
+                    event.record.callsite().target(),
+                    event.record.context.as_slice(),
+                );
+                if let Some(&group_index) = group_by_scope.get(&key) {
+                    groups[group_index].2.push(index);
+                } else {
+                    let group_index = groups.len();
+                    let _ = group_by_scope.insert(key, group_index);
+                    groups.push((key.0, key.1, vec![index]));
+                }
+            }
+
+            buf.clear();
+            let _: EncodeResult =
+                buf.encode_len_delimited(EXPORT_LOGS_REQUEST_RESOURCE_LOGS, |buf| {
+                    buf.extend_from_slice(resource_bytes)?;
+                    for (target, context, indices) in &groups {
+                        encode_scope_logs(buf, target, context, events, indices, scope_cache)?;
+                    }
+                    Ok(())
+                });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1023,6 +1069,59 @@ mod tests {
             ),
         );
         assert_eq!(expected, decoded);
+    }
+
+    /// Scenario: a batch interleaves records from two entity contexts.
+    /// Guarantees: equal contexts share one scope while scope and record order remain stable.
+    #[test]
+    fn encode_export_logs_request_batch_groups_scopes_in_first_seen_order() {
+        let registry = TelemetryRegistryHandle::new();
+        let key_a = registry.register_entity(TestScopeAttributes::new("pipeline-a", 1));
+        let key_b = registry.register_entity(TestScopeAttributes::new("pipeline-b", 2));
+        let mut scope_cache = ScopeToBytesMap::new(registry);
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let events = vec![
+            LogEvent {
+                time,
+                record: __log_record_impl!(Level::INFO, "test.batch.b-first")
+                    .into_record(LogContext::from_buf([key_b])),
+            },
+            LogEvent {
+                time,
+                record: __log_record_impl!(Level::INFO, "test.batch.a")
+                    .into_record(LogContext::from_buf([key_a])),
+            },
+            LogEvent {
+                time,
+                record: __log_record_impl!(Level::INFO, "test.batch.b-second")
+                    .into_record(LogContext::from_buf([key_b])),
+            },
+        ];
+
+        let mut buf = ProtoBuffer::default();
+        encode_export_logs_request_batch(&mut buf, &events, &Bytes::new(), &mut scope_cache);
+        let decoded =
+            ExportLogsServiceRequest::decode(buf.into_bytes()).expect("valid logs request");
+        let scope_logs = &decoded.resource_logs[0].scope_logs;
+
+        assert_eq!(scope_logs.len(), 2);
+        assert_eq!(
+            scope_logs[0]
+                .scope
+                .as_ref()
+                .expect("first scope")
+                .attributes[0],
+            KeyValue::new("pipeline.name", AnyValue::new_string("pipeline-b"))
+        );
+        assert_eq!(
+            scope_logs[0]
+                .log_records
+                .iter()
+                .map(|record| record.event_name.as_str())
+                .collect::<Vec<_>>(),
+            ["test.batch.b-first", "test.batch.b-second"]
+        );
+        assert_eq!(scope_logs[1].log_records[0].event_name, "test.batch.a");
     }
 
     // --- Test infrastructure for Map (kvlist) scope attributes ---
