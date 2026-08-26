@@ -58,15 +58,23 @@ The two transport names belong to compiled ingress and egress
 instructions. The register contains only presence, shape, and typed
 values.
 
-The current transport-header prototype represents each register as an
-ordered list of schema-backed value items. A list of one represents a
-singleton. Cardinality limits and duplicate handling are policy
-constraints, not register type information. An item's schema instruction
-provides its transport key unless observed-name provenance must remain in
-the message.
+Registers support these runtime shapes:
 
-Composite context entries remain part of this RFC's design, but are not
-implemented by the current prototype.
+- one unnamed value;
+- an ordered list of unnamed values;
+- one runtime key/value association;
+- an ordered key/value list;
+- a schema-defined record with compiled field positions.
+
+A key remains in message bytes only when it is part of the runtime
+value. A configured record field name is compiled to a field position
+and is not runtime data.
+
+Record members encode a value-item index and a numeric field position.
+Members are ordered first by field position and then by producer order
+for repeated fields. The packed form therefore supports absent and
+repeated fields without storing field names. Construction validates
+field cardinality and scalar types against the immutable register file.
 
 Each compiler output has an explicit version and immutable register
 file. Messages retain their register file, so several configuration
