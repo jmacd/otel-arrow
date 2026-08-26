@@ -1,26 +1,31 @@
-use super::*;
+use std::sync::Arc;
+
+use otel_arrow_dfe_config::context::{ContextRegisterId, ContextVersion};
+use otel_arrow_dfe_config::transport_headers_policy::CompiledHeaderSchema;
+
+use super::packed::{ContextBytesError, ContextRegister, HeaderValueKind, PdataContextBytes};
 
 pub(super) const SCHEMA_CACHE_CAPACITY: usize = 8;
 
-pub(super) struct SchemaPlanCache<P> {
-    pub(super) entries: Vec<(ContextVersion, P)>,
+struct SchemaPlanCache<P> {
+    entries: Vec<(ContextVersion, P)>,
 }
 
 impl<P> SchemaPlanCache<P> {
-    pub(super) const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
     }
 
-    pub(super) fn get(&self, version: ContextVersion) -> Option<&P> {
+    fn get(&self, version: ContextVersion) -> Option<&P> {
         self.entries
             .iter()
             .find(|(cached, _)| *cached == version)
             .map(|(_, plan)| plan)
     }
 
-    pub(super) fn insert(&mut self, version: ContextVersion, plan: P) -> &P {
+    fn insert(&mut self, version: ContextVersion, plan: P) -> &P {
         if self.entries.len() >= SCHEMA_CACHE_CAPACITY {
             let _ = self.entries.remove(0);
         }
@@ -28,11 +33,7 @@ impl<P> SchemaPlanCache<P> {
         &self.entries.last().expect("inserted schema plan").1
     }
 
-    pub(super) fn get_or_insert_with(
-        &mut self,
-        version: ContextVersion,
-        build: impl FnOnce() -> P,
-    ) -> &P {
+    fn get_or_insert_with(&mut self, version: ContextVersion, build: impl FnOnce() -> P) -> &P {
         if let Some(index) = self
             .entries
             .iter()
@@ -52,8 +53,8 @@ impl<P> SchemaPlanCache<P> {
 /// binding, so replacing the binding also replaces its configuration
 /// generation.
 pub struct ContextRegisterValueBinding {
-    pub(super) symbol: String,
-    pub(super) cache: SchemaPlanCache<Option<ContextRegisterId>>,
+    symbol: String,
+    cache: SchemaPlanCache<Option<ContextRegisterId>>,
 }
 
 impl ContextRegisterValueBinding {
@@ -98,8 +99,8 @@ pub type ContextValueBinding = ContextRegisterValueBinding;
 /// Configuration symbols are linked once per compiler version. Evaluation
 /// visits numeric registers in configuration order without name lookup.
 pub struct ContextRegisterSetBinding {
-    pub(super) symbols: Box<[String]>,
-    pub(super) cache: SchemaPlanCache<Box<[Option<ContextRegisterId>]>>,
+    symbols: Box<[String]>,
+    cache: SchemaPlanCache<Box<[Option<ContextRegisterId>]>>,
 }
 
 impl ContextRegisterSetBinding {
@@ -161,14 +162,14 @@ pub type ContextEntrySetBinding = ContextRegisterSetBinding;
 /// bounded to [`SCHEMA_CACHE_CAPACITY`] entries with FIFO eviction.
 pub struct ContextScalarProjectionBinding {
     /// Source-level symbol compiled for the projected output register.
-    pub(super) register_symbol: String,
+    register_symbol: String,
     /// Schema with one item and one entry, used when there is no input context.
-    pub(super) standalone_schema: Arc<CompiledHeaderSchema>,
+    standalone_schema: Arc<CompiledHeaderSchema>,
     /// schema_index within the standalone schema.
-    pub(super) standalone_schema_index: u16,
+    standalone_schema_index: u16,
     /// Bounded FIFO cache of derived schemas keyed by input schema Arc pointer.
     /// Each plan contains (derived_schema, schema_index, entry_slot).
-    pub(super) cache: SchemaPlanCache<(Arc<CompiledHeaderSchema>, u16, u16)>,
+    cache: SchemaPlanCache<(Arc<CompiledHeaderSchema>, u16, u16)>,
 }
 
 impl ContextScalarProjectionBinding {
@@ -199,7 +200,7 @@ impl ContextScalarProjectionBinding {
             Some(ctx) => {
                 let (derived_schema, schema_index, entry_slot) =
                     self.derived_schema(ctx.schema())?;
-                ctx.project().copy_and_append_entry_item(
+                ctx.project_scalar(
                     schema_index,
                     entry_slot,
                     &self.register_symbol,
@@ -210,15 +211,11 @@ impl ContextScalarProjectionBinding {
             }
             None => {
                 // Build a single-item context with the standalone schema (1 entry)
-                let header = CapturedHeader {
-                    wire_name: &self.register_symbol,
+                PdataContextBytes::from_scalar(
+                    &self.register_symbol,
                     value,
                     kind,
-                    schema_index: self.standalone_schema_index,
-                };
-                PdataContextBytes::build_captured(
-                    &[header],
-                    value.len(),
+                    self.standalone_schema_index,
                     self.standalone_schema.clone(),
                 )
             }
@@ -228,7 +225,7 @@ impl ContextScalarProjectionBinding {
     /// Returns (derived_schema, schema_index, entry_slot) for the given input
     /// schema. Uses Arc pointer identity for cache lookup. Bounded to
     /// [`SCHEMA_CACHE_CAPACITY`] with FIFO eviction.
-    pub(super) fn derived_schema(
+    fn derived_schema(
         &mut self,
         input_schema: &Arc<CompiledHeaderSchema>,
     ) -> Result<(Arc<CompiledHeaderSchema>, u16, u16), ContextBytesError> {

@@ -1,5 +1,6 @@
-use super::bindings::SCHEMA_CACHE_CAPACITY;
-#[cfg(test)]
+use super::super::bindings::{
+    ContextEntrySetBinding, ContextValueBinding, PartitionProjectionBinding, SCHEMA_CACHE_CAPACITY,
+};
 use super::*;
 use otel_arrow_dfe_config::context::{ContextCompiler, ContextRegisterField};
 use otel_arrow_dfe_config::transport_headers_policy::NameStrategy;

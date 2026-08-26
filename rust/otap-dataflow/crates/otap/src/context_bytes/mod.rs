@@ -71,51 +71,15 @@
 //! A zero-length source-name range means the ingress instruction supplies any
 //! statically known key. A non-empty range is explicit runtime provenance.
 
-use std::{
-    fmt,
-    marker::PhantomData,
-    ops::{Deref, Range},
-    sync::Arc,
-};
-
-use otel_arrow_dfe_config::context::{
-    CompiledContext, ContextFieldId, ContextRecordShape, ContextRegisterId, ContextRegisterShape,
-    ContextScalarType, ContextVersion,
-};
-use otel_arrow_dfe_config::transport_headers_policy::{
-    CaptureStats, CompiledHeaderCapturePolicy, CompiledHeaderSchema, CompiledHeaderSchemaItemRef,
-    CompiledOutputName, CompiledSchemaPropagation, PropagationAction, ValueKindConfig,
-};
-use tonic::metadata::{KeyAndValueRef, MetadataMap};
-
 mod bindings;
-mod capture;
-mod context;
-mod descriptors;
-mod hash;
-mod layout;
-mod primitives;
-mod record;
-mod types;
-mod writer;
-
-#[cfg(test)]
-mod tests;
-
-use capture::*;
-
-use descriptors::*;
-use hash::*;
-use layout::*;
-use primitives::*;
-use writer::*;
+mod packed;
 
 pub use bindings::{
     ContextEntrySetBinding, ContextRegisterSetBinding, ContextRegisterValueBinding,
     ContextScalarProjectionBinding, ContextValueBinding, PartitionProjectionBinding,
 };
-pub use context::{
-    ContextEntry, ContextItem, ContextItems, ContextPropagation, ContextRegister,
-    PdataContextBytes, PropagatedContextItem,
+pub use packed::{
+    ContextBytesError, ContextEntry, ContextItem, ContextItems, ContextPropagation,
+    ContextRecordValue, ContextRegister, ContextValueKind, HeaderValueKind, PdataContextBytes,
+    PropagatedContextItem,
 };
-pub use types::{ContextBytesError, ContextRecordValue, ContextValueKind, HeaderValueKind};
