@@ -6,12 +6,13 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use otel_arrow_dfe_config::context::ContextRegisterId;
 use otel_arrow_dfe_config::transport_headers_policy::{
     CaptureDefaults, CaptureRule, CompiledHeaderCapturePolicy, HeaderCapturePolicy,
     HeaderPropagationPolicy, PropagationDefault, PropagationSelector, PropagationSelectorType,
 };
 use otel_arrow_dfe_otap::context_bytes::{
-    HeaderValueKind, PartitionProjectionBinding, PdataContextBytes,
+    ContextScalarProjectionBinding, HeaderValueKind, PdataContextBytes,
 };
 
 const HEADER_COUNTS: [usize; 4] = [1, 4, 16, 32];
@@ -34,7 +35,7 @@ fn bench_context_bytes(c: &mut Criterion) {
     let _ = c.bench_function("pdata_context/lookup/entry", |b| {
         b.iter(|| {
             black_box(&context)
-                .entry(0)
+                .register(ContextRegisterId::from_u16(0))
                 .expect("tenant entry")
                 .values()
                 .count()
@@ -67,7 +68,7 @@ fn bench_context_bytes(c: &mut Criterion) {
     });
 
     let partition_values = partition_values();
-    let mut binding = PartitionProjectionBinding::new("partition");
+    let mut binding = ContextScalarProjectionBinding::new("partition");
     let _ = c.bench_function("pdata_context/project_partition_8", |b| {
         b.iter(|| {
             for value in &partition_values {

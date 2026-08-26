@@ -1,13 +1,17 @@
 use super::super::bindings::{
-    ContextEntrySetBinding, ContextValueBinding, PartitionProjectionBinding, SCHEMA_CACHE_CAPACITY,
+    ContextRegisterSetBinding, ContextRegisterValueBinding, ContextScalarProjectionBinding,
+    SCHEMA_CACHE_CAPACITY,
 };
 use super::*;
-use otel_arrow_dfe_config::context::{ContextCompiler, ContextRegisterField};
 use otel_arrow_dfe_config::transport_headers_policy::NameStrategy;
 use otel_arrow_dfe_config::transport_headers_policy::{
     CaptureDefaults, CaptureRule, HeaderCapturePolicy, HeaderPropagationPolicy, PropagationDefault,
     PropagationMatch, PropagationOverride, PropagationSelector, PropagationSelectorType,
 };
+
+fn register_at(context: &PdataContextBytes, slot: u16) -> Option<ContextRegister<'_>> {
+    context.register(ContextRegisterId::from_u16(slot))
+}
 
 /// Scenario: register presence spans both sides of a bitmap word boundary.
 /// Guarantees: sizing, mutation, and encoded lookup share the same bit arithmetic.
@@ -39,139 +43,10 @@ fn envelope_writer_enforces_section_order() {
     assert!(writer.finish().is_err());
 }
 
-/// Scenario: a record producer supplies compiled fields out of schema order.
-/// Guarantees: the envelope contains numeric fields in canonical order, preserves repeated
-/// values, and stores neither field symbols nor transport provenance.
+/// Scenario: a register has duplicate typed values interleaved with an unmatched header.
+/// Guarantees: captured item order is preserved and the register resolves its ordered members.
 #[test]
-fn record_register_encodes_compiled_field_ordinals() {
-    let mut compiler = ContextCompiler::new(3);
-    let record = compiler
-        .declare_record([
-            (
-                "tenant_id",
-                ContextRegisterField::scalar(ContextScalarType::Text),
-            ),
-            (
-                "roles",
-                ContextRegisterField::repeated(ContextScalarType::Text),
-            ),
-            (
-                "digest",
-                ContextRegisterField::scalar(ContextScalarType::Bytes),
-            ),
-        ])
-        .expect("record shape");
-    let register = compiler
-        .declare("routing", ContextRegisterShape::Record(record))
-        .expect("record register");
-    let compiled = compiler.finish();
-    let tenant = compiled
-        .linker()
-        .resolve_field(record, "tenant_id")
-        .expect("tenant field");
-    let roles = compiled
-        .linker()
-        .resolve_field(record, "roles")
-        .expect("roles field");
-    let digest = compiled
-        .linker()
-        .resolve_field(record, "digest")
-        .expect("digest field");
-
-    let context = PdataContextBytes::from_record(
-        compiled,
-        register,
-        [
-            ContextRecordValue::new(roles, ContextValueKind::Text, b"reader"),
-            ContextRecordValue::new(digest, ContextValueKind::Binary, &[1, 2, 3]),
-            ContextRecordValue::new(tenant, ContextValueKind::Text, b"acme"),
-            ContextRecordValue::new(roles, ContextValueKind::Text, b"writer"),
-        ],
-    )
-    .expect("record context");
-
-    let fields: Vec<_> = context
-        .register(register)
-        .expect("present record")
-        .record_fields()
-        .map(|value| (value.field(), value.kind(), value.value()))
-        .collect();
-    assert_eq!(
-        fields,
-        vec![
-            (tenant, ContextValueKind::Text, b"acme".as_slice()),
-            (roles, ContextValueKind::Text, b"reader".as_slice()),
-            (roles, ContextValueKind::Text, b"writer".as_slice()),
-            (digest, ContextValueKind::Binary, &[1, 2, 3]),
-        ]
-    );
-    assert!(context.items().all(|item| item.schema_index().is_none()
-        && item.wire_name().is_none()
-        && item.stored_name().is_none()));
-    assert!(
-        !context
-            .bytes
-            .windows(b"tenant_id".len())
-            .any(|bytes| bytes == b"tenant_id")
-    );
-    assert!(
-        !context
-            .bytes
-            .windows(b"roles".len())
-            .any(|bytes| bytes == b"roles")
-    );
-    validate(&context.bytes, context.schema()).expect("valid record envelope");
-}
-
-/// Scenario: a record producer repeats a scalar field and supplies invalid text bytes.
-/// Guarantees: shape and scalar-type violations are rejected before bytes are emitted.
-#[test]
-fn record_register_rejects_invalid_field_values() {
-    let mut compiler = ContextCompiler::new(4);
-    let record = compiler
-        .declare_record([(
-            "tenant",
-            ContextRegisterField::scalar(ContextScalarType::Text),
-        )])
-        .expect("record shape");
-    let register = compiler
-        .declare("routing", ContextRegisterShape::Record(record))
-        .expect("record register");
-    let compiled = compiler.finish();
-    let tenant = compiled
-        .linker()
-        .resolve_field(record, "tenant")
-        .expect("tenant field");
-
-    assert!(matches!(
-        PdataContextBytes::from_record(
-            compiled.clone(),
-            register,
-            [
-                ContextRecordValue::new(tenant, ContextValueKind::Text, b"one"),
-                ContextRecordValue::new(tenant, ContextValueKind::Text, b"two"),
-            ],
-        ),
-        Err(ContextBytesError::DuplicateRecordField { .. })
-    ));
-    assert!(matches!(
-        PdataContextBytes::from_record(
-            compiled,
-            register,
-            [ContextRecordValue::new(
-                tenant,
-                ContextValueKind::Text,
-                &[0xff],
-            )],
-        ),
-        Err(ContextBytesError::RecordFieldTypeMismatch { .. })
-    ));
-}
-
-/// Scenario: an entry has duplicate typed values interleaved with a bag-only header.
-/// Guarantees: bag order is preserved and the entry resolves only its ordered members.
-#[test]
-fn packed_context_indexes_entries_and_bag() {
+fn packed_context_indexes_registers_and_items() {
     let policy = HeaderCapturePolicy::new(
         CaptureDefaults::default(),
         vec![
@@ -221,7 +96,7 @@ fn packed_context_indexes_entries_and_bag() {
         Some((HeaderValueKind::Binary, &[0x01u8, 0x02][..]))
     );
 
-    let entry = context.entry(0).expect("entry is present");
+    let entry = register_at(&context, 0).expect("entry is present");
     assert_ne!(entry.hash(), 0);
     assert_eq!(
         entry.values().collect::<Vec<_>>(),
@@ -269,9 +144,9 @@ fn single_item_context_validates_with_trailing_entry_slots() {
         .expect("context");
 
     validate(&context.bytes, context.schema()).expect("validates");
-    assert!(context.entry(0).is_some());
-    assert!(context.entry(1).is_none());
-    assert!(context.entry(2).is_none());
+    assert!(register_at(&context, 0).is_some());
+    assert!(register_at(&context, 1).is_none());
+    assert!(register_at(&context, 2).is_none());
 }
 
 /// Scenario: a captured header uses a schema-backed stored name.
@@ -378,8 +253,20 @@ fn grpc_capture_screens_names_before_preserving_values() {
         items[1].value(),
         Some((HeaderValueKind::Binary, &[0x01, 0x02][..]))
     );
-    assert_eq!(context.entry(0).expect("tenant entry").values().count(), 1);
-    assert_eq!(context.entry(1).expect("trace entry").values().count(), 1);
+    assert_eq!(
+        register_at(&context, 0)
+            .expect("tenant entry")
+            .values()
+            .count(),
+        1
+    );
+    assert_eq!(
+        register_at(&context, 1)
+            .expect("trace entry")
+            .values()
+            .count(),
+        1
+    );
 }
 
 /// Scenario: capture rules match duplicate text and binary headers while limits drop excess.
@@ -626,7 +513,7 @@ fn context_value_binding_resolves_schema_indices() {
         .expect("capture")
         .0
         .expect("context");
-    let mut binding = ContextValueBinding::new("TENANT");
+    let mut binding = ContextRegisterValueBinding::new("TENANT");
 
     assert_eq!(
         binding.value(&context),
@@ -682,8 +569,8 @@ fn context_entry_set_binding_uses_configuration_order_across_schemas() {
     .expect("capture")
     .0
     .expect("context");
-    let mut binding = ContextEntrySetBinding::new(["REGION", "TENANT"]);
-    let collect = |binding: &mut ContextEntrySetBinding, context: &PdataContextBytes| {
+    let mut binding = ContextRegisterSetBinding::new(["REGION", "TENANT"]);
+    let collect = |binding: &mut ContextRegisterSetBinding, context: &PdataContextBytes| {
         let mut visited = Vec::new();
         let count = binding.visit_present(context, |ordinal, entry| {
             visited.push((
@@ -733,7 +620,7 @@ fn context_entry_set_binding_skips_missing_and_absent_entries() {
         .expect("capture")
         .0
         .expect("context");
-    let mut binding = ContextEntrySetBinding::new(["unknown", "region", "tenant"]);
+    let mut binding = ContextRegisterSetBinding::new(["unknown", "region", "tenant"]);
     let mut visited = Vec::new();
 
     let count = binding.visit_present(&context, |ordinal, _| visited.push(ordinal));
@@ -761,15 +648,8 @@ fn context_entry_set_binding_selects_unaliased_exact_header() {
         .expect("capture")
         .0
         .expect("context");
-    let mut binding = ContextEntrySetBinding::new(["x-tenant"]);
+    let mut binding = ContextRegisterSetBinding::new(["x-tenant"]);
     let mut values = Vec::new();
-    let register = context
-        .schema()
-        .compiled_context()
-        .linker()
-        .resolve("x-tenant")
-        .expect("compiled register");
-
     let count = binding.visit_present(&context, |ordinal, entry| {
         values.push((
             ordinal,
@@ -783,22 +663,8 @@ fn context_entry_set_binding_selects_unaliased_exact_header() {
     assert_eq!(count, 1);
     assert_eq!(values, [(0, vec![b"acme".to_vec()])]);
     assert_eq!(
-        context
-            .schema()
-            .compiled_context()
-            .register_file()
-            .shape(register),
-        Some(&ContextRegisterShape::KeyValueList(
-            ContextScalarType::AnyValue
-        ))
-    );
-    assert_eq!(
-        context
-            .register(register)
-            .expect("present register")
-            .key_values()
-            .collect::<Vec<_>>(),
-        vec![("x-tenant", HeaderValueKind::Text, b"acme".as_slice())]
+        context.items().next().and_then(|item| item.wire_name()),
+        Some("x-tenant")
     );
 }
 
@@ -836,15 +702,18 @@ fn projection_preserves_input_and_appends_entry() {
     .expect("capture")
     .0
     .expect("context");
-    let old_hash = input.entry(0).expect("tenant entry").hash();
+    let old_hash = register_at(&input, 0).expect("tenant entry").hash();
 
-    let mut binding = PartitionProjectionBinding::new("partition");
+    let mut binding = ContextScalarProjectionBinding::new("partition");
     let output = binding
         .project(Some(&input), b"west", HeaderValueKind::Text)
         .expect("projection");
 
     // Old entry hash preserved
-    assert_eq!(output.entry(0).expect("tenant entry").hash(), old_hash);
+    assert_eq!(
+        register_at(&output, 0).expect("tenant entry").hash(),
+        old_hash
+    );
     // Original items preserved with original schema indices
     assert_eq!(
         output.items().nth(0).and_then(|i| i.schema_index()),
@@ -857,14 +726,13 @@ fn projection_preserves_input_and_appends_entry() {
     // Appended item has derived schema index and entry slot
     let appended = output.items().nth(2).expect("appended item");
     assert_eq!(appended.schema_index(), Some(2));
-    assert_eq!(appended.entry_slot(), Some(2));
     assert_eq!(appended.wire_name(), Some("partition"));
     assert_eq!(
         appended.value(),
         Some((HeaderValueKind::Text, b"west".as_slice()))
     );
     // New entry is present and contains the projected value
-    let new_entry = output.entry(2).expect("partition entry must be present");
+    let new_entry = register_at(&output, 2).expect("partition entry must be present");
     assert_eq!(
         new_entry.values().collect::<Vec<_>>(),
         vec![(HeaderValueKind::Text, b"west".as_slice())]
@@ -879,7 +747,7 @@ fn projection_preserves_input_and_appends_entry() {
 ///   standalone schema (not schema-less).
 #[test]
 fn projection_without_input_creates_singleton_entry() {
-    let mut binding = PartitionProjectionBinding::new("partition");
+    let mut binding = ContextScalarProjectionBinding::new("partition");
     let output = binding
         .project(None, b"east", HeaderValueKind::Text)
         .expect("projection");
@@ -887,14 +755,13 @@ fn projection_without_input_creates_singleton_entry() {
     assert_eq!(output.items().count(), 1);
     let item = output.items().next().expect("one item");
     assert_eq!(item.schema_index(), Some(0));
-    assert_eq!(item.entry_slot(), Some(0));
     assert_eq!(item.wire_name(), Some("partition"));
     assert_eq!(
         item.value(),
         Some((HeaderValueKind::Text, b"east".as_slice()))
     );
     // The singleton entry is present
-    let entry = output.entry(0).expect("singleton entry must be present");
+    let entry = register_at(&output, 0).expect("singleton entry must be present");
     assert_eq!(
         entry.values().collect::<Vec<_>>(),
         vec![(HeaderValueKind::Text, b"east".as_slice())]
@@ -921,7 +788,7 @@ fn projection_canonicalizes_configured_register_symbol() {
         .expect("capture")
         .0
         .expect("context");
-    let mut binding = PartitionProjectionBinding::new("X-Partition");
+    let mut binding = ContextScalarProjectionBinding::new("X-Partition");
 
     let standalone = binding
         .project(None, b"east", HeaderValueKind::Text)
@@ -991,7 +858,7 @@ fn distinct_input_schemas_produce_isolated_derived_schemas() {
     .0
     .expect("context b");
 
-    let mut binding = PartitionProjectionBinding::new("part");
+    let mut binding = ContextScalarProjectionBinding::new("part");
     let out_a = binding
         .project(Some(&ctx_a), b"1", HeaderValueKind::Text)
         .expect("project a");
@@ -1009,12 +876,12 @@ fn distinct_input_schemas_produce_isolated_derived_schemas() {
     assert_eq!(out_a.items().nth(1).and_then(|i| i.schema_index()), Some(1));
     assert_eq!(out_b.items().nth(2).and_then(|i| i.schema_index()), Some(2));
     // The projected register follows each input register file.
-    let entry_a = out_a.entry(1).expect("partition entry in a");
+    let entry_a = register_at(&out_a, 1).expect("partition entry in a");
     assert_eq!(
         entry_a.values().collect::<Vec<_>>(),
         vec![(HeaderValueKind::Text, b"1".as_slice())]
     );
-    let entry_b = out_b.entry(2).expect("partition entry in b");
+    let entry_b = register_at(&out_b, 2).expect("partition entry in b");
     assert_eq!(
         entry_b.values().collect::<Vec<_>>(),
         vec![(HeaderValueKind::Text, b"2".as_slice())]
@@ -1046,7 +913,7 @@ fn projection_overflow_remains_error() {
         .0
         .expect("context");
 
-    let mut binding = PartitionProjectionBinding::new("partition");
+    let mut binding = ContextScalarProjectionBinding::new("partition");
     let result = binding.project(Some(&input), b"overflow-value", HeaderValueKind::Text);
     assert!(
         result.is_err(),
@@ -1141,7 +1008,7 @@ fn binding_cache_reuses_derived_schema() {
         .0
         .expect("context");
 
-    let mut binding = PartitionProjectionBinding::new("part");
+    let mut binding = ContextScalarProjectionBinding::new("part");
     let out1 = binding
         .project(Some(&ctx1), b"1", HeaderValueKind::Text)
         .expect("project 1");
@@ -1186,7 +1053,7 @@ fn binding_cache_evicts_oldest_when_full() {
         })
         .collect();
 
-    let mut binding = PartitionProjectionBinding::new("part");
+    let mut binding = ContextScalarProjectionBinding::new("part");
 
     // Fill the cache to capacity
     let mut schemas: Vec<Arc<CompiledHeaderSchema>> = Vec::with_capacity(SCHEMA_CACHE_CAPACITY + 1);
@@ -1222,9 +1089,7 @@ fn binding_cache_evicts_oldest_when_full() {
         "evicted schema should produce a fresh derived Arc"
     );
     // But the result is still correct
-    let entry = out_first_again
-        .entry(1)
-        .expect("partition entry after eviction");
+    let entry = register_at(&out_first_again, 1).expect("partition entry after eviction");
     assert_eq!(
         entry.values().collect::<Vec<_>>(),
         vec![(HeaderValueKind::Text, b"w".as_slice())]

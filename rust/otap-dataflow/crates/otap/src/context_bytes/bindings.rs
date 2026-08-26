@@ -91,9 +91,6 @@ impl ContextRegisterValueBinding {
     }
 }
 
-/// Compatibility name for a single-register value binding.
-pub type ContextValueBinding = ContextRegisterValueBinding;
-
 /// Version-linked binding for an ordered set of context registers.
 ///
 /// Configuration symbols are linked once per compiler version. Evaluation
@@ -145,9 +142,6 @@ impl ContextRegisterSetBinding {
         visited
     }
 }
-
-/// Compatibility name for an ordered register-set binding.
-pub type ContextEntrySetBinding = ContextRegisterSetBinding;
 
 /// Compiled singleton context-entry projector for partition output.
 ///
@@ -245,6 +239,3 @@ impl ContextScalarProjectionBinding {
         Ok((derived, schema_index, entry_slot))
     }
 }
-
-/// Compatibility name for the initial partition-processor projection binding.
-pub type PartitionProjectionBinding = ContextScalarProjectionBinding;

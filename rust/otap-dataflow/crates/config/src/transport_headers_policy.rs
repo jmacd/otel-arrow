@@ -18,7 +18,7 @@ use ahash::{AHashMap, AHashSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::context::{CompiledContext, ContextCompiler, ContextRegisterShape, ContextScalarType};
+use crate::context::{CompiledContext, ContextCompiler};
 
 const MAX_CAPTURE_ENTRIES: usize = 1024;
 
@@ -130,40 +130,25 @@ impl HeaderCapturePolicy {
                 MAX_CAPTURE_ENTRIES
             ));
         }
-        if self.headers.len() > usize::from(u16::MAX) + 1 {
-            return Err(format!(
-                "header capture supports at most {} rules",
-                usize::from(u16::MAX) + 1
-            ));
-        }
-
         let mut context_compiler = ContextCompiler::new(deployment_generation);
         let mut matches = AHashMap::new();
         let mut schema_matches = Vec::new();
-        for (rule_id, rule) in self.headers.iter().enumerate() {
+        for rule in &self.headers {
             let shared_register = match rule.store_as.as_ref() {
                 Some(name) => Some(
                     context_compiler
-                        .declare(
-                            name,
-                            ContextRegisterShape::ScalarList(ContextScalarType::AnyValue),
-                        )
+                        .declare(name)
                         .map_err(|error| error.to_string())?,
                 ),
                 None => None,
             };
-            let rule_id = u16::try_from(rule_id)
-                .map_err(|_| "header capture rule identifier overflow".to_string())?;
             for match_name in &rule.match_names {
                 let normalized = match_name.to_ascii_lowercase();
                 if let std::collections::hash_map::Entry::Vacant(slot) = matches.entry(normalized) {
                     let register = match shared_register {
                         Some(register) => register,
                         None => context_compiler
-                            .declare(
-                                slot.key(),
-                                ContextRegisterShape::KeyValueList(ContextScalarType::AnyValue),
-                            )
+                            .declare(slot.key())
                             .map_err(|error| error.to_string())?,
                     };
                     if schema_matches.len() >= usize::from(u16::MAX) {
@@ -176,8 +161,7 @@ impl HeaderCapturePolicy {
                         .expect("schema item count checked above");
                     schema_matches.push(CompiledHeaderSchemaItem {
                         wire_name: slot.key().clone(),
-                        rule_id: Some(rule_id),
-                        register: Some(register),
+                        register,
                         retain_observed_name: retain_observed_names,
                         value_kind: rule.value_kind,
                     });
@@ -272,19 +256,6 @@ impl CompiledHeaderSchema {
         })
     }
 
-    /// Wraps a compiled register file without adding transport instructions.
-    ///
-    /// This is used by context producers whose values have no transport
-    /// provenance. Egress propagation therefore ignores their value items
-    /// unless a later compiler pass explicitly adds an output instruction.
-    #[must_use]
-    pub fn context_only(compiled_context: Arc<CompiledContext>) -> Arc<Self> {
-        Arc::new(Self {
-            items: Box::new([]),
-            compiled_context,
-        })
-    }
-
     /// Number of context entry slots implied by this schema's items.
     #[must_use]
     pub fn entry_count(&self) -> usize {
@@ -297,17 +268,11 @@ impl CompiledHeaderSchema {
     #[must_use]
     pub fn singleton_entry(name: &str) -> (Arc<Self>, u16, u16) {
         let mut compiler = ContextCompiler::new(0);
-        let register = compiler
-            .declare(
-                name,
-                ContextRegisterShape::ScalarList(ContextScalarType::AnyValue),
-            )
-            .expect("singleton context register");
+        let register = compiler.declare(name).expect("singleton context register");
         let schema = Arc::new(Self {
             items: vec![CompiledHeaderSchemaItem {
                 wire_name: name.to_ascii_lowercase(),
-                rule_id: None,
-                register: Some(register),
+                register,
                 retain_observed_name: false,
                 value_kind: None,
             }]
@@ -337,25 +302,18 @@ impl CompiledHeaderSchema {
         if compiler.resolve(name).is_ok() {
             return Err(format!("context register '{name}' is already defined"));
         }
-        let register = compiler
-            .declare(
-                name,
-                ContextRegisterShape::ScalarList(ContextScalarType::AnyValue),
-            )
-            .map_err(|error| error.to_string())?;
+        let register = compiler.declare(name).map_err(|error| error.to_string())?;
         let new_entry_slot = register.as_u16();
         let mut items = Vec::with_capacity(new_len);
         items.extend(base.items.iter().map(|item| CompiledHeaderSchemaItem {
             wire_name: item.wire_name.clone(),
-            rule_id: item.rule_id,
             register: item.register,
             retain_observed_name: item.retain_observed_name,
             value_kind: item.value_kind,
         }));
         items.push(CompiledHeaderSchemaItem {
             wire_name: name.to_ascii_lowercase(),
-            rule_id: None,
-            register: Some(register),
+            register,
             retain_observed_name: false,
             value_kind: None,
         });
@@ -376,7 +334,6 @@ impl CompiledHeaderSchema {
             .get(usize::from(id))
             .map(|item| CompiledHeaderSchemaItemRef {
                 wire_name: &item.wire_name,
-                rule_id: item.rule_id,
                 register: item.register,
                 retain_observed_name: item.retain_observed_name,
                 value_kind: item.value_kind,
@@ -405,8 +362,7 @@ impl CompiledHeaderSchema {
 #[derive(Debug, PartialEq, Eq)]
 struct CompiledHeaderSchemaItem {
     wire_name: String,
-    rule_id: Option<u16>,
-    register: Option<crate::context::ContextRegisterId>,
+    register: crate::context::ContextRegisterId,
     retain_observed_name: bool,
     value_kind: Option<ValueKindConfig>,
 }
@@ -416,10 +372,8 @@ struct CompiledHeaderSchemaItem {
 pub struct CompiledHeaderSchemaItemRef<'a> {
     /// Normalized configured wire name.
     pub wire_name: &'a str,
-    /// First-match capture rule identifier, absent for non-capture entries.
-    pub rule_id: Option<u16>,
-    /// Optional compiled context register.
-    pub register: Option<crate::context::ContextRegisterId>,
+    /// Compiled context register.
+    pub register: crate::context::ContextRegisterId,
     /// Whether ingress must retain observed transport-name provenance.
     pub retain_observed_name: bool,
     /// Configured value-kind override.
@@ -689,14 +643,10 @@ impl CompiledHeaderPropagationPolicy {
                             output_name: CompiledOutputName::Observed,
                         },
                         |item| {
-                            let logical_name = item
-                                .register
-                                .and_then(|register| {
-                                    schema
-                                        .compiled_context
-                                        .linker()
-                                        .compatibility_symbol(register)
-                                })
+                            let logical_name = schema
+                                .compiled_context
+                                .linker()
+                                .compatibility_symbol(item.register)
                                 .unwrap_or(item.wire_name);
                             let resolved = self.resolve(logical_name);
                             let output_name = match resolved.output_name.as_deref() {
@@ -1328,13 +1278,12 @@ named:
         .expect("capture policy");
 
         let matched = policy.match_header("X-Tenant").expect("matched header");
-        assert_eq!(matched.schema_item.rule_id, Some(0));
         assert_eq!(
-            matched.schema_item.register.and_then(|register| policy
+            policy
                 .schema()
                 .compiled_context()
                 .linker()
-                .compatibility_symbol(register)),
+                .compatibility_symbol(matched.schema_item.register),
             Some("tenant")
         );
         assert_eq!(matched.schema_item.value_kind, None);

@@ -8,7 +8,7 @@
 //! logical names or transport names. Each context retains its immutable
 //! compiler version so several generations can remain in flight concurrently.
 //!
-//! - A register is a scalar, scalar list, key/value, key/value list, or record.
+//! - A register contains ordered schema-backed value items.
 //! - A value item carries a schema instruction index, typed bytes, and optional
 //!   source-name provenance.
 //! - Presence is one bit per register.
@@ -31,14 +31,14 @@
 //! +--------------------------------------------------------------------------+
 //! | item descriptors (item count * 12 bytes, in arrival order)               |
 //! +--------------------------------------------------------------------------+
-//! | register members (member count * 4-byte member descriptors)              |
+//! | register members (member count * 2-byte item indexes)                    |
 //! +--------------------------------------------------------------------------+
 //! | blob: observed wire-name occurrences and values                          |
 //! +--------------------------------------------------------------------------+
 //! ```
 //!
 //! Each present register selects an ordered range from the member table. Each
-//! member identifies an item and, for records, its compiled field position:
+//! member identifies one item:
 //!
 //! ```text
 //! register descriptor (12 bytes)
@@ -59,14 +59,11 @@
 //! ```
 //!
 //! ```text
-//! member descriptor (4 bytes)
-//! +----------------+------------------+
-//! | item index u16 | field ordinal u16|
-//! +----------------+------------------+
+//! member descriptor (2 bytes)
+//! +----------------+
+//! | item index u16 |
+//! +----------------+
 //! ```
-//!
-//! Non-record registers use `u16::MAX` for the field ordinal. Record registers
-//! use only numeric field positions; field names never enter the envelope.
 //!
 //! A zero-length source-name range means the ingress instruction supplies any
 //! statically known key. A non-empty range is explicit runtime provenance.
@@ -75,11 +72,9 @@ mod bindings;
 mod packed;
 
 pub use bindings::{
-    ContextEntrySetBinding, ContextRegisterSetBinding, ContextRegisterValueBinding,
-    ContextScalarProjectionBinding, ContextValueBinding, PartitionProjectionBinding,
+    ContextRegisterSetBinding, ContextRegisterValueBinding, ContextScalarProjectionBinding,
 };
 pub use packed::{
-    ContextBytesError, ContextEntry, ContextItem, ContextItems, ContextPropagation,
-    ContextRecordValue, ContextRegister, ContextValueKind, HeaderValueKind, PdataContextBytes,
-    PropagatedContextItem,
+    ContextBytesError, ContextItem, ContextItems, ContextPropagation, ContextRegister,
+    ContextValueKind, HeaderValueKind, PdataContextBytes, PropagatedContextItem,
 };

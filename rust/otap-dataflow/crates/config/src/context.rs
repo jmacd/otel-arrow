@@ -79,129 +79,6 @@ impl ContextRegisterId {
     }
 }
 
-/// Scalar value representation stored in a context register.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContextScalarType {
-    /// UTF-8 text.
-    Text,
-    /// Arbitrary bytes.
-    Bytes,
-    /// An OTLP `AnyValue`.
-    AnyValue,
-}
-
-/// Runtime shape of a context register.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContextRegisterShape {
-    /// One unnamed value.
-    Scalar(ContextScalarType),
-    /// Ordered unnamed values.
-    ScalarList(ContextScalarType),
-    /// One runtime string key and value.
-    KeyValue(ContextScalarType),
-    /// Ordered runtime string key/value associations.
-    KeyValueList(ContextScalarType),
-    /// A fixed record whose field identities and order are compiled.
-    Record(ContextRecordId),
-}
-
-/// Dense record-shape number local to one [`ContextRegisterFile`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ContextRecordId(u16);
-
-impl ContextRecordId {
-    /// Returns the dense record-shape index.
-    #[must_use]
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-/// Dense field number local to one compiled record shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ContextFieldId(u16);
-
-impl ContextFieldId {
-    /// Returns the compiled field position.
-    #[must_use]
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-
-    /// Returns the compact field representation used by context envelopes.
-    #[must_use]
-    pub const fn as_u16(self) -> u16 {
-        self.0
-    }
-
-    /// Restores an identifier from a record-local envelope position.
-    #[must_use]
-    pub const fn from_u16(value: u16) -> Self {
-        Self(value)
-    }
-}
-
-/// Fixed field layout for a schema-defined record register.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextRecordShape {
-    fields: Box<[ContextRegisterField]>,
-}
-
-impl ContextRecordShape {
-    /// Creates a fixed record shape.
-    #[must_use]
-    pub fn new(fields: impl Into<Box<[ContextRegisterField]>>) -> Self {
-        Self {
-            fields: fields.into(),
-        }
-    }
-
-    /// Returns the record fields in compiled order.
-    #[must_use]
-    pub const fn fields(&self) -> &[ContextRegisterField] {
-        &self.fields
-    }
-}
-
-/// One field in a compiled record register.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextRegisterField {
-    scalar_type: ContextScalarType,
-    repeated: bool,
-}
-
-impl ContextRegisterField {
-    /// Creates a scalar record field.
-    #[must_use]
-    pub const fn scalar(scalar_type: ContextScalarType) -> Self {
-        Self {
-            scalar_type,
-            repeated: false,
-        }
-    }
-
-    /// Creates a repeated record field.
-    #[must_use]
-    pub const fn repeated(scalar_type: ContextScalarType) -> Self {
-        Self {
-            scalar_type,
-            repeated: true,
-        }
-    }
-
-    /// Returns the field's scalar representation.
-    #[must_use]
-    pub const fn scalar_type(&self) -> ContextScalarType {
-        self.scalar_type
-    }
-
-    /// Returns whether the field contains an ordered list.
-    #[must_use]
-    pub const fn is_repeated(&self) -> bool {
-        self.repeated
-    }
-}
-
 /// Immutable executable register layout.
 ///
 /// This type intentionally contains no configuration symbols or transport
@@ -210,8 +87,7 @@ impl ContextRegisterField {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ContextRegisterFile {
     version: ContextVersion,
-    registers: Box<[ContextRegisterShape]>,
-    records: Box<[ContextRecordShape]>,
+    register_count: usize,
 }
 
 impl ContextRegisterFile {
@@ -224,25 +100,13 @@ impl ContextRegisterFile {
     /// Returns the number of registers in the layout.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.registers.len()
+        self.register_count
     }
 
     /// Returns whether the layout contains no registers.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.registers.is_empty()
-    }
-
-    /// Returns a register's runtime shape.
-    #[must_use]
-    pub fn shape(&self, register: ContextRegisterId) -> Option<&ContextRegisterShape> {
-        self.registers.get(register.index())
-    }
-
-    /// Returns a compiled record shape.
-    #[must_use]
-    pub fn record(&self, record: ContextRecordId) -> Option<&ContextRecordShape> {
-        self.records.get(record.index())
+        self.register_count == 0
     }
 }
 
@@ -255,7 +119,6 @@ pub struct ContextLinker {
     register_file: Arc<ContextRegisterFile>,
     symbols: AHashMap<Box<str>, ContextRegisterId>,
     register_symbols: Box<[Box<str>]>,
-    record_fields: Box<[AHashMap<Box<str>, ContextFieldId>]>,
 }
 
 impl ContextLinker {
@@ -294,23 +157,6 @@ impl ContextLinker {
             .get(register.index())
             .map(AsRef::as_ref)
     }
-
-    /// Resolves one record-field symbol into a compiled position.
-    pub fn resolve_field(
-        &self,
-        record: ContextRecordId,
-        symbol: &str,
-    ) -> Result<ContextFieldId, ContextCompileError> {
-        let canonical = canonical_symbol(symbol)?;
-        self.record_fields
-            .get(record.index())
-            .and_then(|fields| fields.get(canonical.as_str()))
-            .copied()
-            .ok_or(ContextCompileError::UnknownField {
-                record,
-                symbol: canonical,
-            })
-    }
 }
 
 /// Complete compiler output for one context version.
@@ -339,9 +185,6 @@ pub struct ContextCompiler {
     version: ContextVersion,
     symbols: AHashMap<Box<str>, ContextRegisterId>,
     register_symbols: Vec<Box<str>>,
-    registers: Vec<ContextRegisterShape>,
-    records: Vec<ContextRecordShape>,
-    record_fields: Vec<AHashMap<Box<str>, ContextFieldId>>,
 }
 
 impl ContextCompiler {
@@ -352,9 +195,6 @@ impl ContextCompiler {
             version: ContextVersion::next(deployment_generation),
             symbols: AHashMap::new(),
             register_symbols: Vec::new(),
-            registers: Vec::new(),
-            records: Vec::new(),
-            record_fields: Vec::new(),
         }
     }
 
@@ -369,79 +209,24 @@ impl ContextCompiler {
             version: ContextVersion::next(linker.register_file().version().deployment_generation()),
             symbols: linker.symbols.clone(),
             register_symbols: linker.register_symbols.to_vec(),
-            registers: linker.register_file.registers.to_vec(),
-            records: linker.register_file.records.to_vec(),
-            record_fields: linker.record_fields.to_vec(),
         }
-    }
-
-    /// Declares a record shape and compiles its field symbols to positions.
-    pub fn declare_record<'a>(
-        &mut self,
-        fields: impl IntoIterator<Item = (&'a str, ContextRegisterField)>,
-    ) -> Result<ContextRecordId, ContextCompileError> {
-        let id = u16::try_from(self.records.len())
-            .map(ContextRecordId)
-            .map_err(|_| ContextCompileError::TooManyRecords)?;
-        let mut symbols = AHashMap::new();
-        let mut compiled_fields = Vec::new();
-        for (symbol, field) in fields {
-            let canonical = canonical_symbol(symbol)?;
-            if compiled_fields.len() >= usize::from(u16::MAX) {
-                return Err(ContextCompileError::TooManyFields);
-            }
-            let field_id = ContextFieldId(
-                u16::try_from(compiled_fields.len()).expect("field count checked above"),
-            );
-            if symbols
-                .insert(canonical.clone().into_boxed_str(), field_id)
-                .is_some()
-            {
-                return Err(ContextCompileError::DuplicateField {
-                    record: id,
-                    symbol: canonical,
-                });
-            }
-            compiled_fields.push(field);
-        }
-        self.records
-            .push(ContextRecordShape::new(compiled_fields.into_boxed_slice()));
-        self.record_fields.push(symbols);
-        Ok(id)
     }
 
     /// Declares or reuses a register symbol.
     ///
-    /// Repeated declarations are accepted only when their runtime shape is
-    /// identical. This supports multiple input selectors targeting one logical
-    /// register without making the symbol part of the runtime value.
-    pub fn declare(
-        &mut self,
-        symbol: &str,
-        shape: ContextRegisterShape,
-    ) -> Result<ContextRegisterId, ContextCompileError> {
+    /// Repeated declarations reuse the same register. This supports multiple
+    /// input selectors targeting one logical register without making the
+    /// symbol part of the runtime value.
+    pub fn declare(&mut self, symbol: &str) -> Result<ContextRegisterId, ContextCompileError> {
         let canonical = canonical_symbol(symbol)?;
         if let Some(register) = self.symbols.get(canonical.as_str()).copied() {
-            let declared = self
-                .registers
-                .get(register.index())
-                .expect("declared register");
-            return if declared == &shape {
-                Ok(register)
-            } else {
-                Err(ContextCompileError::ConflictingRegister {
-                    symbol: canonical,
-                    first: declared.clone(),
-                    second: shape,
-                })
-            };
+            return Ok(register);
         }
 
-        let register = ContextRegisterId::from_index(self.registers.len())?;
+        let register = ContextRegisterId::from_index(self.register_symbols.len())?;
         let symbol: Box<str> = canonical.into_boxed_str();
         let _ = self.symbols.insert(symbol.clone(), register);
         self.register_symbols.push(symbol);
-        self.registers.push(shape);
         Ok(register)
     }
 
@@ -457,17 +242,16 @@ impl ContextCompiler {
     /// Finishes the immutable executable layout and compiler linker.
     #[must_use]
     pub fn finish(self) -> Arc<CompiledContext> {
+        let register_count = self.register_symbols.len();
         let register_file = Arc::new(ContextRegisterFile {
             version: self.version,
-            registers: self.registers.into_boxed_slice(),
-            records: self.records.into_boxed_slice(),
+            register_count,
         });
         Arc::new(CompiledContext {
             linker: Arc::new(ContextLinker {
                 register_file,
                 symbols: self.symbols,
                 register_symbols: self.register_symbols.into_boxed_slice(),
-                record_fields: self.record_fields.into_boxed_slice(),
             }),
         })
     }
@@ -504,41 +288,9 @@ pub enum ContextCompileError {
         /// Unresolved source symbol.
         symbol: String,
     },
-    /// A consumer referenced an undeclared record field.
-    #[error("unknown field '{symbol}' in context record {record:?}")]
-    UnknownField {
-        /// Record containing the requested field.
-        record: ContextRecordId,
-        /// Unresolved source symbol.
-        symbol: String,
-    },
-    /// A record declared one field symbol more than once.
-    #[error("duplicate field '{symbol}' in context record {record:?}")]
-    DuplicateField {
-        /// Record containing the duplicate field.
-        record: ContextRecordId,
-        /// Duplicate source symbol.
-        symbol: String,
-    },
-    /// Two declarations assigned incompatible shapes to one symbol.
-    #[error("context register '{symbol}' has conflicting shapes: {first:?} and {second:?}")]
-    ConflictingRegister {
-        /// Conflicting source symbol.
-        symbol: String,
-        /// Shape declared first.
-        first: ContextRegisterShape,
-        /// Shape declared later.
-        second: ContextRegisterShape,
-    },
     /// Dense register identifiers overflowed.
     #[error("context compiler supports at most 65536 registers")]
     TooManyRegisters,
-    /// Dense record identifiers overflowed.
-    #[error("context compiler supports at most 65536 record shapes")]
-    TooManyRecords,
-    /// Dense field identifiers overflowed.
-    #[error("context compiler supports at most 65535 fields per record")]
-    TooManyFields,
 }
 
 impl fmt::Display for ContextVersion {
@@ -560,22 +312,13 @@ mod tests {
     #[test]
     fn compiler_eliminates_register_symbols() {
         let mut compiler = ContextCompiler::new(17);
-        let declared = compiler
-            .declare(
-                "Tenant",
-                ContextRegisterShape::Scalar(ContextScalarType::Text),
-            )
-            .expect("declare register");
+        let declared = compiler.declare("Tenant").expect("declare register");
         let referenced = compiler.resolve("tenant").expect("resolve register");
         let compiled = compiler.finish();
 
         assert_eq!(declared, referenced);
         assert_eq!(declared.index(), 0);
         assert_eq!(compiled.register_file().len(), 1);
-        assert_eq!(
-            compiled.register_file().shape(declared),
-            Some(&ContextRegisterShape::Scalar(ContextScalarType::Text))
-        );
     }
 
     /// Scenario: two compiler runs use the same deployment generation.
@@ -598,83 +341,11 @@ mod tests {
     #[test]
     fn compatible_declarations_share_register() {
         let mut compiler = ContextCompiler::new(1);
-        let first = compiler
-            .declare(
-                "tenant",
-                ContextRegisterShape::ScalarList(ContextScalarType::Text),
-            )
-            .expect("first declaration");
-        let second = compiler
-            .declare(
-                "TENANT",
-                ContextRegisterShape::ScalarList(ContextScalarType::Text),
-            )
-            .expect("second declaration");
+        let first = compiler.declare("tenant").expect("first declaration");
+        let second = compiler.declare("TENANT").expect("second declaration");
 
         assert_eq!(first, second);
         assert_eq!(compiler.finish().register_file().len(), 1);
-    }
-
-    /// Scenario: declarations assign incompatible runtime shapes to one symbol.
-    /// Guarantees: compilation rejects ambiguity before producing executable state.
-    #[test]
-    fn conflicting_register_shapes_are_rejected() {
-        let mut compiler = ContextCompiler::new(1);
-        let _ = compiler
-            .declare(
-                "tenant",
-                ContextRegisterShape::Scalar(ContextScalarType::Text),
-            )
-            .expect("first declaration");
-
-        assert!(matches!(
-            compiler.declare(
-                "tenant",
-                ContextRegisterShape::KeyValue(ContextScalarType::Text)
-            ),
-            Err(ContextCompileError::ConflictingRegister { .. })
-        ));
-    }
-
-    /// Scenario: a composite register declares two named fields.
-    /// Guarantees: field symbols compile to positions and do not enter the executable record shape.
-    #[test]
-    fn record_field_symbols_compile_to_positions() {
-        let mut compiler = ContextCompiler::new(1);
-        let record = compiler
-            .declare_record([
-                (
-                    "customer_id",
-                    ContextRegisterField::scalar(ContextScalarType::Text),
-                ),
-                (
-                    "workspace_id",
-                    ContextRegisterField::scalar(ContextScalarType::Text),
-                ),
-            ])
-            .expect("record shape");
-        let _ = compiler
-            .declare("product_user", ContextRegisterShape::Record(record))
-            .expect("record register");
-        let compiled = compiler.finish();
-
-        assert_eq!(
-            compiled
-                .linker()
-                .resolve_field(record, "WORKSPACE_ID")
-                .expect("compiled field")
-                .index(),
-            1
-        );
-        assert_eq!(
-            compiled
-                .register_file()
-                .record(record)
-                .expect("record shape")
-                .fields()
-                .len(),
-            2
-        );
     }
 
     /// Scenario: a consumer references a symbol absent from the compiler generation.

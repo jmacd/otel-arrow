@@ -3,4 +3,4 @@ component: pipeline
 note: "Pdata context values now use versioned compiled registers, and header propagation supports explicit output names."
 issues: [3872]
 subtext: |
-  Context identifiers and record fields are compiled to numeric positions. Set `output_name` on propagation defaults or overrides to emit a fixed header name without retaining input-name provenance.
+  Context identifiers are compiled to numeric registers. Set `output_name` on propagation defaults or overrides to emit a fixed header name without retaining input-name provenance.

@@ -5,10 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use otel_arrow_dfe_config::context::{
-    CompiledContext, ContextFieldId, ContextRecordShape, ContextRegisterId, ContextRegisterShape,
-    ContextScalarType,
-};
+use otel_arrow_dfe_config::context::ContextRegisterId;
 use otel_arrow_dfe_config::transport_headers_policy::{
     CaptureStats, CompiledHeaderCapturePolicy, CompiledHeaderSchema, CompiledHeaderSchemaItemRef,
     CompiledOutputName, CompiledSchemaPropagation, PropagationAction, ValueKindConfig,
@@ -50,40 +47,6 @@ impl ContextValueKind {
 /// Compatibility name for the former transport-oriented value kind.
 pub type HeaderValueKind = ContextValueKind;
 
-/// One value assigned to a compiled field in a record register.
-#[derive(Clone, Copy, Debug)]
-pub struct ContextRecordValue<'a> {
-    field: ContextFieldId,
-    kind: ContextValueKind,
-    value: &'a [u8],
-}
-
-impl<'a> ContextRecordValue<'a> {
-    /// Creates a value for one compiled record field.
-    #[must_use]
-    pub const fn new(field: ContextFieldId, kind: ContextValueKind, value: &'a [u8]) -> Self {
-        Self { field, kind, value }
-    }
-
-    /// Returns the record-local compiled field position.
-    #[must_use]
-    pub const fn field(&self) -> ContextFieldId {
-        self.field
-    }
-
-    /// Returns the encoded scalar kind.
-    #[must_use]
-    pub const fn kind(&self) -> ContextValueKind {
-        self.kind
-    }
-
-    /// Returns the raw scalar bytes.
-    #[must_use]
-    pub const fn value(&self) -> &'a [u8] {
-        self.value
-    }
-}
-
 /// Failure while constructing or validating a context envelope.
 #[derive(Debug, thiserror::Error)]
 #[allow(variant_size_differences)]
@@ -100,48 +63,12 @@ pub enum ContextBytesError {
     /// The source bytes are not a valid context envelope.
     #[error("invalid context envelope")]
     InvalidEnvelope,
-    /// A producer attempted to construct a record in a non-record register.
-    #[error("context register {register:?} is not a record")]
-    NotARecord {
-        /// Register supplied by the producer.
-        register: ContextRegisterId,
-    },
-    /// A producer attempted to materialize a present register without values.
-    #[error("context register {register:?} has no values")]
-    EmptyRegisterValue {
-        /// Empty register supplied by the producer.
-        register: ContextRegisterId,
-    },
-    /// A producer supplied a field outside the compiled record shape.
-    #[error("field {field:?} does not exist in context register {register:?}")]
-    InvalidRecordField {
-        /// Record register being constructed.
-        register: ContextRegisterId,
-        /// Invalid record-local field.
-        field: ContextFieldId,
-    },
-    /// A producer supplied more than one value for a scalar record field.
-    #[error("scalar field {field:?} occurs more than once in context register {register:?}")]
-    DuplicateRecordField {
-        /// Record register being constructed.
-        register: ContextRegisterId,
-        /// Repeated scalar field.
-        field: ContextFieldId,
-    },
-    /// A producer supplied bytes that do not match a field's compiled scalar type.
-    #[error("value for field {field:?} does not match its compiled scalar type")]
-    RecordFieldTypeMismatch {
-        /// Field whose value did not match.
-        field: ContextFieldId,
-    },
 }
 
 // --- primitives ---
 
-const VERSION: u16 = 7;
+const VERSION: u16 = 8;
 const MAX_CONTEXT_LEN: usize = u16::MAX as usize;
-const NO_FIELD: u16 = u16::MAX;
-const NO_SCHEMA_ITEM: u16 = u16::MAX;
 
 struct PresenceBitmap;
 
@@ -397,15 +324,14 @@ struct MemberFields;
 
 impl MemberFields {
     const ITEM: U16Field = U16Field::new(0);
-    const FIELD: U16Field = U16Field::new(Self::ITEM.end());
-    const LEN: usize = Self::FIELD.end();
+    const LEN: usize = Self::ITEM.end();
 }
 
 const _: () = {
     assert!(HeaderFields::LEN == 8);
     assert!(EntryFields::LEN == 12);
     assert!(ItemFields::LEN == 12);
-    assert!(MemberFields::LEN == 4);
+    assert!(MemberFields::LEN == 2);
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -754,8 +680,8 @@ impl<'a, V> CapturedHeader<'a, V> {
 }
 
 impl<V: AsRef<[u8]>> CapturedHeader<'_, V> {
-    fn entry(&self, schema: &CompiledHeaderSchema) -> Result<Option<u16>, ContextBytesError> {
-        Ok(self.schema_item(schema)?.register.map(|id| id.as_u16()))
+    fn entry(&self, schema: &CompiledHeaderSchema) -> Result<u16, ContextBytesError> {
+        Ok(self.schema_item(schema)?.register.as_u16())
     }
 
     fn encoded_len(&self, schema: &CompiledHeaderSchema) -> Result<usize, ContextBytesError> {
@@ -868,9 +794,7 @@ impl PdataContextBytes {
                 continue;
             }
             let header_blob_len = candidate.encoded_len(schema)?;
-            let added_len = ItemFields::LEN
-                + usize::from(candidate.entry(schema)?.is_some()) * MemberFields::LEN
-                + header_blob_len;
+            let added_len = ItemFields::LEN + MemberFields::LEN + header_blob_len;
             if encoded_len
                 .checked_add(added_len)
                 .is_none_or(|len| len > MAX_CONTEXT_LEN)
@@ -1000,9 +924,7 @@ impl EntryIndex {
         }
 
         for header in headers {
-            let Some(entry) = header.entry(schema)?.map(usize::from) else {
-                continue;
-            };
+            let entry = usize::from(header.entry(schema)?);
             if entry >= entry_count {
                 return Err(ContextBytesError::InvalidEnvelope);
             }
@@ -1018,21 +940,15 @@ impl EntryIndex {
             member_count += entry.member_count;
         }
         let mut members = smallvec::SmallVec::<[MemberDescriptor; 32]>::from_elem(
-            MemberDescriptor {
-                item: 0,
-                field: None,
-            },
+            MemberDescriptor { item: 0 },
             member_count,
         );
         for (item, header) in headers.iter().enumerate() {
-            let Some(entry) = header.entry(schema)?.map(usize::from) else {
-                continue;
-            };
+            let entry = usize::from(header.entry(schema)?);
             let next = entries[entry].next_member;
             members[next] = MemberDescriptor {
                 item: u16::try_from(item)
                     .map_err(|_| ContextBytesError::TooMany { what: "items" })?,
-                field: None,
             };
             entries[entry].next_member += 1;
         }
@@ -1088,25 +1004,17 @@ fn copy_section(
 #[derive(Clone, Copy, Debug)]
 struct MemberDescriptor {
     item: u16,
-    field: Option<ContextFieldId>,
 }
 
 impl MemberDescriptor {
     fn read(bytes: &[u8], at: usize) -> Option<Self> {
-        let field = MemberFields::FIELD.read(bytes, at)?;
         Some(Self {
             item: MemberFields::ITEM.read(bytes, at)?,
-            field: (field != NO_FIELD).then(|| ContextFieldId::from_u16(field)),
         })
     }
 
     fn write(self, bytes: &mut [u8], at: usize) -> Result<(), ContextBytesError> {
-        MemberFields::ITEM.write(bytes, at, self.item)?;
-        MemberFields::FIELD.write(
-            bytes,
-            at,
-            self.field.map_or(NO_FIELD, ContextFieldId::as_u16),
-        )
+        MemberFields::ITEM.write(bytes, at, self.item)
     }
 }
 
@@ -1201,20 +1109,11 @@ impl ItemDescriptor {
 
     #[cfg(test)]
     fn valid_for(self, layout: Layout, blob: &[u8], schema: &CompiledHeaderSchema) -> bool {
-        if self.schema_index == NO_SCHEMA_ITEM {
-            if self.wire_name.len != 0 {
-                return false;
-            }
-        } else {
-            let Some(schema_item) = schema.item(self.schema_index) else {
-                return false;
-            };
-            if schema_item
-                .register
-                .is_some_and(|register| register.index() >= layout.entry_count)
-            {
-                return false;
-            }
+        let Some(schema_item) = schema.item(self.schema_index) else {
+            return false;
+        };
+        if schema_item.register.index() >= layout.entry_count {
+            return false;
         }
         // Wire name occurrence: zero-length is valid (uses schema), else must be valid UTF-8
         if self.wire_name.len > 0 && self.wire_name.text(blob).is_none() {
@@ -1280,29 +1179,9 @@ fn validate(bytes: &[u8], schema: &CompiledHeaderSchema) -> Result<(), ContextBy
         let register = ContextRegisterId::from_u16(
             u16::try_from(slot).map_err(|_| ContextBytesError::InvalidEnvelope)?,
         );
-        let shape = schema
-            .compiled_context()
-            .register_file()
-            .shape(register)
-            .ok_or(ContextBytesError::InvalidEnvelope)?;
-        if matches!(
-            shape,
-            ContextRegisterShape::Scalar(_) | ContextRegisterShape::KeyValue(_)
-        ) && descriptor.member_count > 1
-        {
+        if register.index() >= schema.compiled_context().register_file().len() {
             return Err(ContextBytesError::InvalidEnvelope);
         }
-
-        let record = match shape {
-            ContextRegisterShape::Record(record) => schema
-                .compiled_context()
-                .register_file()
-                .record(*record)
-                .ok_or(ContextBytesError::InvalidEnvelope)?
-                .into(),
-            _ => None,
-        };
-        let mut record_constraints = record.map(|record| RecordConstraints::new(record, true));
         let mut hash = entry_hash_seed();
         for member in descriptor.members() {
             let member = MemberDescriptor::read(
@@ -1316,13 +1195,10 @@ fn validate(bytes: &[u8], schema: &CompiledHeaderSchema) -> Result<(), ContextBy
             let item = Some(item)
                 .filter(|item| *item < items.len())
                 .ok_or(ContextBytesError::InvalidEnvelope)?;
-            let item_entry = (items[item].schema_index != NO_SCHEMA_ITEM)
-                .then(|| schema.item(items[item].schema_index))
-                .flatten()
-                .and_then(|item| item.register);
-            if indexed_items[item]
-                || (items[item].schema_index != NO_SCHEMA_ITEM && item_entry != Some(register))
-            {
+            let item_entry = schema
+                .item(items[item].schema_index)
+                .map(|item| item.register);
+            if indexed_items[item] || item_entry != Some(register) {
                 return Err(ContextBytesError::InvalidEnvelope);
             }
             indexed_items[item] = true;
@@ -1330,32 +1206,7 @@ fn validate(bytes: &[u8], schema: &CompiledHeaderSchema) -> Result<(), ContextBy
                 .value
                 .slice(blob)
                 .ok_or(ContextBytesError::InvalidEnvelope)?;
-            if record.is_some() {
-                let field = member.field.ok_or(ContextBytesError::InvalidEnvelope)?;
-                record_constraints
-                    .as_mut()
-                    .ok_or(ContextBytesError::InvalidEnvelope)?
-                    .accept(field, items[item].kind, value)
-                    .map_err(|_| ContextBytesError::InvalidEnvelope)?;
-                record_hash_value(&mut hash, field, items[item].kind, value)?;
-            } else {
-                if member.field.is_some() {
-                    return Err(ContextBytesError::InvalidEnvelope);
-                }
-                let scalar_type = match shape {
-                    ContextRegisterShape::Scalar(scalar_type)
-                    | ContextRegisterShape::ScalarList(scalar_type)
-                    | ContextRegisterShape::KeyValue(scalar_type)
-                    | ContextRegisterShape::KeyValueList(scalar_type) => *scalar_type,
-                    ContextRegisterShape::Record(_) => {
-                        return Err(ContextBytesError::InvalidEnvelope);
-                    }
-                };
-                if !scalar_value_matches(scalar_type, items[item].kind, value) {
-                    return Err(ContextBytesError::InvalidEnvelope);
-                }
-                entry_hash_value(&mut hash, items[item].kind, value)?;
-            }
+            entry_hash_value(&mut hash, items[item].kind, value)?;
         }
         if descriptor.hash != hash {
             return Err(ContextBytesError::InvalidEnvelope);
@@ -1391,104 +1242,6 @@ fn validate_unused_presence_bits(bytes: &[u8], layout: Layout) -> Result<(), Con
 
 const fn entry_hash_seed() -> u64 {
     0xcbf2_9ce4_8422_2325_u64
-}
-
-enum RecordConstraintError {
-    InvalidField(ContextFieldId),
-    DuplicateField(ContextFieldId),
-    TypeMismatch(ContextFieldId),
-    OutOfOrder,
-}
-
-impl RecordConstraintError {
-    fn into_context_error(self, register: ContextRegisterId) -> ContextBytesError {
-        match self {
-            Self::InvalidField(field) => ContextBytesError::InvalidRecordField { register, field },
-            Self::DuplicateField(field) => {
-                ContextBytesError::DuplicateRecordField { register, field }
-            }
-            Self::TypeMismatch(field) => ContextBytesError::RecordFieldTypeMismatch { field },
-            Self::OutOfOrder => ContextBytesError::InvalidEnvelope,
-        }
-    }
-}
-
-struct RecordConstraints<'a> {
-    record: &'a ContextRecordShape,
-    scalar_seen: Vec<bool>,
-    previous_field: Option<ContextFieldId>,
-    require_order: bool,
-}
-
-impl<'a> RecordConstraints<'a> {
-    fn new(record: &'a ContextRecordShape, require_order: bool) -> Self {
-        Self {
-            record,
-            scalar_seen: vec![false; record.fields().len()],
-            previous_field: None,
-            require_order,
-        }
-    }
-
-    fn accept(
-        &mut self,
-        field: ContextFieldId,
-        kind: ContextValueKind,
-        value: &[u8],
-    ) -> Result<(), RecordConstraintError> {
-        if self.require_order && self.previous_field.is_some_and(|previous| previous > field) {
-            return Err(RecordConstraintError::OutOfOrder);
-        }
-        self.previous_field = Some(field);
-        let field_shape = self
-            .record
-            .fields()
-            .get(field.index())
-            .ok_or(RecordConstraintError::InvalidField(field))?;
-        let seen = self
-            .scalar_seen
-            .get_mut(field.index())
-            .ok_or(RecordConstraintError::InvalidField(field))?;
-        if !field_shape.is_repeated() && std::mem::replace(seen, true) {
-            return Err(RecordConstraintError::DuplicateField(field));
-        }
-        if !scalar_value_matches(field_shape.scalar_type(), kind, value) {
-            return Err(RecordConstraintError::TypeMismatch(field));
-        }
-        Ok(())
-    }
-}
-
-fn scalar_value_matches(
-    scalar_type: ContextScalarType,
-    kind: ContextValueKind,
-    value: &[u8],
-) -> bool {
-    match scalar_type {
-        ContextScalarType::Text => {
-            kind == ContextValueKind::Text && std::str::from_utf8(value).is_ok()
-        }
-        ContextScalarType::Bytes => kind == ContextValueKind::Binary,
-        ContextScalarType::AnyValue => true,
-    }
-}
-
-fn record_hash(values: &[ContextRecordValue<'_>]) -> Result<u64, ContextBytesError> {
-    let mut hash = entry_hash_seed();
-    for value in values {
-        record_hash_value(&mut hash, value.field, value.kind, value.value)?;
-    }
-    Ok(hash)
-}
-
-fn record_hash_value(
-    hash: &mut u64,
-    field: ContextFieldId,
-    kind: ContextValueKind,
-    value: &[u8],
-) -> Result<(), ContextBytesError> {
-    hash_bytes(hash, &field.as_u16().to_le_bytes());
-    entry_hash_value(hash, kind, value)
 }
 
 fn entry_hash_value(
@@ -1561,7 +1314,7 @@ impl PdataContextBytes {
         ContextProjectionAccumulator { input: self }
     }
 
-    /// Iterates all bag items in arrival order.
+    /// Iterates all captured items in arrival order.
     #[must_use]
     pub fn items(&self) -> ContextItems<'_> {
         ContextItems {
@@ -1571,7 +1324,7 @@ impl PdataContextBytes {
         }
     }
 
-    /// Scans the bag using decisions compiled for this context's schema.
+    /// Scans captured items using decisions compiled for this context's schema.
     #[must_use]
     pub fn propagate<'a>(&'a self, plan: &'a CompiledSchemaPropagation) -> ContextPropagation<'a> {
         ContextPropagation {
@@ -1595,16 +1348,6 @@ impl PdataContextBytes {
             register,
             descriptor: layout.entry_descriptor(&self.bytes, slot)?,
         })
-    }
-
-    /// Returns a present register through its schema-local slot.
-    ///
-    /// This compatibility accessor is retained while callers migrate to
-    /// [`Self::register`].
-    #[must_use]
-    pub fn entry(&self, slot: usize) -> Option<ContextRegister<'_>> {
-        let register = u16::try_from(slot).ok().map(ContextRegisterId::from_u16)?;
-        self.register(register)
     }
 
     /// Returns the immutable capture schema referenced by this context.
@@ -1658,15 +1401,11 @@ impl<'a> ContextItem<'a> {
     #[must_use]
     pub fn stored_name(&self) -> Option<&'a str> {
         let schema_item = self.schema_item()?;
-        match schema_item.register {
-            Some(register) => self
-                .context
-                .schema()
-                .compiled_context()
-                .linker()
-                .compatibility_symbol(register),
-            None => Some(schema_item.wire_name),
-        }
+        self.context
+            .schema()
+            .compiled_context()
+            .linker()
+            .compatibility_symbol(schema_item.register)
     }
 
     /// Typed raw value.
@@ -1680,23 +1419,10 @@ impl<'a> ContextItem<'a> {
         ))
     }
 
-    /// Compiled capture-rule identifier.
-    #[must_use]
-    pub fn rule_id(&self) -> Option<u16> {
-        self.schema_item()?.rule_id
-    }
-
-    /// Optional context-entry slot.
-    #[must_use]
-    pub fn entry_slot(&self) -> Option<u16> {
-        self.schema_item()?.register.map(|id| id.as_u16())
-    }
-
     /// Index in the retained compiled schema.
     #[must_use]
     pub fn schema_index(&self) -> Option<u16> {
-        let index = ItemFields::SCHEMA_INDEX.read(&self.context.bytes, self.descriptor_at)?;
-        (index != NO_SCHEMA_ITEM).then_some(index)
+        ItemFields::SCHEMA_INDEX.read(&self.context.bytes, self.descriptor_at)
     }
 
     /// Whether the wire name resolves directly from the compiled schema
@@ -1725,7 +1451,7 @@ impl<'a> ContextItem<'a> {
     }
 }
 
-/// Iterator over bag items in arrival order.
+/// Iterator over captured items in arrival order.
 pub struct ContextItems<'a> {
     context: &'a PdataContextBytes,
     layout: Option<Layout>,
@@ -1803,16 +1529,6 @@ impl<'a> ContextRegister<'a> {
         self.register
     }
 
-    /// Returns this register's compiled runtime shape.
-    #[must_use]
-    pub fn shape(&self) -> Option<&ContextRegisterShape> {
-        self.context
-            .schema()
-            .compiled_context()
-            .register_file()
-            .shape(self.register)
-    }
-
     /// Returns the typed hash. Callers must compare values on a hash hit.
     #[must_use]
     pub const fn hash(&self) -> u64 {
@@ -1830,56 +1546,7 @@ impl<'a> ContextRegister<'a> {
                 .value()
         })
     }
-
-    /// Iterates a record register in compiled field order.
-    ///
-    /// Scalar fields occur at most once. Repeated field values retain their
-    /// producer order within the field.
-    pub fn record_fields(&self) -> impl Iterator<Item = ContextRecordValue<'a>> + '_ {
-        let is_record = matches!(self.shape(), Some(ContextRegisterShape::Record(_)));
-        self.descriptor.members().filter_map(move |member| {
-            if !is_record {
-                return None;
-            }
-            let member =
-                MemberDescriptor::read(&self.context.bytes, self.layout.member_offset(member)?)?;
-            let field = member.field?;
-            let item = self
-                .context
-                .item_with_layout(usize::from(member.item), self.layout)?;
-            let (kind, value) = item.value()?;
-            Some(ContextRecordValue::new(field, kind, value))
-        })
-    }
-
-    /// Iterates ordered runtime key/value associations.
-    ///
-    /// The key comes from retained provenance when required, otherwise from
-    /// the compiled ingress instruction.
-    pub fn key_values(&self) -> impl Iterator<Item = (&'a str, HeaderValueKind, &'a [u8])> + '_ {
-        let is_keyed = matches!(
-            self.shape(),
-            Some(ContextRegisterShape::KeyValue(_) | ContextRegisterShape::KeyValueList(_))
-        );
-        self.descriptor.members().filter_map(move |member| {
-            if !is_keyed {
-                return None;
-            }
-            let item =
-                MemberDescriptor::read(&self.context.bytes, self.layout.member_offset(member)?)?
-                    .item;
-            let item = self
-                .context
-                .item_with_layout(usize::from(item), self.layout)?;
-            let key = item.wire_name()?;
-            let (kind, value) = item.value()?;
-            Some((key, kind, value))
-        })
-    }
 }
-
-/// Compatibility name for a compiled context register.
-pub type ContextEntry<'a> = ContextRegister<'a>;
 
 struct ContextProjectionAccumulator<'a> {
     input: &'a PdataContextBytes,
@@ -2002,7 +1669,6 @@ impl ContextProjectionAccumulator<'_> {
             )?;
             MemberDescriptor {
                 item: new_item_index,
-                field: None,
             }
             .write(section, prefix_len)
         })?;
@@ -2022,119 +1688,6 @@ impl ContextProjectionAccumulator<'_> {
         Ok(PdataContextBytes::from_vec(
             writer.finish()?,
             derived_schema,
-        ))
-    }
-}
-
-// --- record ---
-
-impl PdataContextBytes {
-    /// Builds one standalone schema-defined record register.
-    ///
-    /// Field names have already been compiled into [`ContextFieldId`] values.
-    /// Members are encoded in field order, while repeated values retain their
-    /// input order within each field.
-    pub fn from_record<'a>(
-        compiled_context: Arc<CompiledContext>,
-        register: ContextRegisterId,
-        values: impl IntoIterator<Item = ContextRecordValue<'a>>,
-    ) -> Result<Self, ContextBytesError> {
-        let register_file = compiled_context.register_file();
-        let record_id = match register_file.shape(register) {
-            Some(ContextRegisterShape::Record(record)) => *record,
-            _ => return Err(ContextBytesError::NotARecord { register }),
-        };
-        let record = register_file
-            .record(record_id)
-            .ok_or(ContextBytesError::NotARecord { register })?;
-        let mut values: smallvec::SmallVec<[ContextRecordValue<'a>; 8]> =
-            values.into_iter().collect();
-        if values.is_empty() {
-            return Err(ContextBytesError::EmptyRegisterValue { register });
-        }
-        if values.len() > usize::from(u16::MAX) {
-            return Err(ContextBytesError::TooMany { what: "items" });
-        }
-
-        let mut constraints = RecordConstraints::new(record, false);
-        for value in &values {
-            constraints
-                .accept(value.field, value.kind, value.value)
-                .map_err(|error| error.into_context_error(register))?;
-        }
-        values.sort_by_key(|value| value.field.index());
-
-        let blob_len = values.iter().try_fold(0usize, |total, value| {
-            total
-                .checked_add(value.value.len())
-                .ok_or(ContextBytesError::TooLarge)
-        })?;
-        let layout = Layout::new(register_file.len(), values.len(), values.len(), blob_len)?;
-        let mut writer = EnvelopeWriter::new(layout)?;
-        writer.presence(|section| PresenceBitmap::set_encoded(section, register.index()))?;
-        writer.entries(|section| {
-            for slot in 0..register_file.len() {
-                let descriptor = if slot == register.index() {
-                    EntryDescriptor {
-                        first_member: 0,
-                        member_count: values.len(),
-                        hash: record_hash(&values)?,
-                    }
-                } else {
-                    EntryDescriptor {
-                        first_member: 0,
-                        member_count: 0,
-                        hash: entry_hash_seed(),
-                    }
-                };
-                descriptor.write(section, slot * EntryFields::LEN)?;
-            }
-            Ok(())
-        })?;
-        let mut blob_cursor = 0;
-        writer.items(|section| {
-            for (index, value) in values.iter().enumerate() {
-                let range = BlobRange {
-                    offset: blob_cursor,
-                    len: value.value.len(),
-                };
-                blob_cursor = range.end().ok_or(ContextBytesError::TooLarge)?;
-                ItemDescriptor {
-                    schema_index: NO_SCHEMA_ITEM,
-                    kind: value.kind,
-                    wire_name: BlobRange { offset: 0, len: 0 },
-                    value: range,
-                }
-                .write(section, index * ItemFields::LEN)?;
-            }
-            Ok(())
-        })?;
-        writer.members(|section| {
-            for (item, value) in values.iter().enumerate() {
-                MemberDescriptor {
-                    item: u16::try_from(item)
-                        .map_err(|_| ContextBytesError::TooMany { what: "items" })?,
-                    field: Some(value.field),
-                }
-                .write(section, item * MemberFields::LEN)?;
-            }
-            Ok(())
-        })?;
-        writer.blob(|section| {
-            let mut cursor = 0;
-            for value in &values {
-                write_slice(section, cursor, value.value)?;
-                cursor = cursor
-                    .checked_add(value.value.len())
-                    .ok_or(ContextBytesError::TooLarge)?;
-            }
-            (cursor == section.len())
-                .then_some(())
-                .ok_or(ContextBytesError::InvalidEnvelope)
-        })?;
-        Ok(Self::from_vec(
-            writer.finish()?,
-            CompiledHeaderSchema::context_only(compiled_context),
         ))
     }
 }
