@@ -3,9 +3,12 @@
 
 //! Ultra-minimal test utilities for OTAP components
 
-use crate::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
+use crate::context_bytes::{HeaderValueKind, PdataContextBytes};
 use crate::pdata::OtapPdata;
 use bytes::Bytes;
+use otel_arrow_dfe_config::transport_headers_policy::{
+    CaptureDefaults, CaptureRule, HeaderCapturePolicy,
+};
 use otel_arrow_dfe_engine::control::{AckMsg, NackMsg, UnwindData, nanos_since_birth};
 use otel_arrow_dfe_engine::testing::exporter::{TestRuntime, create_exporter_from_factory};
 use otel_arrow_dfe_engine::{
@@ -51,26 +54,65 @@ impl<'a> TestContextHeader<'a> {
     }
 }
 
-/// Builds a packed pdata context from test header fixtures.
+/// Builds a packed pdata context from test header fixtures using schema-backed capture.
 #[must_use]
 pub fn test_pdata_context<'a>(
     headers: impl IntoIterator<Item = TestContextHeader<'a>>,
 ) -> PdataContextBytes {
-    PdataContextBytes::build(
-        0,
-        headers
-            .into_iter()
-            .enumerate()
-            .map(|(rule_id, header)| HeaderInput {
-                wire_name: header.wire_name,
-                stored_name: header.stored_name,
-                value: header.value,
-                kind: header.kind,
-                rule_id: u16::try_from(rule_id).expect("test header rule id fits in u16"),
-                entry: None,
-            }),
+    let headers: Vec<_> = headers.into_iter().collect();
+    // Build capture rules from test fixtures
+    let rules: Vec<CaptureRule> = headers
+        .iter()
+        .map(|h| CaptureRule {
+            match_names: vec![h.wire_name.to_ascii_lowercase()],
+            store_as: if h.wire_name.to_ascii_lowercase() == h.stored_name {
+                None
+            } else {
+                Some(h.stored_name.to_string())
+            },
+            sensitive: false,
+            value_kind: match h.kind {
+                HeaderValueKind::Binary => {
+                    Some(otel_arrow_dfe_config::transport_headers_policy::ValueKindConfig::Binary)
+                }
+                HeaderValueKind::Text => None,
+            },
+        })
+        .collect();
+    let policy = HeaderCapturePolicy::new(CaptureDefaults::default(), rules)
+        .compile()
+        .expect("test capture policy compiles");
+    let pairs: Vec<(&str, &[u8])> = headers.iter().map(|h| (h.wire_name, h.value)).collect();
+    PdataContextBytes::capture(&policy, pairs)
+        .expect("test capture succeeds")
+        .0
+        .expect("test capture produces a context")
+}
+
+/// Builds a packed pdata context from a single near-limit binary header for
+/// overflow testing. Uses schema-backed capture.
+#[must_use]
+pub fn test_pdata_context_near_limit(wire_name: &str, value: &[u8]) -> PdataContextBytes {
+    let policy = HeaderCapturePolicy::new(
+        CaptureDefaults {
+            max_value_bytes: value.len(),
+            ..CaptureDefaults::default()
+        },
+        vec![CaptureRule {
+            match_names: vec![wire_name.to_ascii_lowercase()],
+            store_as: None,
+            sensitive: false,
+            value_kind: Some(
+                otel_arrow_dfe_config::transport_headers_policy::ValueKindConfig::Binary,
+            ),
+        }],
     )
-    .expect("valid test pdata context")
+    .compile()
+    .expect("test capture policy compiles");
+    PdataContextBytes::capture(&policy, [(wire_name, value)])
+        .expect("test capture succeeds")
+        .0
+        .expect("test capture produces a context")
 }
 
 /// Consume frames to locate the most recent subscriber with ACKS

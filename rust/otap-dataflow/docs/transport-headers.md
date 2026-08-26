@@ -15,6 +15,29 @@ The feature is entirely **opt-in**. When no transport header policy is
 configured, no headers are captured or forwarded and there is zero
 runtime overhead.
 
+### Compiled Execution Model
+
+Transport policy is compiled into context registers and boundary
+instructions:
+
+```text
+ingress header name -> register ID -> egress header name
+```
+
+`store_as` is a configuration symbol. The compiler resolves it to a
+dense register ID; the logical name is not stored with each runtime
+value. Input header names remain in ingress instructions, and output
+header names remain in egress instructions.
+
+Observed input-name spelling is retained with a message only when an
+egress instruction uses `name: preserve`. If every egress mapping uses
+`output_name` or `name: stored_name`, the compiler omits that
+provenance.
+
+Each compiled configuration has an explicit version. Messages retain
+their immutable register file, allowing orchestration to keep several
+configuration generations alive during a safe cutover.
+
 ## Configuration Scope
 
 The transport header policy can be set at multiple levels of the
@@ -128,7 +151,8 @@ when its wire name matches any entry in `match_names`
 - `match_names` (required): wire header names to match
   (case-insensitive)
 - `store_as` (optional): normalized name used for policy matching
-  and storage. Default: first matched name lowercased.
+  and binding. The compiler eliminates this symbol from runtime values.
+  Default: the matched name lowercased.
 - `sensitive` (optional): marks the header as containing sensitive
   data (e.g., auth tokens). Default: `false`.
 - `value_kind` (optional): override auto-detected value kind
@@ -171,6 +195,7 @@ header_propagation:
       type: all_captured    # default: none
     action: propagate       # default: propagate
     name: preserve          # default: preserve
+    output_name: x-forwarded-header # optional explicit output name
     on_error: drop          # default: drop
   overrides:
     - match:
@@ -190,6 +215,8 @@ header_propagation:
   headers (`propagate` or `drop`).
 - `name` (default `preserve`): how the outbound wire name is
   determined. See name strategy below.
+- `output_name` (optional): explicit outbound header name. This
+  supersedes `name` and is compiled as an egress constant.
 - `on_error` (default `drop`): action on error. Currently only
   `drop` is supported.
 
@@ -223,6 +250,21 @@ header_propagation:
 | `preserve` | Use original wire name (default). |
 | `stored_name` | Use the normalized stored name. |
 
+Prefer `output_name` for new configurations:
+
+```yaml
+header_propagation:
+  default:
+    selector:
+      type: named
+      named: [tenant]
+    output_name: x-tenant-id
+```
+
+This compiles to an egress instruction that reads the `tenant`
+register and emits `x-tenant-id`; neither name is carried by the
+runtime register value.
+
 For example, if a header was captured from `X-Tenant-Id` and stored
 as `tenant_id`, then `preserve` emits `X-Tenant-Id` on egress while
 `stored_name` emits `tenant_id`.
@@ -239,6 +281,8 @@ default.
   `propagate`.
 - `name` (optional): override name strategy for matched headers.
   Inherits from `default.name` when omitted.
+- `output_name` (optional): explicit outbound header name for matched
+  registers. It supersedes the inherited name strategy.
 - `on_error` (optional): override error action for matched headers.
   Inherits from `default.on_error` when omitted.
 

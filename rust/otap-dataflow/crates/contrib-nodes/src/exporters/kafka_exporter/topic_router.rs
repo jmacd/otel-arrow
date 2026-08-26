@@ -39,6 +39,7 @@ use super::error::KafkaExporterError;
 use super::metrics::{KafkaExporterMetrics, KafkaTopicSource};
 use crate::common::kafka::validate_kafka_topic;
 use otel_arrow_dfe_config::SignalType;
+use otel_arrow_dfe_otap::context_bytes::ContextRegisterValueBinding;
 use otel_arrow_dfe_otap::pdata::Context;
 use regex::Regex;
 use std::borrow::Cow;
@@ -84,6 +85,7 @@ impl TopicRouter {
     /// * `context` - The pdata context (carries transport headers)
     /// * `signal` - Signal used to attribute the bounded routing metric
     /// * `metrics` - Exporter metrics to increment topic routing counters
+    #[cfg(test)]
     pub fn resolve<'a>(
         signal_config: &'a SignalConfig,
         allowed_regex: Option<&[Regex]>,
@@ -91,8 +93,45 @@ impl TopicRouter {
         signal: SignalType,
         metrics: &mut KafkaExporterMetrics,
     ) -> Result<Cow<'a, str>, KafkaExporterError> {
+        Self::resolve_value(
+            signal_config,
+            allowed_regex,
+            Self::header_topic_value(signal_config, context),
+            signal,
+            metrics,
+        )
+    }
+
+    /// Resolves the destination topic using a schema-compiled context binding.
+    pub fn resolve_bound<'a>(
+        signal_config: &'a SignalConfig,
+        allowed_regex: Option<&[Regex]>,
+        binding: Option<&mut ContextRegisterValueBinding>,
+        context: &Context,
+        signal: SignalType,
+        metrics: &mut KafkaExporterMetrics,
+    ) -> Result<Cow<'a, str>, KafkaExporterError> {
+        let value = signal_config
+            .topic_from_transport_header()
+            .and(binding)
+            .and_then(|binding| {
+                context
+                    .pdata_context_bytes()
+                    .and_then(|context| binding.value(context))
+            })
+            .map(|(_, value)| value);
+        Self::resolve_value(signal_config, allowed_regex, value, signal, metrics)
+    }
+
+    fn resolve_value<'a>(
+        signal_config: &'a SignalConfig,
+        allowed_regex: Option<&[Regex]>,
+        value: Option<&[u8]>,
+        signal: SignalType,
+        metrics: &mut KafkaExporterMetrics,
+    ) -> Result<Cow<'a, str>, KafkaExporterError> {
         // Priority 1: topic from a transport header, if configured and present.
-        if let Some(value) = Self::header_topic_value(signal_config, context) {
+        if let Some(value) = value {
             // A present routing header must be a usable Kafka topic. If it is
             // not (non-UTF-8 value, or a value that fails Kafka topic
             // validation) this is non-retryable: surface an error so the batch
@@ -154,6 +193,7 @@ impl TopicRouter {
     /// topic-routing key, or `None` if routing-by-header is not configured for
     /// the signal or no matching header is present. The first matching header
     /// wins.
+    #[cfg(test)]
     fn header_topic_value<'a>(
         signal_config: &SignalConfig,
         context: &'a Context,
@@ -177,8 +217,8 @@ impl TopicRouter {
 mod tests {
     use super::*;
     use crate::common::kafka::MessageFormat;
-    use otel_arrow_dfe_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
     use otel_arrow_dfe_otap::pdata::Context;
+    use otel_arrow_dfe_otap::testing::{TestContextHeader, test_pdata_context};
 
     // ---- Test helpers ----
 
@@ -195,24 +235,11 @@ mod tests {
     }
 
     fn context_with_headers(headers: Vec<TestHeader<'_>>) -> Context {
-        let stored_names: Vec<_> = headers
+        let test_headers: Vec<_> = headers
             .iter()
-            .map(|header| header.wire_name.to_ascii_lowercase())
+            .map(|h| TestContextHeader::text(h.wire_name, h.wire_name, h.value))
             .collect();
-        let packed = PdataContextBytes::build(
-            0,
-            headers.iter().zip(&stored_names).enumerate().map(
-                |(rule_id, (header, stored_name))| HeaderInput {
-                    wire_name: header.wire_name,
-                    stored_name,
-                    value: header.value,
-                    kind: HeaderValueKind::Text,
-                    rule_id: u16::try_from(rule_id).expect("test rule id fits in u16"),
-                    entry: None,
-                },
-            ),
-        )
-        .expect("packed context");
+        let packed = test_pdata_context(test_headers);
         let mut ctx = Context::default();
         ctx.set_pdata_context_bytes(packed);
         ctx
@@ -242,15 +269,23 @@ mod tests {
     fn test_resolve_header_present() {
         let config = make_signal_config("fallback-logs", Some("x-target-topic"));
         let ctx = context_with_headers(vec![make_transport_header(
-            "X-Target-Topic",
+            "x-target-topic",
             "tenant-a-logs",
         )]);
         let mut metrics = KafkaExporterMetrics::register(
             &crate::exporters::kafka_exporter::exporter::test_support::pipeline_context(),
         );
+        let mut binding = ContextRegisterValueBinding::new("x-target-topic");
 
-        let topic = TopicRouter::resolve(&config, None, &ctx, SignalType::Logs, &mut metrics)
-            .expect("valid topic");
+        let topic = TopicRouter::resolve_bound(
+            &config,
+            None,
+            Some(&mut binding),
+            &ctx,
+            SignalType::Logs,
+            &mut metrics,
+        )
+        .expect("valid topic");
         assert_eq!(&*topic, "tenant-a-logs");
         assert!(matches!(topic, Cow::Owned(_)));
         assert_eq!(
@@ -270,20 +305,11 @@ mod tests {
     fn resolve_topic_from_packed_context() {
         let config = make_signal_config("fallback-logs", Some("x-target-topic"));
         let mut ctx = Context::default();
-        ctx.set_pdata_context_bytes(
-            PdataContextBytes::build(
-                0,
-                [HeaderInput {
-                    wire_name: "X-Target-Topic",
-                    stored_name: "x-target-topic",
-                    value: b"tenant-a-logs",
-                    kind: HeaderValueKind::Text,
-                    rule_id: 0,
-                    entry: None,
-                }],
-            )
-            .expect("packed context"),
-        );
+        ctx.set_pdata_context_bytes(test_pdata_context([TestContextHeader::text(
+            "x-target-topic",
+            "x-target-topic",
+            b"tenant-a-logs",
+        )]));
         let mut metrics = KafkaExporterMetrics::register(
             &crate::exporters::kafka_exporter::exporter::test_support::pipeline_context(),
         );

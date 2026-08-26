@@ -942,6 +942,11 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         // Second pass: create runtime nodes.  Node IDs were pre-assigned above,
         // so we look them up from `node_ids` instead of calling `next_node_id`.
         // ToDo(LQ): Collect all errors instead of failing fast to provide better feedback.
+        let retain_observed_header_names = config.node_iter().any(|(_, node_config)| {
+            node_config.kind() == otel_arrow_dfe_config::node::NodeKind::Exporter
+                && resolve_propagation_policy(node_config, &transport_headers_policy)
+                    .is_some_and(|policy| policy.requires_observed_name_provenance())
+        });
         let empty_capabilities = capability::registry::Capabilities::empty();
         let mut admission_bound_nodes = Vec::new();
         let mut admission_explicitly_opted_out_nodes = Vec::new();
@@ -1006,6 +1011,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                                 channel_capacity_policy.control.node,
                                 channel_capacity_policy.pdata,
                                 &transport_headers_policy,
+                                retain_observed_header_names,
                                 node_capabilities,
                             )
                         },
@@ -1887,6 +1893,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         control_channel_capacity: usize,
         pdata_channel_capacity: usize,
         transport_headers_policy: &Option<TransportHeadersPolicy>,
+        retain_observed_header_names: bool,
         capabilities: &capability::registry::Capabilities,
     ) -> Result<ReceiverWrapper<PData>, Error> {
         let pipeline_group_id = pipeline_ctx.pipeline_group_id();
@@ -1923,7 +1930,12 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         let create = factory.create;
 
         let capture_policy = resolve_capture_policy(&node_config, transport_headers_policy)
-            .map(|policy| policy.compile())
+            .map(|policy| {
+                policy.compile_for_generation_with_provenance(
+                    pipeline_ctx.deployment_generation(),
+                    retain_observed_header_names,
+                )
+            })
             .transpose()
             .map_err(|error| {
                 Error::ConfigError(Box::new(

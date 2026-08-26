@@ -70,18 +70,20 @@ pub struct SignalConfig {
     #[serde(default)]
     topic_from_transport_header: Option<String>,
 
-    /// Enable partitioning by transport headers (default: false).
+    /// Logical context entries used to build the Kafka partition key.
     ///
-    /// When `true`, all transport headers from the pdata context are hashed
-    /// (by normalized name and raw value) to produce a deterministic partition
-    /// key. This ensures that requests carrying the same set of transport
-    /// headers (e.g., same tenant ID, same auth token) are routed to the same
-    /// Kafka partition, regardless of original header casing.
+    /// Entries are evaluated in configuration order through a compiled context
+    /// binding. Missing entries are skipped; when none are present, the Kafka
+    /// record has no partition key.
     ///
     /// Combine with [`KafkaExporterConfig::partitioning_strategy`] to control
     /// which hashing algorithm librdkafka uses to map the key to a partition.
     #[serde(default)]
-    partition_by_transport_headers: bool,
+    partition_by_context: Vec<String>,
+
+    /// Retains the removed field only to produce an actionable migration error.
+    #[serde(default, rename = "partition_by_transport_headers")]
+    legacy_partition_all_headers: Option<bool>,
 
     /// Operator allowlist of exact topic names permitted for
     /// header-supplied (dynamic) routing.
@@ -122,7 +124,8 @@ impl SignalConfig {
             topic,
             encoding,
             topic_from_transport_header: None,
-            partition_by_transport_headers: false,
+            partition_by_context: Vec::new(),
+            legacy_partition_all_headers: None,
             allowed_topics: Vec::new(),
             allowed_topics_regex: Vec::new(),
         }
@@ -153,16 +156,19 @@ impl SignalConfig {
         self
     }
 
-    /// Whether partitioning by transport headers is enabled for this signal.
+    /// Logical context entries used to build this signal's partition key.
     #[must_use]
-    pub fn partition_by_transport_headers(&self) -> bool {
-        self.partition_by_transport_headers
+    pub fn partition_by_context(&self) -> &[String] {
+        &self.partition_by_context
     }
 
-    /// Set the partition by transport headers flag.
+    /// Set the logical context entries used to build the partition key.
     #[must_use]
-    pub fn with_partition_by_transport_headers(mut self, enabled: bool) -> Self {
-        self.partition_by_transport_headers = enabled;
+    pub fn with_partition_by_context(
+        mut self,
+        entries: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.partition_by_context = entries.into_iter().map(Into::into).collect();
         self
     }
 
@@ -654,6 +660,30 @@ pub struct KafkaExporterConfig(KafkaExporterConfigBuilder);
 /// constructing an exporter.
 fn validate_signal_topics(signal: &SignalConfig) -> Result<(), String> {
     validate_kafka_topic(&signal.topic).map_err(|e| format!("topic: {e}"))?;
+    if let Some(was_enabled) = signal.legacy_partition_all_headers {
+        return Err(if was_enabled {
+            "partition_by_transport_headers was replaced by partition_by_context; \
+             configure an explicit list of logical context-entry names"
+                .to_string()
+        } else {
+            "partition_by_transport_headers was removed; delete the field because \
+             an empty partition_by_context list is the default"
+                .to_string()
+        });
+    }
+    for (index, entry) in signal.partition_by_context.iter().enumerate() {
+        if entry.is_empty() {
+            return Err(format!("partition_by_context[{index}] must not be empty"));
+        }
+        if signal.partition_by_context[..index]
+            .iter()
+            .any(|prior| prior.eq_ignore_ascii_case(entry))
+        {
+            return Err(format!(
+                "partition_by_context[{index}] duplicates context entry '{entry}'"
+            ));
+        }
+    }
     for (i, t) in signal.allowed_topics.iter().enumerate() {
         validate_kafka_topic(t).map_err(|e| format!("allowed_topics[{i}]: {e}"))?;
     }
@@ -767,6 +797,9 @@ impl TryFrom<KafkaExporterConfigBuilder> for KafkaExporterConfig {
         {
             if let Some(header) = signal.topic_from_transport_header.as_mut() {
                 *header = header.to_ascii_lowercase();
+            }
+            for entry in &mut signal.partition_by_context {
+                *entry = entry.to_ascii_lowercase();
             }
         }
 
@@ -2419,26 +2452,30 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ---- partition_by_transport_headers (per-signal) ----
+    // ---- partition_by_context (per-signal) ----
 
+    /// Scenario: a signal config names multiple context entries for partitioning.
+    /// Guarantees: deserialization preserves the configured entry order.
     #[test]
-    fn test_signal_config_partition_by_transport_headers_deserialization() {
+    fn test_signal_config_partition_by_context_deserialization() {
         let json = r#"{
             "brokers": "kafka:9092",
             "client_id": "test",
             "traces": {
                 "topic": "otlp_spans",
-                "partition_by_transport_headers": true
+                "partition_by_context": ["tenant", "region"]
             }
         }"#;
 
         let config: KafkaExporterConfig = serde_json::from_str(json).expect("valid config");
         let traces = config.traces().expect("traces configured");
-        assert!(traces.partition_by_transport_headers());
+        assert_eq!(traces.partition_by_context(), ["tenant", "region"]);
     }
 
+    /// Scenario: a signal omits context-based partitioning.
+    /// Guarantees: the partition entry list defaults to empty.
     #[test]
-    fn test_signal_config_partition_by_transport_headers_defaults_to_false() {
+    fn test_signal_config_partition_by_context_defaults_to_empty() {
         let json = r#"{
             "brokers": "kafka:9092",
             "client_id": "test",
@@ -2447,30 +2484,112 @@ mod tests {
 
         let config: KafkaExporterConfig = serde_json::from_str(json).expect("valid config");
         let logs = config.logs().expect("logs configured");
-        assert!(!logs.partition_by_transport_headers());
+        assert!(logs.partition_by_context().is_empty());
     }
 
+    /// Scenario: partition context names use mixed ASCII case.
+    /// Guarantees: validation normalizes names once for schema binding.
     #[test]
-    fn test_signal_config_builder_with_partition_by_transport_headers() {
-        let signal = SignalConfig::new("otlp_spans".into(), MessageFormat::OtlpProto)
-            .with_partition_by_transport_headers(true);
+    fn test_signal_config_partition_by_context_normalizes_names() {
+        let json = r#"{
+            "brokers": "kafka:9092",
+            "client_id": "test",
+            "logs": {
+                "topic": "otlp_logs",
+                "partition_by_context": ["Tenant-ID"]
+            }
+        }"#;
 
-        assert!(signal.partition_by_transport_headers());
+        let config: KafkaExporterConfig = serde_json::from_str(json).expect("valid config");
+        assert_eq!(
+            config
+                .logs()
+                .expect("logs configured")
+                .partition_by_context(),
+            ["tenant-id"]
+        );
+    }
+
+    /// Scenario: a partition context list contains an empty logical name.
+    /// Guarantees: configuration fails before an unusable binding reaches the exporter.
+    #[test]
+    fn test_signal_config_partition_by_context_rejects_empty_name() {
+        let json = r#"{
+            "brokers": "kafka:9092",
+            "client_id": "test",
+            "logs": {
+                "topic": "otlp_logs",
+                "partition_by_context": [""]
+            }
+        }"#;
+
+        let error = serde_json::from_str::<KafkaExporterConfig>(json).expect_err("invalid config");
+        assert!(error.to_string().contains("partition_by_context[0]"));
+    }
+
+    /// Scenario: a partition context list repeats a logical name with different case.
+    /// Guarantees: configuration rejects duplicate entries that would hash values twice.
+    #[test]
+    fn test_signal_config_partition_by_context_rejects_duplicate_name() {
+        let json = r#"{
+            "brokers": "kafka:9092",
+            "client_id": "test",
+            "logs": {
+                "topic": "otlp_logs",
+                "partition_by_context": ["tenant", "TENANT"]
+            }
+        }"#;
+
+        let error = serde_json::from_str::<KafkaExporterConfig>(json).expect_err("invalid config");
+        assert!(error.to_string().contains("duplicates context entry"));
+    }
+
+    /// Scenario: a signal still uses the removed bag-wide partitioning switch.
+    /// Guarantees: configuration reports the explicit context-entry migration instead of ignoring it.
+    #[test]
+    fn test_signal_config_rejects_legacy_partition_by_transport_headers() {
+        let json = r#"{
+            "brokers": "kafka:9092",
+            "client_id": "test",
+            "logs": {
+                "topic": "otlp_logs",
+                "partition_by_transport_headers": true
+            }
+        }"#;
+
+        let error = serde_json::from_str::<KafkaExporterConfig>(json).expect_err("invalid config");
+        assert!(
+            error
+                .to_string()
+                .contains("was replaced by partition_by_context")
+        );
+    }
+
+    /// Scenario: the builder configures a context entry for partitioning.
+    /// Guarantees: the builder stores the requested logical entry name.
+    #[test]
+    fn test_signal_config_builder_with_partition_by_context() {
+        let signal = SignalConfig::new("otlp_spans".into(), MessageFormat::OtlpProto)
+            .with_partition_by_context(["tenant"]);
+
+        assert_eq!(signal.partition_by_context(), ["tenant"]);
         assert_eq!(signal.topic(), "otlp_spans");
     }
 
+    /// Scenario: traces and metrics select different partition context entries.
+    /// Guarantees: context-based partitioning remains independently configurable per signal.
     #[test]
-    fn test_per_signal_partition_by_transport_headers() {
+    fn test_per_signal_partition_by_context() {
         let json = r#"{
             "brokers": "kafka:9092",
             "client_id": "test",
             "traces": {
                 "topic": "otlp_spans",
-                "partition_by_transport_headers": true
+                "partition_by_context": ["tenant"]
             },
             "metrics": {
                 "topic": "otlp_metrics",
-                "partition_by_transport_headers": true
+                "partition_by_context": ["region"]
             },
             "logs": {
                 "topic": "otlp_logs"
@@ -2482,11 +2601,13 @@ mod tests {
         let metrics = config.metrics().expect("metrics configured");
         let logs = config.logs().expect("logs configured");
 
-        assert!(traces.partition_by_transport_headers());
-        assert!(metrics.partition_by_transport_headers());
-        assert!(!logs.partition_by_transport_headers());
+        assert_eq!(traces.partition_by_context(), ["tenant"]);
+        assert_eq!(metrics.partition_by_context(), ["region"]);
+        assert!(logs.partition_by_context().is_empty());
     }
 
+    /// Scenario: every signal configures context partitioning with a custom partitioner.
+    /// Guarantees: all signal bindings and the librdkafka partitioner survive deserialization.
     #[test]
     fn test_full_config_with_partitioning() {
         let json = r#"{
@@ -2495,15 +2616,15 @@ mod tests {
             "partitioning_strategy": "murmur2_random",
             "traces": {
                 "topic": "otlp_spans",
-                "partition_by_transport_headers": true
+                "partition_by_context": ["tenant"]
             },
             "logs": {
                 "topic": "otlp_logs",
-                "partition_by_transport_headers": true
+                "partition_by_context": ["tenant"]
             },
             "metrics": {
                 "topic": "otlp_metrics",
-                "partition_by_transport_headers": true
+                "partition_by_context": ["tenant"]
             }
         }"#;
 
@@ -2512,8 +2633,8 @@ mod tests {
             config.partitioning_strategy(),
             PartitionerStrategy::Murmur2Random
         );
-        assert!(config.traces().unwrap().partition_by_transport_headers());
-        assert!(config.logs().unwrap().partition_by_transport_headers());
-        assert!(config.metrics().unwrap().partition_by_transport_headers());
+        assert_eq!(config.traces().unwrap().partition_by_context(), ["tenant"]);
+        assert_eq!(config.logs().unwrap().partition_by_context(), ["tenant"]);
+        assert_eq!(config.metrics().unwrap().partition_by_context(), ["tenant"]);
     }
 }

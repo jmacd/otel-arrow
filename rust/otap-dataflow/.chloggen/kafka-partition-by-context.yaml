@@ -1,0 +1,6 @@
+change_type: enhancement
+component: pipeline
+note: "Kafka partition keys now use an ordered list of explicitly selected context entries."
+issues: [3509]
+subtext: |
+  Migration: replace `partition_by_transport_headers: true` with `partition_by_context: [entry-name]`. Each selected transport header must declare that logical `store_as` entry in its capture rule.

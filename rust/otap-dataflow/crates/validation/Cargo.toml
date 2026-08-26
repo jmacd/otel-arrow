@@ -32,7 +32,7 @@ otel-arrow-dfe-core-nodes = { workspace = true, features = ["dev-tools"] }
 otel-arrow-dfe-pdata = { workspace = true, features = ["testing"] }
 otel-arrow-dfe-telemetry = { workspace = true }
 otel-arrow-dfe-telemetry-macros = { workspace = true }
-otel-arrow-dfe-otap = { workspace = true }
+otel-arrow-dfe-otap = { workspace = true, features = ["test-utils"] }
 otel-arrow-dfe-controller = { workspace = true }
 prost = { workspace = true }
 

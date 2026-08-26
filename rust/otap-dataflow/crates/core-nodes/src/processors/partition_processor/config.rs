@@ -10,8 +10,9 @@ pub struct Config {
     /// configuration for how to compute the partition
     pub partition_by: PartitionByConfig,
 
-    /// name of the transport header to which the partition value will be written
-    pub partition_header_name: String,
+    /// Context register to which the partition value is projected.
+    #[serde(alias = "partition_header_name")]
+    pub partition_context: String,
 
     /// strategy to use when serializing partition results.
     #[serde(default)]
@@ -32,9 +33,9 @@ pub enum PartitionByConfig {
 }
 
 /// Configuration for strategy of how the partition values are converted to bytes so they can be
-/// inserted into the pdata context headers.
+/// inserted into a pdata context register.
 ///
-/// OTAP Headers can only take on values of Binary and Text, whereas the expression used to
+/// Context scalar registers currently contain Binary or Text values, whereas the expression used to
 /// partition the batch may result in a variety of types including Ints, Doubles, Bools or Null,
 /// so there needs to be a conversion. Different strategies may optimize for performance,
 /// vs preserving type information
@@ -56,11 +57,11 @@ pub enum PartitionValueSerializeStrategy {
     /// all the types produced by the expression are the same, or when the serialization collisions
     /// between different types don't matter to downstream consumers.
     ///
-    /// The header `value_kind` will be set to `Binary` for all non-string partition values.
+    /// The context value kind will be set to `Binary` for all non-string partition values.
     /// When the value is a string value, the value_kind is controlled by the
     /// `text_as_binary_header` flag.
     ToBytesLossy {
-        /// Whether to set the `value_kind` as `Binary` in cases where the partition value is
+        /// Whether to set the value kind as `Binary` in cases where the partition value is
         /// a string value. When `false`, the value_kind will be set to `Text`.
         /// When `true`, the value_kind will be set to `Binary` as it is for all other types.
         #[serde(default = "default_text_as_binary_header")]
@@ -97,11 +98,13 @@ const fn default_outbound_request_limit() -> NonZeroUsize {
 mod test {
     use super::*;
 
+    /// Scenario: the partition processor uses the compiled context-register field.
+    /// Guarantees: omitted limits and serialization settings retain their defaults.
     #[test]
     fn test_deserialize_defaults() {
         let config: Config = serde_json::from_value(serde_json::json!({
             "partition_by": { "opl_expression": "name" },
-            "partition_header_name": "part.name"
+            "partition_context": "part.name"
         }))
         .unwrap();
 
@@ -109,7 +112,7 @@ mod test {
             config,
             Config {
                 partition_by: PartitionByConfig::OplExpression("name".to_string()),
-                partition_header_name: "part.name".to_string(),
+                partition_context: "part.name".to_string(),
                 header_serialization_strategy: PartitionValueSerializeStrategy::ToBytesLossy {
                     text_as_binary_header: false,
                 },
@@ -119,6 +122,8 @@ mod test {
         );
     }
 
+    /// Scenario: a legacy config selects JSON partition serialization.
+    /// Guarantees: the former partition_header_name field remains a migration alias.
     #[test]
     fn test_choose_partition_serialization_strategy_json() {
         let config: Config = serde_json::from_value(serde_json::json!({
@@ -134,6 +139,8 @@ mod test {
         )
     }
 
+    /// Scenario: a legacy config selects lossy byte partition serialization.
+    /// Guarantees: legacy field aliases do not alter the selected conversion settings.
     #[test]
     fn test_choose_partition_serialization_strategy_to_bytes_lossy() {
         let config: Config = serde_json::from_value(serde_json::json!({

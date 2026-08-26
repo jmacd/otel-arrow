@@ -12,19 +12,20 @@
 
 The partition processor can split a single batch into multiple partitions, each
 consisting of the records that have the same value for some evaluated
-partitioning expression. The value will be also be added as a header.
+partitioning expression. The value is projected into a compiled pdata context
+register.
 
 ## Getting started
 
 Write the expression to use when partitioning telemetry batches, and choose the
-name of the header to which you'd like to have the partition value inserted.
+context register to which the partition value should be written.
 
 ```yaml
 type: processor.partition
 config:
   partition_by:
     opl_expression: resource.attributes["k8s.namespace.name"]
-  partition_header_name: k8s-ns
+  partition_context: k8s-ns
 ```
 
 The `opl_expression` can be any expression supported by the
@@ -56,7 +57,7 @@ completes successfully and `failure` when it returns an error.
 ## Limits
 
 - OPL expression evaluation capabilities are still evolving.
-- The default header serialization strategy (`to_bytes_lossy`) does not
+- The default value serialization strategy (`to_bytes_lossy`) does not
   preserve type information of the partition value. If this is important,
   for your downstream nodes, the `json` strategy may be used instead.
 

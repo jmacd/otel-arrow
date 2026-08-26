@@ -1073,9 +1073,9 @@ impl otel_arrow_dfe_engine::ReceivedAtNode for OtapPdata {
 mod test {
     use super::*;
 
-    use crate::context_bytes::{HeaderInput, HeaderValueKind};
     use crate::testing::{
-        TestCallData, create_empty_test_pdata, create_test_pdata, next_ack, next_nack,
+        TestCallData, TestContextHeader, create_empty_test_pdata, create_test_pdata, next_ack,
+        next_nack, test_pdata_context,
     };
     use otel_arrow_dfe_channel::mpsc::Channel as LocalChannel;
     use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
@@ -2188,18 +2188,8 @@ mod test {
     #[test]
     fn clone_detached_keeps_request_metadata_and_drops_routing_state() {
         let addr: SocketAddr = "10.0.0.1:5005".parse().unwrap();
-        let pdata_context = PdataContextBytes::build(
-            0,
-            [HeaderInput {
-                wire_name: "x-tenant",
-                stored_name: "tenant",
-                value: b"acme",
-                kind: HeaderValueKind::Text,
-                rule_id: 0,
-                entry: None,
-            }],
-        )
-        .expect("packed context");
+        let pdata_context =
+            test_pdata_context([TestContextHeader::text("x-tenant", "tenant", b"acme")]);
 
         let (test_data, pdata) = create_test();
         let mut pdata = pdata

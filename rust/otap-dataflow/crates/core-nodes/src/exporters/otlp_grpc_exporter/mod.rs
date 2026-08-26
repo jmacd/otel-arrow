@@ -21,9 +21,10 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use http::HeaderValue;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::SignalType;
+use otel_arrow_dfe_config::context::ContextVersion;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::transport_headers_policy::{
-    CompiledHeaderPropagationPolicy, NameStrategy, PropagationAction,
+    CompiledHeaderPropagationPolicy, CompiledOutputName, PropagationAction,
 };
 use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
 use otel_arrow_dfe_engine::ExporterFactory;
@@ -51,7 +52,7 @@ use otel_arrow_dfe_pdata::{
     OtapArrowRecords, OtapPayload, OtapPayloadHelpers, OtlpProtoBytes, PayloadData,
 };
 use serde::Deserialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1108,18 +1109,19 @@ fn build_grpc_metadata(
 
 #[derive(Default)]
 struct GrpcPropagationCache {
-    schemas: HashMap<usize, GrpcCachedSchema>,
+    schemas: VecDeque<(ContextVersion, GrpcCachedSchema)>,
 }
 
+const GRPC_PROPAGATION_CACHE_CAPACITY: usize = 8;
+
 struct GrpcCachedSchema {
-    _schema: Arc<otel_arrow_dfe_config::transport_headers_policy::CompiledHeaderSchema>,
     decisions: Box<[GrpcSchemaDecision]>,
 }
 
 #[derive(Clone)]
 struct GrpcSchemaDecision {
     action: PropagationAction,
-    name: NameStrategy,
+    uses_observed_name: bool,
     ascii_key: Option<MetadataKey<Ascii>>,
     binary_key: Option<MetadataKey<Binary>>,
 }
@@ -1130,46 +1132,49 @@ impl GrpcPropagationCache {
         schema: &Arc<otel_arrow_dfe_config::transport_headers_policy::CompiledHeaderSchema>,
         policy: &CompiledHeaderPropagationPolicy,
     ) -> &'a GrpcCachedSchema {
-        let key = Arc::as_ptr(schema) as usize;
-        self.schemas.entry(key).or_insert_with(|| {
-            let decisions = (0..schema.len())
-                .map(|id| {
-                    u16::try_from(id)
-                        .ok()
-                        .and_then(|id| schema.item(id))
-                        .map_or_else(
-                            || GrpcSchemaDecision {
-                                action: PropagationAction::Drop,
-                                name: NameStrategy::Preserve,
-                                ascii_key: None,
-                                binary_key: None,
-                            },
-                            |item| {
-                                let (action, name) = policy.resolve_stored_name(item.stored_name);
-                                let outbound_name = match name {
-                                    NameStrategy::Preserve => item.wire_name,
-                                    NameStrategy::StoredName => item.stored_name,
-                                };
-                                let binary_name = if outbound_name.ends_with("-bin") {
-                                    outbound_name.to_string()
-                                } else {
-                                    format!("{outbound_name}-bin")
-                                };
-                                GrpcSchemaDecision {
-                                    action,
-                                    name,
-                                    ascii_key: outbound_name.parse().ok(),
-                                    binary_key: binary_name.parse().ok(),
-                                }
-                            },
-                        )
-                })
-                .collect();
-            GrpcCachedSchema {
-                _schema: schema.clone(),
-                decisions,
-            }
-        })
+        let key = schema.compiled_context().register_file().version();
+        if let Some(index) = self.schemas.iter().position(|(version, _)| *version == key) {
+            return &self.schemas[index].1;
+        }
+        if self.schemas.len() >= GRPC_PROPAGATION_CACHE_CAPACITY {
+            let _ = self.schemas.pop_front();
+        }
+        let propagation = policy.compile_schema(schema);
+        let decisions = (0..schema.len())
+            .map(|id| {
+                u16::try_from(id)
+                    .ok()
+                    .and_then(|id| Some((schema.item(id)?, propagation.decision(id)?)))
+                    .map_or_else(
+                        || GrpcSchemaDecision {
+                            action: PropagationAction::Drop,
+                            uses_observed_name: false,
+                            ascii_key: None,
+                            binary_key: None,
+                        },
+                        |(item, decision)| {
+                            let (outbound_name, uses_observed_name) = match &decision.output_name {
+                                CompiledOutputName::Observed => (item.wire_name, true),
+                                CompiledOutputName::Static(name) => (name.as_ref(), false),
+                            };
+                            let binary_name = if outbound_name.ends_with("-bin") {
+                                outbound_name.to_string()
+                            } else {
+                                format!("{outbound_name}-bin")
+                            };
+                            GrpcSchemaDecision {
+                                action: decision.action,
+                                uses_observed_name,
+                                ascii_key: outbound_name.parse().ok(),
+                                binary_key: binary_name.parse().ok(),
+                            }
+                        },
+                    )
+            })
+            .collect();
+        self.schemas
+            .push_back((key, GrpcCachedSchema { decisions }));
+        &self.schemas.back().expect("inserted propagation plan").1
     }
 }
 
@@ -1199,20 +1204,19 @@ fn build_grpc_metadata_cached(
     if let Some(policy) = propagation_policy {
         if let Some(context_bytes) = context.pdata_context_bytes() {
             let uniform = policy.uniform_decision();
-            let schema_plan = context_bytes
-                .schema()
-                .map(|schema| propagation_cache.schema_plan(schema, policy));
+            let schema = context_bytes.schema();
+            let schema_plan = propagation_cache.schema_plan(schema, policy);
             for item in context_bytes.items().take_while(|_| {
                 !uniform.is_some_and(|(action, _)| action == PropagationAction::Drop)
             }) {
                 let Some((value_kind, value)) = item.value() else {
                     continue;
                 };
-                let schema_decision = schema_plan
-                    .zip(item.schema_item_id())
-                    .and_then(|(plan, item_id)| plan.decisions.get(usize::from(item_id)));
+                let schema_decision = item
+                    .schema_index()
+                    .and_then(|item_id| schema_plan.decisions.get(usize::from(item_id)));
                 let error = if let Some(decision) = schema_decision
-                    && (decision.name == NameStrategy::StoredName || item.uses_schema_wire_name())
+                    && (!decision.uses_observed_name || item.uses_schema_wire_name())
                 {
                     append_precompiled_metadata(
                         &mut metadata,
@@ -1222,18 +1226,13 @@ fn build_grpc_metadata_cached(
                         value,
                     )
                 } else {
-                    let Some(stored_name) = item.stored_name() else {
+                    let Some(decision) = schema_decision else {
                         continue;
                     };
-                    let (action, name) =
-                        uniform.unwrap_or_else(|| policy.resolve_stored_name(stored_name));
-                    if action == PropagationAction::Drop {
+                    if decision.action == PropagationAction::Drop {
                         continue;
                     }
-                    let Some(header_name) = (match name {
-                        NameStrategy::Preserve => item.wire_name(),
-                        NameStrategy::StoredName => Some(stored_name),
-                    }) else {
+                    let Some(header_name) = item.wire_name() else {
                         continue;
                     };
                     append_propagated_metadata(
@@ -1248,7 +1247,7 @@ fn build_grpc_metadata_cached(
                     otel_debug!(
                         "otlp.exporter.grpc.header_skip",
                         reason,
-                        stored_name = item.stored_name().unwrap_or("<invalid>")
+                        schema_index = item.schema_index().unwrap_or(u16::MAX)
                     );
                 }
             }
@@ -3368,6 +3367,7 @@ mod tests {
                 },
                 action: PropagationAction::Drop,
                 name: None,
+                output_name: None,
                 on_error: None,
             }],
         );

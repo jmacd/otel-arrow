@@ -68,7 +68,7 @@ permanently nack it (non-retryable).
 | `topic` | string | **required** | Kafka topic to produce messages to (static fallback). |
 | `encoding` | string | `"otlp_proto"` | Encoding format: `otlp_proto` or `otap_proto`. |
 | `topic_from_transport_header` | string | *none* | Transport header name for dynamic topic routing. When set and the header is present with a valid topic, its value overrides `topic`; if the header is absent the static `topic` is used, and if present but invalid the batch is permanently nacked. See [Dynamic Topic Routing](#dynamic-topic-routing). |
-| `partition_by_transport_headers` | bool | `false` | Serialize all transport headers into a Kafka record key. See [Partitioning](#partitioning). |
+| `partition_by_context` | list of strings | *empty* | Logical context-entry names used, in order, to derive the Kafka record key. See [Partitioning](#partitioning). |
 | `allowed_topics` | list of strings | *empty* | Operator allowlist of exact topic names permitted for header-supplied (dynamic) routing. Empty means no exact-match constraint. See [Security](#security). |
 | `allowed_topics_regex` | list of strings | *empty* | Operator allowlist of regex patterns permitted for header-supplied (dynamic) routing. Each pattern must match the whole topic (anchored, not a substring); entries must be valid standalone regular expressions (validated at config time). Empty means no regex constraint. See [Security](#security). |
 
@@ -149,13 +149,13 @@ Operators who route by header (or otherwise want default-deny) should set
 
 #### Partition-key fingerprinting
 
-When `partition_by_transport_headers` is enabled, the record key is a
-deterministic 16-character hash of the transport header names and values -- never
-the plaintext value -- so tenant IDs / auth tokens are not exposed in the record
-key. The accepted tradeoff is that a given tenant/token produces a *stable* key,
-which makes its traffic fingerprintable via partition-assignment analysis; this
-is intentional (co-locating a tenant's data is the feature). Leave
-`partition_by_transport_headers` disabled (the default) for null-key
+When `partition_by_context` names one or more context entries, the record key is
+a deterministic 16-character hash of the configured names and their typed
+values -- never the plaintext value -- so tenant IDs / auth tokens are not
+exposed in the record key. The accepted tradeoff is that a given tenant/token
+produces a *stable* key, which makes its traffic fingerprintable via
+partition-assignment analysis; this is intentional (co-locating a tenant's data
+is the feature). Leave `partition_by_context` empty (the default) for null-key
 round-robin partitioning.
 
 ### Authentication
@@ -273,13 +273,19 @@ hashed to partition numbers. The default is `consistent_random`.
 | `fnv1a` | FNV-1a hash of key. NULL keys are mapped to a single partition. |
 | `fnv1a_random` | FNV-1a hash of key. NULL keys are randomly partitioned. |
 
-#### Partition by Transport Headers
+#### Partition by Context
 
-When `partition_by_transport_headers` is enabled on a signal, the exporter
-hashes the request's transport headers to derive the Kafka record key, so
-requests carrying the same headers (e.g. same tenant ID) are routed to the same
-partition. This setting is per-signal -- each of `traces`, `metrics`, and `logs`
-can independently opt in.
+When `partition_by_context` names context entries on a signal, the exporter
+hashes those entries in configuration order to derive the Kafka record key, so
+requests carrying the same selected values (for example, the same tenant ID)
+are routed to the same partition. Each name refers to a logical context entry,
+such as a transport header's configured `store_as` name, rather than its wire
+name. Transport headers captured without `store_as` remain bag-only and cannot
+be selected by this binding. Missing entries are skipped; when none of the
+configured entries are present, the record has a null key. Entries are hashed
+in configuration order and repeated values within an entry are hashed in
+arrival order. This setting is per-signal -- each of `traces`, `metrics`, and
+`logs` can select entries independently.
 
 ### Producer Tuning
 
@@ -403,7 +409,7 @@ The Go exporter also exports a `profiles` signal. This exporter supports
 | `partition_traces_by_id` | yes | no (planned) |
 | `partition_*_by_resource_attributes` | yes | no |
 | `partition_logs_by_trace_id` | yes | no |
-| Partition key from hashed transport headers | no | yes (`partition_by_transport_headers`) |
+| Partition key from selected context entries | no | yes (`partition_by_context`) |
 
 #### Partitioning model
 
@@ -569,7 +575,7 @@ config:
     topic: "otlp_spans"
     encoding: "otlp_proto"
     topic_from_transport_header: "x-traces-topic"
-    partition_by_transport_headers: true
+    partition_by_context: ["tenant-id"]
   metrics:
     topic: "otlp_metrics"
     encoding: "otap_proto"
@@ -591,16 +597,16 @@ config:
     topic: "otlp_spans"
     encoding: "otlp_proto"
     topic_from_transport_header: "x-traces-topic"
-    partition_by_transport_headers: true
+    partition_by_context: ["tenant-id"]
   metrics:
     topic: "otlp_metrics"
     encoding: "otlp_proto"
-    partition_by_transport_headers: true
+    partition_by_context: ["tenant-id"]
   logs:
     topic: "otlp_logs"
     encoding: "otlp_proto"
     topic_from_transport_header: "x-logs-topic"
-    partition_by_transport_headers: true
+    partition_by_context: ["tenant-id"]
   timeout_ms: 5000
   compression: "zstd"
   required_acks: "all"

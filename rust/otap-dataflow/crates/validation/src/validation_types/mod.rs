@@ -154,7 +154,7 @@ mod tests {
     use super::*;
     use crate::validation_types::attributes::{AnyValue, KeyValue};
     use crate::validation_types::transport_headers::TransportHeaderKeyValue;
-    use otel_arrow_dfe_otap::context_bytes::{HeaderInput, HeaderValueKind};
+    use otel_arrow_dfe_otap::testing::{TestContextHeader, test_pdata_context};
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
         AnyValue as ProtoAny, KeyValue as ProtoKV, any_value::Value as ProtoVal,
     };
@@ -435,18 +435,11 @@ mod tests {
 
         // Validate that both the original and round-tripped instruction
         // produce identical results when executed.
-        let headers = PdataContextBytes::build(
-            0,
-            [HeaderInput {
-                wire_name: "x-tenant-id",
-                stored_name: "x-tenant-id",
-                value: b"acme",
-                kind: HeaderValueKind::Text,
-                rule_id: 0,
-                entry: None,
-            }],
-        )
-        .expect("packed context");
+        let headers = test_pdata_context([TestContextHeader::text(
+            "x-tenant-id",
+            "x-tenant-id",
+            b"acme",
+        )]);
         let transport = vec![Some(headers)];
         let control: Vec<OtlpProtoMessage> = vec![];
         let suv_msgs: Vec<OtlpProtoMessage> = vec![];

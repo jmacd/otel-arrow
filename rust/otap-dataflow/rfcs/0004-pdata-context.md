@@ -39,6 +39,55 @@ used in the implementation of context entries. This design includes
 the outline of a technical approach that encodes the set of context
 entries in a compact byte array including an index for fast lookup.
 
+### Compiled register model
+
+Context configuration is a program. Entry and field names are
+source-level symbols that the context compiler resolves to dense
+numeric registers. Logical names do not accompany values during
+message processing.
+
+For example:
+
+```text
+request header "x-input-tenant" -> register 3
+register 3 -> Kafka partition input
+register 3 -> output header "x-output-tenant"
+```
+
+The two transport names belong to compiled ingress and egress
+instructions. The register contains only presence, shape, and typed
+values.
+
+Registers support these runtime shapes:
+
+- one unnamed value;
+- an ordered list of unnamed values;
+- one runtime key/value association;
+- an ordered key/value list;
+- a schema-defined record with compiled field positions.
+
+A key remains in message bytes only when it is part of the runtime
+value. A configured record field name is compiled to a field position
+and is not runtime data.
+
+Record members encode a value-item index and a numeric field position.
+Members are ordered first by field position and then by producer order
+for repeated fields. The packed form therefore supports absent and
+repeated fields without storing field names. Construction validates
+field cardinality and scalar types against the immutable register file.
+
+Each compiler output has an explicit version and immutable register
+file. Messages retain their register file, so several configuration
+generations can remain alive concurrently. A control-plane
+orchestration layer is responsible for safe graph cutover; the data
+plane does not reinterpret old messages using new compiler state.
+
+Legacy transport-header `store_as` syntax declares a register symbol.
+Legacy propagation using the stored name compiles that symbol text
+into an egress header-name constant. New explicit output mappings
+compile their own transport name instead. Neither behavior requires a
+transport name in the register.
+
 ## User stories
 
 The term "tenant" is used in these stories to describe use-cases for

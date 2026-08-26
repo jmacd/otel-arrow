@@ -35,10 +35,11 @@ use futures::{FutureExt, StreamExt};
 use futures_channel::oneshot::Canceled;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::SignalType;
+use otel_arrow_dfe_config::context::ContextVersion;
 use otel_arrow_dfe_config::error::Error as ConfigError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::transport_headers_policy::{
-    CompiledHeaderSchema, CompiledSchemaPropagation, NameStrategy, PropagationAction,
+    CompiledHeaderPropagationPolicy, CompiledHeaderSchema, CompiledSchemaPropagation,
 };
 use otel_arrow_dfe_config::validation::validate_typed_config;
 use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
@@ -53,6 +54,7 @@ use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
+use otel_arrow_dfe_otap::context_bytes::ContextRegisterValueBinding;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::Producer as PdataProducer;
 use otel_arrow_dfe_telemetry::common_attributes::Outcome;
@@ -62,7 +64,7 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::Producer;
 use rdkafka::producer::future_producer::OwnedDeliveryResult;
 use regex::Regex;
-use std::collections::HashMap as SchemaPlanMap;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -289,6 +291,40 @@ impl InFlightSends {
     }
 }
 
+const KAFKA_PROPAGATION_CACHE_CAPACITY: usize = 8;
+
+#[derive(Default)]
+struct KafkaPropagationCache {
+    schemas: VecDeque<(ContextVersion, CompiledSchemaPropagation)>,
+}
+
+impl KafkaPropagationCache {
+    fn schema_plan<'a>(
+        &'a mut self,
+        schema: &Arc<CompiledHeaderSchema>,
+        policy: &CompiledHeaderPropagationPolicy,
+    ) -> &'a CompiledSchemaPropagation {
+        let version = schema.compiled_context().register_file().version();
+        if let Some(index) = self
+            .schemas
+            .iter()
+            .position(|(cached, _)| *cached == version)
+        {
+            return &self.schemas[index].1;
+        }
+        if self.schemas.len() >= KAFKA_PROPAGATION_CACHE_CAPACITY {
+            let _ = self.schemas.pop_front();
+        }
+        self.schemas
+            .push_back((version, policy.compile_schema(schema)));
+        &self.schemas.back().expect("inserted propagation plan").1
+    }
+
+    fn clear(&mut self) {
+        self.schemas.clear();
+    }
+}
+
 /// Kafka exporter for OpenTelemetry data.
 ///
 /// Exports telemetry data (traces, metrics, logs) to Apache Kafka topics using the rdkafka client.
@@ -316,7 +352,13 @@ pub struct KafkaExporter {
     traces_allowed_topics_regex: Option<Vec<Regex>>,
     metrics_allowed_topics_regex: Option<Vec<Regex>>,
     logs_allowed_topics_regex: Option<Vec<Regex>>,
-    propagation_cache: SchemaPlanMap<usize, (Arc<CompiledHeaderSchema>, CompiledSchemaPropagation)>,
+    traces_topic_binding: Option<ContextRegisterValueBinding>,
+    metrics_topic_binding: Option<ContextRegisterValueBinding>,
+    logs_topic_binding: Option<ContextRegisterValueBinding>,
+    traces_partition_binding: Option<partitioner::ContextPartitionKeyBinding>,
+    metrics_partition_binding: Option<partitioner::ContextPartitionKeyBinding>,
+    logs_partition_binding: Option<partitioner::ContextPartitionKeyBinding>,
+    propagation_cache: KafkaPropagationCache,
 }
 
 /// Factory registration for the Kafka exporter.
@@ -395,6 +437,10 @@ impl KafkaExporter {
         // the hot path never recompiles.
         let (traces_allowed_topics_regex, metrics_allowed_topics_regex, logs_allowed_topics_regex) =
             Self::compile_signal_allowed_regexes(&config)?;
+        let (traces_topic_binding, metrics_topic_binding, logs_topic_binding) =
+            Self::topic_bindings(&config);
+        let (traces_partition_binding, metrics_partition_binding, logs_partition_binding) =
+            Self::partition_bindings(&config);
 
         Ok(Self {
             config,
@@ -404,8 +450,53 @@ impl KafkaExporter {
             traces_allowed_topics_regex,
             metrics_allowed_topics_regex,
             logs_allowed_topics_regex,
-            propagation_cache: SchemaPlanMap::new(),
+            traces_topic_binding,
+            metrics_topic_binding,
+            logs_topic_binding,
+            traces_partition_binding,
+            metrics_partition_binding,
+            logs_partition_binding,
+            propagation_cache: KafkaPropagationCache::default(),
         })
+    }
+
+    fn topic_bindings(
+        config: &KafkaExporterConfig,
+    ) -> (
+        Option<ContextRegisterValueBinding>,
+        Option<ContextRegisterValueBinding>,
+        Option<ContextRegisterValueBinding>,
+    ) {
+        let binding = |signal: Option<&SignalConfig>| {
+            signal
+                .and_then(SignalConfig::topic_from_transport_header)
+                .map(ContextRegisterValueBinding::new)
+        };
+        (
+            binding(config.traces()),
+            binding(config.metrics()),
+            binding(config.logs()),
+        )
+    }
+
+    fn partition_bindings(
+        config: &KafkaExporterConfig,
+    ) -> (
+        Option<partitioner::ContextPartitionKeyBinding>,
+        Option<partitioner::ContextPartitionKeyBinding>,
+        Option<partitioner::ContextPartitionKeyBinding>,
+    ) {
+        let binding = |signal: Option<&SignalConfig>| {
+            let entries = signal?.partition_by_context();
+            (!entries.is_empty()).then(|| {
+                partitioner::ContextPartitionKeyBinding::new(entries.iter().map(String::as_str))
+            })
+        };
+        (
+            binding(config.traces()),
+            binding(config.metrics()),
+            binding(config.logs()),
+        )
     }
 
     /// Compiles the dynamic-routing allowlist regexes for all three signals
@@ -497,7 +588,7 @@ impl KafkaExporter {
             format_header_key,
             context,
             effect_handler,
-            &mut SchemaPlanMap::new(),
+            &mut KafkaPropagationCache::default(),
         )
     }
 
@@ -506,10 +597,7 @@ impl KafkaExporter {
         format_header_key: &str,
         context: &otel_arrow_dfe_otap::pdata::Context,
         effect_handler: Option<&EffectHandler<OtapPdata>>,
-        propagation_cache: &mut SchemaPlanMap<
-            usize,
-            (Arc<CompiledHeaderSchema>, CompiledSchemaPropagation),
-        >,
+        propagation_cache: &mut KafkaPropagationCache,
     ) -> OwnedHeaders {
         let mut headers = OwnedHeaders::new();
 
@@ -527,47 +615,15 @@ impl KafkaExporter {
         // policy is configured and the pdata context carries transport headers.
         if let Some(policy) = effect_handler.and_then(|eh| eh.propagation_policy()) {
             if let Some(context_bytes) = context.pdata_context_bytes() {
-                let uniform = policy.uniform_decision();
-                let schema_plan = context_bytes.schema().map(|schema| {
-                    let key = Arc::as_ptr(schema) as usize;
-                    &propagation_cache
-                        .entry(key)
-                        .or_insert_with(|| (schema.clone(), policy.compile_schema(schema)))
-                        .1
-                });
-                for item in context_bytes.items().take_while(|_| {
-                    !uniform.is_some_and(|(action, _)| action == PropagationAction::Drop)
-                }) {
-                    let Some((_, value)) = item.value() else {
-                        continue;
-                    };
-                    let schema_decision = schema_plan
-                        .zip(item.schema_item_id())
-                        .and_then(|(plan, item_id)| plan.decision(item_id));
-                    let (action, name) = match schema_decision {
-                        Some(decision) => (decision.action, decision.name),
-                        None => {
-                            let Some(stored_name) = item.stored_name() else {
-                                continue;
-                            };
-                            uniform.unwrap_or_else(|| policy.resolve_stored_name(stored_name))
-                        }
-                    };
-                    if action == PropagationAction::Drop {
-                        continue;
-                    }
-                    let Some(header_name) = (match name {
-                        NameStrategy::Preserve => item.wire_name(),
-                        NameStrategy::StoredName => item.stored_name(),
-                    }) else {
-                        continue;
-                    };
-                    if header_name == format_header_key {
+                let schema = context_bytes.schema();
+                let schema_plan = propagation_cache.schema_plan(schema, policy);
+                for header in context_bytes.propagate(schema_plan) {
+                    if header.header_name == format_header_key {
                         continue;
                     }
                     headers = headers.insert(Header {
-                        key: header_name,
-                        value: Some(value),
+                        key: header.header_name,
+                        value: Some(header.value),
                     });
                 }
             }
@@ -661,13 +717,19 @@ impl KafkaExporter {
             &self.metrics_allowed_topics_regex,
             &self.logs_allowed_topics_regex,
         );
+        let topic_binding = match signal_type {
+            SignalType::Traces => self.traces_topic_binding.as_mut(),
+            SignalType::Metrics => self.metrics_topic_binding.as_mut(),
+            SignalType::Logs => self.logs_topic_binding.as_mut(),
+        };
 
         // Resolve topic via the dynamic topic router *before* doing any encoding
         // work. If a transport header supplied an invalid topic,
         // permanently nack the batch
-        let topic = match TopicRouter::resolve(
+        let topic = match TopicRouter::resolve_bound(
             signal_config,
             allowed_regex,
+            topic_binding,
             &context,
             signal_type,
             &mut self.metrics,
@@ -687,7 +749,12 @@ impl KafkaExporter {
             }
         };
 
-        let partition_key = partitioner::partition_key_for_signal(signal_config, &context);
+        let partition_key = match signal_type {
+            SignalType::Traces => self.traces_partition_binding.as_mut(),
+            SignalType::Metrics => self.metrics_partition_binding.as_mut(),
+            SignalType::Logs => self.logs_partition_binding.as_mut(),
+        }
+        .and_then(|binding| binding.partition_key(&context));
 
         // Build Kafka headers (format header + propagated transport headers)
         let format_header_key = self.config.message_format_header();
@@ -1073,6 +1140,10 @@ impl KafkaExporter {
                     return;
                 }
             };
+        let (new_traces_binding, new_metrics_binding, new_logs_binding) =
+            Self::topic_bindings(&new_config);
+        let (new_traces_partition, new_metrics_partition, new_logs_partition) =
+            Self::partition_bindings(&new_config);
 
         effect_handler
             .info("Reconfiguring Kafka exporter: draining old producer before swap")
@@ -1122,6 +1193,13 @@ impl KafkaExporter {
         self.traces_allowed_topics_regex = new_traces_regex;
         self.metrics_allowed_topics_regex = new_metrics_regex;
         self.logs_allowed_topics_regex = new_logs_regex;
+        self.traces_topic_binding = new_traces_binding;
+        self.metrics_topic_binding = new_metrics_binding;
+        self.logs_topic_binding = new_logs_binding;
+        self.traces_partition_binding = new_traces_partition;
+        self.metrics_partition_binding = new_metrics_partition;
+        self.logs_partition_binding = new_logs_partition;
+        self.propagation_cache.clear();
         // create new InFlightSends if user changes max_in_flight setting
         if let Some(max_in_flight) = new_max_in_flight {
             *in_flight = InFlightSends::new(max_in_flight);
@@ -1545,7 +1623,7 @@ pub mod test_support {
         use crate::exporters::kafka_exporter::config::PartitionerStrategy;
         use crate::exporters::kafka_exporter::config::TlsConfig;
         use crate::exporters::kafka_exporter::config::{CompressionType, RequiredAcks};
-        use crate::exporters::kafka_exporter::partitioner::partition_key_from_context_bytes;
+        use crate::exporters::kafka_exporter::partitioner::ContextPartitionKeyBinding;
         use bytes::Bytes;
         use otel_arrow_dfe_config::transport_headers_policy::{
             HeaderPropagationPolicy, PropagationDefault, PropagationSelector,
@@ -2142,6 +2220,23 @@ pub mod test_support {
                     value.as_bytes(),
                 )]));
             }
+            OtapPdata::new(context, proto.into())
+        }
+
+        /// Wraps OTLP logs bytes with a schema-declared logical context entry.
+        fn logs_pdata_entry(
+            bytes: Vec<u8>,
+            wire_name: &str,
+            stored_name: &str,
+            value: &str,
+        ) -> OtapPdata {
+            let proto = OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes));
+            let mut context = Context::default();
+            context.set_pdata_context_bytes(test_pdata_context([TestContextHeader::text(
+                wire_name,
+                stored_name,
+                value.as_bytes(),
+            )]));
             OtapPdata::new(context, proto.into())
         }
 
@@ -3141,7 +3236,7 @@ pub mod test_support {
                     let cfg = KafkaExporterConfigBuilder::new(cluster.bootstrap_servers(), "it")
                         .with_logs(
                             SignalConfig::new(topic.into(), MessageFormat::OtlpProto)
-                                .with_partition_by_transport_headers(true),
+                                .with_partition_by_context(["tenant"]),
                         )
                         .with_partitioning_strategy(PartitionerStrategy::Murmur2Random)
                         .with_max_in_flight(8)
@@ -3152,9 +3247,11 @@ pub mod test_support {
                     let payloads: Vec<Vec<u8>> = (0..N).map(logs_request_bytes_seq).collect();
                     for payload in &payloads {
                         exporter
-                            .send_pdata(logs_pdata(
+                            .send_pdata(logs_pdata_entry(
                                 payload.clone(),
-                                Some(("X-Tenant-Id", "tenant-42")),
+                                "X-Tenant-Id",
+                                "tenant",
+                                "tenant-42",
                             ))
                             .await
                             .expect("send pdata");
@@ -4562,7 +4659,7 @@ pub mod test_support {
                     let cfg = KafkaExporterConfigBuilder::new(cluster.bootstrap_servers(), "it")
                         .with_logs(
                             SignalConfig::new(topic.into(), MessageFormat::OtlpProto)
-                                .with_partition_by_transport_headers(true),
+                                .with_partition_by_context(["tenant"]),
                         )
                         .with_partitioning_strategy(PartitionerStrategy::Murmur2Random)
                         .try_into()
@@ -4570,20 +4667,25 @@ pub mod test_support {
                     let exporter = KafkaExporterHarness::start(&cluster, cfg);
 
                     let expected_key = {
-                        let pdata =
-                            logs_pdata(logs_request_bytes(), Some(("X-Tenant-Id", "tenant-42")));
+                        let pdata = logs_pdata_entry(
+                            logs_request_bytes(),
+                            "X-Tenant-Id",
+                            "tenant",
+                            "tenant-42",
+                        );
                         let (context, _payload) = pdata.into_parts();
-                        partition_key_from_context_bytes(
-                            context.pdata_context_bytes().expect("headers"),
-                        )
-                        .expect("headers produce a key")
+                        ContextPartitionKeyBinding::new(["tenant"])
+                            .partition_key(&context)
+                            .expect("headers produce a key")
                     };
 
                     for _ in 0..N {
                         exporter
-                            .send_pdata(logs_pdata(
+                            .send_pdata(logs_pdata_entry(
                                 logs_request_bytes(),
-                                Some(("X-Tenant-Id", "tenant-42")),
+                                "X-Tenant-Id",
+                                "tenant",
+                                "tenant-42",
                             ))
                             .await
                             .expect("send pdata");
@@ -5583,8 +5685,7 @@ pub mod test_support {
 
         /// Scenario (Kafka integration: encodings and routing): derive the record partition key from transport headers with
         /// a Murmur2Random partitioner.
-        /// Guarantees: the produced record's key matches the key computed by
-        /// `partition_key_from_context_bytes` for the same headers.
+        /// Guarantees: the produced record's key matches the configured context-entry binding.
         #[tokio::test]
         async fn sets_partition_key_from_pdata_context() {
             let topic = "it-partition-key";
@@ -5596,7 +5697,7 @@ pub mod test_support {
                         KafkaExporterConfigBuilder::new(cluster.bootstrap_servers(), "it-client")
                             .with_logs(
                                 SignalConfig::new(topic.into(), MessageFormat::OtlpProto)
-                                    .with_partition_by_transport_headers(true),
+                                    .with_partition_by_context(["tenant"]),
                             )
                             .with_partitioning_strategy(PartitionerStrategy::Murmur2Random)
                             .try_into()
@@ -5604,13 +5705,11 @@ pub mod test_support {
                     let exporter = KafkaExporterHarness::start(&cluster, cfg);
 
                     let payload = logs_request_bytes();
-                    let pdata = logs_pdata(payload, Some(("X-Tenant-Id", "tenant-123")));
+                    let pdata = logs_pdata_entry(payload, "X-Tenant-Id", "tenant", "tenant-123");
                     let expected_key = {
                         let (context, _payload) = pdata.clone().into_parts();
-                        let headers = context
-                            .pdata_context_bytes()
-                            .expect("pdata should carry transport headers");
-                        partition_key_from_context_bytes(headers)
+                        ContextPartitionKeyBinding::new(["tenant"])
+                            .partition_key(&context)
                             .expect("headers should produce a partition key")
                     };
 

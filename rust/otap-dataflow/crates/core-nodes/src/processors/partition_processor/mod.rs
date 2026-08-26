@@ -33,10 +33,8 @@ use otel_arrow_dfe_engine::{
 use otel_arrow_dfe_otap::OTAP_PROCESSOR_FACTORIES;
 use otel_arrow_dfe_otap::accessory::context::split_contexts::Contexts;
 use otel_arrow_dfe_otap::accessory::slots::Key;
-use otel_arrow_dfe_otap::context_bytes::{
-    ContextBytesError, HeaderInput, HeaderValueKind, PdataContextBytes,
-};
-use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
+use otel_arrow_dfe_otap::context_bytes::{ContextScalarProjectionBinding, HeaderValueKind};
+use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::{OtapArrowRecords, OtapPayload, TryIntoWithOptions};
 use otel_arrow_dfe_query_engine::parser::default_parser_options;
 use otel_arrow_dfe_query_engine::pipeline::partition::{PartitionValue, Partitioner};
@@ -111,7 +109,7 @@ pub static PARTITION_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorF
 pub struct PartitionProcessor {
     contexts: Contexts,
     partitioner: Partitioner,
-    header_name: String,
+    projection_binding: ContextScalarProjectionBinding,
     serialization_strategy: PartitionValueSerializeStrategy,
     metrics: MeasurementMetricSet<Metrics>,
 }
@@ -146,7 +144,7 @@ impl PartitionProcessor {
         Ok(Self {
             partitioner,
             contexts: Contexts::new(config.inbound_request_limit, config.outbound_request_limit),
-            header_name: config.partition_header_name,
+            projection_binding: ContextScalarProjectionBinding::new(&config.partition_context),
             serialization_strategy: config.header_serialization_strategy,
             metrics: Metrics::register(pipeline_ctx),
         })
@@ -288,25 +286,31 @@ impl Processor<OtapPdata> for PartitionProcessor {
                         let partition = partitions.next().expect("at least one partition");
 
                         let partition_header = partition_value_to_transport_header(
-                            self.header_name.clone(),
                             &self.serialization_strategy,
                             partition.value,
                         );
-                        if let Err(error) =
-                            project_partition_header(&mut inbound_context, &partition_header)
-                        {
-                            let payload = return_batch
-                                .map_or_else(|| partition.batch.into(), OtapPayload::from);
-                            let pdata = OtapPdata::new(inbound_context, payload);
-                            effect_handler
-                                .notify_nack(NackMsg::new_permanent(
-                                    format!("failed to project partition header: {error}"),
-                                    pdata,
-                                ))
-                                .await?;
-                            return Ok(());
+                        match self.projection_binding.project(
+                            inbound_context.pdata_context_bytes(),
+                            &partition_header.value,
+                            partition_header.kind,
+                        ) {
+                            Ok(projected) => {
+                                inbound_context.set_pdata_context_bytes(projected);
+                                drop(return_batch);
+                            }
+                            Err(error) => {
+                                let payload = return_batch
+                                    .map_or_else(|| partition.batch.into(), OtapPayload::from);
+                                let pdata = OtapPdata::new(inbound_context, payload);
+                                effect_handler
+                                    .notify_nack(NackMsg::new_permanent(
+                                        format!("failed to project partition header: {error}"),
+                                        pdata,
+                                    ))
+                                    .await?;
+                                return Ok(());
+                            }
                         }
-                        drop(return_batch);
 
                         let pdata =
                             OtapPdata::new(inbound_context, OtapPayload::from(partition.batch));
@@ -318,7 +322,6 @@ impl Processor<OtapPdata> for PartitionProcessor {
                         let prepared_partitions = partitions
                             .map(|partition| {
                                 let partition_header = partition_value_to_transport_header(
-                                    self.header_name.clone(),
                                     &self.serialization_strategy,
                                     partition.value,
                                 );
@@ -331,21 +334,31 @@ impl Processor<OtapPdata> for PartitionProcessor {
                             .max_by_key(|(_, (header, _))| header.value.len())
                             .expect("multiple partitions");
                         let outbound_context = inbound_context.clone_detached();
-                        let mut largest_projected_context = outbound_context.clone();
-                        if let Err(error) =
-                            project_partition_header(&mut largest_projected_context, largest_header)
-                        {
-                            let payload = return_batch
-                                .map_or_else(|| OtapPayload::empty(signal_type), OtapPayload::from);
-                            let pdata = OtapPdata::new(inbound_context, payload);
-                            effect_handler
-                                .notify_nack(NackMsg::new_permanent(
-                                    format!("failed to project partition header: {error}"),
-                                    pdata,
-                                ))
-                                .await?;
-                            return Ok(());
-                        }
+                        let largest_projected_context = match self.projection_binding.project(
+                            outbound_context.pdata_context_bytes(),
+                            &largest_header.value,
+                            largest_header.kind,
+                        ) {
+                            Ok(projected) => {
+                                let mut ctx = outbound_context.clone();
+                                ctx.set_pdata_context_bytes(projected);
+                                ctx
+                            }
+                            Err(error) => {
+                                let payload = return_batch.map_or_else(
+                                    || OtapPayload::empty(signal_type),
+                                    OtapPayload::from,
+                                );
+                                let pdata = OtapPdata::new(inbound_context, payload);
+                                effect_handler
+                                    .notify_nack(NackMsg::new_permanent(
+                                        format!("failed to project partition header: {error}"),
+                                        pdata,
+                                    ))
+                                    .await?;
+                                return Ok(());
+                            }
+                        };
                         drop(return_batch);
                         let mut largest_projected_context = Some(largest_projected_context);
 
@@ -404,8 +417,15 @@ impl Processor<OtapPdata> for PartitionProcessor {
                                 let mut pdata_context = outbound_context.clone();
                                 // Projection size is monotonic in the value length, so the
                                 // successful largest-header preflight guarantees this succeeds.
-                                project_partition_header(&mut pdata_context, &partition_header)
+                                let projected = self
+                                    .projection_binding
+                                    .project(
+                                        pdata_context.pdata_context_bytes(),
+                                        &partition_header.value,
+                                        partition_header.kind,
+                                    )
                                     .expect("partition header projection was preflighted");
+                                pdata_context.set_pdata_context_bytes(projected);
                                 pdata_context
                             };
                             let outbound_batch_num_items = partition_batch.num_items();
@@ -459,35 +479,13 @@ impl Processor<OtapPdata> for PartitionProcessor {
     }
 }
 
-fn project_partition_header(
-    context: &mut Context,
-    header: &PartitionContextHeader,
-) -> Result<(), ContextBytesError> {
-    let input = HeaderInput {
-        wire_name: &header.name,
-        stored_name: &header.name,
-        value: &header.value,
-        kind: header.kind,
-        rule_id: u16::MAX,
-        entry: None,
-    };
-    let projected = match context.pdata_context_bytes() {
-        Some(context) => context.project().copy_and_append_bag_header(input)?,
-        None => PdataContextBytes::build(0, [input])?,
-    };
-    context.set_pdata_context_bytes(projected);
-    Ok(())
-}
-
 #[derive(Debug, PartialEq)]
 struct PartitionContextHeader {
-    name: String,
     kind: HeaderValueKind,
     value: Vec<u8>,
 }
 
 fn partition_value_to_transport_header(
-    name: String,
     strategy: &PartitionValueSerializeStrategy,
     partition_value: PartitionValue,
 ) -> PartitionContextHeader {
@@ -514,7 +512,6 @@ fn partition_value_to_transport_header(
             };
 
             PartitionContextHeader {
-                name,
                 kind: value_kind,
                 value: header_bytes,
             }
@@ -551,7 +548,6 @@ fn partition_value_to_transport_header(
             };
 
             PartitionContextHeader {
-                name,
                 kind: HeaderValueKind::Text,
                 value: header_bytes,
             }
@@ -577,7 +573,10 @@ mod test {
     };
     use otel_arrow_dfe_otap::{
         pdata::Context,
-        testing::{TestCallData, TestContextHeader, next_ack, next_nack, test_pdata_context},
+        testing::{
+            TestCallData, TestContextHeader, next_ack, next_nack, test_pdata_context,
+            test_pdata_context_near_limit,
+        },
     };
     use otel_arrow_dfe_pdata::{
         OtlpProtoBytes, TryFromWithOptions,
@@ -691,11 +690,9 @@ mod test {
     }
 
     fn create_near_limit_context() -> Context {
-        let value = vec![0; 65_500];
+        let value = vec![0; 65_470];
         let mut context = Context::default();
-        context.set_pdata_context_bytes(test_pdata_context([TestContextHeader::binary(
-            "w", "s", &value,
-        )]));
+        context.set_pdata_context_bytes(test_pdata_context_near_limit("w", &value));
         context
     }
 
@@ -1391,20 +1388,17 @@ mod test {
 
     #[test]
     fn test_partition_value_to_transport_header_to_bytes_lossy() {
-        let header_name = "partition";
         let strategy = PartitionValueSerializeStrategy::ToBytesLossy {
             text_as_binary_header: false,
         };
 
         let header = partition_value_to_transport_header(
-            header_name.to_string(),
             &strategy,
             PartitionValue::String("test".to_string()),
         );
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Text,
                 value: "test".as_bytes().to_vec()
             }
@@ -1412,7 +1406,6 @@ mod test {
 
         // ensure we also encode as Binary if configured ...
         let header = partition_value_to_transport_header(
-            header_name.to_string(),
             &PartitionValueSerializeStrategy::ToBytesLossy {
                 text_as_binary_header: true,
             },
@@ -1421,7 +1414,6 @@ mod test {
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Binary,
                 value: "test".as_bytes().to_vec()
             }
@@ -1429,85 +1421,56 @@ mod test {
 
         // check other header types ...
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Int(514),
-        );
+        let header = partition_value_to_transport_header(&strategy, PartitionValue::Int(514));
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Binary,
                 value: 514i64.to_le_bytes().to_vec()
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Float(14.7),
-        );
+        let header = partition_value_to_transport_header(&strategy, PartitionValue::Float(14.7));
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Binary,
                 value: 14.7f64.to_le_bytes().to_vec()
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Boolean(true),
-        );
+        let header = partition_value_to_transport_header(&strategy, PartitionValue::Boolean(true));
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Binary,
                 value: vec![1]
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Boolean(false),
-        );
+        let header = partition_value_to_transport_header(&strategy, PartitionValue::Boolean(false));
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Binary,
                 value: vec![0]
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Binary(vec![4, 1, 8]),
-        );
+        let header =
+            partition_value_to_transport_header(&strategy, PartitionValue::Binary(vec![4, 1, 8]));
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Binary,
                 value: vec![4, 1, 8],
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Null,
-        );
+        let header = partition_value_to_transport_header(&strategy, PartitionValue::Null);
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Binary,
                 value: vec![]
             }
@@ -1516,102 +1479,70 @@ mod test {
 
     #[test]
     fn test_partition_value_to_transport_header_json() {
-        let header_name = "partition";
         let strategy = PartitionValueSerializeStrategy::Json;
 
         let header = partition_value_to_transport_header(
-            header_name.to_string(),
             &strategy,
             PartitionValue::String("test".to_string()),
         );
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Text,
                 value: "\"test\"".as_bytes().to_vec()
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Int(514),
-        );
+        let header = partition_value_to_transport_header(&strategy, PartitionValue::Int(514));
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Text,
                 value: "514".as_bytes().to_vec()
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Float(14.7),
-        );
+        let header = partition_value_to_transport_header(&strategy, PartitionValue::Float(14.7));
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Text,
                 value: "14.7".as_bytes().to_vec()
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Boolean(true),
-        );
+        let header = partition_value_to_transport_header(&strategy, PartitionValue::Boolean(true));
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Text,
                 value: "true".as_bytes().to_vec()
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Boolean(false),
-        );
+        let header = partition_value_to_transport_header(&strategy, PartitionValue::Boolean(false));
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Text,
                 value: "false".as_bytes().to_vec()
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Binary(vec![4, 1, 8]),
-        );
+        let header =
+            partition_value_to_transport_header(&strategy, PartitionValue::Binary(vec![4, 1, 8]));
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Text,
                 value: "[4,1,8]".as_bytes().to_vec()
             }
         );
 
-        let header = partition_value_to_transport_header(
-            header_name.to_string(),
-            &strategy,
-            PartitionValue::Null,
-        );
+        let header = partition_value_to_transport_header(&strategy, PartitionValue::Null);
         assert_eq!(
             header,
             PartitionContextHeader {
-                name: header_name.to_string(),
                 kind: HeaderValueKind::Text,
                 value: "null".as_bytes().to_vec()
             }

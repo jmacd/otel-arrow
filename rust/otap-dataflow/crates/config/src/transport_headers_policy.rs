@@ -18,6 +18,8 @@ use ahash::{AHashMap, AHashSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::context::{CompiledContext, ContextCompiler, ContextRegisterShape, ContextScalarType};
+
 const MAX_CAPTURE_ENTRIES: usize = 1024;
 
 // -- Stats types --------------------------------------------------------------
@@ -99,6 +101,29 @@ impl HeaderCapturePolicy {
     /// Returns an error when the configured capture limits cannot be represented
     /// by the packed context format.
     pub fn compile(&self) -> Result<CompiledHeaderCapturePolicy, String> {
+        self.compile_for_generation(0)
+    }
+
+    /// Compiles capture rules for an orchestration-owned deployment generation.
+    ///
+    /// Contexts retain the resulting immutable compiler state, allowing old and
+    /// new generations to remain in flight concurrently during a safe cutover.
+    pub fn compile_for_generation(
+        &self,
+        deployment_generation: u64,
+    ) -> Result<CompiledHeaderCapturePolicy, String> {
+        self.compile_for_generation_with_provenance(deployment_generation, true)
+    }
+
+    /// Compiles capture rules with an explicit observed-name provenance requirement.
+    ///
+    /// A graph compiler sets `retain_observed_names` only when an egress
+    /// instruction requests the observed input spelling.
+    pub fn compile_for_generation_with_provenance(
+        &self,
+        deployment_generation: u64,
+        retain_observed_names: bool,
+    ) -> Result<CompiledHeaderCapturePolicy, String> {
         if self.defaults.max_entries > MAX_CAPTURE_ENTRIES {
             return Err(format!(
                 "header capture max_entries must not exceed {}",
@@ -112,33 +137,19 @@ impl HeaderCapturePolicy {
             ));
         }
 
-        let mut entry_ids = AHashMap::new();
+        let mut context_compiler = ContextCompiler::new(deployment_generation);
         let mut matches = AHashMap::new();
         let mut schema_matches = Vec::new();
         for (rule_id, rule) in self.headers.iter().enumerate() {
-            let entry = match rule.store_as.as_ref() {
-                Some(name) => {
-                    let normalized = name.to_ascii_lowercase();
-                    match entry_ids.get(&normalized) {
-                        Some(entry) => Some(*entry),
-                        None => {
-                            if entry_ids.len() >= MAX_CAPTURE_ENTRIES {
-                                return Err(format!(
-                                    "header capture supports at most {} named entries",
-                                    MAX_CAPTURE_ENTRIES
-                                ));
-                            }
-                            let entry = u16::try_from(entry_ids.len()).map_err(|_| {
-                                format!(
-                                    "header capture supports at most {} named entries",
-                                    MAX_CAPTURE_ENTRIES
-                                )
-                            })?;
-                            let _ = entry_ids.insert(normalized, entry);
-                            Some(entry)
-                        }
-                    }
-                }
+            let shared_register = match rule.store_as.as_ref() {
+                Some(name) => Some(
+                    context_compiler
+                        .declare(
+                            name,
+                            ContextRegisterShape::ScalarList(ContextScalarType::AnyValue),
+                        )
+                        .map_err(|error| error.to_string())?,
+                ),
                 None => None,
             };
             let rule_id = u16::try_from(rule_id)
@@ -146,30 +157,40 @@ impl HeaderCapturePolicy {
             for match_name in &rule.match_names {
                 let normalized = match_name.to_ascii_lowercase();
                 if let std::collections::hash_map::Entry::Vacant(slot) = matches.entry(normalized) {
-                    let stored_name = rule.store_as.clone().unwrap_or_else(|| slot.key().clone());
-                    let schema_item = u16::try_from(schema_matches.len()).map_err(|_| {
-                        format!(
+                    let register = match shared_register {
+                        Some(register) => register,
+                        None => context_compiler
+                            .declare(
+                                slot.key(),
+                                ContextRegisterShape::KeyValueList(ContextScalarType::AnyValue),
+                            )
+                            .map_err(|error| error.to_string())?,
+                    };
+                    if schema_matches.len() >= usize::from(u16::MAX) {
+                        return Err(format!(
                             "header capture supports at most {} distinct matches",
                             u16::MAX
-                        )
-                    })?;
+                        ));
+                    }
+                    let schema_index = u16::try_from(schema_matches.len())
+                        .expect("schema item count checked above");
                     schema_matches.push(CompiledHeaderSchemaItem {
                         wire_name: slot.key().clone(),
-                        stored_name: stored_name.clone(),
-                        rule_id,
-                        entry,
+                        rule_id: Some(rule_id),
+                        register: Some(register),
+                        retain_observed_name: retain_observed_names,
                         value_kind: rule.value_kind,
                     });
-                    let _ = slot.insert(CompiledCaptureMatch {
-                        schema_item,
-                        rule_id,
-                        entry,
-                        wire_name: match_name.to_ascii_lowercase(),
-                        stored_name,
-                        value_kind: rule.value_kind,
-                    });
+                    let _ = slot.insert(schema_index);
                 }
             }
+        }
+        let compiled_context = context_compiler.finish();
+        if compiled_context.register_file().len() > MAX_CAPTURE_ENTRIES {
+            return Err(format!(
+                "header capture supports at most {} named entries",
+                MAX_CAPTURE_ENTRIES
+            ));
         }
         Ok(CompiledHeaderCapturePolicy {
             defaults: self.defaults.clone(),
@@ -178,9 +199,9 @@ impl HeaderCapturePolicy {
                 .map(|name| 1u64 << header_probe_bit(name.as_bytes()))
                 .fold(0, |probe, bit| probe | bit),
             matches: CompiledCaptureMatches::new(matches),
-            entry_count: entry_ids.len(),
             schema: Arc::new(CompiledHeaderSchema {
                 items: schema_matches.into_boxed_slice(),
+                compiled_context,
             }),
         })
     }
@@ -197,15 +218,14 @@ pub struct CompiledHeaderCapturePolicy {
     defaults: CaptureDefaults,
     header_probe: u64,
     matches: CompiledCaptureMatches,
-    entry_count: usize,
     schema: Arc<CompiledHeaderSchema>,
 }
 
 impl CompiledHeaderCapturePolicy {
     /// Number of compiled `store_as` entries.
     #[must_use]
-    pub const fn entry_count(&self) -> usize {
-        self.entry_count
+    pub fn entry_count(&self) -> usize {
+        self.schema.entry_count()
     }
 
     /// Finds the first capture rule matching `wire_name`.
@@ -214,16 +234,11 @@ impl CompiledHeaderCapturePolicy {
         if self.header_probe & (1u64 << header_probe_bit(wire_name.as_bytes())) == 0 {
             return None;
         }
-        self.matches
-            .get(wire_name)
-            .map(|matched| CompiledHeaderMatch {
-                schema_item: matched.schema_item,
-                rule_id: matched.rule_id,
-                entry: matched.entry,
-                configured_name: &matched.wire_name,
-                stored_name: &matched.stored_name,
-                value_kind: matched.value_kind,
-            })
+        let schema_index = self.matches.get(wire_name)?;
+        Some(CompiledHeaderMatch {
+            schema_index,
+            schema_item: self.schema.item(schema_index)?,
+        })
     }
 
     /// Returns the configured capture limits.
@@ -243,9 +258,117 @@ impl CompiledHeaderCapturePolicy {
 #[derive(Debug, PartialEq, Eq)]
 pub struct CompiledHeaderSchema {
     items: Box<[CompiledHeaderSchemaItem]>,
+    compiled_context: Arc<CompiledContext>,
 }
 
 impl CompiledHeaderSchema {
+    /// Returns an empty schema with no captured header matches.
+    #[must_use]
+    pub fn empty() -> Arc<Self> {
+        let compiled_context = ContextCompiler::new(0).finish();
+        Arc::new(Self {
+            items: Box::new([]),
+            compiled_context,
+        })
+    }
+
+    /// Wraps a compiled register file without adding transport instructions.
+    ///
+    /// This is used by context producers whose values have no transport
+    /// provenance. Egress propagation therefore ignores their value items
+    /// unless a later compiler pass explicitly adds an output instruction.
+    #[must_use]
+    pub fn context_only(compiled_context: Arc<CompiledContext>) -> Arc<Self> {
+        Arc::new(Self {
+            items: Box::new([]),
+            compiled_context,
+        })
+    }
+
+    /// Number of context entry slots implied by this schema's items.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.compiled_context.register_file().len()
+    }
+
+    /// Builds a schema containing a single item with one singleton context entry.
+    ///
+    /// Returns `(schema, schema_index=0, entry_slot=0)`.
+    #[must_use]
+    pub fn singleton_entry(name: &str) -> (Arc<Self>, u16, u16) {
+        let mut compiler = ContextCompiler::new(0);
+        let register = compiler
+            .declare(
+                name,
+                ContextRegisterShape::ScalarList(ContextScalarType::AnyValue),
+            )
+            .expect("singleton context register");
+        let schema = Arc::new(Self {
+            items: vec![CompiledHeaderSchemaItem {
+                wire_name: name.to_ascii_lowercase(),
+                rule_id: None,
+                register: Some(register),
+                retain_observed_name: false,
+                value_kind: None,
+            }]
+            .into_boxed_slice(),
+            compiled_context: compiler.finish(),
+        });
+        (schema, 0, 0)
+    }
+
+    /// Derives a schema by copying all items from `base` and appending one
+    /// item with a new singleton entry slot.
+    ///
+    /// The new entry slot is one past the highest existing entry slot in `base`.
+    /// Returns `(derived_schema, schema_index, entry_slot)`.
+    pub fn derive_with_entry(base: &Self, name: &str) -> Result<(Arc<Self>, u16, u16), String> {
+        let new_len = base
+            .items
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| "schema item overflow".to_string())?;
+        if base.items.len() >= usize::from(u16::MAX) {
+            return Err("schema item index overflow".to_string());
+        }
+        let schema_index =
+            u16::try_from(base.items.len()).expect("schema item count checked above");
+        let mut compiler = ContextCompiler::derive(&base.compiled_context);
+        if compiler.resolve(name).is_ok() {
+            return Err(format!("context register '{name}' is already defined"));
+        }
+        let register = compiler
+            .declare(
+                name,
+                ContextRegisterShape::ScalarList(ContextScalarType::AnyValue),
+            )
+            .map_err(|error| error.to_string())?;
+        let new_entry_slot = register.as_u16();
+        let mut items = Vec::with_capacity(new_len);
+        items.extend(base.items.iter().map(|item| CompiledHeaderSchemaItem {
+            wire_name: item.wire_name.clone(),
+            rule_id: item.rule_id,
+            register: item.register,
+            retain_observed_name: item.retain_observed_name,
+            value_kind: item.value_kind,
+        }));
+        items.push(CompiledHeaderSchemaItem {
+            wire_name: name.to_ascii_lowercase(),
+            rule_id: None,
+            register: Some(register),
+            retain_observed_name: false,
+            value_kind: None,
+        });
+        Ok((
+            Arc::new(Self {
+                items: items.into_boxed_slice(),
+                compiled_context: compiler.finish(),
+            }),
+            schema_index,
+            new_entry_slot,
+        ))
+    }
+
     /// Resolves a schema-local captured item.
     #[must_use]
     pub fn item(&self, id: u16) -> Option<CompiledHeaderSchemaItemRef<'_>> {
@@ -253,11 +376,17 @@ impl CompiledHeaderSchema {
             .get(usize::from(id))
             .map(|item| CompiledHeaderSchemaItemRef {
                 wire_name: &item.wire_name,
-                stored_name: &item.stored_name,
                 rule_id: item.rule_id,
-                entry: item.entry,
+                register: item.register,
+                retain_observed_name: item.retain_observed_name,
                 value_kind: item.value_kind,
             })
+    }
+
+    /// Returns this schema's compiler state.
+    #[must_use]
+    pub fn compiled_context(&self) -> &Arc<CompiledContext> {
+        &self.compiled_context
     }
 
     /// Number of distinct captured header matches in this schema.
@@ -276,9 +405,9 @@ impl CompiledHeaderSchema {
 #[derive(Debug, PartialEq, Eq)]
 struct CompiledHeaderSchemaItem {
     wire_name: String,
-    stored_name: String,
-    rule_id: u16,
-    entry: Option<u16>,
+    rule_id: Option<u16>,
+    register: Option<crate::context::ContextRegisterId>,
+    retain_observed_name: bool,
     value_kind: Option<ValueKindConfig>,
 }
 
@@ -287,36 +416,26 @@ struct CompiledHeaderSchemaItem {
 pub struct CompiledHeaderSchemaItemRef<'a> {
     /// Normalized configured wire name.
     pub wire_name: &'a str,
-    /// Logical stored name.
-    pub stored_name: &'a str,
-    /// First-match capture rule identifier.
-    pub rule_id: u16,
-    /// Optional logical entry slot.
-    pub entry: Option<u16>,
+    /// First-match capture rule identifier, absent for non-capture entries.
+    pub rule_id: Option<u16>,
+    /// Optional compiled context register.
+    pub register: Option<crate::context::ContextRegisterId>,
+    /// Whether ingress must retain observed transport-name provenance.
+    pub retain_observed_name: bool,
     /// Configured value-kind override.
     pub value_kind: Option<ValueKindConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CompiledCaptureMatch {
-    schema_item: u16,
-    rule_id: u16,
-    entry: Option<u16>,
-    wire_name: String,
-    stored_name: String,
-    value_kind: Option<ValueKindConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum CompiledCaptureMatches {
-    Linear(Box<[(String, CompiledCaptureMatch)]>),
-    Hashed(AHashMap<String, CompiledCaptureMatch>),
+    Linear(Box<[(String, u16)]>),
+    Hashed(AHashMap<String, u16>),
 }
 
 impl CompiledCaptureMatches {
     const LINEAR_LIMIT: usize = 8;
 
-    fn new(matches: AHashMap<String, CompiledCaptureMatch>) -> Self {
+    fn new(matches: AHashMap<String, u16>) -> Self {
         if matches.len() <= Self::LINEAR_LIMIT {
             let mut matches: Vec<_> = matches.into_iter().collect();
             matches.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
@@ -326,12 +445,12 @@ impl CompiledCaptureMatches {
         }
     }
 
-    fn get(&self, wire_name: &str) -> Option<&CompiledCaptureMatch> {
+    fn get(&self, wire_name: &str) -> Option<u16> {
         match self {
             Self::Linear(matches) => matches.iter().find_map(|(name, matched)| {
-                (name == wire_name || name.eq_ignore_ascii_case(wire_name)).then_some(matched)
+                (name == wire_name || name.eq_ignore_ascii_case(wire_name)).then_some(*matched)
             }),
-            Self::Hashed(matches) => lookup_ascii_case_insensitive(matches, wire_name),
+            Self::Hashed(matches) => lookup_ascii_case_insensitive(matches, wire_name).copied(),
         }
     }
 }
@@ -339,19 +458,10 @@ impl CompiledCaptureMatches {
 /// A receiver-facing result of matching one inbound header.
 #[derive(Debug, Clone, Copy)]
 pub struct CompiledHeaderMatch<'a> {
-    /// Schema-local captured item identifier.
-    pub schema_item: u16,
-    /// First-match capture rule identifier.
-    pub rule_id: u16,
-    /// Optional `store_as` entry slot.
-    pub entry: Option<u16>,
-    /// Normalized configured wire name.
-    pub configured_name: &'a str,
-    /// Stored name: `store_as` when configured, otherwise the normalized
-    /// matched wire name.
-    pub stored_name: &'a str,
-    /// Explicit value kind override, if configured.
-    pub value_kind: Option<ValueKindConfig>,
+    /// Index of the matching item in the compiled schema.
+    pub schema_index: u16,
+    /// Matching metadata resolved from the retained schema.
+    pub schema_item: CompiledHeaderSchemaItemRef<'a>,
 }
 
 /// Default limits for header capture.
@@ -460,7 +570,33 @@ impl HeaderPropagationPolicy {
     /// that invalid selectors cannot be silently accepted in one path while
     /// being rejected in another.
     pub fn validate(&self) -> Result<(), String> {
-        self.default.selector.validate()
+        self.default.selector.validate()?;
+        validate_output_name(self.default.output_name.as_deref())?;
+        for rule in &self.overrides {
+            validate_output_name(rule.output_name.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether any compiled egress instruction can request observed
+    /// input-name provenance.
+    #[must_use]
+    pub fn requires_observed_name_provenance(&self) -> bool {
+        let default_uses_observed = self.default.selector.selector_type
+            != PropagationSelectorType::None
+            && self.default.action == PropagationAction::Propagate
+            && self.default.output_name.is_none()
+            && self.default.name == NameStrategy::Preserve;
+        default_uses_observed
+            || self.overrides.iter().any(|rule| {
+                rule.action == PropagationAction::Propagate
+                    && rule
+                        .output_name
+                        .as_ref()
+                        .or(self.default.output_name.as_ref())
+                        .is_none()
+                    && rule.name.unwrap_or(self.default.name) == NameStrategy::Preserve
+            })
     }
 
     /// Compiles selectors and overrides for constant-time egress lookup.
@@ -485,11 +621,16 @@ impl HeaderPropagationPolicy {
                     CompiledPropagationOverride {
                         action: rule.action,
                         name: rule.name.unwrap_or(self.default.name),
+                        output_name: rule
+                            .output_name
+                            .clone()
+                            .or_else(|| self.default.output_name.clone()),
                     },
                 );
             }
         }
         let uniform = (self.overrides.is_empty()
+            && self.default.output_name.is_none()
             && self.default.selector.selector_type != PropagationSelectorType::Named)
             .then(|| {
                 let selected =
@@ -509,6 +650,7 @@ impl HeaderPropagationPolicy {
             selected_names,
             default_action: self.default.action,
             default_name: self.default.name,
+            default_output_name: self.default.output_name.clone(),
             overrides,
         })
     }
@@ -522,6 +664,7 @@ pub struct CompiledHeaderPropagationPolicy {
     selected_names: AHashSet<String>,
     default_action: PropagationAction,
     default_name: NameStrategy,
+    default_output_name: Option<String>,
     overrides: AHashMap<String, CompiledPropagationOverride>,
 }
 
@@ -543,11 +686,32 @@ impl CompiledHeaderPropagationPolicy {
                     .map_or(
                         CompiledPropagationDecision {
                             action: PropagationAction::Drop,
-                            name: NameStrategy::Preserve,
+                            output_name: CompiledOutputName::Observed,
                         },
                         |item| {
-                            let (action, name) = self.resolve_stored_name(item.stored_name);
-                            CompiledPropagationDecision { action, name }
+                            let logical_name = item
+                                .register
+                                .and_then(|register| {
+                                    schema
+                                        .compiled_context
+                                        .linker()
+                                        .compatibility_symbol(register)
+                                })
+                                .unwrap_or(item.wire_name);
+                            let resolved = self.resolve(logical_name);
+                            let output_name = match resolved.output_name.as_deref() {
+                                Some(output_name) => CompiledOutputName::Static(output_name.into()),
+                                None => match resolved.name {
+                                    NameStrategy::Preserve => CompiledOutputName::Observed,
+                                    NameStrategy::StoredName => {
+                                        CompiledOutputName::Static(logical_name.into())
+                                    }
+                                },
+                            };
+                            CompiledPropagationDecision {
+                                action: resolved.action,
+                                output_name,
+                            }
                         },
                     )
             })
@@ -558,8 +722,17 @@ impl CompiledHeaderPropagationPolicy {
     /// Resolves propagation behavior from a stored context name.
     #[must_use]
     pub fn resolve_stored_name(&self, stored_name: &str) -> (PropagationAction, NameStrategy) {
+        let resolved = self.resolve(stored_name);
+        (resolved.action, resolved.name)
+    }
+
+    fn resolve(&self, stored_name: &str) -> ResolvedPropagation<'_> {
         if let Some(override_rule) = lookup_ascii_case_insensitive(&self.overrides, stored_name) {
-            return (override_rule.action, override_rule.name);
+            return ResolvedPropagation {
+                action: override_rule.action,
+                name: override_rule.name,
+                output_name: override_rule.output_name.as_deref(),
+            };
         }
 
         let selected = match self.selector_type {
@@ -569,14 +742,15 @@ impl CompiledHeaderPropagationPolicy {
                 contains_ascii_case_insensitive(&self.selected_names, stored_name)
             }
         };
-        (
-            if selected {
+        ResolvedPropagation {
+            action: if selected {
                 self.default_action
             } else {
                 PropagationAction::Drop
             },
-            self.default_name,
-        )
+            name: self.default_name,
+            output_name: self.default_output_name.as_deref(),
+        }
     }
 }
 
@@ -589,24 +763,52 @@ pub struct CompiledSchemaPropagation {
 impl CompiledSchemaPropagation {
     /// Resolves one schema-local item without a name lookup.
     #[must_use]
-    pub fn decision(&self, item_id: u16) -> Option<CompiledPropagationDecision> {
-        self.decisions.get(usize::from(item_id)).copied()
+    pub fn decision(&self, item_id: u16) -> Option<&CompiledPropagationDecision> {
+        self.decisions.get(usize::from(item_id))
     }
 }
 
 /// Pre-resolved propagation behavior for one captured schema item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledPropagationDecision {
     /// Whether the item is propagated.
     pub action: PropagationAction,
-    /// Which captured name is emitted.
-    pub name: NameStrategy,
+    /// Compiled output header-name instruction.
+    pub output_name: CompiledOutputName,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Header-name operand in a compiled egress instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompiledOutputName {
+    /// Use observed-name provenance from the input occurrence.
+    Observed,
+    /// Emit a compile-time output constant.
+    Static(Box<str>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CompiledPropagationOverride {
     action: PropagationAction,
     name: NameStrategy,
+    output_name: Option<String>,
+}
+
+struct ResolvedPropagation<'a> {
+    action: PropagationAction,
+    name: NameStrategy,
+    output_name: Option<&'a str>,
+}
+
+fn validate_output_name(output_name: Option<&str>) -> Result<(), String> {
+    if output_name.is_some_and(str::is_empty) {
+        return Err("propagation output_name must not be empty".to_string());
+    }
+    if let Some(output_name) = output_name
+        && !output_name.is_ascii()
+    {
+        return Err("propagation output_name must contain only ASCII characters".to_string());
+    }
+    Ok(())
 }
 
 fn lookup_ascii_case_insensitive<'a, T>(
@@ -650,6 +852,12 @@ pub struct PropagationDefault {
     /// How to derive the outbound header name from the stored header.
     #[serde(default)]
     pub name: NameStrategy,
+    /// Explicit outbound header name.
+    ///
+    /// When present, this compile-time constant supersedes the legacy `name`
+    /// strategy. The source register itself carries no transport name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_name: Option<String>,
     /// Action taken when a header cannot be propagated.
     #[serde(default)]
     pub on_error: ErrorAction,
@@ -746,6 +954,9 @@ pub struct PropagationOverride {
     /// Override the name strategy for matched headers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<NameStrategy>,
+    /// Explicit outbound header name for matching registers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_name: Option<String>,
     /// Override the error action for matched headers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_error: Option<ErrorAction>,
@@ -979,6 +1190,45 @@ named:
         assert!(policy.validate().is_ok());
     }
 
+    /// Scenario: every propagated register uses an explicit output header name.
+    /// Guarantees: the graph compiler can omit observed input-name provenance.
+    #[test]
+    fn explicit_output_name_eliminates_observed_name_requirement() {
+        let policy = HeaderPropagationPolicy::new(
+            PropagationDefault {
+                selector: PropagationSelector {
+                    selector_type: PropagationSelectorType::AllCaptured,
+                    named: None,
+                },
+                output_name: Some("x-output".to_string()),
+                ..Default::default()
+            },
+            vec![],
+        );
+
+        assert!(!policy.requires_observed_name_provenance());
+        assert!(policy.validate().is_ok());
+    }
+
+    /// Scenario: a propagated register requests its observed input name.
+    /// Guarantees: the graph compiler marks source-name provenance as live.
+    #[test]
+    fn preserve_output_requires_observed_name_provenance() {
+        let policy = HeaderPropagationPolicy::new(
+            PropagationDefault {
+                selector: PropagationSelector {
+                    selector_type: PropagationSelectorType::AllCaptured,
+                    named: None,
+                },
+                name: NameStrategy::Preserve,
+                ..Default::default()
+            },
+            vec![],
+        );
+
+        assert!(policy.requires_observed_name_provenance());
+    }
+
     /// Scenario: a capture policy declares more rules than a u16 identifier can represent.
     /// Guarantees: policy compilation rejects the configuration instead of aliasing rule IDs.
     #[test]
@@ -1078,9 +1328,16 @@ named:
         .expect("capture policy");
 
         let matched = policy.match_header("X-Tenant").expect("matched header");
-        assert_eq!(matched.rule_id, 0);
-        assert_eq!(matched.stored_name, "tenant");
-        assert_eq!(matched.value_kind, None);
+        assert_eq!(matched.schema_item.rule_id, Some(0));
+        assert_eq!(
+            matched.schema_item.register.and_then(|register| policy
+                .schema()
+                .compiled_context()
+                .linker()
+                .compatibility_symbol(register)),
+            Some("tenant")
+        );
+        assert_eq!(matched.schema_item.value_kind, None);
     }
 
     /// Scenario: named selection and duplicate overrides use mixed-case stored names.
@@ -1102,6 +1359,7 @@ named:
                     },
                     action: PropagationAction::Drop,
                     name: Some(NameStrategy::StoredName),
+                    output_name: None,
                     on_error: None,
                 },
                 PropagationOverride {
@@ -1110,6 +1368,7 @@ named:
                     },
                     action: PropagationAction::Propagate,
                     name: None,
+                    output_name: None,
                     on_error: None,
                 },
             ],

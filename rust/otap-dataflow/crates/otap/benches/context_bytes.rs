@@ -10,7 +10,9 @@ use otel_arrow_dfe_config::transport_headers_policy::{
     CaptureDefaults, CaptureRule, CompiledHeaderCapturePolicy, HeaderCapturePolicy,
     HeaderPropagationPolicy, PropagationDefault, PropagationSelector, PropagationSelectorType,
 };
-use otel_arrow_dfe_otap::context_bytes::{HeaderInput, HeaderValueKind, PdataContextBytes};
+use otel_arrow_dfe_otap::context_bytes::{
+    HeaderValueKind, PartitionProjectionBinding, PdataContextBytes,
+};
 
 const HEADER_COUNTS: [usize; 4] = [1, 4, 16, 32];
 
@@ -27,6 +29,7 @@ fn bench_context_bytes(c: &mut Criterion) {
     let propagation = propagation_policy()
         .compile()
         .expect("valid propagation policy");
+    let propagation_plan = propagation.compile_schema(context.schema());
 
     let _ = c.bench_function("pdata_context/lookup/entry", |b| {
         b.iter(|| {
@@ -57,26 +60,19 @@ fn bench_context_bytes(c: &mut Criterion) {
     let _ = c.bench_function("pdata_context/propagate", |b| {
         b.iter(|| {
             black_box(&context)
-                .propagate(&propagation)
+                .propagate(&propagation_plan)
                 .map(|header| header.header_name.len() + header.value.len())
                 .sum::<usize>()
         });
     });
 
     let partition_values = partition_values();
+    let mut binding = PartitionProjectionBinding::new("partition");
     let _ = c.bench_function("pdata_context/project_partition_8", |b| {
         b.iter(|| {
             for value in &partition_values {
-                let projected = black_box(&context)
-                    .project()
-                    .copy_and_append_bag_header(HeaderInput {
-                        wire_name: "partition",
-                        stored_name: "partition",
-                        value,
-                        kind: HeaderValueKind::Text,
-                        rule_id: u16::MAX,
-                        entry: None,
-                    })
+                let projected = binding
+                    .project(Some(black_box(&context)), value, HeaderValueKind::Text)
                     .expect("context projection");
                 let _ = black_box(projected);
             }
@@ -89,7 +85,7 @@ fn bench_context_bytes(c: &mut Criterion) {
             let hop1 = captured.clone();
             let hop2 = hop1.clone();
             black_box(
-                hop2.propagate(&propagation)
+                hop2.propagate(&propagation_plan)
                     .map(|header| header.value.len())
                     .sum::<usize>(),
             )

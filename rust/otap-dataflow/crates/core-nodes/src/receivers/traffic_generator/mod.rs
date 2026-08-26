@@ -16,6 +16,9 @@ use linkme::distributed_slice;
 use metrics::TrafficGeneratorReceiverMetrics;
 use otel_arrow_dfe_channel::error::{RecvError, SendError};
 use otel_arrow_dfe_config::node::NodeUserConfig;
+use otel_arrow_dfe_config::transport_headers_policy::{
+    CaptureDefaults, CaptureRule, HeaderCapturePolicy, ValueKindConfig,
+};
 use otel_arrow_dfe_engine::MessageSourceLocalEffectHandlerExtension;
 use otel_arrow_dfe_engine::config::ReceiverConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
@@ -29,9 +32,9 @@ use otel_arrow_dfe_engine::{
     Interests, ProducerEffectHandlerExtension, ReceiverFactory, control::NodeControlMsg,
 };
 use otel_arrow_dfe_otap::OTAP_RECEIVER_FACTORIES;
-use otel_arrow_dfe_otap::context_bytes::{
-    ContextBytesError, HeaderInput, HeaderValueKind, PdataContextBytes,
-};
+#[cfg(test)]
+use otel_arrow_dfe_otap::context_bytes::HeaderValueKind;
+use otel_arrow_dfe_otap::context_bytes::{ContextBytesError, PdataContextBytes};
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::OtapPayload;
 #[cfg(test)]
@@ -491,47 +494,68 @@ fn build_transport_context(
     if config_headers.is_empty() {
         return Ok(None);
     }
-    let mut headers = Vec::with_capacity(config_headers.len());
+    let mut headers: Vec<(String, Vec<u8>)> = Vec::with_capacity(config_headers.len());
+    let mut rules = Vec::with_capacity(config_headers.len());
     for (key, value) in config_headers {
         // Infer the value kind from the key name, matching the convention
         // used by the header capture policy: keys ending in `-bin` are
         // treated as binary (the gRPC binary metadata convention).
-        if key.ends_with("-bin") {
-            let resolved_value = match value {
-                Some(v) => v.as_bytes().to_vec(),
-                None => {
-                    let mut buf = [0u8; 16];
-                    rand::RngExt::fill(&mut rand::rng(), &mut buf);
-                    buf.to_vec()
-                }
-            };
-            headers.push((key, resolved_value, HeaderValueKind::Binary));
-        } else {
-            let resolved_value = match value {
-                Some(v) => v.as_bytes().to_vec(),
-                None => {
-                    // Generate bytes in ASCII printable range (space..tilde)
-                    let mut rng = rand::rng();
-                    (0..16)
-                        .map(|_| rand::RngExt::random_range(&mut rng, 32u8..127))
-                        .collect()
-                }
-            };
-            headers.push((key, resolved_value, HeaderValueKind::Text));
-        }
+        let is_binary = key.ends_with("-bin");
+        let resolved_value = match value {
+            Some(v) => v.as_bytes().to_vec(),
+            None if is_binary => {
+                let mut buf = [0u8; 16];
+                rand::RngExt::fill(&mut rand::rng(), &mut buf);
+                buf.to_vec()
+            }
+            None => {
+                // Generate bytes in ASCII printable range (space..tilde)
+                let mut rng = rand::rng();
+                (0..16)
+                    .map(|_| rand::RngExt::random_range(&mut rng, 32u8..127))
+                    .collect()
+            }
+        };
+        rules.push(CaptureRule {
+            match_names: vec![key.to_ascii_lowercase()],
+            store_as: None,
+            sensitive: false,
+            value_kind: if is_binary {
+                Some(ValueKindConfig::Binary)
+            } else {
+                None
+            },
+        });
+        headers.push((key.clone(), resolved_value));
     }
-    let packed = PdataContextBytes::build(
-        0,
-        headers.iter().map(|(name, value, kind)| HeaderInput {
-            wire_name: name,
-            stored_name: name,
-            value,
-            kind: *kind,
-            rule_id: u16::MAX,
-            entry: None,
-        }),
-    )?;
-    Ok(Some(packed))
+    let defaults = CaptureDefaults {
+        max_entries: headers.len(),
+        max_name_bytes: headers
+            .iter()
+            .map(|(name, _)| name.len())
+            .max()
+            .unwrap_or(0),
+        max_value_bytes: headers
+            .iter()
+            .map(|(_, value)| value.len())
+            .max()
+            .unwrap_or(0),
+        ..CaptureDefaults::default()
+    };
+    let policy = HeaderCapturePolicy::new(defaults, rules)
+        .compile()
+        .map_err(|_| ContextBytesError::TooMany {
+            what: "capture rules",
+        })?;
+    let pairs: Vec<(&str, &[u8])> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_slice()))
+        .collect();
+    let (context, stats) = PdataContextBytes::capture(&policy, pairs)?;
+    if stats.is_some() {
+        return Err(ContextBytesError::TooLarge);
+    }
+    Ok(context)
 }
 
 /// Waits for a terminal control message after the producer has finished.
@@ -805,6 +829,28 @@ mod tests {
     const MESSAGE_PER_SECOND: usize = 3;
     const MAX_SIGNALS: u64 = 3;
     const MAX_BATCH: usize = 30;
+
+    /// Scenario: Configured transport headers exceed the ingress capture defaults.
+    /// Guarantees: The traffic generator retains every configured header.
+    #[test]
+    fn test_build_transport_context_uses_configuration_limits() {
+        let mut headers = (0..33)
+            .map(|index| (format!("x-header-{index}"), Some(index.to_string())))
+            .collect::<HashMap<_, _>>();
+        let long_name = format!("x-{}", "n".repeat(129));
+        let _ = headers.insert(long_name.clone(), Some("long-name".to_string()));
+
+        let context = build_transport_context(&headers)
+            .expect("configured headers should fit")
+            .expect("non-empty headers should produce a context");
+
+        assert_eq!(context.items().count(), headers.len());
+        assert!(
+            context
+                .items()
+                .any(|item| item.stored_name() == Some(long_name.as_str()))
+        );
+    }
 
     /// Scenario: Ack/Nack tracking is enabled, one generated batch remains
     /// unresolved when receiver-first shutdown begins, and its Ack arrives later.

@@ -13,7 +13,7 @@
 //! For **deny** checks, `None` entries are acceptable -- a signal without
 //! headers cannot contain a forbidden key.
 
-use otel_arrow_dfe_otap::context_bytes::PdataContextBytes;
+use otel_arrow_dfe_otap::context_bytes::{ContextRegisterSetBinding, PdataContextBytes};
 use serde::{Deserialize, Serialize};
 
 /// A key/value pair for transport header assertions.
@@ -57,21 +57,14 @@ pub fn validate_transport_header_require_keys(
         return false;
     }
 
+    let mut binding = ContextRegisterSetBinding::new(keys.iter().map(String::as_str));
     for entry in suv {
-        let headers = match entry {
-            Some(h) => h,
+        let context = match entry {
+            Some(context) => context,
             None => return false,
         };
         let mut found = vec![false; keys.len()];
-        for header in headers.items() {
-            if let Some(name) = header.stored_name() {
-                for (index, key) in keys.iter().enumerate() {
-                    if !found[index] && name == key {
-                        found[index] = true;
-                    }
-                }
-            }
-        }
+        let _ = binding.visit_present(context, |ordinal, _| found[ordinal] = true);
         if found.iter().any(|found| !found) {
             return false;
         }
@@ -104,28 +97,18 @@ pub fn validate_transport_header_require_key_values(
         return false;
     }
 
+    let mut binding = ContextRegisterSetBinding::new(pairs.iter().map(|pair| pair.key.as_str()));
     for entry in suv {
-        let headers = match entry {
-            Some(h) => h,
+        let context = match entry {
+            Some(context) => context,
             None => return false,
         };
         let mut found = vec![false; pairs.len()];
-        for header in headers.items() {
-            let Some(name) = header.stored_name() else {
-                continue;
-            };
-            let Some(value) = header
-                .value()
-                .and_then(|(_, value)| std::str::from_utf8(value).ok())
-            else {
-                continue;
-            };
-            for (index, pair) in pairs.iter().enumerate() {
-                if !found[index] && name == pair.key && value == pair.value {
-                    found[index] = true;
-                }
-            }
-        }
+        let _ = binding.visit_present(context, |ordinal, register| {
+            found[ordinal] = register.values().any(|(_, value)| {
+                std::str::from_utf8(value).is_ok_and(|value| value == pairs[ordinal].value)
+            });
+        });
         if found.iter().any(|found| !found) {
             return false;
         }
@@ -148,12 +131,9 @@ pub fn validate_transport_header_deny_keys(
         return true;
     }
 
-    for headers in suv.iter().flatten() {
-        if headers.items().any(|header| {
-            header
-                .stored_name()
-                .is_some_and(|name| keys.iter().any(|key| name == key))
-        }) {
+    let mut binding = ContextRegisterSetBinding::new(keys.iter().map(String::as_str));
+    for context in suv.iter().flatten() {
+        if binding.visit_present(context, |_, _| {}) > 0 {
             return false;
         }
     }
@@ -164,24 +144,14 @@ pub fn validate_transport_header_deny_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otel_arrow_dfe_otap::context_bytes::{HeaderInput, HeaderValueKind};
+    use otel_arrow_dfe_otap::testing::{TestContextHeader, test_pdata_context};
 
     fn make_headers(entries: &[(&str, &str)]) -> PdataContextBytes {
-        PdataContextBytes::build(
-            0,
-            entries
-                .iter()
-                .enumerate()
-                .map(|(rule_id, (name, value))| HeaderInput {
-                    wire_name: name,
-                    stored_name: name,
-                    value: value.as_bytes(),
-                    kind: HeaderValueKind::Text,
-                    rule_id: u16::try_from(rule_id).expect("test rule id fits in u16"),
-                    entry: None,
-                }),
-        )
-        .expect("packed context")
+        let headers: Vec<_> = entries
+            .iter()
+            .map(|(name, value)| TestContextHeader::text(name, name, value.as_bytes()))
+            .collect();
+        test_pdata_context(headers)
     }
 
     #[test]
