@@ -219,6 +219,7 @@ mod exporter_harness {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use otel_arrow_dfe_config::context::CompiledContext;
     use otel_arrow_dfe_config::node::NodeUserConfig;
     use otel_arrow_dfe_engine::Interests;
     use otel_arrow_dfe_engine::config::ExporterConfig;
@@ -262,7 +263,16 @@ mod exporter_harness {
         /// Starts the exporter with an explicit `cfg` (its `bootstrap.servers`
         /// must already point at `cluster`). Spawns onto the current `LocalSet`.
         pub(crate) fn start(_cluster: &KafkaTestCluster, cfg: KafkaExporterConfig) -> Self {
-            let pipeline_ctx = test_pipeline_context();
+            Self::start_with_context_compilers(_cluster, cfg, [])
+        }
+
+        /// Starts the exporter with the context compilers used by test pdata.
+        pub(crate) fn start_with_context_compilers(
+            _cluster: &KafkaTestCluster,
+            cfg: KafkaExporterConfig,
+            compilers: impl Into<Arc<[Arc<CompiledContext>]>>,
+        ) -> Self {
+            let pipeline_ctx = test_pipeline_context().with_context_compilers(compilers.into());
             let node_config = Arc::new(NodeUserConfig::new_exporter_config(KAFKA_EXPORTER_URN));
             let exporter_config = ExporterConfig::new("test-kafka-exporter");
             let node_id = test_node(exporter_config.name.clone());

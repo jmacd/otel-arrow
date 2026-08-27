@@ -133,6 +133,12 @@ pub enum KafkaExporterError {
         reason: String,
     },
 
+    /// More than one value was supplied for the dynamic topic register.
+    /// Non-retryable: selecting one by arrival order would make routing
+    /// ambiguous, so the exporter permanently nacks the batch.
+    #[error("multiple values supplied for the Kafka topic transport header")]
+    AmbiguousHeaderTopic,
+
     /// A topic was supplied via a transport header and is a syntactically valid
     /// Kafka topic, but it is not permitted by the signal's operator-configured
     /// dynamic-routing allowlist (exact or regex). Non-retryable: the batch is

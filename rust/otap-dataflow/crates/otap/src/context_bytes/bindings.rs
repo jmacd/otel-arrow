@@ -1,11 +1,17 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 use std::sync::Arc;
 
-use otel_arrow_dfe_config::context::{ContextRegisterId, ContextVersion};
+use otel_arrow_dfe_config::context::{
+    CompiledContext, ContextCompileError, ContextRegisterId, ContextVersion,
+};
 use otel_arrow_dfe_config::transport_headers_policy::CompiledHeaderSchema;
 
 use super::packed::{ContextBytesError, ContextRegister, HeaderValueKind, PdataContextBytes};
 
-pub(super) const SCHEMA_CACHE_CAPACITY: usize = 8;
+// We admit a limited number of compiled schemas at once.
+pub(super) const SCHEMA_CACHE_CAPACITY: usize = 2;
 
 struct SchemaPlanCache<P> {
     entries: Vec<(ContextVersion, P)>,
@@ -32,114 +38,162 @@ impl<P> SchemaPlanCache<P> {
         self.entries.push((version, plan));
         &self.entries.last().expect("inserted schema plan").1
     }
-
-    fn get_or_insert_with(&mut self, version: ContextVersion, build: impl FnOnce() -> P) -> &P {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|(cached, _)| *cached == version)
-        {
-            return &self.entries[index].1;
-        }
-        self.insert(version, build())
-    }
 }
 
-/// Version-linked lookup binding for the first value of one context register.
+/// A configured binding failed to link against a context compiler version.
+#[derive(Debug, thiserror::Error)]
+pub enum ContextBindingError {
+    /// A configured binding has no reachable context compiler to link against.
+    #[error("context binding for {symbols} has no reachable context compiler")]
+    NoReachableContextCompiler {
+        /// Configured symbol or symbol list.
+        symbols: String,
+    },
+    /// A configured register symbol is not declared by this compiler version.
+    #[error("context binding configuration error for compiler version {version}: {source}")]
+    Configuration {
+        /// Version that failed to link.
+        version: ContextVersion,
+        /// Compiler diagnostic identifying the invalid binding.
+        #[source]
+        source: ContextCompileError,
+    },
+    /// Runtime data carried a compiler version omitted from the binding plan.
+    #[error("context binding has no plan for compiler version {version}")]
+    UnlinkedContextVersion {
+        /// Unexpected compiler version.
+        version: ContextVersion,
+    },
+}
+
+fn binding_error(version: ContextVersion, source: ContextCompileError) -> ContextBindingError {
+    ContextBindingError::Configuration { version, source }
+}
+
+/// Version-linked binding for one context register.
 ///
-/// This is a transitional predicate-binding primitive: it resolves the
-/// configured name once per input schema, then evaluates contexts using only
-/// schema indices. The bounded cache is local to the node that owns the
-/// binding, so replacing the binding also replaces its configuration
-/// generation.
-pub struct ContextRegisterValueBinding {
-    symbol: String,
-    cache: SchemaPlanCache<Option<ContextRegisterId>>,
+/// The configured symbol is linked against every reachable compiler before
+/// the node starts. Runtime evaluation performs only a version-plan lookup and
+/// numeric register access.
+pub struct ContextRegisterBinding {
+    plans: Box<[(ContextVersion, ContextRegisterId)]>,
 }
 
-impl ContextRegisterValueBinding {
-    /// Creates a binding for one source-level register symbol.
-    #[must_use]
-    pub fn new(symbol: &str) -> Self {
-        Self {
-            symbol: symbol.to_ascii_lowercase(),
-            cache: SchemaPlanCache::new(),
+impl ContextRegisterBinding {
+    /// Links one source-level register symbol against every reachable compiler.
+    pub fn new(
+        symbol: &str,
+        compilers: &[Arc<CompiledContext>],
+    ) -> Result<Self, ContextBindingError> {
+        let symbol = symbol.to_ascii_lowercase();
+        if compilers.is_empty() {
+            return Err(ContextBindingError::NoReachableContextCompiler { symbols: symbol });
         }
+        let plans = compilers
+            .iter()
+            .map(|compiler| {
+                let version = compiler.register_file().version();
+                compiler
+                    .linker()
+                    .resolve(&symbol)
+                    .map(|register| (version, register))
+                    .map_err(|error| binding_error(version, error))
+            })
+            .collect::<Result<Box<[_]>, _>>()?;
+        Ok(Self { plans })
     }
 
-    /// Returns the first matching value in context arrival order.
-    pub fn value<'a>(
-        &mut self,
+    /// Returns the configured register when it is present in this context.
+    pub fn register<'a>(
+        &self,
         context: &'a PdataContextBytes,
-    ) -> Option<(HeaderValueKind, &'a [u8])> {
+    ) -> Result<Option<ContextRegister<'a>>, ContextBindingError> {
         let version = context
             .schema()
             .compiled_context()
             .register_file()
             .version();
-        let register = *self.cache.get_or_insert_with(version, || {
-            context
-                .schema()
-                .compiled_context()
-                .linker()
-                .resolve(&self.symbol)
-                .ok()
-        });
-        register
-            .and_then(|register| context.register(register))
-            .and_then(|entry| entry.values().next())
+        let register_file = context.schema().compiled_context().register_file();
+        let register = self
+            .plans
+            .iter()
+            .find_map(|(planned_version, register)| {
+                register_file
+                    .is_compatible_with(*planned_version)
+                    .then_some(*register)
+            })
+            .ok_or(ContextBindingError::UnlinkedContextVersion { version })?;
+        Ok(context.register(register))
     }
 }
 
 /// Version-linked binding for an ordered set of context registers.
 ///
-/// Configuration symbols are linked once per compiler version. Evaluation
-/// visits numeric registers in configuration order without name lookup.
+/// Configuration symbols are linked against every reachable compiler before
+/// the node starts. Runtime evaluation visits numeric registers in
+/// configuration order without name lookup or cache mutation.
 pub struct ContextRegisterSetBinding {
-    symbols: Box<[String]>,
-    cache: SchemaPlanCache<Box<[Option<ContextRegisterId>]>>,
+    plans: Box<[(ContextVersion, Box<[ContextRegisterId]>)]>,
 }
 
 impl ContextRegisterSetBinding {
-    /// Creates a binding for an ordered set of register symbols.
-    #[must_use]
-    pub fn new<'a>(symbols: impl IntoIterator<Item = &'a str>) -> Self {
-        Self {
-            symbols: symbols.into_iter().map(str::to_ascii_lowercase).collect(),
-            cache: SchemaPlanCache::new(),
+    /// Links an ordered set of symbols against every reachable compiler.
+    pub fn new<'a>(
+        symbols: impl IntoIterator<Item = &'a str>,
+        compilers: &[Arc<CompiledContext>],
+    ) -> Result<Self, ContextBindingError> {
+        let symbols: Box<[String]> = symbols.into_iter().map(str::to_ascii_lowercase).collect();
+        if compilers.is_empty() && !symbols.is_empty() {
+            return Err(ContextBindingError::NoReachableContextCompiler {
+                symbols: symbols.join(", "),
+            });
         }
+        let plans = compilers
+            .iter()
+            .map(|compiler| {
+                let version = compiler.register_file().version();
+                compiler
+                    .linker()
+                    .resolve_all(symbols.iter().map(String::as_str))
+                    .map(|registers| (version, registers))
+                    .map_err(|error| binding_error(version, error))
+            })
+            .collect::<Result<Box<[_]>, _>>()?;
+        Ok(Self { plans })
     }
 
     /// Visits each configured register that is present in the context.
     ///
     /// Returns the number of entries visited.
     pub fn visit_present(
-        &mut self,
+        &self,
         context: &PdataContextBytes,
         mut visitor: impl FnMut(usize, ContextRegister<'_>),
-    ) -> usize {
+    ) -> Result<usize, ContextBindingError> {
         let version = context
             .schema()
             .compiled_context()
             .register_file()
             .version();
-        let symbols = &self.symbols;
-        let slots = self.cache.get_or_insert_with(version, || {
-            let linker = context.schema().compiled_context().linker();
-            symbols
-                .iter()
-                .map(|symbol| linker.resolve(symbol).ok())
-                .collect()
-        });
+        let register_file = context.schema().compiled_context().register_file();
+        let slots = self
+            .plans
+            .iter()
+            .find_map(|(planned_version, slots)| {
+                register_file
+                    .is_compatible_with(*planned_version)
+                    .then_some(slots.as_ref())
+            })
+            .ok_or(ContextBindingError::UnlinkedContextVersion { version })?;
         let mut visited = 0;
         for (ordinal, register) in slots.iter().copied().enumerate() {
-            let Some(entry) = register.and_then(|register| context.register(register)) else {
+            let Some(entry) = context.register(register) else {
                 continue;
             };
             visitor(ordinal, entry);
             visited += 1;
         }
-        visited
+        Ok(visited)
     }
 }
 

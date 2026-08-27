@@ -37,6 +37,7 @@ use otel_arrow_dfe_config::MetricLevel;
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_config::{
     PipelineGroupId, PipelineId, PortName,
+    context::{CompiledContext, ContextVersion},
     engine::INTERNAL_TELEMETRY_RECEIVER_URN,
     node::NodeUserConfig,
     pipeline::{DispatchPolicy, PipelineConfig},
@@ -44,7 +45,8 @@ use otel_arrow_dfe_config::{
         ChannelCapacityPolicy, RateLimiterDeclarationScope, RateLimiterPolicy, TelemetryPolicy,
     },
     transport_headers_policy::{
-        HeaderCapturePolicy, HeaderPropagationPolicy, TransportHeadersPolicy,
+        CompiledHeaderCapturePolicy, HeaderCapturePolicy, HeaderPropagationPolicy,
+        TransportHeadersPolicy,
     },
 };
 use otel_arrow_dfe_telemetry::InternalTelemetrySettings;
@@ -947,6 +949,14 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                 && resolve_propagation_policy(node_config, &transport_headers_policy)
                     .is_some_and(|policy| policy.requires_observed_name_provenance())
         });
+        let compiled_capture_policies = compile_capture_policies(
+            &config,
+            &transport_headers_policy,
+            pipeline_ctx.deployment_generation(),
+            retain_observed_header_names,
+        )?;
+        let context_compilers_by_node =
+            reachable_context_compilers(&config, &compiled_capture_policies);
         let empty_capabilities = capability::registry::Capabilities::empty();
         let mut admission_bound_nodes = Vec::new();
         let mut admission_explicitly_opted_out_nodes = Vec::new();
@@ -958,6 +968,12 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                 node_config.r#type.clone(),
                 node_kind,
                 node_config.identity_attributes(),
+            );
+            base_ctx.set_context_compilers(
+                context_compilers_by_node
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::from([])),
             );
             let invalid_binding = |error: String| {
                 Error::ConfigError(Box::new(
@@ -1010,8 +1026,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                                 node_config.clone(),
                                 channel_capacity_policy.control.node,
                                 channel_capacity_policy.pdata,
-                                &transport_headers_policy,
-                                retain_observed_header_names,
+                                compiled_capture_policies.get(name).cloned(),
                                 node_capabilities,
                             )
                         },
@@ -1892,8 +1907,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         node_config: Arc<NodeUserConfig>,
         control_channel_capacity: usize,
         pdata_channel_capacity: usize,
-        transport_headers_policy: &Option<TransportHeadersPolicy>,
-        retain_observed_header_names: bool,
+        capture_policy: Option<CompiledHeaderCapturePolicy>,
         capabilities: &capability::registry::Capabilities,
     ) -> Result<ReceiverWrapper<PData>, Error> {
         let pipeline_group_id = pipeline_ctx.pipeline_group_id();
@@ -1928,24 +1942,6 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             pdata_channel_capacity,
         );
         let create = factory.create;
-
-        let capture_policy = resolve_capture_policy(&node_config, transport_headers_policy)
-            .map(|policy| {
-                policy.compile_for_generation_with_provenance(
-                    pipeline_ctx.deployment_generation(),
-                    retain_observed_header_names,
-                )
-            })
-            .transpose()
-            .map_err(|error| {
-                Error::ConfigError(Box::new(
-                    otel_arrow_dfe_config::error::Error::InvalidUserConfig {
-                        error: format!(
-                            "receiver `{name}` has an invalid header capture policy: {error}"
-                        ),
-                    },
-                ))
-            })?;
 
         let receiver = create(
             (*pipeline_ctx).clone(),
@@ -2140,6 +2136,100 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
 
         Ok(exporter)
     }
+}
+
+fn compile_capture_policies(
+    config: &PipelineConfig,
+    transport_headers_policy: &Option<TransportHeadersPolicy>,
+    deployment_generation: u64,
+    retain_observed_names: bool,
+) -> Result<HashMap<NodeName, CompiledHeaderCapturePolicy>, Error> {
+    config
+        .node_iter()
+        .filter(|(_, node_config)| {
+            node_config.kind() == otel_arrow_dfe_config::node::NodeKind::Receiver
+        })
+        .filter_map(|(name, node_config)| {
+            resolve_capture_policy(node_config, transport_headers_policy)
+                .map(|policy| (name.clone(), policy))
+        })
+        .map(|(name, policy)| {
+            policy
+                .compile_for_generation_with_provenance(
+                    deployment_generation,
+                    retain_observed_names,
+                )
+                .map(|policy| (name.clone(), policy))
+                .map_err(|error| {
+                    Error::ConfigError(Box::new(
+                        otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                            error: format!(
+                                "receiver `{name}` has an invalid header capture policy: {error}"
+                            ),
+                        },
+                    ))
+                })
+        })
+        .collect()
+}
+
+fn reachable_context_compilers(
+    config: &PipelineConfig,
+    capture_policies: &HashMap<NodeName, CompiledHeaderCapturePolicy>,
+) -> HashMap<NodeName, Arc<[Arc<CompiledContext>]>> {
+    let all_compilers = || {
+        capture_policies
+            .values()
+            .map(|policy| Arc::clone(policy.schema().compiled_context()))
+            .collect::<Arc<[_]>>()
+    };
+    if !config.has_connections() {
+        let compilers = all_compilers();
+        return config
+            .node_iter()
+            .map(|(name, _)| (name.clone(), Arc::clone(&compilers)))
+            .collect();
+    }
+
+    let mut predecessors: HashMap<NodeName, Vec<NodeName>> = HashMap::new();
+    for connection in config.connection_iter() {
+        let sources: Vec<NodeName> = connection
+            .from_sources()
+            .into_iter()
+            .map(|source| source.node_id().as_ref().to_string().into())
+            .collect();
+        for destination in connection.to_nodes() {
+            predecessors
+                .entry(destination.as_ref().to_string().into())
+                .or_default()
+                .extend(sources.iter().cloned());
+        }
+    }
+
+    config
+        .node_iter()
+        .map(|(name, _)| {
+            let mut stack = vec![name.clone()];
+            let mut visited = HashSet::new();
+            let mut versions = HashSet::<ContextVersion>::new();
+            let mut compilers = Vec::new();
+            while let Some(current) = stack.pop() {
+                if !visited.insert(current.clone()) {
+                    continue;
+                }
+                if let Some(policy) = capture_policies.get(&current) {
+                    let compiler = policy.schema().compiled_context();
+                    if versions.insert(compiler.register_file().version()) {
+                        compilers.push(Arc::clone(compiler));
+                    }
+                }
+                if let Some(upstream) = predecessors.get(&current) {
+                    stack.extend(upstream.iter().cloned());
+                }
+            }
+            (name.clone(), compilers.into())
+        })
+        .collect()
 }
 
 /// Resolves the effective capture policy for a receiver node.
@@ -2688,6 +2778,7 @@ fn stable_hash64(value: &str) -> u64 {
 #[cfg(test)]
 mod test {
     use super::*;
+    use otel_arrow_dfe_config::pipeline::{PipelineConfigBuilder, PipelineType};
     use otel_arrow_dfe_config::policy::{
         RateLimitAggregation, RateLimitEnforcement, RateLimitPressure, RateLimitUnit,
         TokenBucketPolicy,
@@ -2697,6 +2788,51 @@ mod test {
         PropagationAction, PropagationDefault, PropagationSelector, PropagationSelectorType,
     };
     use std::time::Duration;
+
+    /// Scenario: two receivers feed disjoint downstream branches.
+    /// Guarantees: each node receives only the context compiler versions that
+    /// can reach it through configured pipeline connections.
+    #[test]
+    fn context_compilers_follow_pipeline_reachability() {
+        let config = PipelineConfigBuilder::new()
+            .add_receiver("left", "urn:otel:receiver:left", None)
+            .add_receiver("right", "urn:otel:receiver:right", None)
+            .add_exporter("left_sink", "urn:otel:exporter:left", None)
+            .add_exporter("right_sink", "urn:otel:exporter:right", None)
+            .broadcast("left", ["left_sink"])
+            .broadcast("right", ["right_sink"])
+            .build(PipelineType::Otap, "group", "pipeline")
+            .expect("pipeline config");
+        let compile = |name: &str| {
+            HeaderCapturePolicy::new(
+                CaptureDefaults::default(),
+                vec![CaptureRule {
+                    match_names: vec![name.to_string()],
+                    store_as: None,
+                    sensitive: false,
+                    value_kind: None,
+                }],
+            )
+            .compile()
+            .expect("capture policy")
+        };
+        let left = compile("x-left");
+        let left_version = left.schema().compiled_context().register_file().version();
+        let right = compile("x-right");
+        let right_version = right.schema().compiled_context().register_file().version();
+        let policies = HashMap::from([("left".into(), left), ("right".into(), right)]);
+
+        let reachable = reachable_context_compilers(&config, &policies);
+        let versions = |node: &str| {
+            reachable[node]
+                .iter()
+                .map(|compiler| compiler.register_file().version())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(versions("left_sink"), [left_version]);
+        assert_eq!(versions("right_sink"), [right_version]);
+    }
 
     fn admission_policy(unit: RateLimitUnit) -> RateLimiterPolicy {
         RateLimiterPolicy {

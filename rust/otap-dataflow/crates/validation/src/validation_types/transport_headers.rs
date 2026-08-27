@@ -13,7 +13,10 @@
 //! For **deny** checks, `None` entries are acceptable -- a signal without
 //! headers cannot contain a forbidden key.
 
-use otel_arrow_dfe_otap::context_bytes::{ContextRegisterSetBinding, PdataContextBytes};
+use otel_arrow_dfe_otap::context_bytes::{
+    ContextBindingError, ContextRegisterSetBinding, PdataContextBytes,
+};
+use otel_arrow_dfe_telemetry::otel_error;
 use serde::{Deserialize, Serialize};
 
 /// A key/value pair for transport header assertions.
@@ -36,6 +39,14 @@ impl TransportHeaderKeyValue {
     }
 }
 
+fn reject_binding_error(error: &ContextBindingError) -> bool {
+    otel_error!(
+        "validation.transport_header.binding_configuration_error",
+        error = %error
+    );
+    false
+}
+
 /// Validate that **every** SUV message has transport headers and that each
 /// set of headers contains all specified keys.
 ///
@@ -49,6 +60,7 @@ impl TransportHeaderKeyValue {
 pub fn validate_transport_header_require_keys(
     suv: &[Option<PdataContextBytes>],
     keys: &[String],
+    binding: &ContextRegisterSetBinding,
 ) -> bool {
     if keys.is_empty() {
         return true;
@@ -57,14 +69,15 @@ pub fn validate_transport_header_require_keys(
         return false;
     }
 
-    let mut binding = ContextRegisterSetBinding::new(keys.iter().map(String::as_str));
     for entry in suv {
         let context = match entry {
             Some(context) => context,
             None => return false,
         };
         let mut found = vec![false; keys.len()];
-        let _ = binding.visit_present(context, |ordinal, _| found[ordinal] = true);
+        if let Err(error) = binding.visit_present(context, |ordinal, _| found[ordinal] = true) {
+            return reject_binding_error(&error);
+        }
         if found.iter().any(|found| !found) {
             return false;
         }
@@ -89,6 +102,7 @@ pub fn validate_transport_header_require_keys(
 pub fn validate_transport_header_require_key_values(
     suv: &[Option<PdataContextBytes>],
     pairs: &[TransportHeaderKeyValue],
+    binding: &ContextRegisterSetBinding,
 ) -> bool {
     if pairs.is_empty() {
         return true;
@@ -97,18 +111,19 @@ pub fn validate_transport_header_require_key_values(
         return false;
     }
 
-    let mut binding = ContextRegisterSetBinding::new(pairs.iter().map(|pair| pair.key.as_str()));
     for entry in suv {
         let context = match entry {
             Some(context) => context,
             None => return false,
         };
         let mut found = vec![false; pairs.len()];
-        let _ = binding.visit_present(context, |ordinal, register| {
+        if let Err(error) = binding.visit_present(context, |ordinal, register| {
             found[ordinal] = register.values().any(|(_, value)| {
                 std::str::from_utf8(value).is_ok_and(|value| value == pairs[ordinal].value)
             });
-        });
+        }) {
+            return reject_binding_error(&error);
+        }
         if found.iter().any(|found| !found) {
             return false;
         }
@@ -131,9 +146,12 @@ pub fn validate_transport_header_deny_keys(
         return true;
     }
 
-    let mut binding = ContextRegisterSetBinding::new(keys.iter().map(String::as_str));
     for context in suv.iter().flatten() {
-        if binding.visit_present(context, |_, _| {}) > 0 {
+        if context.items().any(|item| {
+            item.stored_name().is_some_and(|stored_name| {
+                keys.iter().any(|key| stored_name.eq_ignore_ascii_case(key))
+            })
+        }) {
             return false;
         }
     }
@@ -144,7 +162,49 @@ pub fn validate_transport_header_deny_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otel_arrow_dfe_config::context::{CompiledContext, ContextVersion};
     use otel_arrow_dfe_otap::testing::{TestContextHeader, test_pdata_context};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn compilers(suv: &[Option<PdataContextBytes>]) -> Vec<Arc<CompiledContext>> {
+        let mut versions = HashSet::<ContextVersion>::new();
+        suv.iter()
+            .flatten()
+            .filter_map(|context| {
+                let compiler = context.schema().compiled_context();
+                versions
+                    .insert(compiler.register_file().version())
+                    .then(|| Arc::clone(compiler))
+            })
+            .collect()
+    }
+
+    fn validate_transport_header_require_keys(
+        suv: &[Option<PdataContextBytes>],
+        keys: &[String],
+    ) -> bool {
+        let compilers = compilers(suv);
+        let Ok(binding) =
+            ContextRegisterSetBinding::new(keys.iter().map(String::as_str), &compilers)
+        else {
+            return false;
+        };
+        super::validate_transport_header_require_keys(suv, keys, &binding)
+    }
+
+    fn validate_transport_header_require_key_values(
+        suv: &[Option<PdataContextBytes>],
+        pairs: &[TransportHeaderKeyValue],
+    ) -> bool {
+        let compilers = compilers(suv);
+        let Ok(binding) =
+            ContextRegisterSetBinding::new(pairs.iter().map(|pair| pair.key.as_str()), &compilers)
+        else {
+            return false;
+        };
+        super::validate_transport_header_require_key_values(suv, pairs, &binding)
+    }
 
     fn make_headers(entries: &[(&str, &str)]) -> PdataContextBytes {
         let headers: Vec<_> = entries
@@ -213,6 +273,8 @@ mod tests {
         ));
     }
 
+    /// Scenario: a denied key is absent from the context compiler version.
+    /// Guarantees: the negative assertion passes because no runtime item can use that key.
     #[test]
     fn deny_keys_passes_when_key_absent() {
         let headers = make_headers(&[("x-tenant-id", "acme")]);
@@ -299,6 +361,8 @@ mod tests {
         ));
     }
 
+    /// Scenario: a mixed SUV stream has no item matching a denied key.
+    /// Guarantees: messages without headers and schemas without the key both satisfy the assertion.
     #[test]
     fn deny_keys_passes_when_mixed_some_and_none() {
         let headers = make_headers(&[("x-tenant-id", "acme")]);

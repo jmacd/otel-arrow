@@ -21,7 +21,7 @@ use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
-use otel_arrow_dfe_otap::context_bytes::PdataContextBytes;
+use otel_arrow_dfe_otap::context_bytes::{ContextRegisterSetBinding, PdataContextBytes};
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::TryFromWithOptions;
 use otel_arrow_dfe_pdata::otlp::OtlpProtoBytes;
@@ -85,6 +85,7 @@ pub struct ValidationExporter {
     suv_index: usize,
     control_indices: HashSet<usize>,
     validations: Vec<ValidationInstructions>,
+    context_bindings: Vec<Option<ContextRegisterSetBinding>>,
     control_msgs: Vec<OtlpProtoMessage>,
     suv_msgs: Vec<(OtlpProtoMessage, Duration)>,
     /// Transport headers extracted from each SUV message's pipeline context.
@@ -131,12 +132,13 @@ impl ValidationExporter {
             self.suv_msgs.iter().map(|(msg, _)| msg.clone()).collect();
 
         let mut valid = true;
-        for instruction in &self.validations {
-            valid &= instruction.validate(
+        for (instruction, context_binding) in self.validations.iter().zip(&self.context_bindings) {
+            valid &= instruction.validate_with_context_binding(
                 &self.control_msgs,
                 &suv_msgs,
                 &self.suv_msgs,
                 &self.suv_transport_headers,
+                context_binding.as_ref(),
             );
         }
 
@@ -175,10 +177,22 @@ impl ValidationExporter {
                     })?;
             let _ = control_indices.insert(ctrl_node.index);
         }
+        let context_bindings = config
+            .validations
+            .iter()
+            .map(|instruction| {
+                instruction
+                    .compile_context_binding(pipeline_ctx.context_compilers())
+                    .map_err(|error| ConfigError::InvalidUserConfig {
+                        error: error.to_string(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             suv_index: suv_node.index,
             control_indices,
             validations: config.validations,
+            context_bindings,
             metrics,
             control_msgs: Vec::new(),
             suv_msgs: Vec::new(),

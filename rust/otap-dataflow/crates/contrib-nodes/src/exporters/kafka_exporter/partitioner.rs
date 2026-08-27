@@ -9,9 +9,11 @@
 //!
 //! [`PartitionerStrategy`]: super::config::PartitionerStrategy
 
-use otel_arrow_dfe_otap::context_bytes::ContextRegisterSetBinding;
+use otel_arrow_dfe_config::context::CompiledContext;
+use otel_arrow_dfe_otap::context_bytes::{ContextBindingError, ContextRegisterSetBinding};
 use otel_arrow_dfe_otap::pdata::Context;
 use std::hash::Hasher;
+use std::sync::Arc;
 use xxhash_rust::xxh64::Xxh64;
 
 fn hash_bytes(hasher: &mut Xxh64, bytes: &[u8]) {
@@ -26,16 +28,24 @@ pub struct ContextPartitionKeyBinding {
 
 impl ContextPartitionKeyBinding {
     /// Creates a binding from context-register symbols in configuration order.
-    #[must_use]
-    pub fn new<'a>(registers: impl IntoIterator<Item = &'a str>) -> Self {
-        Self {
-            registers: ContextRegisterSetBinding::new(registers),
-        }
+    pub fn new<'a>(
+        registers: impl IntoIterator<Item = &'a str>,
+        compilers: &[Arc<CompiledContext>],
+    ) -> Result<Self, ContextBindingError> {
+        Ok(Self {
+            registers: ContextRegisterSetBinding::new(registers, compilers)?,
+        })
     }
 
     /// Builds a deterministic key from configured entries present in `context`.
-    pub fn partition_key(&mut self, context: &Context) -> Option<String> {
-        let context = context.pdata_context_bytes()?;
+    ///
+    /// Linked registers absent from this message produce no key. A register
+    /// that does not link against this compiler version returns a configuration
+    /// error.
+    pub fn partition_key(&self, context: &Context) -> Result<Option<String>, ContextBindingError> {
+        let Some(context) = context.pdata_context_bytes() else {
+            return Ok(None);
+        };
         let mut hasher = Xxh64::new(0);
         let visited = self.registers.visit_present(context, |ordinal, register| {
             hasher.write(&(ordinal as u64).to_be_bytes());
@@ -43,8 +53,8 @@ impl ContextPartitionKeyBinding {
                 hasher.write(&[kind as u8]);
                 hash_bytes(&mut hasher, value);
             }
-        });
-        (visited > 0).then(|| hex::encode(hasher.finish().to_be_bytes()))
+        })?;
+        Ok((visited > 0).then(|| hex::encode(hasher.finish().to_be_bytes())))
     }
 }
 
@@ -62,21 +72,39 @@ mod tests {
     use otel_arrow_dfe_otap::pdata::Context;
     use otel_arrow_dfe_otap::testing::{TestContextHeader, test_pdata_context};
 
+    fn compiler_for(symbol: &str) -> Arc<CompiledContext> {
+        test_pdata_context([TestContextHeader::text("X-Test", symbol, b"value")])
+            .schema()
+            .compiled_context()
+            .clone()
+    }
+
     fn partition_key(
         entries: &[&str],
         context: otel_arrow_dfe_otap::context_bytes::PdataContextBytes,
     ) -> Option<String> {
+        let compilers = [context.schema().compiled_context().clone()];
         let mut pdata_context = Context::default();
         pdata_context.set_pdata_context_bytes(context);
-        ContextPartitionKeyBinding::new(entries.iter().copied()).partition_key(&pdata_context)
+        ContextPartitionKeyBinding::new(entries.iter().copied(), &compilers)
+            .expect("linked context binding")
+            .partition_key(&pdata_context)
+            .expect("context binding")
     }
 
     /// Scenario: the pdata context is absent from the Context.
     /// Guarantees: no Kafka partition key is generated when there is no context.
     #[test]
     fn empty_context_returns_none() {
-        let mut binding = ContextPartitionKeyBinding::new(["tenant"]);
-        assert!(binding.partition_key(&Context::default()).is_none());
+        let compilers = [compiler_for("tenant")];
+        let binding =
+            ContextPartitionKeyBinding::new(["tenant"], &compilers).expect("linked binding");
+        assert!(
+            binding
+                .partition_key(&Context::default())
+                .expect("context binding")
+                .is_none()
+        );
     }
 
     /// Scenario: the same packed header set is hashed repeatedly.
@@ -171,8 +199,15 @@ mod tests {
     /// Guarantees: Kafka receives a null key when none of the configured entries are present.
     #[test]
     fn enabled_signal_without_context_returns_none() {
-        let mut binding = ContextPartitionKeyBinding::new(["x_tenant_id"]);
-        assert!(binding.partition_key(&Context::default()).is_none());
+        let compilers = [compiler_for("x_tenant_id")];
+        let binding =
+            ContextPartitionKeyBinding::new(["x_tenant_id"], &compilers).expect("linked binding");
+        assert!(
+            binding
+                .partition_key(&Context::default())
+                .expect("context binding")
+                .is_none()
+        );
     }
 
     /// Scenario: a configured context entry is present in a packed context.
@@ -185,11 +220,30 @@ mod tests {
             b"tenant-123",
         )]);
         let expected = partition_key(&["x_tenant_id"], packed.clone());
+        let compilers = [packed.schema().compiled_context().clone()];
         let mut context = Context::default();
         context.set_pdata_context_bytes(packed);
-        let mut binding = ContextPartitionKeyBinding::new(["x_tenant_id"]);
+        let binding = ContextPartitionKeyBinding::new(["x_tenant_id"], &compilers)
+            .expect("linked context binding");
 
-        assert_eq!(binding.partition_key(&context), expected);
+        assert_eq!(
+            binding.partition_key(&context).expect("context binding"),
+            expected
+        );
+    }
+
+    /// Scenario: a configured partition register is absent from the compiler version.
+    /// Guarantees: partitioning reports a configuration error instead of emitting a null key.
+    #[test]
+    fn partition_key_rejects_unlinked_register() {
+        let packed = test_pdata_context([TestContextHeader::text("X-Other", "other", b"value")]);
+        let compilers = [packed.schema().compiled_context().clone()];
+        let error = match ContextPartitionKeyBinding::new(["tenant"], &compilers) {
+            Err(error) => error,
+            Ok(_) => panic!("unlinked partition register must fail"),
+        };
+
+        assert!(matches!(error, ContextBindingError::Configuration { .. }));
     }
 
     /// Scenario: sensitive header names and values are used for partitioning.

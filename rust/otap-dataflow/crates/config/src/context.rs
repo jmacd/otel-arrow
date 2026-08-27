@@ -88,6 +88,7 @@ impl ContextRegisterId {
 pub struct ContextRegisterFile {
     version: ContextVersion,
     register_count: usize,
+    compatible_predecessors: Box<[ContextVersion]>,
 }
 
 impl ContextRegisterFile {
@@ -107,6 +108,15 @@ impl ContextRegisterFile {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.register_count == 0
+    }
+
+    /// Returns whether register IDs compiled for `version` remain valid here.
+    ///
+    /// Derived register files only append declarations, so every inherited
+    /// register retains its numeric ID.
+    #[must_use]
+    pub fn is_compatible_with(&self, version: ContextVersion) -> bool {
+        self.version == version || self.compatible_predecessors.contains(&version)
     }
 }
 
@@ -185,6 +195,7 @@ pub struct ContextCompiler {
     version: ContextVersion,
     symbols: AHashMap<Box<str>, ContextRegisterId>,
     register_symbols: Vec<Box<str>>,
+    compatible_predecessors: Vec<ContextVersion>,
 }
 
 impl ContextCompiler {
@@ -195,6 +206,7 @@ impl ContextCompiler {
             version: ContextVersion::next(deployment_generation),
             symbols: AHashMap::new(),
             register_symbols: Vec::new(),
+            compatible_predecessors: Vec::new(),
         }
     }
 
@@ -205,10 +217,14 @@ impl ContextCompiler {
     #[must_use]
     pub fn derive(compiled: &CompiledContext) -> Self {
         let linker = compiled.linker();
+        let register_file = linker.register_file();
+        let mut compatible_predecessors = register_file.compatible_predecessors.to_vec();
+        compatible_predecessors.push(register_file.version());
         Self {
-            version: ContextVersion::next(linker.register_file().version().deployment_generation()),
+            version: ContextVersion::next(register_file.version().deployment_generation()),
             symbols: linker.symbols.clone(),
             register_symbols: linker.register_symbols.to_vec(),
+            compatible_predecessors,
         }
     }
 
@@ -246,6 +262,7 @@ impl ContextCompiler {
         let register_file = Arc::new(ContextRegisterFile {
             version: self.version,
             register_count,
+            compatible_predecessors: self.compatible_predecessors.into_boxed_slice(),
         });
         Arc::new(CompiledContext {
             linker: Arc::new(ContextLinker {

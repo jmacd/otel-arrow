@@ -8,11 +8,13 @@
 //! 1. **Transport header** (`topic_from_transport_header` on the per-signal config):
 //!    If configured for the signal type and the header is present in the pdata
 //!    context, its value becomes the topic for the batch. If the header is
-//!    present but its value is an invalid Kafka topic, routing fails with
-//!    [`KafkaExporterError::InvalidHeaderTopic`] and the batch is permanently
-//!    nacked -- it does **not** fall back to the static topic.
+//!    present more than once or its value is an invalid Kafka topic, routing
+//!    fails and the batch is permanently nacked -- it does **not** select by
+//!    arrival order or fall back to the static topic.
 //! 2. **Static fallback**: The per-signal `topic` from config, used only when
 //!    the configured header is absent (or no header key is configured).
+//!    A configured register absent from the context compiler version is a
+//!    configuration error, not an absent header, and does not fall back.
 //!
 //! Each signal type can use a different transport header key (or none), allowing
 //! independent dynamic routing per signal.
@@ -39,7 +41,9 @@ use super::error::KafkaExporterError;
 use super::metrics::{KafkaExporterMetrics, KafkaTopicSource};
 use crate::common::kafka::validate_kafka_topic;
 use otel_arrow_dfe_config::SignalType;
-use otel_arrow_dfe_otap::context_bytes::ContextRegisterValueBinding;
+#[cfg(test)]
+use otel_arrow_dfe_otap::context_bytes::ContextBindingError;
+use otel_arrow_dfe_otap::context_bytes::ContextRegisterBinding;
 use otel_arrow_dfe_otap::pdata::Context;
 use regex::Regex;
 use std::borrow::Cow;
@@ -63,11 +67,10 @@ impl TopicRouter {
     /// from `signal_config`) or `Ok(Cow::Owned)` on the header path (one
     /// allocation for the extracted header value).
     ///
-    /// If a topic is supplied via a transport header but is invalid, this
-    /// returns [`KafkaExporterError::InvalidHeaderTopic`] instead of falling
+    /// If a topic register has multiple values, or its sole value is invalid,
+    /// this returns an error instead of selecting by arrival order or falling
     /// back to the static topic. The caller is expected to permanently nack the
-    /// batch, since rerouting an explicitly-requested-but-invalid topic to the
-    /// static topic could silently misdeliver tenant data.
+    /// batch, since guessing could silently misdeliver tenant data.
     ///
     /// If a syntactically valid header topic is not permitted by the signal's
     /// operator-configured allowlist ([`SignalConfig::allowed_topics`] exact
@@ -93,34 +96,59 @@ impl TopicRouter {
         signal: SignalType,
         metrics: &mut KafkaExporterMetrics,
     ) -> Result<Cow<'a, str>, KafkaExporterError> {
-        Self::resolve_value(
-            signal_config,
-            allowed_regex,
-            Self::header_topic_value(signal_config, context),
-            signal,
-            metrics,
-        )
+        let value = Self::header_topic_value(signal_config, context)?;
+        Self::resolve_value(signal_config, allowed_regex, value, signal, metrics)
     }
 
     /// Resolves the destination topic using a schema-compiled context binding.
+    ///
+    /// A linked register absent from this message uses the static topic. A
+    /// register that does not link against this compiler version returns a
+    /// configuration error.
     pub fn resolve_bound<'a>(
         signal_config: &'a SignalConfig,
         allowed_regex: Option<&[Regex]>,
-        binding: Option<&mut ContextRegisterValueBinding>,
+        binding: Option<&ContextRegisterBinding>,
         context: &Context,
         signal: SignalType,
         metrics: &mut KafkaExporterMetrics,
     ) -> Result<Cow<'a, str>, KafkaExporterError> {
-        let value = signal_config
-            .topic_from_transport_header()
-            .and(binding)
-            .and_then(|binding| {
-                context
+        let value = match signal_config.topic_from_transport_header() {
+            Some(symbol) => {
+                let binding = binding.ok_or_else(|| {
+                    KafkaExporterError::Configuration(format!(
+                        "context binding for register '{symbol}' was not compiled"
+                    ))
+                })?;
+                let register = context
                     .pdata_context_bytes()
-                    .and_then(|context| binding.value(context))
-            })
-            .map(|(_, value)| value);
+                    .map(|context| {
+                        binding
+                            .register(context)
+                            .map_err(|error| KafkaExporterError::Configuration(error.to_string()))
+                    })
+                    .transpose()?
+                    .flatten();
+                match register {
+                    Some(register) => {
+                        Self::require_single_value(register.values().map(|(_, value)| value))?
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
         Self::resolve_value(signal_config, allowed_regex, value, signal, metrics)
+    }
+
+    fn require_single_value<'a>(
+        mut values: impl Iterator<Item = &'a [u8]>,
+    ) -> Result<Option<&'a [u8]>, KafkaExporterError> {
+        let first = values.next();
+        if values.next().is_some() {
+            return Err(KafkaExporterError::AmbiguousHeaderTopic);
+        }
+        Ok(first)
     }
 
     fn resolve_value<'a>(
@@ -189,27 +217,28 @@ impl TopicRouter {
         allowed_regex.is_some_and(|patterns| patterns.iter().any(|re| re.is_match(topic)))
     }
 
-    /// Returns the transport header whose name matches this signal's configured
-    /// topic-routing key, or `None` if routing-by-header is not configured for
-    /// the signal or no matching header is present. The first matching header
-    /// wins.
+    /// Returns the sole transport header matching this signal's configured
+    /// topic-routing key, or `None` if routing-by-header is not configured or
+    /// no matching header is present.
     #[cfg(test)]
     fn header_topic_value<'a>(
         signal_config: &SignalConfig,
         context: &'a Context,
-    ) -> Option<&'a [u8]> {
+    ) -> Result<Option<&'a [u8]>, KafkaExporterError> {
         // `topic_from_transport_header` is pre-normalized (lowercased) in
         // `KafkaExporterConfig::try_from`, matching how transport headers store
         // their logical names, so a plain equality check is sufficient here.
-        let header_key = signal_config.topic_from_transport_header()?;
+        let Some(header_key) = signal_config.topic_from_transport_header() else {
+            return Ok(None);
+        };
         if let Some(context_bytes) = context.pdata_context_bytes() {
-            return context_bytes.items().find_map(|item| {
+            return Self::require_single_value(context_bytes.items().filter_map(|item| {
                 (item.stored_name()? == header_key)
                     .then(|| item.value().map(|(_, value)| value))
                     .flatten()
-            });
+            }));
         }
-        None
+        Ok(None)
     }
 }
 
@@ -275,12 +304,19 @@ mod tests {
         let mut metrics = KafkaExporterMetrics::register(
             &crate::exporters::kafka_exporter::exporter::test_support::pipeline_context(),
         );
-        let mut binding = ContextRegisterValueBinding::new("x-target-topic");
+        let compilers = [ctx
+            .pdata_context_bytes()
+            .expect("pdata context")
+            .schema()
+            .compiled_context()
+            .clone()];
+        let binding =
+            ContextRegisterBinding::new("x-target-topic", &compilers).expect("linked binding");
 
         let topic = TopicRouter::resolve_bound(
             &config,
             None,
-            Some(&mut binding),
+            Some(&binding),
             &ctx,
             SignalType::Logs,
             &mut metrics,
@@ -296,6 +332,68 @@ mod tests {
             routing_count(&metrics, SignalType::Logs, KafkaTopicSource::StaticConfig),
             0
         );
+    }
+
+    /// Scenario: two captured headers populate the configured topic register.
+    /// Guarantees: routing rejects the ambiguity instead of selecting by arrival order.
+    #[test]
+    fn resolve_bound_rejects_multiple_topic_values() {
+        let config = make_signal_config("fallback-logs", Some("x-target-topic"));
+        let mut ctx = Context::default();
+        ctx.set_pdata_context_bytes(test_pdata_context([
+            TestContextHeader::text("X-Topic-A", "x-target-topic", b"tenant-a-logs"),
+            TestContextHeader::text("X-Topic-B", "x-target-topic", b"tenant-b-logs"),
+        ]));
+        let mut metrics = KafkaExporterMetrics::register(
+            &crate::exporters::kafka_exporter::exporter::test_support::pipeline_context(),
+        );
+        let compilers = [ctx
+            .pdata_context_bytes()
+            .expect("pdata context")
+            .schema()
+            .compiled_context()
+            .clone()];
+        let binding =
+            ContextRegisterBinding::new("x-target-topic", &compilers).expect("linked binding");
+
+        let error = TopicRouter::resolve_bound(
+            &config,
+            None,
+            Some(&binding),
+            &ctx,
+            SignalType::Logs,
+            &mut metrics,
+        )
+        .expect_err("ambiguous topic register must fail routing");
+
+        assert!(matches!(error, KafkaExporterError::AmbiguousHeaderTopic));
+        assert_eq!(
+            routing_count(&metrics, SignalType::Logs, KafkaTopicSource::Header),
+            0
+        );
+        assert_eq!(
+            routing_count(&metrics, SignalType::Logs, KafkaTopicSource::StaticConfig),
+            0
+        );
+    }
+
+    /// Scenario: a configured topic register is absent from the context compiler version.
+    /// Guarantees: routing reports a configuration error instead of using the static topic.
+    #[test]
+    fn resolve_bound_rejects_unlinked_topic_register() {
+        let ctx = context_with_headers(vec![make_transport_header("x-other", "value")]);
+        let compilers = [ctx
+            .pdata_context_bytes()
+            .expect("pdata context")
+            .schema()
+            .compiled_context()
+            .clone()];
+        let error = match ContextRegisterBinding::new("x-target-topic", &compilers) {
+            Err(error) => error,
+            Ok(_) => panic!("unlinked topic register must fail configuration"),
+        };
+
+        assert!(matches!(error, ContextBindingError::Configuration { .. }));
     }
 
     /// Scenario: the dynamic Kafka topic is carried only by the packed

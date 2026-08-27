@@ -72,7 +72,8 @@ mod bindings;
 mod packed;
 
 pub use bindings::{
-    ContextRegisterSetBinding, ContextRegisterValueBinding, ContextScalarProjectionBinding,
+    ContextBindingError, ContextRegisterBinding, ContextRegisterSetBinding,
+    ContextScalarProjectionBinding,
 };
 pub use packed::{
     ContextBytesError, ContextItem, ContextItems, ContextPropagation, ContextRegister,

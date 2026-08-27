@@ -1,6 +1,9 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 use super::super::bindings::{
-    ContextRegisterSetBinding, ContextRegisterValueBinding, ContextScalarProjectionBinding,
-    SCHEMA_CACHE_CAPACITY,
+    ContextBindingError, ContextRegisterBinding, ContextRegisterSetBinding,
+    ContextScalarProjectionBinding, SCHEMA_CACHE_CAPACITY,
 };
 use super::*;
 use otel_arrow_dfe_config::transport_headers_policy::NameStrategy;
@@ -470,10 +473,10 @@ fn propagation_uses_explicit_compiled_output_name() {
     assert_eq!(propagated[0].value, b"acme");
 }
 
-/// Scenario: a value binding evaluates contexts sharing and changing schemas.
-/// Guarantees: lookup preserves first-value order without runtime name matching.
+/// Scenario: a register binding evaluates contexts sharing and changing schemas.
+/// Guarantees: lookup preserves every register value without imposing cardinality policy.
 #[test]
-fn context_value_binding_resolves_schema_indices() {
+fn context_register_binding_resolves_schema_indices() {
     let policy = HeaderCapturePolicy::new(
         CaptureDefaults::default(),
         vec![
@@ -513,16 +516,148 @@ fn context_value_binding_resolves_schema_indices() {
         .expect("capture")
         .0
         .expect("context");
-    let mut binding = ContextRegisterValueBinding::new("TENANT");
+    let compilers = [context.schema().compiled_context().clone()];
+    let binding = ContextRegisterBinding::new("TENANT", &compilers).expect("linked binding");
 
     assert_eq!(
-        binding.value(&context),
-        Some((HeaderValueKind::Text, b"first".as_slice()))
+        binding
+            .register(&context)
+            .expect("linked context version")
+            .expect("present register")
+            .values()
+            .collect::<Vec<_>>(),
+        [
+            (HeaderValueKind::Text, b"first".as_slice()),
+            (HeaderValueKind::Binary, b"second".as_slice()),
+        ]
     );
-    assert_eq!(binding.value(&other), None);
+    assert!(
+        binding
+            .register(&other)
+            .expect("linked context version")
+            .is_none()
+    );
     assert_eq!(
-        binding.value(&context),
-        Some((HeaderValueKind::Text, b"first".as_slice()))
+        binding
+            .register(&context)
+            .expect("cached context version")
+            .expect("present register")
+            .values()
+            .count(),
+        2
+    );
+}
+
+/// Scenario: a register binding names a register absent from the compiler version.
+/// Guarantees: lookup reports a configuration error instead of runtime absence.
+#[test]
+fn context_register_binding_rejects_unknown_register() {
+    let policy = HeaderCapturePolicy::new(
+        CaptureDefaults::default(),
+        vec![CaptureRule {
+            match_names: vec!["x-tenant".to_string()],
+            store_as: Some("tenant".to_string()),
+            sensitive: false,
+            value_kind: None,
+        }],
+    )
+    .compile()
+    .expect("capture policy");
+    let context = PdataContextBytes::capture(&policy, [("x-tenant", b"acme".as_slice())])
+        .expect("capture")
+        .0
+        .expect("context");
+    let compilers = [context.schema().compiled_context().clone()];
+    let error = match ContextRegisterBinding::new("unknown", &compilers) {
+        Err(error) => error,
+        Ok(_) => panic!("unknown register must fail configuration"),
+    };
+
+    assert!(matches!(error, ContextBindingError::Configuration { .. }));
+}
+
+/// Scenario: a configured register binding has no reachable context compiler.
+/// Guarantees: initial linking fails instead of creating an empty runtime plan.
+#[test]
+fn context_register_binding_rejects_missing_compiler() {
+    let error = match ContextRegisterBinding::new("tenant", &[]) {
+        Err(error) => error,
+        Ok(_) => panic!("binding without a compiler must fail configuration"),
+    };
+
+    assert!(matches!(
+        error,
+        ContextBindingError::NoReachableContextCompiler { .. }
+    ));
+}
+
+/// Scenario: runtime context uses a compiler version omitted during binding.
+/// Guarantees: runtime reports the invariant violation without attempting to link it.
+#[test]
+fn context_register_binding_rejects_unlinked_runtime_version() {
+    let compile = || {
+        HeaderCapturePolicy::new(
+            CaptureDefaults::default(),
+            vec![CaptureRule {
+                match_names: vec!["x-tenant".to_string()],
+                store_as: Some("tenant".to_string()),
+                sensitive: false,
+                value_kind: None,
+            }],
+        )
+        .compile()
+        .expect("capture policy")
+    };
+    let planned_policy = compile();
+    let runtime_policy = compile();
+    let runtime_context =
+        PdataContextBytes::capture(&runtime_policy, [("x-tenant", b"acme".as_slice())])
+            .expect("capture")
+            .0
+            .expect("context");
+    let compilers = [planned_policy.schema().compiled_context().clone()];
+    let binding = ContextRegisterBinding::new("tenant", &compilers).expect("linked binding");
+
+    assert!(matches!(
+        binding.register(&runtime_context),
+        Err(ContextBindingError::UnlinkedContextVersion { .. })
+    ));
+}
+
+/// Scenario: a processor appends a register to a context after consumer linking.
+/// Guarantees: bindings for inherited registers remain valid without runtime relinking.
+#[test]
+fn context_register_binding_accepts_derived_runtime_version() {
+    let policy = HeaderCapturePolicy::new(
+        CaptureDefaults::default(),
+        vec![CaptureRule {
+            match_names: vec!["x-tenant".to_string()],
+            store_as: Some("tenant".to_string()),
+            sensitive: false,
+            value_kind: None,
+        }],
+    )
+    .compile()
+    .expect("capture policy");
+    let context = PdataContextBytes::capture(&policy, [("x-tenant", b"acme".as_slice())])
+        .expect("capture")
+        .0
+        .expect("context");
+    let compilers = [context.schema().compiled_context().clone()];
+    let binding = ContextRegisterBinding::new("tenant", &compilers).expect("linked binding");
+    let mut projection = ContextScalarProjectionBinding::new("partition");
+    let derived = projection
+        .project(Some(&context), b"west", HeaderValueKind::Text)
+        .expect("projection");
+
+    assert_eq!(
+        binding
+            .register(&derived)
+            .expect("compatible derived version")
+            .expect("tenant register")
+            .values()
+            .next(),
+        Some((HeaderValueKind::Text, b"acme".as_slice()))
     );
 }
 
@@ -569,18 +704,25 @@ fn context_entry_set_binding_uses_configuration_order_across_schemas() {
     .expect("capture")
     .0
     .expect("context");
-    let mut binding = ContextRegisterSetBinding::new(["REGION", "TENANT"]);
-    let collect = |binding: &mut ContextRegisterSetBinding, context: &PdataContextBytes| {
+    let compilers = [
+        first.schema().compiled_context().clone(),
+        second.schema().compiled_context().clone(),
+    ];
+    let binding =
+        ContextRegisterSetBinding::new(["REGION", "TENANT"], &compilers).expect("linked binding");
+    let collect = |binding: &ContextRegisterSetBinding, context: &PdataContextBytes| {
         let mut visited = Vec::new();
-        let count = binding.visit_present(context, |ordinal, entry| {
-            visited.push((
-                ordinal,
-                entry
-                    .values()
-                    .map(|(_, value)| value.to_vec())
-                    .collect::<Vec<_>>(),
-            ));
-        });
+        let count = binding
+            .visit_present(context, |ordinal, entry| {
+                visited.push((
+                    ordinal,
+                    entry
+                        .values()
+                        .map(|(_, value)| value.to_vec())
+                        .collect::<Vec<_>>(),
+                ));
+            })
+            .expect("linked context version");
         (count, visited)
     };
 
@@ -588,15 +730,15 @@ fn context_entry_set_binding_uses_configuration_order_across_schemas() {
         2,
         vec![(0, vec![b"west".to_vec()]), (1, vec![b"acme".to_vec()])],
     );
-    assert_eq!(collect(&mut binding, &first), expected);
-    assert_eq!(collect(&mut binding, &second), expected);
-    assert_eq!(collect(&mut binding, &first), expected);
+    assert_eq!(collect(&binding, &first), expected);
+    assert_eq!(collect(&binding, &second), expected);
+    assert_eq!(collect(&binding, &first), expected);
 }
 
-/// Scenario: configured entries are absent from either the schema or the captured message.
-/// Guarantees: missing and absent entries are skipped without hiding a present entry.
+/// Scenario: a configured register is absent from the compiler version.
+/// Guarantees: binding fails as a configuration error instead of treating it as missing data.
 #[test]
-fn context_entry_set_binding_skips_missing_and_absent_entries() {
+fn context_entry_set_binding_rejects_unknown_register() {
     let policy = HeaderCapturePolicy::new(
         CaptureDefaults::default(),
         vec![
@@ -620,13 +762,13 @@ fn context_entry_set_binding_skips_missing_and_absent_entries() {
         .expect("capture")
         .0
         .expect("context");
-    let mut binding = ContextRegisterSetBinding::new(["unknown", "region", "tenant"]);
-    let mut visited = Vec::new();
+    let compilers = [context.schema().compiled_context().clone()];
+    let error = match ContextRegisterSetBinding::new(["unknown", "region", "tenant"], &compilers) {
+        Err(error) => error,
+        Ok(_) => panic!("unknown register must fail configuration"),
+    };
 
-    let count = binding.visit_present(&context, |ordinal, _| visited.push(ordinal));
-
-    assert_eq!(count, 1);
-    assert_eq!(visited, [2]);
+    assert!(matches!(error, ContextBindingError::Configuration { .. }));
 }
 
 /// Scenario: a captured exact-name header has no explicit logical alias.
@@ -648,17 +790,20 @@ fn context_entry_set_binding_selects_unaliased_exact_header() {
         .expect("capture")
         .0
         .expect("context");
-    let mut binding = ContextRegisterSetBinding::new(["x-tenant"]);
+    let compilers = [context.schema().compiled_context().clone()];
+    let binding = ContextRegisterSetBinding::new(["x-tenant"], &compilers).expect("linked binding");
     let mut values = Vec::new();
-    let count = binding.visit_present(&context, |ordinal, entry| {
-        values.push((
-            ordinal,
-            entry
-                .values()
-                .map(|(_, value)| value.to_vec())
-                .collect::<Vec<_>>(),
-        ));
-    });
+    let count = binding
+        .visit_present(&context, |ordinal, entry| {
+            values.push((
+                ordinal,
+                entry
+                    .values()
+                    .map(|(_, value)| value.to_vec())
+                    .collect::<Vec<_>>(),
+            ));
+        })
+        .expect("linked context version");
 
     assert_eq!(count, 1);
     assert_eq!(values, [(0, vec![b"acme".to_vec()])]);

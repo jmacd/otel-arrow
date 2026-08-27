@@ -16,6 +16,7 @@ use crate::listener_group::ListenerGroupSnapshot;
 use crate::memory_limiter::MemoryPressureState;
 use crate::node::NodeId as EngineNodeId;
 use data_encoding::BASE32_NOPAD;
+use otel_arrow_dfe_config::context::CompiledContext;
 use otel_arrow_dfe_config::node::NodeKind;
 use otel_arrow_dfe_config::pipeline::telemetry::TelemetryAttribute;
 use otel_arrow_dfe_config::{NodeId as ConfigNodeId, NodeUrn, PipelineGroupId, PipelineId};
@@ -138,6 +139,8 @@ pub struct PipelineContext {
     // Consumers should cache any needed listener plan during setup rather than cloning
     // or searching this snapshot from the per-record data path.
     listener_group_snapshot: Arc<ListenerGroupSnapshot>,
+    /// Compiler versions whose pdata contexts can reach this node.
+    context_compilers: Arc<[Arc<CompiledContext>]>,
 }
 
 /// Registrar that binds generated metric-set registration to an existing entity.
@@ -327,6 +330,7 @@ impl PipelineContext {
             node_names: Arc::new(HashMap::new()),
             topic_set: None,
             listener_group_snapshot: Arc::new(ListenerGroupSnapshot::empty()),
+            context_compilers: Arc::from([]),
         }
     }
 
@@ -352,6 +356,32 @@ impl PipelineContext {
     #[must_use]
     pub const fn deployment_generation(&self) -> u64 {
         self.deployment_generation
+    }
+
+    /// Returns the context compiler versions whose pdata can reach this node.
+    #[must_use]
+    pub fn context_compilers(&self) -> &[Arc<CompiledContext>] {
+        &self.context_compilers
+    }
+
+    /// Returns this pipeline context with the compiler versions whose pdata
+    /// can reach the node.
+    ///
+    /// Runtime builders normally populate this from pipeline topology. Direct
+    /// node embedders must provide the same compiler set before constructing a
+    /// node that uses context bindings.
+    #[must_use]
+    pub fn with_context_compilers(
+        mut self,
+        compilers: impl Into<Arc<[Arc<CompiledContext>]>>,
+    ) -> Self {
+        self.context_compilers = compilers.into();
+        self
+    }
+
+    /// Sets the context compiler versions whose pdata can reach this node.
+    pub(crate) fn set_context_compilers(&mut self, compilers: Arc<[Arc<CompiledContext>]>) {
+        self.context_compilers = compilers;
     }
 
     /// Returns the total number of cores allocated to this pipeline.
@@ -759,6 +789,7 @@ impl PipelineContext {
             node_names: self.node_names.clone(),
             topic_set: self.topic_set.clone(),
             listener_group_snapshot: Arc::clone(&self.listener_group_snapshot),
+            context_compilers: Arc::clone(&self.context_compilers),
         }
     }
 }

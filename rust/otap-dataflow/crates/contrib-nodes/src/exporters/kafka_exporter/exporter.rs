@@ -35,7 +35,7 @@ use futures::{FutureExt, StreamExt};
 use futures_channel::oneshot::Canceled;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::SignalType;
-use otel_arrow_dfe_config::context::ContextVersion;
+use otel_arrow_dfe_config::context::{CompiledContext, ContextVersion};
 use otel_arrow_dfe_config::error::Error as ConfigError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::transport_headers_policy::{
@@ -54,7 +54,7 @@ use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
-use otel_arrow_dfe_otap::context_bytes::ContextRegisterValueBinding;
+use otel_arrow_dfe_otap::context_bytes::ContextRegisterBinding;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::Producer as PdataProducer;
 use otel_arrow_dfe_telemetry::common_attributes::Outcome;
@@ -352,12 +352,13 @@ pub struct KafkaExporter {
     traces_allowed_topics_regex: Option<Vec<Regex>>,
     metrics_allowed_topics_regex: Option<Vec<Regex>>,
     logs_allowed_topics_regex: Option<Vec<Regex>>,
-    traces_topic_binding: Option<ContextRegisterValueBinding>,
-    metrics_topic_binding: Option<ContextRegisterValueBinding>,
-    logs_topic_binding: Option<ContextRegisterValueBinding>,
+    traces_topic_binding: Option<ContextRegisterBinding>,
+    metrics_topic_binding: Option<ContextRegisterBinding>,
+    logs_topic_binding: Option<ContextRegisterBinding>,
     traces_partition_binding: Option<partitioner::ContextPartitionKeyBinding>,
     metrics_partition_binding: Option<partitioner::ContextPartitionKeyBinding>,
     logs_partition_binding: Option<partitioner::ContextPartitionKeyBinding>,
+    context_compilers: Arc<[Arc<CompiledContext>]>,
     propagation_cache: KafkaPropagationCache,
 }
 
@@ -437,10 +438,12 @@ impl KafkaExporter {
         // the hot path never recompiles.
         let (traces_allowed_topics_regex, metrics_allowed_topics_regex, logs_allowed_topics_regex) =
             Self::compile_signal_allowed_regexes(&config)?;
+        let context_compilers: Arc<[Arc<CompiledContext>]> =
+            pipeline_ctx.context_compilers().to_vec().into();
         let (traces_topic_binding, metrics_topic_binding, logs_topic_binding) =
-            Self::topic_bindings(&config);
+            Self::topic_bindings(&config, &context_compilers)?;
         let (traces_partition_binding, metrics_partition_binding, logs_partition_binding) =
-            Self::partition_bindings(&config);
+            Self::partition_bindings(&config, &context_compilers)?;
 
         Ok(Self {
             config,
@@ -456,47 +459,69 @@ impl KafkaExporter {
             traces_partition_binding,
             metrics_partition_binding,
             logs_partition_binding,
+            context_compilers,
             propagation_cache: KafkaPropagationCache::default(),
         })
     }
 
     fn topic_bindings(
         config: &KafkaExporterConfig,
-    ) -> (
-        Option<ContextRegisterValueBinding>,
-        Option<ContextRegisterValueBinding>,
-        Option<ContextRegisterValueBinding>,
-    ) {
+        compilers: &[Arc<CompiledContext>],
+    ) -> Result<
+        (
+            Option<ContextRegisterBinding>,
+            Option<ContextRegisterBinding>,
+            Option<ContextRegisterBinding>,
+        ),
+        KafkaExporterError,
+    > {
         let binding = |signal: Option<&SignalConfig>| {
             signal
                 .and_then(SignalConfig::topic_from_transport_header)
-                .map(ContextRegisterValueBinding::new)
+                .map(|symbol| {
+                    ContextRegisterBinding::new(symbol, compilers)
+                        .map_err(|error| KafkaExporterError::Configuration(error.to_string()))
+                })
+                .transpose()
         };
-        (
-            binding(config.traces()),
-            binding(config.metrics()),
-            binding(config.logs()),
-        )
+        Ok((
+            binding(config.traces())?,
+            binding(config.metrics())?,
+            binding(config.logs())?,
+        ))
     }
 
     fn partition_bindings(
         config: &KafkaExporterConfig,
-    ) -> (
-        Option<partitioner::ContextPartitionKeyBinding>,
-        Option<partitioner::ContextPartitionKeyBinding>,
-        Option<partitioner::ContextPartitionKeyBinding>,
-    ) {
-        let binding = |signal: Option<&SignalConfig>| {
-            let entries = signal?.partition_by_context();
-            (!entries.is_empty()).then(|| {
-                partitioner::ContextPartitionKeyBinding::new(entries.iter().map(String::as_str))
-            })
-        };
+        compilers: &[Arc<CompiledContext>],
+    ) -> Result<
         (
-            binding(config.traces()),
-            binding(config.metrics()),
-            binding(config.logs()),
-        )
+            Option<partitioner::ContextPartitionKeyBinding>,
+            Option<partitioner::ContextPartitionKeyBinding>,
+            Option<partitioner::ContextPartitionKeyBinding>,
+        ),
+        KafkaExporterError,
+    > {
+        let binding = |signal: Option<&SignalConfig>| {
+            let Some(signal) = signal else {
+                return Ok(None);
+            };
+            let entries = signal.partition_by_context();
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            partitioner::ContextPartitionKeyBinding::new(
+                entries.iter().map(String::as_str),
+                compilers,
+            )
+            .map(Some)
+            .map_err(|error| KafkaExporterError::Configuration(error.to_string()))
+        };
+        Ok((
+            binding(config.traces())?,
+            binding(config.metrics())?,
+            binding(config.logs())?,
+        ))
     }
 
     /// Compiles the dynamic-routing allowlist regexes for all three signals
@@ -718,9 +743,9 @@ impl KafkaExporter {
             &self.logs_allowed_topics_regex,
         );
         let topic_binding = match signal_type {
-            SignalType::Traces => self.traces_topic_binding.as_mut(),
-            SignalType::Metrics => self.metrics_topic_binding.as_mut(),
-            SignalType::Logs => self.logs_topic_binding.as_mut(),
+            SignalType::Traces => self.traces_topic_binding.as_ref(),
+            SignalType::Metrics => self.metrics_topic_binding.as_ref(),
+            SignalType::Logs => self.logs_topic_binding.as_ref(),
         };
 
         // Resolve topic via the dynamic topic router *before* doing any encoding
@@ -736,12 +761,13 @@ impl KafkaExporter {
         ) {
             Ok(t) => t,
             Err(e) => {
-                self.metrics.record_failure(
-                    signal_type,
-                    KafkaExporterErrorType::InvalidTopic,
-                    export_start.elapsed(),
-                    None,
-                );
+                let error_type = if matches!(&e, KafkaExporterError::Configuration(_)) {
+                    KafkaExporterErrorType::Other
+                } else {
+                    KafkaExporterErrorType::InvalidTopic
+                };
+                self.metrics
+                    .record_failure(signal_type, error_type, export_start.elapsed(), None);
                 let _ = reporter
                     .nack_permanent(e.to_string(), OtapPdata::new(context, payload))
                     .await;
@@ -749,12 +775,30 @@ impl KafkaExporter {
             }
         };
 
-        let partition_key = match signal_type {
-            SignalType::Traces => self.traces_partition_binding.as_mut(),
-            SignalType::Metrics => self.metrics_partition_binding.as_mut(),
-            SignalType::Logs => self.logs_partition_binding.as_mut(),
-        }
-        .and_then(|binding| binding.partition_key(&context));
+        let partition_binding = match signal_type {
+            SignalType::Traces => self.traces_partition_binding.as_ref(),
+            SignalType::Metrics => self.metrics_partition_binding.as_ref(),
+            SignalType::Logs => self.logs_partition_binding.as_ref(),
+        };
+        let partition_key = match partition_binding {
+            Some(binding) => match binding.partition_key(&context) {
+                Ok(key) => key,
+                Err(binding_error) => {
+                    let error = KafkaExporterError::Configuration(binding_error.to_string());
+                    self.metrics.record_failure(
+                        signal_type,
+                        KafkaExporterErrorType::Other,
+                        export_start.elapsed(),
+                        None,
+                    );
+                    let _ = reporter
+                        .nack_permanent(error.to_string(), OtapPdata::new(context, payload))
+                        .await;
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
 
         // Build Kafka headers (format header + propagated transport headers)
         let format_header_key = self.config.message_format_header();
@@ -1094,9 +1138,48 @@ impl KafkaExporter {
             );
         }
 
-        // Build the replacement producer before touching the running one, using
-        // the appropriate (AWS-gated) client context. On failure, keep the
-        // current producer/config running.
+        // Compile all replacement routing state before creating a producer or
+        // touching the active configuration.
+        let (new_traces_regex, new_metrics_regex, new_logs_regex) =
+            match Self::compile_signal_allowed_regexes(&new_config) {
+                Ok(regexes) => regexes,
+                Err(e) => {
+                    otel_warn!(
+                        "kafka.exporter.reconfigure_error",
+                        error = %e,
+                        "failed to compile allowed_topics_regex for new config; \
+                         keeping current configuration",
+                    );
+                    return;
+                }
+            };
+        let (new_traces_binding, new_metrics_binding, new_logs_binding) =
+            match Self::topic_bindings(&new_config, &self.context_compilers) {
+                Ok(bindings) => bindings,
+                Err(error) => {
+                    otel_warn!(
+                        "kafka.exporter.reconfigure_error",
+                        error = %error,
+                        "failed to link topic context bindings; keeping current configuration",
+                    );
+                    return;
+                }
+            };
+        let (new_traces_partition, new_metrics_partition, new_logs_partition) =
+            match Self::partition_bindings(&new_config, &self.context_compilers) {
+                Ok(bindings) => bindings,
+                Err(error) => {
+                    otel_warn!(
+                        "kafka.exporter.reconfigure_error",
+                        error = %error,
+                        "failed to link partition context bindings; keeping current configuration",
+                    );
+                    return;
+                }
+            };
+
+        // Build the replacement producer only after the complete candidate
+        // configuration has linked successfully.
         let client_config = new_config.build_client_config();
 
         #[cfg(feature = "aws")]
@@ -1123,27 +1206,6 @@ impl KafkaExporter {
                 return;
             }
         };
-
-        // Recompile the dynamic-routing allowlist regexes for the new config
-        // before touching the running one. On failure, keep the current
-        // producer/config running.
-        let (new_traces_regex, new_metrics_regex, new_logs_regex) =
-            match Self::compile_signal_allowed_regexes(&new_config) {
-                Ok(regexes) => regexes,
-                Err(e) => {
-                    otel_warn!(
-                        "kafka.exporter.reconfigure_error",
-                        error = %e,
-                        "failed to compile allowed_topics_regex for new config; \
-                         keeping current configuration",
-                    );
-                    return;
-                }
-            };
-        let (new_traces_binding, new_metrics_binding, new_logs_binding) =
-            Self::topic_bindings(&new_config);
-        let (new_traces_partition, new_metrics_partition, new_logs_partition) =
-            Self::partition_bindings(&new_config);
 
         effect_handler
             .info("Reconfiguring Kafka exporter: draining old producer before swap")
@@ -1626,9 +1688,11 @@ pub mod test_support {
         use crate::exporters::kafka_exporter::partitioner::ContextPartitionKeyBinding;
         use bytes::Bytes;
         use otel_arrow_dfe_config::transport_headers_policy::{
+            CaptureDefaults, CaptureRule, CompiledHeaderCapturePolicy, HeaderCapturePolicy,
             HeaderPropagationPolicy, PropagationDefault, PropagationSelector,
             PropagationSelectorType,
         };
+        use otel_arrow_dfe_otap::context_bytes::PdataContextBytes;
         use otel_arrow_dfe_otap::pdata::Context;
         use otel_arrow_dfe_pdata::OtlpProtoBytes;
         use prost::Message as _;
@@ -2036,7 +2100,12 @@ pub mod test_support {
         /// Guarantees: The message is permanently nacked and classified as an invalid-topic failure.
         #[tokio::test]
         async fn test_export_invalid_dynamic_topic_is_permanently_nacked() {
-            let pipeline_ctx = pipeline_context();
+            let pdata =
+                sample_pdata_with_header(SignalType::Logs, "X-Target-Topic", "bad topic/name");
+            let (pdata_context, _) = pdata.clone().into_parts();
+            let compilers =
+                context_compilers(pdata_context.pdata_context_bytes().expect("pdata context"));
+            let pipeline_ctx = pipeline_context().with_context_compilers(compilers);
             // Logs configured to resolve their topic from a transport header.
             let config: KafkaExporterConfig =
                 KafkaExporterConfigBuilder::new("localhost:9092", "test-client")
@@ -2051,9 +2120,6 @@ pub mod test_support {
 
             let reporter = RecordingReporter::new();
             // Header supplies an invalid topic ("bad topic/name" contains a space and slash).
-            let pdata =
-                sample_pdata_with_header(SignalType::Logs, "X-Target-Topic", "bad topic/name");
-
             let result = export_once(&mut exporter, pdata, &reporter).await;
             assert!(result.is_err());
             assert!(
@@ -2223,21 +2289,59 @@ pub mod test_support {
             OtapPdata::new(context, proto.into())
         }
 
-        /// Wraps OTLP logs bytes with a schema-declared logical context entry.
-        fn logs_pdata_entry(
-            bytes: Vec<u8>,
-            wire_name: &str,
-            stored_name: &str,
-            value: &str,
-        ) -> OtapPdata {
+        /// Wraps OTLP logs bytes with an already compiled pdata context.
+        fn logs_pdata_with_context(bytes: Vec<u8>, pdata_context: &PdataContextBytes) -> OtapPdata {
             let proto = OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes));
             let mut context = Context::default();
-            context.set_pdata_context_bytes(test_pdata_context([TestContextHeader::text(
-                wire_name,
-                stored_name,
-                value.as_bytes(),
-            )]));
+            context.set_pdata_context_bytes(pdata_context.clone());
             OtapPdata::new(context, proto.into())
+        }
+
+        /// Wraps OTLP logs bytes and a compiled context with a NACKS subscriber.
+        fn logs_pdata_subscribed_with_context(
+            bytes: Vec<u8>,
+            pdata_context: &PdataContextBytes,
+        ) -> OtapPdata {
+            use otel_arrow_dfe_engine::Interests;
+            use otel_arrow_dfe_otap::testing::TestCallData;
+
+            logs_pdata_with_context(bytes, pdata_context).test_subscribe_to(
+                Interests::ACKS_OR_NACKS | Interests::RETURN_DATA,
+                TestCallData::default().into(),
+                654321,
+            )
+        }
+
+        /// Compiles one text-header register for tests that vary its value.
+        fn text_context_policy(wire_name: &str, stored_name: &str) -> CompiledHeaderCapturePolicy {
+            HeaderCapturePolicy::new(
+                CaptureDefaults::default(),
+                vec![CaptureRule {
+                    match_names: vec![wire_name.to_string()],
+                    store_as: Some(stored_name.to_string()),
+                    sensitive: false,
+                    value_kind: None,
+                }],
+            )
+            .compile()
+            .expect("test context policy")
+        }
+
+        /// Captures one value using an existing test context compiler.
+        fn capture_text_context(
+            policy: &CompiledHeaderCapturePolicy,
+            wire_name: &str,
+            value: &str,
+        ) -> PdataContextBytes {
+            PdataContextBytes::capture(policy, [(wire_name, value.as_bytes())])
+                .expect("capture test context")
+                .0
+                .expect("captured context")
+        }
+
+        /// Returns the compiler that produced a test pdata context.
+        fn context_compilers(pdata_context: &PdataContextBytes) -> [Arc<CompiledContext>; 1] {
+            [pdata_context.schema().compiled_context().clone()]
         }
 
         /// Wraps OTLP logs bytes into an [`OtapPdata`] that carries a NACKS
@@ -2504,7 +2608,12 @@ pub mod test_support {
         /// client-controlled header cannot direct data to an arbitrary topic.
         #[tokio::test]
         async fn disallowed_dynamic_topic_is_permanently_nacked() {
-            let pipeline_ctx = pipeline_context();
+            let pdata =
+                sample_pdata_with_header(SignalType::Logs, "X-Target-Topic", "evil-destination");
+            let (pdata_context, _) = pdata.clone().into_parts();
+            let compilers =
+                context_compilers(pdata_context.pdata_context_bytes().expect("pdata context"));
+            let pipeline_ctx = pipeline_context().with_context_compilers(compilers);
             let config: KafkaExporterConfig =
                 KafkaExporterConfigBuilder::new("localhost:9092", "test-client")
                     .with_logs(
@@ -2519,9 +2628,6 @@ pub mod test_support {
 
             let reporter = RecordingReporter::new();
             // Header requests a syntactically valid but disallowed topic.
-            let pdata =
-                sample_pdata_with_header(SignalType::Logs, "X-Target-Topic", "evil-destination");
-
             let result = export_once(&mut exporter, pdata, &reporter).await;
             assert!(result.is_err());
             assert!(
@@ -2564,14 +2670,18 @@ pub mod test_support {
                             .with_topic_from_transport_header("x-target-topic")
                             .with_allowed_topics_regex(["tenant_.*"]),
                     );
-                    let exporter = KafkaExporterHarness::start(&cluster, cfg);
+                    let policy = text_context_policy("X-Target-Topic", "x-target-topic");
+                    let pdata_context =
+                        capture_text_context(&policy, "X-Target-Topic", allowed_topic);
+                    let exporter = KafkaExporterHarness::start_with_context_compilers(
+                        &cluster,
+                        cfg,
+                        context_compilers(&pdata_context),
+                    );
 
                     let payload = logs_request_bytes();
                     exporter
-                        .send_pdata(logs_pdata(
-                            payload.clone(),
-                            Some(("X-Target-Topic", allowed_topic)),
-                        ))
+                        .send_pdata(logs_pdata_with_context(payload.clone(), &pdata_context))
                         .await
                         .expect("send pdata");
 
@@ -2612,14 +2722,23 @@ pub mod test_support {
                             .with_topic_from_transport_header("x-target-topic")
                             .with_allowed_topics([allowed_topic]),
                     );
-                    let mut exporter = KafkaExporterHarness::start(&cluster, cfg);
+                    let policy = text_context_policy("X-Target-Topic", "x-target-topic");
+                    let unlisted_context =
+                        capture_text_context(&policy, "X-Target-Topic", "tenant_not_listed");
+                    let allowed_context =
+                        capture_text_context(&policy, "X-Target-Topic", allowed_topic);
+                    let mut exporter = KafkaExporterHarness::start_with_context_compilers(
+                        &cluster,
+                        cfg,
+                        context_compilers(&unlisted_context),
+                    );
 
                     // 1. Unlisted topic: a subscribed pdata so the permanent nack
                     // unwinds observably; assert it is permanent and not delivered.
                     exporter
-                        .send_pdata(logs_pdata_subscribed(
+                        .send_pdata(logs_pdata_subscribed_with_context(
                             logs_request_bytes(),
-                            Some(("X-Target-Topic", "tenant_not_listed")),
+                            &unlisted_context,
                         ))
                         .await
                         .expect("send unlisted");
@@ -2635,10 +2754,7 @@ pub mod test_support {
                     // 2. Listed topic: delivered to the header-named topic.
                     let payload = logs_request_bytes();
                     exporter
-                        .send_pdata(logs_pdata(
-                            payload.clone(),
-                            Some(("X-Target-Topic", allowed_topic)),
-                        ))
+                        .send_pdata(logs_pdata_with_context(payload.clone(), &allowed_context))
                         .await
                         .expect("send listed");
                     let _ = consumer
@@ -2731,6 +2847,55 @@ pub mod test_support {
                         .recv()
                         .await
                         .assert_topic(new_topic)
+                        .assert_payload(&payload);
+
+                    exporter.shutdown(Duration::from_millis(500)).await;
+                    exporter.await_stopped().await;
+                },
+            )
+            .await;
+        }
+
+        /// Scenario: live Kafka reconfiguration references a context register
+        /// that was not declared by any reachable compiler.
+        /// Guarantees: the candidate is rejected before activation and later
+        /// records continue to use the active static topic.
+        #[tokio::test]
+        async fn reconfigure_rejects_unlinked_context_binding() {
+            let active_topic = "it-reconfig-active";
+            let candidate_topic = "it-reconfig-candidate";
+            with_cluster(
+                KafkaTestCluster::builder()
+                    .topic(active_topic)
+                    .topic(candidate_topic),
+                |cluster| async move {
+                    let consumer = cluster.consumer().subscribe(&[active_topic]);
+                    let cfg = logs_config(
+                        cluster.bootstrap_servers(),
+                        SignalConfig::new(active_topic.into(), MessageFormat::OtlpProto),
+                    );
+                    let exporter = KafkaExporterHarness::start(&cluster, cfg);
+                    exporter
+                        .send_config(serde_json::json!({
+                            "brokers": cluster.bootstrap_servers(),
+                            "client_id": "it-client",
+                            "logs": {
+                                "topic": candidate_topic,
+                                "encoding": "otlp_proto",
+                                "topic_from_transport_header": "undeclared-topic"
+                            }
+                        }))
+                        .await;
+
+                    let payload = logs_request_bytes();
+                    exporter
+                        .send_pdata(logs_pdata(payload.clone(), None))
+                        .await
+                        .expect("send pdata");
+                    let _ = consumer
+                        .recv()
+                        .await
+                        .assert_topic(active_topic)
                         .assert_payload(&payload);
 
                     exporter.shutdown(Duration::from_millis(500)).await;
@@ -3242,17 +3407,21 @@ pub mod test_support {
                         .with_max_in_flight(8)
                         .try_into()
                         .expect("config should be valid");
-                    let exporter = KafkaExporterHarness::start(&cluster, cfg);
+                    let pdata_context = test_pdata_context([TestContextHeader::text(
+                        "X-Tenant-Id",
+                        "tenant",
+                        b"tenant-42",
+                    )]);
+                    let exporter = KafkaExporterHarness::start_with_context_compilers(
+                        &cluster,
+                        cfg,
+                        context_compilers(&pdata_context),
+                    );
 
                     let payloads: Vec<Vec<u8>> = (0..N).map(logs_request_bytes_seq).collect();
                     for payload in &payloads {
                         exporter
-                            .send_pdata(logs_pdata_entry(
-                                payload.clone(),
-                                "X-Tenant-Id",
-                                "tenant",
-                                "tenant-42",
-                            ))
+                            .send_pdata(logs_pdata_with_context(payload.clone(), &pdata_context))
                             .await
                             .expect("send pdata");
                     }
@@ -4097,12 +4266,19 @@ pub mod test_support {
                             .with_topic_from_transport_header("x-target-topic")
                             .with_allowed_topics_regex(["tenant_.*"]),
                     );
-                    let mut exporter = KafkaExporterHarness::start(&cluster, cfg);
+                    let policy = text_context_policy("X-Target-Topic", "x-target-topic");
+                    let pdata_context =
+                        capture_text_context(&policy, "X-Target-Topic", "evil-destination");
+                    let mut exporter = KafkaExporterHarness::start_with_context_compilers(
+                        &cluster,
+                        cfg,
+                        context_compilers(&pdata_context),
+                    );
 
                     exporter
-                        .send_pdata(logs_pdata_subscribed(
+                        .send_pdata(logs_pdata_subscribed_with_context(
                             logs_request_bytes(),
-                            Some(("X-Target-Topic", "evil-destination")),
+                            &pdata_context,
                         ))
                         .await
                         .expect("send pdata");
@@ -4208,12 +4384,18 @@ pub mod test_support {
                             .with_topic_from_transport_header("x-target-topic")
                             .with_allowed_topics_regex(["tenant_.*"]),
                     );
-                    let mut exporter = KafkaExporterHarness::start(&cluster, cfg);
+                    let policy = text_context_policy("X-Target-Topic", "x-target-topic");
+                    let pdata_context = capture_text_context(&policy, "X-Target-Topic", disallowed);
+                    let mut exporter = KafkaExporterHarness::start_with_context_compilers(
+                        &cluster,
+                        cfg,
+                        context_compilers(&pdata_context),
+                    );
 
                     exporter
-                        .send_pdata(logs_pdata_subscribed(
+                        .send_pdata(logs_pdata_subscribed_with_context(
                             logs_request_bytes(),
-                            Some(("X-Target-Topic", disallowed)),
+                            &pdata_context,
                         ))
                         .await
                         .expect("send pdata");
@@ -4664,28 +4846,38 @@ pub mod test_support {
                         .with_partitioning_strategy(PartitionerStrategy::Murmur2Random)
                         .try_into()
                         .expect("config should be valid");
-                    let exporter = KafkaExporterHarness::start(&cluster, cfg);
+                    let pdata_context = test_pdata_context([TestContextHeader::text(
+                        "X-Tenant-Id",
+                        "tenant",
+                        b"tenant-42",
+                    )]);
+                    let exporter = KafkaExporterHarness::start_with_context_compilers(
+                        &cluster,
+                        cfg,
+                        context_compilers(&pdata_context),
+                    );
 
                     let expected_key = {
-                        let pdata = logs_pdata_entry(
-                            logs_request_bytes(),
-                            "X-Tenant-Id",
-                            "tenant",
-                            "tenant-42",
-                        );
+                        let pdata = logs_pdata_with_context(logs_request_bytes(), &pdata_context);
                         let (context, _payload) = pdata.into_parts();
-                        ContextPartitionKeyBinding::new(["tenant"])
+                        let compilers = [context
+                            .pdata_context_bytes()
+                            .expect("pdata context")
+                            .schema()
+                            .compiled_context()
+                            .clone()];
+                        ContextPartitionKeyBinding::new(["tenant"], &compilers)
+                            .expect("linked context binding")
                             .partition_key(&context)
+                            .expect("context binding")
                             .expect("headers produce a key")
                     };
 
                     for _ in 0..N {
                         exporter
-                            .send_pdata(logs_pdata_entry(
+                            .send_pdata(logs_pdata_with_context(
                                 logs_request_bytes(),
-                                "X-Tenant-Id",
-                                "tenant",
-                                "tenant-42",
+                                &pdata_context,
                             ))
                             .await
                             .expect("send pdata");
@@ -5663,11 +5855,20 @@ pub mod test_support {
                         SignalConfig::new(static_topic.into(), MessageFormat::OtlpProto)
                             .with_topic_from_transport_header("x-target-topic"),
                     );
-                    let exporter = KafkaExporterHarness::start(&cluster, cfg);
+                    let pdata_context = test_pdata_context([TestContextHeader::text(
+                        "X-Target-Topic",
+                        "x-target-topic",
+                        dynamic_topic.as_bytes(),
+                    )]);
+                    let exporter = KafkaExporterHarness::start_with_context_compilers(
+                        &cluster,
+                        cfg,
+                        context_compilers(&pdata_context),
+                    );
 
                     let payload = logs_request_bytes();
                     exporter
-                        .send_pdata(logs_pdata(payload, Some(("X-Target-Topic", dynamic_topic))))
+                        .send_pdata(logs_pdata_with_context(payload, &pdata_context))
                         .await
                         .expect("send pdata");
 
@@ -5702,14 +5903,31 @@ pub mod test_support {
                             .with_partitioning_strategy(PartitionerStrategy::Murmur2Random)
                             .try_into()
                             .expect("config should be valid");
-                    let exporter = KafkaExporterHarness::start(&cluster, cfg);
+                    let pdata_context = test_pdata_context([TestContextHeader::text(
+                        "X-Tenant-Id",
+                        "tenant",
+                        b"tenant-123",
+                    )]);
+                    let exporter = KafkaExporterHarness::start_with_context_compilers(
+                        &cluster,
+                        cfg,
+                        context_compilers(&pdata_context),
+                    );
 
                     let payload = logs_request_bytes();
-                    let pdata = logs_pdata_entry(payload, "X-Tenant-Id", "tenant", "tenant-123");
+                    let pdata = logs_pdata_with_context(payload, &pdata_context);
                     let expected_key = {
                         let (context, _payload) = pdata.clone().into_parts();
-                        ContextPartitionKeyBinding::new(["tenant"])
+                        let compilers = [context
+                            .pdata_context_bytes()
+                            .expect("pdata context")
+                            .schema()
+                            .compiled_context()
+                            .clone()];
+                        ContextPartitionKeyBinding::new(["tenant"], &compilers)
+                            .expect("linked context binding")
                             .partition_key(&context)
+                            .expect("context binding")
                             .expect("headers should produce a partition key")
                     };
 
@@ -6348,13 +6566,22 @@ pub mod test_support {
                         SignalConfig::new(static_topic.into(), MessageFormat::OtlpProto)
                             .with_topic_from_transport_header("x-target-topic"),
                     );
-                    let exporter = KafkaExporterHarness::start(&cluster, cfg);
+                    let pdata_context = test_pdata_context([TestContextHeader::text(
+                        "X-Target-Topic",
+                        "x-target-topic",
+                        dynamic_topic.as_bytes(),
+                    )]);
+                    let exporter = KafkaExporterHarness::start_with_context_compilers(
+                        &cluster,
+                        cfg,
+                        context_compilers(&pdata_context),
+                    );
 
                     // Header-routed batch -> dynamic topic.
                     exporter
-                        .send_pdata(logs_pdata(
+                        .send_pdata(logs_pdata_with_context(
                             logs_request_bytes(),
-                            Some(("X-Target-Topic", dynamic_topic)),
+                            &pdata_context,
                         ))
                         .await
                         .expect("send header-routed pdata");

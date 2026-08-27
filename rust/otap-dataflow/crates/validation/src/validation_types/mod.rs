@@ -13,11 +13,15 @@ use attributes::{
     validate_require_key_values, validate_require_keys,
 };
 use batch::{validate_batch_bytes, validate_batch_items};
-use otel_arrow_dfe_otap::context_bytes::PdataContextBytes;
+use otel_arrow_dfe_config::context::CompiledContext;
+use otel_arrow_dfe_otap::context_bytes::{
+    ContextBindingError, ContextRegisterSetBinding, PdataContextBytes,
+};
 use otel_arrow_dfe_pdata::proto::OtlpProtoMessage;
 use otel_arrow_dfe_pdata::testing::equiv::validate_equivalent;
 use serde::{Deserialize, Serialize};
 use signal_dropped::validate_signal_drop;
+use std::sync::Arc;
 use std::time::Duration;
 use transport_headers::{
     TransportHeaderKeyValue, validate_transport_header_deny_keys,
@@ -102,7 +106,25 @@ pub enum ValidationInstructions {
     },
 }
 impl ValidationInstructions {
+    pub(crate) fn compile_context_binding(
+        &self,
+        compilers: &[Arc<CompiledContext>],
+    ) -> Result<Option<ContextRegisterSetBinding>, ContextBindingError> {
+        match self {
+            Self::TransportHeaderRequireKey { keys } => {
+                ContextRegisterSetBinding::new(keys.iter().map(String::as_str), compilers).map(Some)
+            }
+            Self::TransportHeaderRequireKeyValue { pairs } => ContextRegisterSetBinding::new(
+                pairs.iter().map(|pair| pair.key.as_str()),
+                compilers,
+            )
+            .map(Some),
+            _ => Ok(None),
+        }
+    }
+
     /// Evaluate this validation against control and system-under-validation messages.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn validate(
         &self,
@@ -110,6 +132,23 @@ impl ValidationInstructions {
         suv_msgs: &[OtlpProtoMessage],
         suv_with_duration: &[(OtlpProtoMessage, Duration)],
         transport_headers: &[Option<PdataContextBytes>],
+    ) -> bool {
+        self.validate_with_context_binding(
+            control,
+            suv_msgs,
+            suv_with_duration,
+            transport_headers,
+            None,
+        )
+    }
+
+    pub(crate) fn validate_with_context_binding(
+        &self,
+        control: &[OtlpProtoMessage],
+        suv_msgs: &[OtlpProtoMessage],
+        suv_with_duration: &[(OtlpProtoMessage, Duration)],
+        transport_headers: &[Option<PdataContextBytes>],
+        context_binding: Option<&ContextRegisterSetBinding>,
     ) -> bool {
         match self {
             ValidationInstructions::Equivalence => validate_equivalent(control, suv_msgs),
@@ -137,12 +176,14 @@ impl ValidationInstructions {
                 validate_require_key_values(suv_msgs, domains, pairs)
             }
             ValidationInstructions::AttributeNoDuplicate => validate_no_duplicate_keys(suv_msgs),
-            ValidationInstructions::TransportHeaderRequireKey { keys } => {
-                validate_transport_header_require_keys(transport_headers, keys)
-            }
-            ValidationInstructions::TransportHeaderRequireKeyValue { pairs } => {
-                validate_transport_header_require_key_values(transport_headers, pairs)
-            }
+            ValidationInstructions::TransportHeaderRequireKey { keys } => context_binding
+                .is_some_and(|binding| {
+                    validate_transport_header_require_keys(transport_headers, keys, binding)
+                }),
+            ValidationInstructions::TransportHeaderRequireKeyValue { pairs } => context_binding
+                .is_some_and(|binding| {
+                    validate_transport_header_require_key_values(transport_headers, pairs, binding)
+                }),
             ValidationInstructions::TransportHeaderDeny { keys } => {
                 validate_transport_header_deny_keys(transport_headers, keys)
             }
@@ -444,9 +485,31 @@ mod tests {
         let control: Vec<OtlpProtoMessage> = vec![];
         let suv_msgs: Vec<OtlpProtoMessage> = vec![];
         let suv_with_dur: Vec<(OtlpProtoMessage, Duration)> = vec![];
+        let compilers = [transport[0]
+            .as_ref()
+            .expect("transport context")
+            .schema()
+            .compiled_context()
+            .clone()];
+        let binding = instruction
+            .compile_context_binding(&compilers)
+            .expect("linked validation")
+            .expect("transport binding");
 
-        let result_original = instruction.validate(&control, &suv_msgs, &suv_with_dur, &transport);
-        let result_roundtrip = back.validate(&control, &suv_msgs, &suv_with_dur, &transport);
+        let result_original = instruction.validate_with_context_binding(
+            &control,
+            &suv_msgs,
+            &suv_with_dur,
+            &transport,
+            Some(&binding),
+        );
+        let result_roundtrip = back.validate_with_context_binding(
+            &control,
+            &suv_msgs,
+            &suv_with_dur,
+            &transport,
+            Some(&binding),
+        );
         assert!(result_original);
         assert_eq!(result_original, result_roundtrip);
     }
