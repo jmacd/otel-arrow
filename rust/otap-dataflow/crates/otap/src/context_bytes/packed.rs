@@ -14,10 +14,10 @@ use std::{
     sync::Arc,
 };
 
-use otel_arrow_dfe_config::context::ContextRegisterId;
+use otel_arrow_dfe_config::context::{ContextNameRetention, ContextRegisterId};
 use otel_arrow_dfe_config::transport_headers_policy::{
-    CaptureStats, CompiledHeaderCapturePolicy, CompiledHeaderSchema, CompiledHeaderSchemaItemRef,
-    ValueKindConfig,
+    CaptureSchemaItemId, CaptureStats, CompiledHeaderCapturePolicy, CompiledHeaderSchema,
+    CompiledHeaderSchemaItemRef, ValueKindConfig,
 };
 use tonic::metadata::{KeyAndValueRef, MetadataMap};
 
@@ -308,8 +308,8 @@ impl EntryFields {
 struct ItemFields;
 
 impl ItemFields {
-    const SCHEMA_INDEX: U16Field = U16Field::new(0);
-    const KIND: U8Field = U8Field::new(Self::SCHEMA_INDEX.end());
+    const SCHEMA_ITEM_ID: U16Field = U16Field::new(0);
+    const KIND: U8Field = U8Field::new(Self::SCHEMA_ITEM_ID.end());
     const _PAD: U8Field = U8Field::new(Self::KIND.end());
     const WIRE_NAME: BlobRangeField = BlobRangeField::new(Self::_PAD.end());
     const VALUE: BlobRangeField = BlobRangeField::new(Self::WIRE_NAME.end());
@@ -646,8 +646,8 @@ struct CapturedHeader<'a, V> {
     value: V,
     // Text or binary transport semantics.
     kind: ContextValueKind,
-    // Index of the ingress instruction and register in the retained schema.
-    schema_index: u16,
+    // Ingress instruction in the retained schema.
+    schema_item_id: CaptureSchemaItemId,
 }
 
 impl<'a, V> CapturedHeader<'a, V> {
@@ -656,15 +656,16 @@ impl<'a, V> CapturedHeader<'a, V> {
         schema: &'s CompiledHeaderSchema,
     ) -> Result<CompiledHeaderSchemaItemRef<'s>, ContextBytesError> {
         schema
-            .item(self.schema_index)
+            .item(self.schema_item_id)
             .ok_or(ContextBytesError::InvalidEnvelope)
     }
 
-    fn wire_name_occurrence(
+    fn stored_original_wire_name(
         &self,
         schema_item: CompiledHeaderSchemaItemRef<'_>,
     ) -> Option<&'a str> {
-        (schema_item.retain_observed_name && schema_item.wire_name != self.wire_name)
+        (schema_item.retention == ContextNameRetention::Observed
+            && schema_item.wire_name != self.wire_name)
             .then_some(self.wire_name)
     }
 }
@@ -676,7 +677,9 @@ impl<V: AsRef<[u8]>> CapturedHeader<'_, V> {
 
     fn encoded_len(&self, schema: &CompiledHeaderSchema) -> Result<usize, ContextBytesError> {
         let schema_item = self.schema_item(schema)?;
-        let wire_name_len = self.wire_name_occurrence(schema_item).map_or(0, str::len);
+        let wire_name_len = self
+            .stored_original_wire_name(schema_item)
+            .map_or(0, str::len);
         wire_name_len
             .checked_add(self.value.as_ref().len())
             .ok_or(ContextBytesError::TooLarge)
@@ -688,7 +691,7 @@ impl<V: AsRef<[u8]>> CapturedHeader<'_, V> {
         bytes: &mut [u8],
         cursor: &mut usize,
     ) -> Result<(), ContextBytesError> {
-        if let Some(wire_name) = self.wire_name_occurrence(schema_item) {
+        if let Some(wire_name) = self.stored_original_wire_name(schema_item) {
             write_slice(bytes, *cursor, wire_name.as_bytes())?;
             *cursor = cursor
                 .checked_add(wire_name.len())
@@ -714,7 +717,7 @@ impl PdataContextBytes {
                 wire_name,
                 value,
                 kind: ContextValueKind::captured(matched.schema_item.value_kind, wire_name),
-                schema_index: matched.schema_index,
+                schema_item_id: matched.schema_item_id,
             }))
         });
         Self::capture_candidates(policy, candidates)
@@ -735,7 +738,7 @@ impl PdataContextBytes {
                         wire_name,
                         value: CapturedValue::Borrowed(value.as_bytes()),
                         kind: ContextValueKind::captured(matched.schema_item.value_kind, wire_name),
-                        schema_index: matched.schema_index,
+                        schema_item_id: matched.schema_item_id,
                     }))
                 }
                 KeyAndValueRef::Binary(key, value) => {
@@ -749,7 +752,7 @@ impl PdataContextBytes {
                                 matched.schema_item.value_kind,
                                 wire_name,
                             ),
-                            schema_index: matched.schema_index,
+                            schema_item_id: matched.schema_item_id,
                         }),
                         Err(_) => Err(ContextBytesError::InvalidTransportValue),
                     })
@@ -774,12 +777,13 @@ impl PdataContextBytes {
 
         for candidate in candidates {
             let candidate = candidate?;
-            let wire_name = candidate.wire_name;
             if captured.len() >= defaults.max_entries {
                 skipped.max_entries += 1;
                 continue;
             }
-            if wire_name.len() > defaults.max_name_bytes {
+            let schema_item = candidate.schema_item(schema)?;
+            let stored_wire_name = candidate.stored_original_wire_name(schema_item);
+            if stored_wire_name.is_some_and(|name| name.len() > defaults.max_name_bytes) {
                 skipped.name_too_long += 1;
                 continue;
             }
@@ -1026,7 +1030,7 @@ impl EntryDescriptor {
 
 #[derive(Clone, Copy, Debug)]
 struct ItemDescriptor {
-    schema_index: u16,
+    schema_item_id: CaptureSchemaItemId,
     kind: ContextValueKind,
     wire_name: BlobRange,
     value: BlobRange,
@@ -1038,7 +1042,7 @@ impl ItemDescriptor {
         schema_item: CompiledHeaderSchemaItemRef<'_>,
         cursor: &mut usize,
     ) -> Result<Self, ContextBytesError> {
-        let wire_name = if let Some(wire_name) = header.wire_name_occurrence(schema_item) {
+        let wire_name = if let Some(wire_name) = header.stored_original_wire_name(schema_item) {
             let range = BlobRange {
                 offset: *cursor,
                 len: wire_name.len(),
@@ -1054,7 +1058,7 @@ impl ItemDescriptor {
         };
         *cursor = value.end().ok_or(ContextBytesError::TooLarge)?;
         Ok(Self {
-            schema_index: header.schema_index,
+            schema_item_id: header.schema_item_id,
             kind: header.kind,
             wire_name,
             value,
@@ -1064,7 +1068,9 @@ impl ItemDescriptor {
     #[cfg(test)]
     fn read(bytes: &[u8], at: usize) -> Option<Self> {
         Some(Self {
-            schema_index: ItemFields::SCHEMA_INDEX.read(bytes, at)?,
+            schema_item_id: CaptureSchemaItemId::from_u16(
+                ItemFields::SCHEMA_ITEM_ID.read(bytes, at)?,
+            ),
             kind: ContextValueKind::decode(ItemFields::KIND.read(bytes, at)?)?,
             wire_name: ItemFields::WIRE_NAME.read(bytes, at)?,
             value: ItemFields::VALUE.read(bytes, at)?,
@@ -1072,7 +1078,7 @@ impl ItemDescriptor {
     }
 
     fn write(self, bytes: &mut [u8], at: usize) -> Result<(), ContextBytesError> {
-        ItemFields::SCHEMA_INDEX.write(bytes, at, self.schema_index)?;
+        ItemFields::SCHEMA_ITEM_ID.write(bytes, at, self.schema_item_id.as_u16())?;
         ItemFields::KIND.write(bytes, at, self.kind as u8)?;
         ItemFields::_PAD.write(bytes, at, 0)?;
         ItemFields::WIRE_NAME.write(bytes, at, self.wire_name)?;
@@ -1081,10 +1087,13 @@ impl ItemDescriptor {
 
     #[cfg(test)]
     fn valid_for(self, layout: Layout, blob: &[u8], schema: &CompiledHeaderSchema) -> bool {
-        let Some(schema_item) = schema.item(self.schema_index) else {
+        let Some(schema_item) = schema.item(self.schema_item_id) else {
             return false;
         };
         if schema_item.register.index() >= layout.entry_count {
+            return false;
+        }
+        if schema_item.retention != ContextNameRetention::Observed && self.wire_name.len != 0 {
             return false;
         }
         if self.wire_name.len > 0 && self.wire_name.text(blob).is_none() {
@@ -1121,7 +1130,7 @@ fn validate(bytes: &[u8], schema: &CompiledHeaderSchema) -> Result<(), ContextBy
     if bytes.len() != layout.total_len {
         return Err(ContextBytesError::InvalidEnvelope);
     }
-    if layout.entry_count != schema.register_file().len() {
+    if layout.entry_count != schema.register_layout().len() {
         return Err(ContextBytesError::InvalidEnvelope);
     }
     validate_unused_presence_bits(bytes, layout)?;
@@ -1149,7 +1158,7 @@ fn validate(bytes: &[u8], schema: &CompiledHeaderSchema) -> Result<(), ContextBy
         let register = ContextRegisterId::from_u16(
             u16::try_from(slot).map_err(|_| ContextBytesError::InvalidEnvelope)?,
         );
-        if register.index() >= schema.register_file().len() {
+        if register.index() >= schema.register_layout().len() {
             return Err(ContextBytesError::InvalidEnvelope);
         }
         let mut hash = entry_hash_seed();
@@ -1166,7 +1175,7 @@ fn validate(bytes: &[u8], schema: &CompiledHeaderSchema) -> Result<(), ContextBy
                 .filter(|item| *item < items.len())
                 .ok_or(ContextBytesError::InvalidEnvelope)?;
             let item_entry = schema
-                .item(items[item].schema_index)
+                .item(items[item].schema_item_id)
                 .map(|item| item.register);
             if indexed_items[item] || item_entry != Some(register) {
                 return Err(ContextBytesError::InvalidEnvelope);
@@ -1329,13 +1338,28 @@ pub struct ContextItem<'a> {
 }
 
 impl<'a> ContextItem<'a> {
-    /// Returns the observed or schema-defined transport name.
+    /// Returns the lowercase transport name from the compiled schema.
     #[must_use]
-    pub fn wire_name(&self) -> Option<&'a str> {
+    pub fn lowercase_wire_name(&self) -> Option<&'a str> {
+        let schema_item = self.schema_item()?;
+        match schema_item.retention {
+            ContextNameRetention::None => None,
+            ContextNameRetention::Canonical | ContextNameRetention::Observed => {
+                Some(schema_item.wire_name)
+            }
+        }
+    }
+
+    /// Returns the original ingress transport name when retained.
+    #[must_use]
+    pub fn original_wire_name(&self) -> Option<&'a str> {
+        let schema_item = self.schema_item()?;
+        if schema_item.retention != ContextNameRetention::Observed {
+            return None;
+        }
         let wire_range = ItemFields::WIRE_NAME.read(&self.context.bytes, self.descriptor_at)?;
         if wire_range.len == 0 {
-            // No occurrence data -- use schema-normalized wire name
-            return Some(self.schema_item()?.wire_name);
+            return Some(schema_item.wire_name);
         }
         self.text(ItemFields::WIRE_NAME)
     }
@@ -1351,18 +1375,24 @@ impl<'a> ContextItem<'a> {
         ))
     }
 
-    /// Index in the retained compiled schema.
+    /// Returns the capture instruction identity.
     #[must_use]
-    pub fn schema_index(&self) -> Option<u16> {
-        ItemFields::SCHEMA_INDEX.read(&self.context.bytes, self.descriptor_at)
+    pub fn schema_item_id(&self) -> Option<CaptureSchemaItemId> {
+        Some(CaptureSchemaItemId::from_u16(
+            ItemFields::SCHEMA_ITEM_ID.read(&self.context.bytes, self.descriptor_at)?,
+        ))
     }
 
-    /// Returns whether the wire name comes from the compiled schema.
+    /// Returns whether the original wire name comes from the compiled schema.
     #[must_use]
-    pub fn uses_schema_wire_name(&self) -> bool {
-        ItemFields::WIRE_NAME
-            .read(&self.context.bytes, self.descriptor_at)
-            .is_some_and(|range| range.len == 0)
+    pub fn original_wire_name_uses_schema(&self) -> bool {
+        let Some(schema_item) = self.schema_item() else {
+            return false;
+        };
+        schema_item.retention == ContextNameRetention::Observed
+            && ItemFields::WIRE_NAME
+                .read(&self.context.bytes, self.descriptor_at)
+                .is_some_and(|range| range.len == 0)
     }
 
     fn bytes(&self, field: BlobRangeField) -> Option<&'a [u8]> {
@@ -1377,7 +1407,7 @@ impl<'a> ContextItem<'a> {
     }
 
     fn schema_item(&self) -> Option<CompiledHeaderSchemaItemRef<'a>> {
-        let id = self.schema_index()?;
+        let id = self.schema_item_id()?;
         self.context.bytes.schema().item(id)
     }
 }
@@ -1438,28 +1468,37 @@ impl<'a> ContextRegister<'a> {
 mod tests {
     use super::*;
     use http::{HeaderMap, HeaderValue};
-    use otel_arrow_dfe_config::context::ContextCompiler;
+    use otel_arrow_dfe_config::context::{
+        ContextCompiler, ContextNameRetention, ContextRegisterRequirement,
+    };
     use otel_arrow_dfe_config::transport_headers_policy::{
         CaptureDefaults, CaptureRule, HeaderCapturePolicy,
     };
     use tonic::metadata::{Ascii, Binary, MetadataKey, MetadataMap, MetadataValue};
 
     fn compile_capture(rules: Vec<CaptureRule>, names: &[&str]) -> CompiledHeaderCapturePolicy {
-        compile_capture_with_provenance(rules, names, false)
+        compile_capture_with_retention(rules, names, |_| ContextNameRetention::None)
     }
 
-    fn compile_capture_with_provenance(
+    fn compile_capture_with_retention(
         rules: Vec<CaptureRule>,
         names: &[&str],
-        retain_observed_names: bool,
+        retention: impl Fn(&str) -> ContextNameRetention,
     ) -> CompiledHeaderCapturePolicy {
         let mut compiler = ContextCompiler::new();
         for name in names {
-            let _ = compiler.declare(name).expect("declare register");
+            let retention = retention(name);
+            let _ = compiler
+                .declare(ContextRegisterRequirement::with_retention(name, retention))
+                .expect("declare register");
         }
-        HeaderCapturePolicy::new(CaptureDefaults::default(), rules)
-            .compile(compiler.finish(), retain_observed_names)
-            .expect("compile capture")
+        let policy = HeaderCapturePolicy::new(CaptureDefaults::default(), rules);
+        for requirement in policy.register_requirements() {
+            let _ = compiler
+                .declare(requirement)
+                .expect("declare capture register");
+        }
+        policy.compile(compiler.finish()).expect("compile capture")
     }
 
     fn rule(matches: &[&str], store_as: Option<&str>) -> CaptureRule {
@@ -1544,7 +1583,7 @@ mod tests {
     /// Guarantees: item order, kinds, names, hashes, and indexes survive packing.
     #[test]
     fn packed_items_preserve_schema_semantics() {
-        let policy = compile_capture_with_provenance(
+        let policy = compile_capture_with_retention(
             vec![
                 rule(&["x-tenant"], Some("tenant")),
                 CaptureRule {
@@ -1556,7 +1595,13 @@ mod tests {
                 rule(&["x-request-id"], None),
             ],
             &["tenant", "x-request-id"],
-            true,
+            |name| {
+                if name == "tenant" {
+                    ContextNameRetention::Observed
+                } else {
+                    ContextNameRetention::None
+                }
+            },
         );
         let (context, _) = PdataContextBytes::capture(
             &policy,
@@ -1571,8 +1616,10 @@ mod tests {
         let items = context.items().collect::<Vec<_>>();
 
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0].wire_name(), Some("X-Tenant"));
-        assert_eq!(items[1].wire_name(), Some("X-Request-Id"));
+        assert_eq!(items[0].lowercase_wire_name(), Some("x-tenant"));
+        assert_eq!(items[0].original_wire_name(), Some("X-Tenant"));
+        assert_eq!(items[1].lowercase_wire_name(), None);
+        assert_eq!(items[1].original_wire_name(), None);
         assert_eq!(
             items[2].value(),
             Some((ContextValueKind::Binary, &[0x01, 0x02][..]))
@@ -1592,6 +1639,25 @@ mod tests {
             ]
         );
         validate(&context.bytes, context.schema()).expect("valid envelope");
+    }
+
+    /// Scenario: one capture rule stores multiple names as distinct registers.
+    /// Guarantees: packed items expose schema names without storing observed names.
+    #[test]
+    fn multiple_match_names_retain_canonical_names() {
+        let policy = compile_capture(
+            vec![rule(&["x-tenant", "x-org"], None)],
+            &["x-tenant", "x-org"],
+        );
+        let (context, _) =
+            PdataContextBytes::capture(&policy, [("X-Org", b"acme".as_slice())]).expect("capture");
+        let context = context.expect("context");
+        let items = context.items().collect::<Vec<_>>();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].lowercase_wire_name(), Some("x-org"));
+        assert_eq!(items[0].original_wire_name(), None);
+        assert!(!items[0].original_wire_name_uses_schema());
     }
 
     /// Scenario: gRPC metadata mixes unmatched, text, and binary values.
@@ -1625,7 +1691,8 @@ mod tests {
         let items = context.items().collect::<Vec<_>>();
 
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].wire_name(), Some("x-tenant"));
+        assert_eq!(items[0].lowercase_wire_name(), None);
+        assert_eq!(items[0].original_wire_name(), None);
         assert_eq!(
             items[1].value(),
             Some((ContextValueKind::Binary, &[0x01, 0x02][..]))
@@ -1660,20 +1727,25 @@ mod tests {
         let rules = vec![
             rule(&["x-tenant"], Some("tenant")),
             rule(&["trace-bin"], None),
-            rule(&["x-long-name-value"], None),
+            rule(&["x-long-name-value"], Some("tenant")),
         ];
+        let policy = HeaderCapturePolicy::new(defaults, rules);
         let mut compiler = ContextCompiler::new();
-        for name in ["tenant", "trace-bin", "x-long-name-value"] {
-            let _ = compiler.declare(name).expect("declare register");
+        for requirement in policy.register_requirements() {
+            let _ = compiler.declare(requirement).expect("declare register");
         }
-        let policy = HeaderCapturePolicy::new(defaults, rules)
-            .compile(compiler.finish(), true)
-            .expect("compile capture");
+        let _ = compiler
+            .declare(ContextRegisterRequirement::with_retention(
+                "tenant",
+                ContextNameRetention::Observed,
+            ))
+            .expect("declare tenant");
+        let policy = policy.compile(compiler.finish()).expect("compile capture");
 
         let (context, stats) = PdataContextBytes::capture(
             &policy,
             [
-                ("x-long-name-value", b"ok".as_slice()),
+                ("X-Long-Name-Value", b"ok".as_slice()),
                 ("x-tenant", b"extra".as_slice()),
                 ("X-Tenant", b"acme".as_slice()),
                 ("trace-bin", &[0x01, 0x02]),
@@ -1716,10 +1788,6 @@ mod tests {
             vec![rule(&["x-tenant"], Some("tenant"))],
         );
 
-        assert!(
-            policy
-                .compile(ContextCompiler::new().finish(), false)
-                .is_err()
-        );
+        assert!(policy.compile(ContextCompiler::new().finish()).is_err());
     }
 }

@@ -32,13 +32,72 @@ impl ContextRegisterId {
     }
 }
 
+/// Describes whether context consumers require name metadata for a register.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ContextNameRetention {
+    /// Consumers only need the captured value.
+    #[default]
+    None,
+    /// Consumers need the schema-normalized name.
+    Canonical,
+    /// Consumers need the original name observed on ingress.
+    Observed,
+}
+
+/// One named context register and its name metadata requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContextRegisterRequirement<'a> {
+    /// Logical context register name.
+    pub name: &'a str,
+    /// Strongest name metadata requirement for this register.
+    pub retention: ContextNameRetention,
+}
+
+impl<'a> ContextRegisterRequirement<'a> {
+    /// Declares a register with no name metadata requirement.
+    #[must_use]
+    pub const fn new(name: &'a str) -> Self {
+        Self {
+            name,
+            retention: ContextNameRetention::None,
+        }
+    }
+
+    /// Declares a register with a name metadata requirement.
+    #[must_use]
+    pub const fn with_retention(name: &'a str, retention: ContextNameRetention) -> Self {
+        Self { name, retention }
+    }
+}
+
+/// Compiled metadata for one dense context register.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContextRegisterDescriptor {
+    name: Box<str>,
+    retention: ContextNameRetention,
+}
+
+impl ContextRegisterDescriptor {
+    /// Returns the canonical register name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the name metadata requirement.
+    #[must_use]
+    pub const fn retention(&self) -> ContextNameRetention {
+        self.retention
+    }
+}
+
 /// Immutable executable register layout.
 #[derive(Debug, PartialEq, Eq)]
-pub struct ContextRegisterFile {
+pub struct ContextRegisterLayout {
     register_count: usize,
 }
 
-impl ContextRegisterFile {
+impl ContextRegisterLayout {
     /// Returns the number of registers.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -55,16 +114,16 @@ impl ContextRegisterFile {
 /// Global compiler output used to build node access plans.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CompiledContext {
-    register_file: Arc<ContextRegisterFile>,
+    register_layout: Arc<ContextRegisterLayout>,
     symbols: HashMap<Box<str>, ContextRegisterId>,
-    register_symbols: Box<[Box<str>]>,
+    registers: Box<[ContextRegisterDescriptor]>,
 }
 
 impl CompiledContext {
     /// Returns the executable register layout.
     #[must_use]
-    pub fn register_file(&self) -> &Arc<ContextRegisterFile> {
-        &self.register_file
+    pub fn register_layout(&self) -> &Arc<ContextRegisterLayout> {
+        &self.register_layout
     }
 
     /// Resolves one configuration symbol.
@@ -76,20 +135,20 @@ impl CompiledContext {
             .ok_or(ContextCompileError::UnknownRegister { symbol: canonical })
     }
 
-    /// Returns a source symbol for compatibility output.
+    /// Returns the compiled metadata for one register.
     #[must_use]
-    pub fn symbol(&self, register: ContextRegisterId) -> Option<&str> {
-        self.register_symbols
-            .get(register.index())
-            .map(AsRef::as_ref)
+    pub fn register(&self, register: ContextRegisterId) -> Option<&ContextRegisterDescriptor> {
+        self.registers.get(register.index())
     }
 }
 
-/// Builds one global register layout.
+/// The context compiler.
 #[derive(Debug, Default)]
 pub struct ContextCompiler {
+    /// Symbol name to index
     symbols: HashMap<Box<str>, ContextRegisterId>,
-    register_symbols: Vec<Box<str>>,
+    /// Registers in index position
+    registers: Vec<ContextRegisterDescriptor>,
 }
 
 impl ContextCompiler {
@@ -99,22 +158,33 @@ impl ContextCompiler {
         Self::default()
     }
 
-    /// Declares or reuses one register symbol.
-    pub fn declare(&mut self, symbol: &str) -> Result<ContextRegisterId, ContextCompileError> {
-        let canonical = canonical_symbol(symbol)?;
+    /// Declares or reuses one register requirement.
+    pub fn declare(
+        &mut self,
+        requirement: ContextRegisterRequirement<'_>,
+    ) -> Result<ContextRegisterId, ContextCompileError> {
+        let canonical = canonical_symbol(requirement.name)?;
         if let Some(register) = self.symbols.get(canonical.as_str()).copied() {
+            let slot = self
+                .registers
+                .get_mut(register.index())
+                .expect("declared register has retention slot");
+            slot.retention = slot.retention.max(requirement.retention);
             return Ok(register);
         }
-        if self.register_symbols.len() >= usize::from(u16::MAX) {
+        if self.registers.len() >= usize::from(u16::MAX) {
             return Err(ContextCompileError::TooManyRegisters);
         }
         let register = ContextRegisterId(
-            u16::try_from(self.register_symbols.len())
+            u16::try_from(self.registers.len())
                 .map_err(|_| ContextCompileError::TooManyRegisters)?,
         );
         let symbol: Box<str> = canonical.into_boxed_str();
         let _ = self.symbols.insert(symbol.clone(), register);
-        self.register_symbols.push(symbol);
+        self.registers.push(ContextRegisterDescriptor {
+            name: symbol,
+            retention: requirement.retention,
+        });
         Ok(register)
     }
 
@@ -122,11 +192,11 @@ impl ContextCompiler {
     #[must_use]
     pub fn finish(self) -> Arc<CompiledContext> {
         Arc::new(CompiledContext {
-            register_file: Arc::new(ContextRegisterFile {
-                register_count: self.register_symbols.len(),
+            register_layout: Arc::new(ContextRegisterLayout {
+                register_count: self.registers.len(),
             }),
             symbols: self.symbols,
-            register_symbols: self.register_symbols.into_boxed_slice(),
+            registers: self.registers.into_boxed_slice(),
         })
     }
 }
@@ -176,14 +246,44 @@ mod tests {
     #[test]
     fn declarations_are_canonical_and_dense() {
         let mut compiler = ContextCompiler::new();
-        let first = compiler.declare("Tenant").expect("first");
-        let second = compiler.declare("tenant").expect("second");
+        let first = compiler
+            .declare(ContextRegisterRequirement::new("Tenant"))
+            .expect("first");
+        let second = compiler
+            .declare(ContextRegisterRequirement::new("tenant"))
+            .expect("second");
         let context = compiler.finish();
 
         assert_eq!(first, second);
         assert_eq!(first.index(), 0);
-        assert_eq!(context.register_file().len(), 1);
+        assert_eq!(context.register_layout().len(), 1);
         assert_eq!(context.resolve("TENANT"), Ok(first));
+    }
+
+    /// Scenario: multiple declarations require different name metadata for one register.
+    /// Guarantees: the compiled context retains the strongest requirement.
+    #[test]
+    fn retention_uses_strongest_requirement() {
+        let mut compiler = ContextCompiler::new();
+        let register = compiler
+            .declare(ContextRegisterRequirement::with_retention(
+                "tenant",
+                ContextNameRetention::Canonical,
+            ))
+            .expect("canonical tenant");
+        assert_eq!(
+            compiler.declare(ContextRegisterRequirement::with_retention(
+                "tenant",
+                ContextNameRetention::Observed,
+            )),
+            Ok(register)
+        );
+        let context = compiler.finish();
+
+        assert_eq!(
+            context.register(register).expect("register").retention(),
+            ContextNameRetention::Observed
+        );
     }
 
     /// Scenario: a consumer names an undeclared register.
@@ -205,13 +305,19 @@ mod tests {
         let mut compiler = ContextCompiler::new();
 
         assert_eq!(
-            compiler.declare(" "),
+            compiler.declare(ContextRegisterRequirement::new(" ")),
             Err(ContextCompileError::EmptyRegister)
         );
         assert!(matches!(
-            compiler.declare("t\u{e9}nant"),
+            compiler.declare(ContextRegisterRequirement::new("t\u{e9}nant")),
             Err(ContextCompileError::NonAsciiRegister { .. })
         ));
-        assert_eq!(compiler.declare("tenant").expect("tenant").index(), 0);
+        assert_eq!(
+            compiler
+                .declare(ContextRegisterRequirement::new("tenant"))
+                .expect("tenant")
+                .index(),
+            0
+        );
     }
 }

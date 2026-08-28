@@ -3,15 +3,17 @@
 
 //! Component context declarations collected before runtime construction.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use otel_arrow_dfe_config::context::{CompiledContext, ContextCompiler};
+use otel_arrow_dfe_config::context::{
+    CompiledContext, ContextCompiler, ContextNameRetention, ContextRegisterRequirement,
+};
 use otel_arrow_dfe_config::engine::{ResolvedOtelDataflowSpec, ResolvedPipelineConfig};
 use otel_arrow_dfe_config::error::Error;
 use otel_arrow_dfe_config::node::{NodeKind, NodeUserConfig};
 use otel_arrow_dfe_config::transport_headers_policy::{
-    CompiledHeaderCapturePolicy, HeaderCapturePolicy,
+    CompiledHeaderCapturePolicy, HeaderCapturePolicy, HeaderPropagationPolicy,
 };
 use otel_arrow_dfe_config::{NodeId as ConfigNodeId, PipelineKey};
 
@@ -100,6 +102,47 @@ fn receiver_capture_policy<'a>(
     })
 }
 
+fn exporter_propagation_policy<'a>(
+    pipeline: &'a ResolvedPipelineConfig,
+    node: &'a NodeUserConfig,
+) -> Option<&'a HeaderPropagationPolicy> {
+    if node.kind() != NodeKind::Exporter {
+        return None;
+    }
+    node.header_propagation.as_ref().or_else(|| {
+        pipeline
+            .policies
+            .transport_headers
+            .as_ref()
+            .map(|policy| &policy.header_propagation)
+    })
+}
+
+fn pipeline_capture_retention(
+    pipeline: &ResolvedPipelineConfig,
+    stored_name: &str,
+) -> ContextNameRetention {
+    pipeline
+        .pipeline
+        .node_iter()
+        .filter_map(|(_, node_config)| exporter_propagation_policy(pipeline, node_config))
+        .map(|policy| policy.capture_retention(stored_name))
+        .max()
+        .unwrap_or(ContextNameRetention::None)
+}
+
+fn require_register_name(
+    requirements: &mut BTreeMap<String, ContextNameRetention>,
+    name: &str,
+    retention: ContextNameRetention,
+) {
+    let canonical = name.trim().to_ascii_lowercase();
+    let _ = requirements
+        .entry(canonical)
+        .and_modify(|existing| *existing = (*existing).max(retention))
+        .or_insert(retention);
+}
+
 impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
     /// Compiles context policy from the complete resolved configuration.
     pub fn compile_context_policy(
@@ -107,7 +150,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         resolved: &ResolvedOtelDataflowSpec,
     ) -> Result<Arc<CompiledContextPolicy>, EngineError> {
         let mut declarations = HashMap::new();
-        let mut register_names = BTreeSet::new();
+        let mut register_requirements = BTreeMap::new();
 
         for pipeline in &resolved.pipelines {
             let pipeline_key = PipelineKey::new(
@@ -115,6 +158,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                 pipeline.pipeline_id.clone(),
             );
             let mut declarations_by_node = HashMap::new();
+            let mut pipeline_capture_names = BTreeSet::new();
 
             for (node_id, node_config) in pipeline.pipeline.node_iter() {
                 let node_declarations = self.node_context_declarations(
@@ -124,30 +168,44 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                 )?;
                 for declaration in &node_declarations {
                     if let ContextDeclaration::Produces { name, .. } = declaration {
-                        let _ = register_names.insert(name.trim().to_ascii_lowercase());
+                        require_register_name(
+                            &mut register_requirements,
+                            name,
+                            ContextNameRetention::None,
+                        );
                     }
                 }
                 if let Some(capture) = receiver_capture_policy(pipeline, node_config) {
-                    register_names.extend(
-                        capture
-                            .register_names()
-                            .map(|name| name.trim().to_ascii_lowercase()),
-                    );
+                    for requirement in capture.register_requirements() {
+                        require_register_name(
+                            &mut register_requirements,
+                            requirement.name,
+                            requirement.retention,
+                        );
+                        let _ = pipeline_capture_names
+                            .insert(requirement.name.trim().to_ascii_lowercase());
+                    }
                 }
                 let _ = declarations_by_node
                     .insert(node_id.clone(), node_declarations.into_boxed_slice());
             }
 
+            for name in pipeline_capture_names {
+                let retention = pipeline_capture_retention(pipeline, &name);
+                require_register_name(&mut register_requirements, &name, retention);
+            }
             let _ = declarations.insert(pipeline_key, declarations_by_node);
         }
 
         let mut compiler = ContextCompiler::new();
-        for name in register_names {
-            let _ = compiler.declare(&name).map_err(|error| {
-                EngineError::ConfigError(Box::new(Error::InvalidUserConfig {
-                    error: error.to_string(),
-                }))
-            })?;
+        for (name, retention) in register_requirements {
+            let _ = compiler
+                .declare(ContextRegisterRequirement::with_retention(&name, retention))
+                .map_err(|error| {
+                    EngineError::ConfigError(Box::new(Error::InvalidUserConfig {
+                        error: error.to_string(),
+                    }))
+                })?;
         }
 
         let compiled_context = compiler.finish();
@@ -160,14 +218,9 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
             let mut captures_by_node = HashMap::new();
             for (node_id, node_config) in pipeline.pipeline.node_iter() {
                 if let Some(capture) = receiver_capture_policy(pipeline, node_config) {
-                    let compiled =
-                        capture
-                            .compile(compiled_context.clone(), true)
-                            .map_err(|error| {
-                                EngineError::ConfigError(Box::new(Error::InvalidUserConfig {
-                                    error,
-                                }))
-                            })?;
+                    let compiled = capture.compile(compiled_context.clone()).map_err(|error| {
+                        EngineError::ConfigError(Box::new(Error::InvalidUserConfig { error }))
+                    })?;
                     let _ = captures_by_node.insert(node_id.clone(), compiled);
                 }
             }
@@ -312,9 +365,9 @@ mod tests {
     }
 
     /// Scenario: capture and component producers span one resolved configuration.
-    /// Guarantees: one sorted register file backs every compiled receiver schema.
+    /// Guarantees: one sorted register layout backs every compiled receiver schema.
     #[test]
-    fn compiles_one_global_register_file() {
+    fn compiles_one_global_register_layout() {
         let mut spec = OtelDataflowSpec::from_yaml(
             r#"
 version: otel_dataflow/v1
@@ -328,6 +381,10 @@ groups:
               headers:
                 - match_names: [x-alpha]
                   store_as: alpha
+            header_propagation:
+              default:
+                selector:
+                  type: all_captured
         nodes:
           source:
             type: urn:test:receiver:context
@@ -374,9 +431,17 @@ groups:
         let pipeline = PipelineKey::new("group".into(), "pipeline".into());
         let capture = &policy.receiver_capture[&pipeline]["source"];
         assert!(Arc::ptr_eq(
-            capture.schema().register_file(),
-            policy.compiled_context.register_file()
+            capture.schema().register_layout(),
+            policy.compiled_context.register_layout()
         ));
+        assert_eq!(
+            capture
+                .match_header("x-alpha")
+                .expect("x-alpha capture")
+                .schema_item
+                .retention,
+            ContextNameRetention::Observed
+        );
     }
 
     /// Scenario: policy compilation indexes declarations by pipeline and node.
@@ -390,7 +455,9 @@ groups:
             name: "tenant".into(),
         };
         let mut compiler = ContextCompiler::new();
-        let _ = compiler.declare("tenant").expect("tenant");
+        let _ = compiler
+            .declare(ContextRegisterRequirement::new("tenant"))
+            .expect("tenant");
         let policy = CompiledContextPolicy {
             compiled_context: compiler.finish(),
             receiver_capture: HashMap::new(),
