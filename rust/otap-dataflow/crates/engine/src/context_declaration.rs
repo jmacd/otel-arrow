@@ -3,12 +3,16 @@
 
 //! Component context declarations collected before runtime construction.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use otel_arrow_dfe_config::engine::ResolvedOtelDataflowSpec;
+use otel_arrow_dfe_config::context::{CompiledContext, ContextCompiler};
+use otel_arrow_dfe_config::engine::{ResolvedOtelDataflowSpec, ResolvedPipelineConfig};
 use otel_arrow_dfe_config::error::Error;
-use otel_arrow_dfe_config::node::NodeKind;
+use otel_arrow_dfe_config::node::{NodeKind, NodeUserConfig};
+use otel_arrow_dfe_config::transport_headers_policy::{
+    CompiledHeaderCapturePolicy, HeaderCapturePolicy,
+};
 use otel_arrow_dfe_config::{NodeId as ConfigNodeId, PipelineKey};
 
 use crate::PipelineFactory;
@@ -71,9 +75,29 @@ pub type ContextDeclarationFn = fn(&serde_json::Value) -> Result<Vec<ContextDecl
 /// Opaque context policy compiled from the resolved configuration.
 #[derive(Debug)]
 pub struct CompiledContextPolicy {
-    // Replaced by executable plans in the next compiler pass.
+    #[allow(dead_code)]
+    compiled_context: Arc<CompiledContext>,
+    #[allow(dead_code)]
+    receiver_capture: HashMap<PipelineKey, HashMap<ConfigNodeId, CompiledHeaderCapturePolicy>>,
+    // Retained until component bindings are compiled.
     #[allow(dead_code)]
     declarations: HashMap<PipelineKey, HashMap<ConfigNodeId, Box<[ContextDeclaration]>>>,
+}
+
+fn receiver_capture_policy<'a>(
+    pipeline: &'a ResolvedPipelineConfig,
+    node: &'a NodeUserConfig,
+) -> Option<&'a HeaderCapturePolicy> {
+    if node.kind() != NodeKind::Receiver {
+        return None;
+    }
+    node.header_capture.as_ref().or_else(|| {
+        pipeline
+            .policies
+            .transport_headers
+            .as_ref()
+            .map(|policy| &policy.header_capture)
+    })
 }
 
 impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
@@ -83,6 +107,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         resolved: &ResolvedOtelDataflowSpec,
     ) -> Result<Arc<CompiledContextPolicy>, EngineError> {
         let mut declarations = HashMap::new();
+        let mut register_names = BTreeSet::new();
 
         for pipeline in &resolved.pipelines {
             let pipeline_key = PipelineKey::new(
@@ -97,6 +122,18 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                     node_config.r#type.as_ref(),
                     &node_config.config,
                 )?;
+                for declaration in &node_declarations {
+                    if let ContextDeclaration::Produces { name, .. } = declaration {
+                        let _ = register_names.insert(name.trim().to_ascii_lowercase());
+                    }
+                }
+                if let Some(capture) = receiver_capture_policy(pipeline, node_config) {
+                    register_names.extend(
+                        capture
+                            .register_names()
+                            .map(|name| name.trim().to_ascii_lowercase()),
+                    );
+                }
                 let _ = declarations_by_node
                     .insert(node_id.clone(), node_declarations.into_boxed_slice());
             }
@@ -104,7 +141,44 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
             let _ = declarations.insert(pipeline_key, declarations_by_node);
         }
 
-        Ok(Arc::new(CompiledContextPolicy { declarations }))
+        let mut compiler = ContextCompiler::new();
+        for name in register_names {
+            let _ = compiler.declare(&name).map_err(|error| {
+                EngineError::ConfigError(Box::new(Error::InvalidUserConfig {
+                    error: error.to_string(),
+                }))
+            })?;
+        }
+
+        let compiled_context = compiler.finish();
+        let mut receiver_capture = HashMap::new();
+        for pipeline in &resolved.pipelines {
+            let pipeline_key = PipelineKey::new(
+                pipeline.pipeline_group_id.clone(),
+                pipeline.pipeline_id.clone(),
+            );
+            let mut captures_by_node = HashMap::new();
+            for (node_id, node_config) in pipeline.pipeline.node_iter() {
+                if let Some(capture) = receiver_capture_policy(pipeline, node_config) {
+                    let compiled =
+                        capture
+                            .compile(compiled_context.clone(), true)
+                            .map_err(|error| {
+                                EngineError::ConfigError(Box::new(Error::InvalidUserConfig {
+                                    error,
+                                }))
+                            })?;
+                    let _ = captures_by_node.insert(node_id.clone(), compiled);
+                }
+            }
+            let _ = receiver_capture.insert(pipeline_key, captures_by_node);
+        }
+
+        Ok(Arc::new(CompiledContextPolicy {
+            compiled_context,
+            receiver_capture,
+            declarations,
+        }))
     }
 
     fn node_context_declarations(
@@ -148,6 +222,68 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otel_arrow_dfe_config::engine::OtelDataflowSpec;
+
+    use crate::config::{ExporterConfig, ReceiverConfig};
+    use crate::context::PipelineContext;
+    use crate::exporter::ExporterWrapper;
+    use crate::node::NodeId;
+    use crate::receiver::ReceiverWrapper;
+    use crate::wiring_contract::WiringContract;
+    use crate::{ExporterFactory, ReceiverFactory};
+
+    fn test_receiver_create(
+        _pipeline: PipelineContext,
+        _node: NodeId,
+        _node_config: Arc<NodeUserConfig>,
+        _config: &ReceiverConfig,
+        _capabilities: &crate::capability::registry::Capabilities,
+    ) -> Result<ReceiverWrapper<()>, Error> {
+        panic!("test receiver must not be constructed")
+    }
+
+    fn test_exporter_create(
+        _pipeline: PipelineContext,
+        _node: NodeId,
+        _node_config: Arc<NodeUserConfig>,
+        _config: &ExporterConfig,
+        _capabilities: &crate::capability::registry::Capabilities,
+    ) -> Result<ExporterWrapper<()>, Error> {
+        panic!("test exporter must not be constructed")
+    }
+
+    fn test_receiver_declarations(
+        _config: &serde_json::Value,
+    ) -> Result<Vec<ContextDeclaration>, Error> {
+        Ok(vec![
+            ContextDeclaration::Produces {
+                access: ContextAccessId::new(0),
+                name: "zeta".into(),
+            },
+            ContextDeclaration::Produces {
+                access: ContextAccessId::new(1),
+                name: "beta".into(),
+            },
+        ])
+    }
+
+    fn test_factory() -> PipelineFactory<()> {
+        let receivers = Box::leak(Box::new([ReceiverFactory {
+            name: "urn:test:receiver:context",
+            create: test_receiver_create,
+            wiring_contract: WiringContract::UNRESTRICTED,
+            validate_config: otel_arrow_dfe_config::validation::no_config,
+            context_declarations: Some(test_receiver_declarations),
+        }]));
+        let exporters = Box::leak(Box::new([ExporterFactory {
+            name: "urn:test:exporter:context",
+            create: test_exporter_create,
+            wiring_contract: WiringContract::UNRESTRICTED,
+            validate_config: otel_arrow_dfe_config::validation::no_config,
+            context_declarations: None,
+        }]));
+        PipelineFactory::new(receivers, &[], exporters, &[])
+    }
 
     /// Scenario: A factory callback receives node config.
     /// Guarantees: it returns the configured declaration.
@@ -175,6 +311,74 @@ mod tests {
         }
     }
 
+    /// Scenario: capture and component producers span one resolved configuration.
+    /// Guarantees: one sorted register file backs every compiled receiver schema.
+    #[test]
+    fn compiles_one_global_register_file() {
+        let mut spec = OtelDataflowSpec::from_yaml(
+            r#"
+version: otel_dataflow/v1
+groups:
+  group:
+    pipelines:
+      pipeline:
+        policies:
+          transport_headers:
+            header_capture:
+              headers:
+                - match_names: [x-alpha]
+                  store_as: alpha
+        nodes:
+          source:
+            type: urn:test:receiver:context
+            config: {}
+          sink:
+            type: urn:test:exporter:context
+            config: {}
+        connections:
+          - from: source
+            to: sink
+"#,
+        )
+        .expect("valid config");
+        spec.engine.observability.pipeline.nodes = Default::default();
+        spec.engine.observability.pipeline.connections.clear();
+        let policy = test_factory()
+            .compile_context_policy(&spec.resolve())
+            .expect("compiled policy");
+
+        assert_eq!(
+            policy
+                .compiled_context
+                .resolve("alpha")
+                .expect("alpha")
+                .index(),
+            0
+        );
+        assert_eq!(
+            policy
+                .compiled_context
+                .resolve("beta")
+                .expect("beta")
+                .index(),
+            1
+        );
+        assert_eq!(
+            policy
+                .compiled_context
+                .resolve("zeta")
+                .expect("zeta")
+                .index(),
+            2
+        );
+        let pipeline = PipelineKey::new("group".into(), "pipeline".into());
+        let capture = &policy.receiver_capture[&pipeline]["source"];
+        assert!(Arc::ptr_eq(
+            capture.schema().register_file(),
+            policy.compiled_context.register_file()
+        ));
+    }
+
     /// Scenario: policy compilation indexes declarations by pipeline and node.
     /// Guarantees: each node retains only its declarations.
     #[test]
@@ -185,7 +389,11 @@ mod tests {
             access: ContextAccessId::new(0),
             name: "tenant".into(),
         };
+        let mut compiler = ContextCompiler::new();
+        let _ = compiler.declare("tenant").expect("tenant");
         let policy = CompiledContextPolicy {
+            compiled_context: compiler.finish(),
+            receiver_capture: HashMap::new(),
             declarations: HashMap::from([(
                 pipeline.clone(),
                 HashMap::from([(node.clone(), vec![declaration.clone()].into_boxed_slice())]),

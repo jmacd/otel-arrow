@@ -75,6 +75,9 @@ pub mod crypto;
 /// propagation through the pipeline.
 pub mod transport_headers;
 
+/// Packed schema-backed pdata context.
+pub mod context_bytes;
+
 /// TLS utilities
 pub mod tls_utils;
 

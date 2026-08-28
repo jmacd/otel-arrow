@@ -11,11 +11,14 @@
 //!
 //! TODO: Implement the sensitive capability for headers
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::context::{CompiledContext, ContextRegisterFile, ContextRegisterId};
 use crate::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
 
 // -- Stats types --------------------------------------------------------------
@@ -100,6 +103,18 @@ impl HeaderCapturePolicy {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.headers.is_empty()
+    }
+
+    /// Returns the logical context names declared by this policy.
+    pub fn register_names(&self) -> impl Iterator<Item = &str> {
+        self.headers.iter().flat_map(|rule| {
+            let names = rule
+                .store_as
+                .as_ref()
+                .map(std::slice::from_ref)
+                .unwrap_or(&rule.match_names);
+            names.iter().map(String::as_str)
+        })
     }
 
     /// Capture headers from an iterator of `(wire_name, value)` pairs.
@@ -193,6 +208,172 @@ impl HeaderCapturePolicy {
                 .any(|m| wire_name.eq_ignore_ascii_case(m))
         })
     }
+
+    /// Compiles capture rules against the global context register file.
+    pub fn compile(
+        &self,
+        compiled_context: Arc<CompiledContext>,
+        retain_observed_names: bool,
+    ) -> Result<CompiledHeaderCapturePolicy, String> {
+        let mut matches = HashMap::new();
+        let mut schema_items = Vec::new();
+        for rule in &self.headers {
+            let shared_register = rule
+                .store_as
+                .as_deref()
+                .map(|name| compiled_context.resolve(name))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            for match_name in &rule.match_names {
+                let normalized = match_name.to_ascii_lowercase();
+                if matches.contains_key(normalized.as_str()) {
+                    continue;
+                }
+                let register = match shared_register {
+                    Some(register) => register,
+                    None => compiled_context
+                        .resolve(&normalized)
+                        .map_err(|error| error.to_string())?,
+                };
+                if schema_items.len() >= usize::from(u16::MAX) {
+                    return Err("header capture supports at most 65535 matches".to_string());
+                }
+                let schema_index =
+                    u16::try_from(schema_items.len()).expect("schema item count checked above");
+                schema_items.push(CompiledHeaderSchemaItem {
+                    wire_name: normalized.clone(),
+                    register,
+                    retain_observed_name: retain_observed_names,
+                    value_kind: rule.value_kind,
+                });
+                let _ = matches.insert(normalized.into_boxed_str(), schema_index);
+            }
+        }
+        let schema = Arc::new(CompiledHeaderSchema {
+            items: schema_items.into_boxed_slice(),
+            register_file: compiled_context.register_file().clone(),
+        });
+        Ok(CompiledHeaderCapturePolicy {
+            defaults: self.defaults.clone(),
+            matches,
+            schema,
+        })
+    }
+}
+
+/// Immutable receiver capture plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledHeaderCapturePolicy {
+    defaults: CaptureDefaults,
+    matches: HashMap<Box<str>, u16>,
+    schema: Arc<CompiledHeaderSchema>,
+}
+
+impl CompiledHeaderCapturePolicy {
+    /// Returns the matching capture instruction.
+    #[must_use]
+    pub fn match_header(&self, wire_name: &str) -> Option<CompiledHeaderMatch<'_>> {
+        let normalized;
+        let lookup = if wire_name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            normalized = wire_name.to_ascii_lowercase();
+            normalized.as_str()
+        } else {
+            wire_name
+        };
+        let schema_index = self.matches.get(lookup).copied()?;
+        Some(CompiledHeaderMatch {
+            schema_index,
+            schema_item: self.schema.item(schema_index)?,
+        })
+    }
+
+    /// Returns the configured capture limits.
+    #[must_use]
+    pub const fn defaults(&self) -> &CaptureDefaults {
+        &self.defaults
+    }
+
+    /// Returns the shared capture schema.
+    #[must_use]
+    pub fn schema(&self) -> &Arc<CompiledHeaderSchema> {
+        &self.schema
+    }
+}
+
+/// Immutable schema metadata referenced by packed context items.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompiledHeaderSchema {
+    items: Box<[CompiledHeaderSchemaItem]>,
+    register_file: Arc<ContextRegisterFile>,
+}
+
+impl CompiledHeaderSchema {
+    /// Returns the global register count.
+    #[must_use]
+    pub fn register_count(&self) -> usize {
+        self.register_file.len()
+    }
+
+    /// Resolves one schema-local capture instruction.
+    #[must_use]
+    pub fn item(&self, id: u16) -> Option<CompiledHeaderSchemaItemRef<'_>> {
+        self.items
+            .get(usize::from(id))
+            .map(|item| CompiledHeaderSchemaItemRef {
+                wire_name: &item.wire_name,
+                register: item.register,
+                retain_observed_name: item.retain_observed_name,
+                value_kind: item.value_kind,
+            })
+    }
+
+    /// Returns the executable register layout.
+    #[must_use]
+    pub fn register_file(&self) -> &Arc<ContextRegisterFile> {
+        &self.register_file
+    }
+
+    /// Returns the number of capture instructions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Returns whether the schema has no capture instructions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CompiledHeaderSchemaItem {
+    wire_name: String,
+    register: ContextRegisterId,
+    retain_observed_name: bool,
+    value_kind: Option<ValueKindConfig>,
+}
+
+/// Borrowed metadata for one capture instruction.
+#[derive(Debug, Clone, Copy)]
+pub struct CompiledHeaderSchemaItemRef<'a> {
+    /// Normalized configured wire name.
+    pub wire_name: &'a str,
+    /// Global context register.
+    pub register: ContextRegisterId,
+    /// Whether ingress must retain observed transport-name provenance.
+    pub retain_observed_name: bool,
+    /// Configured value-kind override.
+    pub value_kind: Option<ValueKindConfig>,
+}
+
+/// One receiver-side capture match.
+#[derive(Debug, Clone, Copy)]
+pub struct CompiledHeaderMatch<'a> {
+    /// Index of the matching capture instruction.
+    pub schema_index: u16,
+    /// Matching capture metadata.
+    pub schema_item: CompiledHeaderSchemaItemRef<'a>,
 }
 
 /// Default limits for header capture.
