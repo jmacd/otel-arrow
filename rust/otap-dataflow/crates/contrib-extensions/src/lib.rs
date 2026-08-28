@@ -22,4 +22,7 @@ pub mod mqtt_client;
 #[cfg(feature = "mqtt-server-extension")]
 pub mod mqtt_server;
 
+#[cfg(feature = "mqtt-sparkplug-extension")]
+pub mod mqtt_sparkplug;
+
 pub mod common;

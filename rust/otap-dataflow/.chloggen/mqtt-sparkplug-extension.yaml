@@ -1,0 +1,6 @@
+change_type: new_component
+component: pipeline
+note: Add experimental extension:mqtt_sparkplug for self-hosted Sparkplug device ingress without an external broker.
+issues: [3]
+subtext: |
+  Phase 1 scope is single core, single listener, no TLS, retained STATE only, graceful OFFLINE instead of crash-safe Will, and raw mqtt_ingress relay only. It targets the standalone role of jmacd/opentelemetry-mqtt-sparkplug.

@@ -8,8 +8,8 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo::rerun-if-changed=proto/sparkplug.proto");
 
-    let protoc = protoc_bin_vendored::protoc_bin_path()
-        .expect("failed to locate bundled protoc binary");
+    let protoc =
+        protoc_bin_vendored::protoc_bin_path().expect("failed to locate bundled protoc binary");
 
     let mut config = prost_build::Config::new();
     let _ = config.protoc_executable(protoc);

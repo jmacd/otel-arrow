@@ -20,6 +20,7 @@ otel-arrow-dfe-engine = { workspace = true }
 otel-arrow-dfe-otap = { workspace = true }
 otel-arrow-dfe-telemetry = { workspace = true }
 otel-arrow-dfe-telemetry-macros = { workspace = true }
+otel-arrow-dfe-sparkplug = { workspace = true, optional = true }
 
 async-trait.workspace = true
 bytes.workspace = true
@@ -52,7 +53,7 @@ ms-mqtt-client = { workspace = true, optional = true }
 
 [features]
 # Umbrella feature enabling all contrib extensions.
-contrib-extensions = ["azure-identity-auth-extension", "k8s-service-account-token-auth-extension", "oauth2-client-auth-extension", "mqtt-client-extension", "mqtt-server-extension"]
+contrib-extensions = ["azure-identity-auth-extension", "k8s-service-account-token-auth-extension", "oauth2-client-auth-extension", "mqtt-client-extension", "mqtt-server-extension", "mqtt-sparkplug-extension"]
 # Azure Identity authentication extension (BearerTokenProvider capability).
 azure-identity-auth-extension = ["dep:azure_core", "dep:azure_identity", "dep:humantime-serde", "dep:rand"]
 # Kubernetes service-account-token authorizer extension (BearerTokenAuthorizer
@@ -73,6 +74,14 @@ mqtt-server-extension = [
     "dep:ntex-net",
     "dep:ntex-service",
     "dep:humantime-serde",
+]
+# MQTT Sparkplug extension (MqttIngress/MqttEgress capabilities), backed by
+# `ntex-mqtt` plus the engine-free `otel-arrow-dfe-sparkplug` state machine.
+mqtt-sparkplug-extension = [
+    "dep:ntex-mqtt",
+    "dep:ntex-net",
+    "dep:ntex-service",
+    "dep:otel-arrow-dfe-sparkplug",
 ]
 
 # JWT assertion-signing backend for the OAuth 2.0 client auth extension. These

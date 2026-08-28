@@ -149,7 +149,8 @@ impl SparkplugState {
                 edge.store
                     .visit_lifecycle_or_data(topic.message_type(), payload, observed_at)?;
 
-                let cascaded_device_deaths = if topic.message_type() == LifecycleMessageType::NDeath {
+                let cascaded_device_deaths = if topic.message_type() == LifecycleMessageType::NDeath
+                {
                     edge.cascade_node_death(topic.group_id(), topic.edge_node_id(), observed_at)
                 } else {
                     Vec::new()
@@ -202,7 +203,9 @@ impl SparkplugState {
             }
 
             if resolved_name == "bdSeq" {
-                b_d_seq = MetricValue::from_proto(metric).and_then(|value| value.as_u64()).or(b_d_seq);
+                b_d_seq = MetricValue::from_proto(metric)
+                    .and_then(|value| value.as_u64())
+                    .or(b_d_seq);
             }
         }
 
@@ -241,7 +244,6 @@ impl SparkplugState {
             Some(&edge.store)
         }
     }
-
 }
 
 /// Builds immutable decode context for one lifecycle or data payload.

@@ -98,7 +98,11 @@ mod tests {
         }
     }
 
-    fn payload(metrics: Vec<pb::payload::Metric>, timestamp: Timestamp, seq: u64) -> SparkplugPayload {
+    fn payload(
+        metrics: Vec<pb::payload::Metric>,
+        timestamp: Timestamp,
+        seq: u64,
+    ) -> SparkplugPayload {
         SparkplugPayload::from(pb::Payload {
             timestamp: Some(timestamp),
             metrics,
@@ -110,7 +114,11 @@ mod tests {
 
     fn lifecycle_topic(topic: &str) -> LifecycleTopic {
         let parsed = must_ok(Topic::parse(topic));
-        must_ok(parsed.as_lifecycle_topic().map_err(SparkplugStateError::NotLifecycleOrData))
+        must_ok(
+            parsed
+                .as_lifecycle_topic()
+                .map_err(SparkplugStateError::NotLifecycleOrData),
+        )
     }
 
     /// Scenario: Parsing every Sparkplug topic form, including both STATE profiles.
@@ -154,11 +162,15 @@ mod tests {
         ));
         assert!(matches!(
             Topic::parse("spBv1.0/group/DBIRTH/edge"),
-            Err(TopicParseError::MissingDeviceId(SparkplugMessageType::DBirth))
+            Err(TopicParseError::MissingDeviceId(
+                SparkplugMessageType::DBirth
+            ))
         ));
         assert!(matches!(
             Topic::parse("spBv1.0/group/NDATA/edge/device"),
-            Err(TopicParseError::UnexpectedDeviceId(SparkplugMessageType::NData))
+            Err(TopicParseError::UnexpectedDeviceId(
+                SparkplugMessageType::NData
+            ))
         ));
         assert!(matches!(
             Topic::parse("spBv1.0/group/STATE/edge"),
@@ -291,26 +303,44 @@ mod tests {
         let outcome = must_ok(state.visit_message(&ndeath_topic, &ndeath, 3000));
 
         assert_eq!(outcome.cascaded_device_deaths.len(), 2);
-        assert!(outcome.cascaded_device_deaths.contains(&CascadedDeviceDeath {
-            group_id: "group".to_owned(),
-            edge_node_id: "edge".to_owned(),
-            device_id: "device-a".to_owned(),
-        }));
-        assert!(outcome.cascaded_device_deaths.contains(&CascadedDeviceDeath {
-            group_id: "group".to_owned(),
-            edge_node_id: "edge".to_owned(),
-            device_id: "device-b".to_owned(),
-        }));
+        assert!(
+            outcome
+                .cascaded_device_deaths
+                .contains(&CascadedDeviceDeath {
+                    group_id: "group".to_owned(),
+                    edge_node_id: "edge".to_owned(),
+                    device_id: "device-a".to_owned(),
+                })
+        );
+        assert!(
+            outcome
+                .cascaded_device_deaths
+                .contains(&CascadedDeviceDeath {
+                    group_id: "group".to_owned(),
+                    edge_node_id: "edge".to_owned(),
+                    device_id: "device-b".to_owned(),
+                })
+        );
 
         let edge = must_some(
             must_some(state.group_ref("group"), "group").edge_node_ref("edge"),
             "edge",
         );
         assert!(!edge.store.is_online());
-        assert!(!must_some(edge.device_ref("device-a"), "device-a").store.is_online());
-        assert!(!must_some(edge.device_ref("device-b"), "device-b").store.is_online());
+        assert!(
+            !must_some(edge.device_ref("device-a"), "device-a")
+                .store
+                .is_online()
+        );
+        assert!(
+            !must_some(edge.device_ref("device-b"), "device-b")
+                .store
+                .is_online()
+        );
         assert_eq!(
-            must_some(edge.device_ref("device-a"), "device-a").store.last_time(),
+            must_some(edge.device_ref("device-a"), "device-a")
+                .store
+                .last_time(),
             Some(3000)
         );
     }
@@ -382,13 +412,12 @@ mod tests {
         assert_eq!(decoded.as_inner(), &original);
 
         let mut store = Store::default();
-        must_ok(store.visit_lifecycle_or_data(
-            LifecycleMessageType::NBirth,
-            &decoded,
-            999,
-        ));
+        must_ok(store.visit_lifecycle_or_data(LifecycleMessageType::NBirth, &decoded, 999));
 
-        assert_eq!(must_some(store.metric_by_name("int"), "int").value, Some(MetricValue::Int(10)));
+        assert_eq!(
+            must_some(store.metric_by_name("int"), "int").value,
+            Some(MetricValue::Int(10))
+        );
         assert_eq!(
             must_some(store.metric_by_name("long"), "long").value,
             Some(MetricValue::Long(11))
@@ -437,11 +466,7 @@ mod tests {
         );
 
         let mut store = Store::default();
-        must_ok(store.visit_lifecycle_or_data(
-            LifecycleMessageType::NBirth,
-            &decoded,
-            2000,
-        ));
+        must_ok(store.visit_lifecycle_or_data(LifecycleMessageType::NBirth, &decoded, 2000));
 
         assert_eq!(
             must_some(store.metric_by_name("dataset"), "dataset").value,
@@ -536,11 +561,8 @@ mod tests {
             2,
         );
         let data_topic = lifecycle_topic("spBv1.0/group/NDATA/edge");
-        let context = must_ok(state.classify_decode_context(
-            &data_topic,
-            &data,
-            DeathOrigin::Unknown,
-        ));
+        let context =
+            must_ok(state.classify_decode_context(&data_topic, &data, DeathOrigin::Unknown));
 
         assert_eq!(context.resolved_aliases.len(), 1);
         assert_eq!(
