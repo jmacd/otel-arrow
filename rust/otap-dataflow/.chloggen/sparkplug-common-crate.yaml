@@ -1,0 +1,6 @@
+change_type: new_component
+component: all
+note: Add an internal otel-arrow-dfe-sparkplug crate as groundwork for future Sparkplug MQTT support.
+issues: [3452]
+subtext: |
+  This crate is not wired into any receiver, exporter, or extension yet.

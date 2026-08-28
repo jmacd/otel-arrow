@@ -131,7 +131,7 @@ extension:mqtt_sparkplug
   +-- NCMD/DCMD rebirth publication
   |
   +-- mqtt_ingress / mqtt_egress
-  +-- sparkplug-b representation tagging and decode context
+  +-- sparkplug representation tagging and decode context
 ```
 
 It does not bind to `extension:mqtt_client` or `extension:mqtt_server`.
@@ -269,7 +269,7 @@ extension:mqtt_sparkplug
        |
        +---- mqtt_ingress ------> receiver:mqtt
        |                              |
-       |                              +--> sparkplug-b encoded pdata
+       |                              +--> sparkplug encoded pdata
        |                                      |
        |                                      +--> raw relay
        |                                      |
@@ -424,7 +424,7 @@ struct MqttIngressItem {
 
 enum EncodedRepresentation {
     MqttPublish,
-    SparkplugB {
+    Sparkplug {
         version: SparkplugPayloadVersion,
         message_type: SparkplugMessageType,
         signal: SignalType,
@@ -458,7 +458,7 @@ Death origin is best-effort:
 - A client connected to an external broker receives a Will as an ordinary
   PUBLISH; MQTT carries no "this was a Will" flag, so its origin is `unknown`.
 
-The `sparkplug-b` PData codec initially maps deaths to OTAP logs:
+The `sparkplug` PData codec initially maps deaths to OTAP logs:
 
 - `event_name = "sparkplug.node.death"` or
   `"sparkplug.device.death"`;
@@ -596,7 +596,7 @@ and device telemetry admission remain inactive.
 A separate Sparkplug module or crate depends on this common MQTT crate and adds
 topic parsing, Primary Host behavior, and bounded Sparkplug session state.
 It exposes both an active-service adapter used by
-`extension:mqtt_sparkplug` and a pure `sparkplug-b` PData codec. There is no
+`extension:mqtt_sparkplug` and a pure `sparkplug` PData codec. There is no
 runtime dependency between those registrations and therefore no need for an
 extension startup-order graph.
 

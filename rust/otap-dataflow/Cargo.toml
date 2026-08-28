@@ -68,6 +68,7 @@ otel-arrow-dfe-core-nodes = { path = "crates/core-nodes" }
 otel-arrow-dfe-engine = { path = "crates/engine" }
 otel-arrow-dfe-expohisto = { path = "crates/expohisto" }
 otel-arrow-dfe-otap = { path = "crates/otap" }
+otel-arrow-dfe-sparkplug = { path = "crates/sparkplug" }
 otel-arrow-dfe-wasm-host = { path = "crates/wasm-host" }
 otel-arrow-dfe-test-tls-certs = { path = "crates/otap-test-tls-certs" }
 otel-arrow-dfe-test-net = { path = "crates/otap-test-net" }
