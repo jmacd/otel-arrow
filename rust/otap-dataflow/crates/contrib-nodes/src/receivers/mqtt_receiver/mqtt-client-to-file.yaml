@@ -1,0 +1,47 @@
+# Example pipeline: MQTT in -> OTLP JSON file out.
+#
+# This milestone uses the capability-based MQTT client extension together with
+# `receiver:mqtt`. Each inbound MQTT PUBLISH becomes one OTLP log record whose
+# body is the payload text and whose `mqtt.topic` attribute preserves the source
+# topic.
+#
+# Run with the required features enabled:
+#   cargo run --features mqtt-client-extension,mqtt-receiver -- --pipeline <path to this file>
+version: otel_dataflow/v1
+engine: {}
+groups:
+  default:
+    pipelines:
+      main:
+        policies:
+          resources:
+            core_allocation:
+              type: core_count
+              count: 1
+
+        extensions:
+          mqtt_client:
+            type: extension:mqtt_client
+            config:
+              hostname: "127.0.0.1"
+              port: 1883
+              client_id: "otap-mqtt-receiver-demo"
+              subscribe_topic_filter: "demo/#"
+
+        nodes:
+          mqtt_in:
+            type: receiver:mqtt
+            capabilities:
+              mqtt_ingress: mqtt_client
+            config:
+              topic_filter: "demo/#"
+
+          file:
+            type: exporter:file
+            config:
+              path: "mqtt-demo-{signal}-{core_id}-{generation}.jsonl"
+              format: otlp_json
+
+        connections:
+          - from: mqtt_in
+            to: file

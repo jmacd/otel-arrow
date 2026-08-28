@@ -6,3 +6,8 @@
 /// Shared Kafka utilities for Kafka receiver and exporter.
 #[cfg(any(feature = "kafka-receiver", feature = "kafka-exporter"))]
 pub mod kafka;
+
+/// Shared MQTT backend utilities (built on `ms-mqtt-client`) for
+/// `extension:mqtt_client`.
+#[cfg(feature = "mqtt-client-backend")]
+pub mod mqtt;

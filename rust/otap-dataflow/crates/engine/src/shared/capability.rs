@@ -32,3 +32,15 @@ pub mod auth {
 pub mod vendor_bundle {
     pub use crate::capability::vendor_bundle::shared::VendorBundle;
 }
+
+/// MQTT capabilities (shared `Send + Sync` trait variants).
+pub mod mqtt {
+    /// Shared (Send + Sync) trait variant of the MQTT egress capability.
+    pub mod mqtt_egress {
+        pub use crate::capability::mqtt::mqtt_egress::shared::MqttEgress;
+    }
+    /// Shared (Send + Sync) trait variant of the MQTT ingress capability.
+    pub mod mqtt_ingress {
+        pub use crate::capability::mqtt::mqtt_ingress::shared::MqttIngress;
+    }
+}

@@ -47,6 +47,7 @@
 pub mod auth;
 pub(crate) mod error;
 pub(crate) mod factory;
+pub mod mqtt;
 pub mod registry;
 pub mod vendor_bundle;
 

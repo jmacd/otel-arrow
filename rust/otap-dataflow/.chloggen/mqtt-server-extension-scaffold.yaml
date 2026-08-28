@@ -1,0 +1,7 @@
+change_type: new_component
+component: pipeline
+note: Add experimental `extension:mqtt_server` for standalone MQTT device fleets without an existing broker.
+issues: []
+subtext: >-
+  Phase-1 scaffold only: single-core listener, MQTT v5, no TLS, no retained
+  messages, no Will handling, and no persistent sessions yet.

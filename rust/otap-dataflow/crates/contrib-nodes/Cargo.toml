@@ -46,6 +46,7 @@ otel-arrow-contrib-data-engine-expressions = { workspace = true, optional = true
 otel-arrow-contrib-data-engine-kql-parser = { workspace = true, optional = true }
 otel-arrow-contrib-data-engine-recordset = { workspace = true, optional = true }
 rdkafka = { workspace = true, features = ["zstd", "ssl"], optional = true }
+ms-mqtt-client = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, optional = true, features = ["xxh64"] }
 hex = { workspace = true, optional = true }
@@ -112,6 +113,7 @@ aws = [
 contrib-receivers = [
     "etw-receiver",
     "kafka-receiver",
+    "mqtt-receiver",
     "user_events-receiver",
 ]
 user_events-receiver = [
@@ -129,7 +131,18 @@ contrib-exporters = [
     "azure-monitor-exporter",
     "kafka-exporter",
     "clickhouse-exporter",
+    "mqtt-exporter",
 ]
+# MQTT exporter backed by the mqtt_egress capability.
+mqtt-exporter = []
+# Shared `ms-mqtt-client`-backed MQTT connection backend used by
+# `extension:mqtt_client`. See the KNOWN ISSUE note on the `ms-mqtt-client`
+# workspace dependency (root Cargo.toml) for its temporary unconditional
+# OpenSSL dependency.
+mqtt-client-backend = [
+    "dep:ms-mqtt-client",
+]
+mqtt-receiver = []
 clickhouse-exporter = [
     "dep:clickhouse",
     "dep:clickhouse-ext-arrow",

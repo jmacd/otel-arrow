@@ -16,4 +16,10 @@ pub mod k8s_service_account_token_auth;
 #[cfg(feature = "oauth2-client-auth-extension")]
 pub mod oauth2_client_auth;
 
+#[cfg(feature = "mqtt-client-extension")]
+pub mod mqtt_client;
+
+#[cfg(feature = "mqtt-server-extension")]
+pub mod mqtt_server;
+
 pub mod common;

@@ -1,0 +1,10 @@
+change_type: new_component
+component: pipeline
+note: Add an opt-in capability-based MQTT receiver (`urn:otel:receiver:mqtt`) that wraps inbound MQTT publishes as OTLP log records.
+# Fill in the pull request number here before merging if no tracking issue exists.
+issues: []
+subtext: |
+  Enable with the `mqtt-receiver` feature and bind `mqtt_ingress` from an MQTT
+  service extension such as `extension:mqtt_client`. Each inbound PUBLISH becomes
+  one OTLP log record with the payload as the body text and `mqtt.topic` as a
+  log attribute.

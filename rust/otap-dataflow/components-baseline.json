@@ -60,6 +60,12 @@
     "attributes": {}
   },
   {
+    "id": "urn:otel:exporter:mqtt",
+    "category": "Exporter",
+    "description": null,
+    "attributes": {}
+  },
+  {
     "id": "urn:otel:exporter:noop",
     "category": "Exporter",
     "description": null,

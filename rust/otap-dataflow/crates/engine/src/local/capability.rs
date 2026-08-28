@@ -32,3 +32,15 @@ pub mod auth {
 pub mod vendor_bundle {
     pub use crate::capability::vendor_bundle::local::VendorBundle;
 }
+
+/// MQTT capabilities (local `!Send` trait variants).
+pub mod mqtt {
+    /// Local (!Send) trait variant of the MQTT egress capability.
+    pub mod mqtt_egress {
+        pub use crate::capability::mqtt::mqtt_egress::local::MqttEgress;
+    }
+    /// Local (!Send) trait variant of the MQTT ingress capability.
+    pub mod mqtt_ingress {
+        pub use crate::capability::mqtt::mqtt_ingress::local::MqttIngress;
+    }
+}

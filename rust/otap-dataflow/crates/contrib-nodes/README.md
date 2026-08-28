@@ -51,10 +51,11 @@ For the canonical node URN format, see [`docs/urns.md`](../../docs/urns.md).
 
 Receivers ingest data into a pipeline.
 
-| Type                                                                                | Feature                | Stability    | Description                                      |
-| ----------------------------------------------------------------------------------- | ---------------------- | ------------ | ------------------------------------------------ |
-| [`receiver:kafka`](src/receivers/kafka_receiver/README.md)                          | `kafka-receiver`       | Experimental | Consumes traces, metrics, and logs from Kafka.   |
-| [`receiver:user_events`](src/receivers/user_events_receiver/README.md)              | `user_events-receiver` | Experimental | Ingests Linux `user_events` tracepoints as logs. |
+| Type | Feature | Stability | Description |
+| --- | --- | --- | --- |
+| [`receiver:kafka`](src/receivers/kafka_receiver/README.md) | `kafka-receiver` | Experimental | Consumes traces, metrics, and logs from Kafka. |
+| [`receiver:mqtt`](src/receivers/mqtt_receiver/README.md) | `mqtt-receiver` | Experimental | Wraps inbound MQTT publishes as OTLP log records. |
+| [`receiver:user_events`](src/receivers/user_events_receiver/README.md) | `user_events-receiver` | Experimental | Ingests Linux `user_events` tracepoints as logs. |
 
 ## Processors
 
@@ -70,11 +71,12 @@ Processors transform or validate data already moving through a pipeline.
 
 Exporters send data out of a pipeline.
 
-| Type                                                                                              | Feature                  | Stability               | Description                                      |
-| ------------------------------------------------------------------------------------------------- | ------------------------ | ----------------------- | ------------------------------------------------ |
-| [`urn:microsoft:exporter:azure_monitor`](src/exporters/azure_monitor_exporter/README.md)          | `azure-monitor-exporter` | Alpha; supports logs    | Sends OpenTelemetry logs to Azure Monitor.       |
-| [`urn:microsoft:exporter:geneva`](src/exporters/geneva_exporter/README.md)                        | `geneva-exporter`        | Alpha; logs and traces  | Sends telemetry to Microsoft's Geneva backend.   |
-| [`exporter:kafka`](src/exporters/kafka_exporter/README.md)                                        | `kafka-exporter`         | Experimental            | Produces traces, metrics, and logs to Kafka.     |
+| Type | Feature | Stability | Description |
+| --- | --- | --- | --- |
+| [`urn:microsoft:exporter:azure_monitor`](src/exporters/azure_monitor_exporter/README.md) | `azure-monitor-exporter` | Alpha; supports logs | Sends OpenTelemetry logs to Azure Monitor. |
+| [`urn:microsoft:exporter:geneva`](src/exporters/geneva_exporter/README.md) | `geneva-exporter` | Alpha; logs and traces | Sends telemetry to Microsoft's Geneva backend. |
+| [`exporter:kafka`](src/exporters/kafka_exporter/README.md) | `kafka-exporter` | Experimental | Produces traces, metrics, and logs to Kafka. |
+| [`exporter:mqtt`](src/exporters/mqtt_exporter/README.md) | `mqtt-exporter` | Experimental; logs only | Publishes log record bodies through `mqtt_egress`. |
 
 ## Feature Aggregates
 

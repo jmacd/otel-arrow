@@ -15,3 +15,7 @@ pub mod clickhouse_exporter;
 /// Kafka Exporter for Apache Kafka
 #[cfg(feature = "kafka-exporter")]
 pub mod kafka_exporter;
+
+/// MQTT exporter backed by the mqtt_egress capability.
+#[cfg(feature = "mqtt-exporter")]
+pub mod mqtt_exporter;

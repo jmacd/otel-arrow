@@ -1,0 +1,6 @@
+change_type: breaking
+component: pipeline
+note: Replace `exporter:mqtt` with the capability-based node; the former `exporter:mqtt_publish` now reclaims `urn:otel:exporter:mqtt`.
+issues: []
+subtext: |
+  Migration: Replace inline broker/auth/TLS/QoS/retain/allowlist/property config with `capabilities.mqtt_egress: <extension:mqtt_client>` and `config.topic`. TLS, mTLS, topic allowlists, QoS/retain policy, and MQTT property controls are not yet supported.
