@@ -1,0 +1,69 @@
+# Standalone Sparkplug datalogger: MQTT devices -> OTLP JSON file.
+#
+# This is a worked example of the RFC 0003 standalone Sparkplug datalogger
+# topology (rfcs/0003-mqtt-service-capabilities.md, "Sparkplug standalone
+# datalogger"), sized to replace the role that
+# https://github.com/jmacd/opentelemetry-mqtt-sparkplug plays in a
+# jmacd/caspar.water-style pumphouse deployment: field devices (edge nodes
+# and their attached sensors/actuators) have no independent SCADA broker and
+# connect directly to this process as their Primary Host.
+#
+# `extension:mqtt_sparkplug` is the embedded MQTT v5 broker and Sparkplug
+# session tracker (birth/death/session state, Primary Host STATE, NDEATH ->
+# per-device death cascade). `receiver:mqtt` relays every matching PUBLISH,
+# unchanged, as one OTLP log record per message (this scaffold does not yet
+# decode Sparkplug protobuf payloads into native OTAP metrics -- see
+# sparkplug-death-codec and sparkplug-e2e-datalogger-demo in the project's
+# tracked follow-on work). The file exporter writes one OTLP JSON Lines file
+# per signal, giving an operator a durable, human-readable record of every
+# birth/death/data message a pumphouse control system emits, mirroring what
+# opentelemetry-mqtt-sparkplug's stdout/file sink already provides today.
+#
+# Run with the required features enabled:
+#   cargo run --features mqtt-sparkplug-extension,mqtt-receiver -- \
+#     --config configs/mqtt-sparkplug-pumphouse-datalogger.yaml
+#
+# Point a real Sparkplug edge node (or a hand-rolled test publisher using
+# paho-mqtt plus the vendored crates/sparkplug/proto/sparkplug.proto schema)
+# at 127.0.0.1:1883 with topics under the `spBv1.0/pumphouse/#` namespace,
+# for example `spBv1.0/pumphouse/NBIRTH/wellhouse-1`. Inspect the resulting
+# lines in the generated
+# /tmp/mqtt-pumphouse-datalogger-logs-{core_id}-{generation}.jsonl file.
+version: otel_dataflow/v1
+engine: {}
+groups:
+  default:
+    pipelines:
+      main:
+        policies:
+          resources:
+            core_allocation:
+              type: core_count
+              count: 1
+
+        extensions:
+          sparkplug:
+            type: urn:microsoft:extension:mqtt_sparkplug
+            config:
+              bind_host: "0.0.0.0"
+              bind_port: 1883
+              host_id: "pumphouse-datalogger-01"
+              state_profile: sparkplug_3
+
+        nodes:
+          mqtt_in:
+            type: receiver:mqtt
+            capabilities:
+              mqtt_ingress: sparkplug
+            config:
+              topic_filter: "spBv1.0/pumphouse/#"
+
+          file:
+            type: exporter:file
+            config:
+              path: "/tmp/mqtt-pumphouse-datalogger-{signal}-{core_id}-{generation}.jsonl"
+              format: otlp_json
+
+        connections:
+          - from: mqtt_in
+            to: file

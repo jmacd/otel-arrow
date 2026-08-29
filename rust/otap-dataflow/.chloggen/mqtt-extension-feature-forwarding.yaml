@@ -1,0 +1,6 @@
+change_type: enhancement
+component: pipeline
+note: Forward mqtt-server-extension and mqtt-sparkplug-extension feature flags from the top-level otel-arrow-dfe binary crate.
+issues: [3]
+subtext: |
+  These extension crates already existed but had no root Cargo feature, so cargo run could not enable them. Adds a runnable configs/mqtt-sparkplug-pumphouse-datalogger.yaml example replacing opentelemetry-mqtt-sparkplug's standalone role.

@@ -389,6 +389,8 @@ azure-identity-auth-extension = ["otel-arrow-dfe-contrib-extensions/azure-identi
 k8s-service-account-token-auth-extension = ["otel-arrow-dfe-contrib-extensions/k8s-service-account-token-auth-extension"]
 oauth2-client-auth-extension = ["otel-arrow-dfe-contrib-extensions/oauth2-client-auth-extension"]
 mqtt-client-extension = ["otel-arrow-dfe-contrib-extensions/mqtt-client-extension"]
+mqtt-server-extension = ["otel-arrow-dfe-contrib-extensions/mqtt-server-extension"]
+mqtt-sparkplug-extension = ["otel-arrow-dfe-contrib-extensions/mqtt-sparkplug-extension"]
 # Contrib receivers (opt-in) - now in contrib-nodes
 contrib-receivers = ["otel-arrow-dfe-contrib-nodes/contrib-receivers"]
 kafka-receiver = ["otel-arrow-dfe-contrib-nodes/kafka-receiver"]

@@ -61,7 +61,7 @@ groups:
               count: 1
         extensions:
           sparkplug:
-            type: extension:mqtt_sparkplug
+            type: urn:microsoft:extension:mqtt_sparkplug
             config:
               bind_host: "0.0.0.0"
               bind_port: 1883

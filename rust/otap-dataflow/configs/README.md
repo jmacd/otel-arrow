@@ -284,6 +284,28 @@ configuration from a remote OpAMP server. See the
 [documentation](../crates/controller/src/extension/opamp/README.md)
 for more details about how to run this example.
 
+### `mqtt-sparkplug-pumphouse-datalogger.yaml`
+
+Standalone Sparkplug datalogger example, sized to replace the role
+[opentelemetry-mqtt-sparkplug](https://github.com/jmacd/opentelemetry-mqtt-sparkplug)
+plays in a `jmacd/caspar.water`-style pumphouse deployment where field devices
+have no independent SCADA broker:
+
+- `extension:mqtt_sparkplug` embeds an MQTT v5 listener and tracks Sparkplug
+  session state (birth/death/session, Primary Host STATE, NDEATH cascade)
+- `receiver:mqtt` relays matching Sparkplug topics as OTLP log records
+- `exporter:file` writes one OTLP JSON Lines file per signal
+
+This scaffold does not yet decode Sparkplug protobuf payloads into native OTAP
+metrics (see `crates/sparkplug` and the death-log codec in
+`crates/contrib-nodes/src/receivers/mqtt_receiver/sparkplug_death_codec.rs`
+for the tracked follow-on work).
+
+```bash
+cargo run --features mqtt-sparkplug-extension,mqtt-receiver -- \
+  --config configs/mqtt-sparkplug-pumphouse-datalogger.yaml
+```
+
 ## Usage
 
 You can use these configurations with the following CLI command:
