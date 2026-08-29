@@ -1,0 +1,6 @@
+change_type: new_component
+component: pipeline
+note: Add a Sparkplug NDEATH/DDEATH to OTLP log conversion function for the Sparkplug datalogger milestone.
+issues: [3]
+subtext: |
+  Maps NDEATH/DDEATH to sparkplug.node.death/sparkplug.device.death logs with group/edge/device resource attributes and bdSeq/death-origin/topic/QoS/retain log attributes. Pure conversion function; not yet wired into a running receiver (tracked as follow-on work).

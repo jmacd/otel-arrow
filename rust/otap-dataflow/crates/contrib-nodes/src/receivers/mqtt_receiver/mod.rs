@@ -3,6 +3,9 @@
 
 //! MQTT receiver backed by the `mqtt_ingress` capability.
 
+#[cfg(feature = "sparkplug-death-codec")]
+pub mod sparkplug_death_codec;
+
 otel_arrow_dfe_telemetry::otel_component_scope!(
     urn = MQTT_RECEIVER_URN,
     target = "otel.receiver.mqtt",
