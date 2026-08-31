@@ -24,6 +24,7 @@ use otel_arrow_dfe_admin::{
     PipelineRolloutSummary as ApiPipelineRolloutSummary, PipelineShutdownInitiator,
     ReconfigureRequest, RolloutCoreStatus, RolloutStatus, ShutdownCoreStatus, ShutdownStatus,
 };
+use otel_arrow_dfe_engine::context_declaration::ContextPolicyGeneration;
 use otel_arrow_dfe_engine::topology::NumaTopology;
 use otel_arrow_dfe_state::conditions::ConditionStatus;
 use otel_arrow_dfe_state::phase::PipelinePhase;
@@ -77,8 +78,6 @@ pub(super) struct ControllerRuntime<PData: 'static + Clone + Send + Sync + std::
     metrics_reporter: MetricsReporter,
     /// Topic registry shared by all runtime instances.
     declared_topics: DeclaredTopics<PData>,
-    /// Compiled context policy created at startup.
-    context_policy: Arc<CompiledContextPolicy>,
     /// Controller-wide core ids available for policy-based allocation.
     available_core_ids: Vec<CoreId>,
     /// Controller-owned topology snapshot used for live rollout placement metadata.
@@ -112,6 +111,8 @@ pub(super) struct LaunchedPipelineThread<PData> {
     pub(super) pipeline_key: DeployedPipelineKey,
     /// Admin sender used by live control to send shutdown to the instance.
     pub(super) control_sender: Arc<dyn PipelineAdminSender>,
+    /// Context policy injected into this runtime instance.
+    pub(super) context_policy: Arc<CompiledContextPolicy>,
     /// Keeps the launch result tied to the pipeline data type.
     pub(super) _marker: std::marker::PhantomData<PData>,
 }
@@ -147,7 +148,6 @@ impl<
             engine_event_reporter,
             metrics_reporter,
             declared_topics,
-            context_policy,
             available_core_ids,
             topology,
             engine_tracing_setup,
@@ -157,6 +157,8 @@ impl<
             state: Mutex::new(ControllerRuntimeState {
                 live_config,
                 config_revision: 0,
+                context_policy,
+                next_context_policy_generation: 1,
                 logical_pipelines: HashMap::new(),
                 runtime_instances: HashMap::new(),
                 runtime_recoveries: HashMap::new(),
@@ -210,6 +212,7 @@ impl<
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let context_policy = Arc::clone(&state.context_policy);
         _ = state
             .generation_counters
             .insert(pipeline_key.clone(), generation + 1);
@@ -217,6 +220,7 @@ impl<
             pipeline_key,
             LogicalPipelineRecord {
                 resolved,
+                context_policy,
                 active_generation: generation,
                 placement,
                 placement_generation: 0,

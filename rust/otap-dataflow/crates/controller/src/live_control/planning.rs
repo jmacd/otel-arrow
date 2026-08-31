@@ -626,6 +626,7 @@ impl<
             None,
             None,
             None,
+            None,
         )?;
         self.spawn_rollout(plan)
     }
@@ -645,7 +646,36 @@ impl<
             None,
             None,
             None,
+            None,
         )
+    }
+
+    fn compile_context_policy(
+        &self,
+        resolved: &ResolvedOtelDataflowSpec,
+    ) -> Result<Arc<CompiledContextPolicy>, ControlPlaneError> {
+        let candidate_context_policy = self
+            .pipeline_factory
+            .compile_context_policy(resolved)
+            .map_err(|error| ControlPlaneError::InvalidRequest {
+                message: error.to_string(),
+            })?;
+        let generation = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state
+                .context_policy
+                .equivalent_declarations(&candidate_context_policy)
+            {
+                return Ok(Arc::clone(&state.context_policy));
+            }
+            let generation = state.next_context_policy_generation;
+            state.next_context_policy_generation += 1;
+            ContextPolicyGeneration::new(generation)
+        };
+        Ok(candidate_context_policy.with_generation(generation))
     }
 
     fn prepare_rollout_plan_for_engine_operation(
@@ -654,6 +684,7 @@ impl<
         pipeline_id: &str,
         request: &ReconfigureRequest,
         planning_config: Option<&OtelDataflowSpec>,
+        prepared_context_policy: Option<Arc<CompiledContextPolicy>>,
         engine_operation_id: Option<&str>,
         projected_reserved_core_ids: Option<&BTreeSet<usize>>,
     ) -> Result<CandidateRolloutPlan, ControlPlaneError> {
@@ -728,8 +759,12 @@ impl<
         }
         Self::validate_live_memory_limiter_unchanged(&live_config, &candidate_config)?;
 
-        let resolved_pipeline = candidate_config
-            .resolve()
+        let resolved_candidate_config = candidate_config.resolve();
+        let context_policy = match prepared_context_policy {
+            Some(policy) => policy,
+            None => self.compile_context_policy(&resolved_candidate_config)?,
+        };
+        let resolved_pipeline = resolved_candidate_config
             .pipelines
             .into_iter()
             .find(|pipeline| {
@@ -976,6 +1011,7 @@ impl<
             pipeline_id,
             action,
             resolved_pipeline,
+            context_policy,
             base_config_revision,
             current_record,
             current_placement,
@@ -1177,15 +1213,29 @@ impl<
                     plan.pipeline_id.clone(),
                     plan.resolved_pipeline.pipeline.clone(),
                 );
+            let context_policy = match plan.action {
+                RolloutAction::NoOp => plan
+                    .current_record
+                    .as_ref()
+                    .map(|record| Arc::clone(&record.context_policy))
+                    .expect("no-op rollout has a committed record"),
+                RolloutAction::Create | RolloutAction::Resize | RolloutAction::Replace => {
+                    Arc::clone(&plan.context_policy)
+                }
+            };
             _ = state.logical_pipelines.insert(
                 plan.pipeline_key.clone(),
                 LogicalPipelineRecord {
                     resolved: plan.resolved_pipeline.clone(),
+                    context_policy: Arc::clone(&context_policy),
                     active_generation,
                     placement: plan.target_placement.placement.clone(),
                     placement_generation: plan.target_placement.listener_group_snapshot.generation,
                 },
             );
+            if !matches!(plan.action, RolloutAction::NoOp) {
+                state.context_policy = context_policy;
+            }
             state.config_revision += 1;
             state
                 .runtime_recoveries
@@ -1982,14 +2032,18 @@ impl<
                 ));
             }
         }
-        let desired_phase_by_key: HashMap<_, _> = desired_config
-            .resolve()
+        let desired_resolved_config = desired_config.resolve();
+        let desired_context_policy = self.compile_context_policy(&desired_resolved_config)?;
+        let desired_phase_by_key: HashMap<_, _> = desired_resolved_config
             .pipelines
-            .into_iter()
+            .iter()
             .filter(|pipeline| pipeline.role == ResolvedPipelineRole::Regular)
             .map(|pipeline| {
                 (
-                    PipelineKey::new(pipeline.pipeline_group_id, pipeline.pipeline_id),
+                    PipelineKey::new(
+                        pipeline.pipeline_group_id.clone(),
+                        pipeline.pipeline_id.clone(),
+                    ),
                     Self::reconcile_placement_phase_for_strategy(
                         &pipeline.policies.resources.core_allocation.strategy,
                     ),
@@ -2034,6 +2088,7 @@ impl<
                 pipeline_key.pipeline_id(),
                 &reconfigure_request,
                 Some(&desired_config),
+                Some(Arc::clone(&desired_context_policy)),
                 Some(guard.operation_id()),
                 Some(&projected_exclusive_core_ids),
             )?;

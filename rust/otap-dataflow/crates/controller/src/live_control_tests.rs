@@ -165,28 +165,24 @@ fn recovery_test_exporter_create(
 
 static TEST_RECEIVER_FACTORIES: &[ReceiverFactory<()>] = &[
     ReceiverFactory {
-        context_declarations: None,
         name: "urn:test:receiver:example",
         create: test_receiver_create,
         wiring_contract: WiringContract::UNRESTRICTED,
         validate_config: test_validate_config,
     },
     ReceiverFactory {
-        context_declarations: None,
         name: "urn:otel:receiver:topic",
         create: test_receiver_create,
         wiring_contract: WiringContract::UNRESTRICTED,
         validate_config: test_validate_config,
     },
     ReceiverFactory {
-        context_declarations: None,
         name: "urn:otel:receiver:otlp",
         create: test_receiver_create,
         wiring_contract: WiringContract::UNRESTRICTED,
         validate_config: test_validate_config,
     },
     ReceiverFactory {
-        context_declarations: None,
         name: "urn:otel:receiver:internal_telemetry",
         create: test_receiver_create,
         wiring_contract: WiringContract::UNRESTRICTED,
@@ -195,7 +191,6 @@ static TEST_RECEIVER_FACTORIES: &[ReceiverFactory<()>] = &[
 ];
 
 static TEST_PROCESSOR_FACTORIES: &[ProcessorFactory<()>] = &[ProcessorFactory {
-    context_declarations: None,
     name: "urn:otel:processor:type_router",
     create: test_processor_create,
     wiring_contract: WiringContract::UNRESTRICTED,
@@ -204,28 +199,24 @@ static TEST_PROCESSOR_FACTORIES: &[ProcessorFactory<()>] = &[ProcessorFactory {
 
 static TEST_EXPORTER_FACTORIES: &[ExporterFactory<()>] = &[
     ExporterFactory {
-        context_declarations: None,
         name: "urn:test:exporter:example",
         create: test_exporter_create,
         wiring_contract: WiringContract::UNRESTRICTED,
         validate_config: test_validate_config,
     },
     ExporterFactory {
-        context_declarations: None,
         name: "urn:otel:exporter:topic",
         create: test_exporter_create,
         wiring_contract: WiringContract::UNRESTRICTED,
         validate_config: test_validate_config,
     },
     ExporterFactory {
-        context_declarations: None,
         name: "urn:otel:exporter:console",
         create: test_exporter_create,
         wiring_contract: WiringContract::UNRESTRICTED,
         validate_config: test_validate_config,
     },
     ExporterFactory {
-        context_declarations: None,
         name: "urn:otel:exporter:noop",
         create: test_exporter_create,
         wiring_contract: WiringContract::UNRESTRICTED,
@@ -242,14 +233,12 @@ static TEST_PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::new(
 
 static RECOVERY_TEST_RECEIVER_FACTORIES: &[ReceiverFactory<()>] = &[
     ReceiverFactory {
-        context_declarations: None,
         name: "urn:test:receiver:example",
         create: recovery_test_receiver_create,
         wiring_contract: WiringContract::UNRESTRICTED,
         validate_config: test_validate_config,
     },
     ReceiverFactory {
-        context_declarations: None,
         name: "urn:otel:receiver:internal_telemetry",
         create: recovery_test_receiver_create,
         wiring_contract: WiringContract::UNRESTRICTED,
@@ -259,21 +248,18 @@ static RECOVERY_TEST_RECEIVER_FACTORIES: &[ReceiverFactory<()>] = &[
 
 static RECOVERY_TEST_EXPORTER_FACTORIES: &[ExporterFactory<()>] = &[
     ExporterFactory {
-        context_declarations: None,
         name: "urn:test:exporter:example",
         create: recovery_test_exporter_create,
         wiring_contract: WiringContract::UNRESTRICTED,
         validate_config: test_validate_config,
     },
     ExporterFactory {
-        context_declarations: None,
         name: "urn:otel:exporter:console",
         create: recovery_test_exporter_create,
         wiring_contract: WiringContract::UNRESTRICTED,
         validate_config: test_validate_config,
     },
     ExporterFactory {
-        context_declarations: None,
         name: "urn:otel:exporter:noop",
         create: recovery_test_exporter_create,
         wiring_contract: WiringContract::UNRESTRICTED,
@@ -590,6 +576,7 @@ fn register_runtime_instance(
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let context_policy = Arc::clone(&state.context_policy);
     _ = state.runtime_instances.insert(
         DeployedPipelineKey {
             pipeline_group_id: pipeline_group_id.to_owned().into(),
@@ -599,6 +586,7 @@ fn register_runtime_instance(
         },
         RuntimeInstanceRecord {
             control_sender: Some(control_sender),
+            context_policy,
             lifecycle,
         },
     );
@@ -619,10 +607,12 @@ fn register_runtime_instance_with_sender(
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let context_policy = Arc::clone(&state.context_policy);
     _ = state.runtime_instances.insert(
         pipeline_key,
         RuntimeInstanceRecord {
             control_sender: Some(control_sender),
+            context_policy,
             lifecycle,
         },
     );
@@ -714,6 +704,7 @@ fn deadline_notifying_admin_sender() -> (
 }
 
 fn launched_runtime_instance(
+    runtime: &ControllerRuntime<()>,
     pipeline_group_id: &str,
     pipeline_id: &str,
     core_id: usize,
@@ -721,6 +712,13 @@ fn launched_runtime_instance(
 ) -> LaunchedPipelineThread<()> {
     let (tx, _rx) = runtime_ctrl_msg_channel::<()>(4);
     let control_sender: Arc<dyn PipelineAdminSender> = Arc::new(tx);
+    let context_policy = {
+        let state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&state.context_policy)
+    };
     LaunchedPipelineThread {
         pipeline_key: DeployedPipelineKey {
             pipeline_group_id: pipeline_group_id.to_owned().into(),
@@ -729,6 +727,7 @@ fn launched_runtime_instance(
             deployment_generation: generation,
         },
         control_sender,
+        context_policy,
         _marker: std::marker::PhantomData,
     }
 }
@@ -3483,10 +3482,12 @@ fn rollback_replace_rollout_restores_recovered_serving_generation() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = state.generation_counters.insert(pipeline_key.clone(), 2);
+        let context_policy = Arc::clone(&state.context_policy);
         let _ = state.runtime_recoveries.insert(
             (pipeline_key.clone(), 0),
             RuntimeRecoveryState {
                 serving_generation: 1,
+                context_policy,
                 restart_count: 1,
                 ready_since: Some(Instant::now()),
                 worker_id: None,
@@ -5473,7 +5474,7 @@ fn register_launched_instance_reconciles_early_exit_without_leaking_active_count
     let deployed_key = deployed_key("g1", "p1", 0, 0);
     runtime.note_instance_exit(deployed_key.clone(), RuntimeInstanceExit::Success);
 
-    runtime.register_launched_instance(launched_runtime_instance("g1", "p1", 0, 0));
+    runtime.register_launched_instance(launched_runtime_instance(&runtime, "g1", "p1", 0, 0));
 
     let state = runtime
         .state
@@ -5495,7 +5496,7 @@ fn release_instance_wait_unblocks_wait_with_active_instances() {
     let runtime = test_runtime(&empty_engine_config());
 
     // Simulate a launched, still-active pipeline instance that never exits.
-    runtime.register_launched_instance(launched_runtime_instance("g1", "p1", 0, 0));
+    runtime.register_launched_instance(launched_runtime_instance(&runtime, "g1", "p1", 0, 0));
     assert_eq!(
         runtime
             .state
