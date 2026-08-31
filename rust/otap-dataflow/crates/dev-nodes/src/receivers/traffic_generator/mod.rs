@@ -777,7 +777,7 @@ fn traffic_generator_declarations(
         .enumerate()
         .map(|(index, name)| ContextDeclaration::Produces {
             access: ContextAccessId::new(index),
-            name: name.to_ascii_lowercase(),
+            name: name.clone(),
         })
         .collect())
 }
