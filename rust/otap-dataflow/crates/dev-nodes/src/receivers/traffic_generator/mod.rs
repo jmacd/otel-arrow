@@ -1,0 +1,2090 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! A traffic generator receiver.
+//! Note: This receiver will be replaced in the future with a more sophisticated implementation.
+//!
+
+otel_arrow_dfe_telemetry::otel_component_scope!(
+    urn = TRAFFIC_GENERATOR_RECEIVER_URN,
+    target = "otel.receiver.traffic_generator",
+);
+
+use crate::receivers::traffic_generator::config::Config;
+use async_trait::async_trait;
+use linkme::distributed_slice;
+use metrics::TrafficGeneratorReceiverMetrics;
+use otel_arrow_dfe_channel::error::{RecvError, SendError};
+use otel_arrow_dfe_config::node::NodeUserConfig;
+use otel_arrow_dfe_config::transport_headers_policy::{
+    CaptureDefaults, CaptureRule, HeaderCapturePolicy, ValueKindConfig,
+};
+use otel_arrow_dfe_engine::MessageSourceLocalEffectHandlerExtension;
+use otel_arrow_dfe_engine::config::ReceiverConfig;
+use otel_arrow_dfe_engine::context::PipelineContext;
+use otel_arrow_dfe_engine::context_declaration::{
+    ContextDeclaration, ContextDeclarationProvider, ContextDeclarationsBuilder,
+};
+use otel_arrow_dfe_engine::control::CallData;
+use otel_arrow_dfe_engine::error::{Error, ReceiverErrorKind, TypedError};
+use otel_arrow_dfe_engine::local::receiver as local;
+use otel_arrow_dfe_engine::node::NodeId;
+use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
+use otel_arrow_dfe_engine::terminal_state::TerminalState;
+use otel_arrow_dfe_engine::{
+    Interests, ProducerEffectHandlerExtension, ReceiverFactory, control::NodeControlMsg,
+};
+use otel_arrow_dfe_otap::OTAP_RECEIVER_FACTORIES;
+#[cfg(test)]
+use otel_arrow_dfe_otap::context_bytes::HeaderValueKind;
+use otel_arrow_dfe_otap::context_bytes::{ContextBytesError, PdataContextBytes};
+use otel_arrow_dfe_otap::pdata::OtapPdata;
+use otel_arrow_dfe_pdata::OtapPayload;
+#[cfg(test)]
+use otel_arrow_dfe_pdata::TryIntoWithOptions;
+use otel_arrow_dfe_telemetry::metrics::MetricSet;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant as StdInstant;
+use tokio::time::{Duration, Interval, MissedTickBehavior, interval};
+
+use self::producer::{GenerateError, TrafficProducer};
+
+pub mod attributes;
+
+#[cfg(test)]
+mod compression_ratio_tests;
+/// allows the user to configure their traffic generator receiver
+pub mod config;
+/// provides synthetic data for generated signals
+pub mod fake_data;
+/// traffic generator metrics implementation
+pub mod metrics;
+/// Signal generation abstractions
+pub mod producer;
+/// generates signals based on OTel semantic conventions registry
+pub mod semconv_signal;
+/// Synthetic hardcoded signal generators for lightweight load testing
+pub mod synthetic_signal;
+
+/// The URN for the traffic generator receiver.
+pub const TRAFFIC_GENERATOR_RECEIVER_URN: &str = "urn:otel:receiver:traffic_generator";
+
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+/// A Receiver that generates fake OTAP data for testing purposes.
+pub struct TrafficGeneratorReceiver {
+    /// Configuration for the traffic generator
+    config: Config,
+
+    /// Metrics for the traffic generator
+    metrics: MetricSet<TrafficGeneratorReceiverMetrics>,
+
+    /// Successfully admitted batches still waiting for Ack/Nack completion.
+    pending_completions: u64,
+}
+
+fn smooth_batch_interval(run_len: usize) -> Option<Duration> {
+    if run_len == 0 {
+        return None;
+    }
+
+    let run_len = run_len as u128;
+    let nanos = NANOS_PER_SECOND.div_ceil(run_len);
+    u64::try_from(nanos).ok().map(Duration::from_nanos)
+}
+
+fn duration_nanos(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e9
+}
+
+fn elapsed_nanos(start: StdInstant) -> f64 {
+    duration_nanos(start.elapsed())
+}
+
+/// Declares the traffic generator as a local receiver factory
+///
+/// Unsafe code is temporarily used here to allow the use of `distributed_slice` macro
+/// This macro is part of the `linkme` crate which is considered safe and well maintained.
+#[allow(unsafe_code)]
+#[otel_arrow_dfe_engine::component_inventory(category = Receiver)]
+#[distributed_slice(OTAP_RECEIVER_FACTORIES)]
+pub static TRAFFIC_GENERATOR_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
+    name: TRAFFIC_GENERATOR_RECEIVER_URN,
+    create:
+        |pipeline: PipelineContext,
+         node: NodeId,
+         node_config: Arc<NodeUserConfig>,
+         receiver_config: &ReceiverConfig,
+         _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities| {
+            Ok(ReceiverWrapper::local(
+                TrafficGeneratorReceiver::from_config(pipeline, &node_config.config)?,
+                node,
+                node_config,
+                receiver_config,
+            ))
+        },
+    wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
+    validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<Config>,
+};
+
+#[distributed_slice(otel_arrow_dfe_engine::context_declaration::CONTEXT_DECLARATION_PROVIDERS)]
+static TRAFFIC_GENERATOR_CONTEXT_DECLARATIONS: ContextDeclarationProvider =
+    ContextDeclarationProvider::from_config(
+        TRAFFIC_GENERATOR_RECEIVER_URN,
+        traffic_generator_declarations,
+    );
+
+impl TrafficGeneratorReceiver {
+    /// creates a new TrafficGeneratorReceiver
+    #[must_use]
+    pub fn new(pipeline_ctx: PipelineContext, config: Config) -> Self {
+        let metrics = pipeline_ctx.register_metrics::<TrafficGeneratorReceiverMetrics>();
+        Self {
+            config,
+            metrics,
+            pending_completions: 0,
+        }
+    }
+
+    /// Creates a new traffic generator from a configuration object
+    pub fn from_config(
+        pipeline_ctx: PipelineContext,
+        config: &Value,
+    ) -> Result<Self, otel_arrow_dfe_config::error::Error> {
+        let config: Config = serde_json::from_value(config.clone()).map_err(|e| {
+            otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                error: e.to_string(),
+            }
+        })?;
+        config.get_traffic_config().validate()?;
+        Ok(TrafficGeneratorReceiver::new(pipeline_ctx, config))
+    }
+
+    async fn run_smooth(
+        mut self: Box<Self>,
+        mut ctrl_msg_recv: local::ControlChannel<OtapPdata>,
+        handler: &local::EffectHandler<OtapPdata>,
+        mut producer: TrafficProducer,
+        mut run_ticker: Interval,
+        mut batch_ticker: Interval,
+        transport_context: Option<PdataContextBytes>,
+    ) -> Result<TerminalState, Error> {
+        let mut run_produced: u64 = 0;
+        let mut next_pdata: Option<OtapPdata> = None;
+        let enable_ack_nack = self.config.enable_ack_nack();
+
+        loop {
+            producer.record_production(run_produced);
+            run_produced = 0;
+
+            let Ok(Some(mut current_run)) = producer.next_run() else {
+                return wait_for_terminal(
+                    ctrl_msg_recv,
+                    handler,
+                    enable_ack_nack,
+                    &mut self.pending_completions,
+                    &mut self.metrics,
+                )
+                .await;
+            };
+
+            self.metrics.smooth_runs_started.inc();
+            let mut run_completed = false;
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    msg = ctrl_msg_recv.recv() => {
+                        if let Some(terminal) = handle_control_msg(
+                            msg,
+                            &mut ctrl_msg_recv,
+                            handler,
+                            enable_ack_nack,
+                            &mut self.pending_completions,
+                            &mut self.metrics,
+                        ).await? {
+                            return Ok(terminal);
+                        }
+                    }
+
+                    _ = run_ticker.tick() => {
+                        let remaining_batches = current_run.len() + usize::from(next_pdata.is_some());
+                        let remaining_items = current_run.remaining_signal_count()
+                            + next_pdata.as_mut().map_or(0, |pdata| pdata.num_items() as u64);
+                        if remaining_batches > 0 {
+                            self.metrics.smooth_runs_behind.inc();
+                            self.metrics
+                                .smooth_behind_remaining_batches
+                                .record(remaining_batches as f64);
+                            self.metrics
+                                .smooth_behind_remaining_items
+                                .record(remaining_items as f64);
+                            otel_warn!(
+                                "traffic_generator.smooth_run_behind",
+                                message = "Data generator is falling behind and didn't finish the current run. For highest possible throughput, use production_mode: open",
+                                remaining=remaining_batches,
+                                remaining_items,
+                            );
+                        } else if !run_completed {
+                            self.metrics.smooth_runs_completed.inc();
+                            run_completed = true;
+                        }
+
+                        if next_pdata.is_some() {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    scheduled = batch_ticker.tick() => {
+                        let tick_lateness = tokio::time::Instant::now()
+                            .saturating_duration_since(scheduled);
+                        self.metrics
+                            .smooth_batch_tick_lateness_duration_ns
+                            .record(duration_nanos(tick_lateness));
+
+                        let channel_result = match next_pdata.take() {
+                            Some(pdata) => {
+                                self.metrics.smooth_payload_send_retry.inc();
+                                let send_start = StdInstant::now();
+                                let result = self.export_pdata(handler, pdata)?;
+                                self.metrics
+                                    .smooth_payload_send_duration_ns
+                                    .record(elapsed_nanos(send_start));
+                                result
+                            }
+                            None => {
+                                let generate_start = StdInstant::now();
+                                let payload = current_run.next();
+
+                                let Some(payload) = payload else {
+                                    if !run_completed {
+                                        self.metrics.smooth_runs_completed.inc();
+                                        run_completed = true;
+                                    }
+                                    continue;
+                                };
+                                self.metrics
+                                    .smooth_payload_generate_duration_ns
+                                    .record(elapsed_nanos(generate_start));
+
+                                let send_start = StdInstant::now();
+                                let result = self.handle_payload(handler, payload, &transport_context)?;
+                                self.metrics
+                                    .smooth_payload_send_duration_ns
+                                    .record(elapsed_nanos(send_start));
+                                result
+                            }
+                        };
+
+                        match channel_result {
+                            Ok(count) => {
+                                run_produced += count;
+                            }
+                            Err(pdata) => {
+                                self.metrics.smooth_payload_send_full.inc();
+                                next_pdata = Some(pdata);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_open(
+        mut self: Box<Self>,
+        mut ctrl_msg_recv: local::ControlChannel<OtapPdata>,
+        handler: &local::EffectHandler<OtapPdata>,
+        mut producer: TrafficProducer,
+        mut run_ticker: Interval,
+        transport_context: Option<PdataContextBytes>,
+    ) -> Result<TerminalState, Error> {
+        let mut run_produced: u64 = 0;
+        let enable_ack_nack = self.config.enable_ack_nack();
+        'start: loop {
+            producer.record_production(run_produced);
+            run_produced = 0;
+
+            let Ok(Some(mut current_run)) = producer.next_run() else {
+                return wait_for_terminal(
+                    ctrl_msg_recv,
+                    handler,
+                    enable_ack_nack,
+                    &mut self.pending_completions,
+                    &mut self.metrics,
+                )
+                .await;
+            };
+
+            // First phase is the open export phase where we pump data as fast as
+            // possible one chunk at a time while checking for control messages
+            // in between.
+            let mut next_pdata: Option<OtapPdata> = None;
+            loop {
+                // In the first select statement, we try to drain the entire run
+                tokio::select! {
+                    biased;
+
+                    msg = ctrl_msg_recv.recv() => {
+                        if let Some(terminal) = handle_control_msg(
+                            msg,
+                            &mut ctrl_msg_recv,
+                            handler,
+                            enable_ack_nack,
+                            &mut self.pending_completions,
+                            &mut self.metrics,
+                        ).await? {
+                            return Ok(terminal);
+                        }
+                    }
+
+                    _ = run_ticker.tick() => {
+                        otel_debug!(
+                            "traffic_generator.open_run_behind",
+                            message = "Data generator is falling behind and didn't finish the current run.",
+                            remaining=current_run.len(),
+                        );
+
+                        continue 'start;
+                    }
+
+                    _ = std::future::ready(()) => {
+                        let channel_result = match next_pdata.take() {
+                            Some(pdata) => {
+                                self.export_pdata(handler, pdata)?
+                            }
+                            None => {
+                                let Some(payload) = current_run.next() else {
+                                    break;
+                                };
+
+                               self.handle_payload(handler, payload, &transport_context)?
+                            }
+                        };
+
+                        match channel_result {
+                            Ok(count) => {
+                                run_produced += count;
+                            }
+                            Err(pdata) => {
+                                next_pdata = Some(pdata);
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            loop {
+                // The second phase starts once we exhaust a traffic run. At this point
+                // we only process control messages while we wait for a tick at which point
+                // we start the next run.
+                tokio::select! {
+                    biased;
+
+                    msg = ctrl_msg_recv.recv() => {
+                        if let Some(terminal) = handle_control_msg(
+                            msg,
+                            &mut ctrl_msg_recv,
+                            handler,
+                            enable_ack_nack,
+                            &mut self.pending_completions,
+                            &mut self.metrics,
+                        ).await? {
+                            return Ok(terminal);
+                        }
+                    }
+
+                    _ = run_ticker.tick() => {
+                        continue 'start;
+                    }
+                }
+            }
+        }
+    }
+
+    // There are two failure modes here
+    fn handle_payload(
+        &mut self,
+        handler: &local::EffectHandler<OtapPdata>,
+        payload: Result<OtapPayload, GenerateError>,
+        transport_context: &Option<PdataContextBytes>,
+    ) -> Result<Result<u64, OtapPdata>, Error> {
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(e) => {
+                return Err(Error::ReceiverError {
+                    receiver: handler.receiver_id(),
+                    kind: ReceiverErrorKind::Other,
+                    error: format!("Failed to generate data: {}", e),
+                    source_detail: String::new(),
+                });
+            }
+        };
+
+        let mut pdata = OtapPdata::new_todo_context(payload);
+        if let Some(context) = transport_context {
+            pdata.set_pdata_context_bytes(context.clone());
+        }
+        if self.config.enable_ack_nack() {
+            handler.subscribe_to(
+                Interests::ACKS | Interests::NACKS,
+                CallData::default(),
+                &mut pdata,
+            );
+        }
+
+        self.export_pdata(handler, pdata)
+    }
+
+    fn export_pdata(
+        &mut self,
+        handler: &local::EffectHandler<OtapPdata>,
+        mut pdata: OtapPdata,
+    ) -> Result<Result<u64, OtapPdata>, Error> {
+        let signal = pdata.signal_type();
+        let count = pdata.num_items() as u64;
+        let payload_bytes = pdata.num_bytes();
+        match handler.try_send_message_with_source_node(pdata) {
+            Ok(()) => {
+                if self.config.enable_ack_nack() {
+                    self.pending_completions = self.pending_completions.saturating_add(1);
+                    self.metrics
+                        .completion_pending
+                        .set(self.pending_completions);
+                }
+                match signal {
+                    otel_arrow_dfe_config::SignalType::Traces => {
+                        self.metrics.spans_produced.add(count)
+                    }
+                    otel_arrow_dfe_config::SignalType::Metrics => {
+                        self.metrics.metrics_produced.add(count)
+                    }
+                    otel_arrow_dfe_config::SignalType::Logs => {
+                        self.metrics.logs_produced.add(count);
+                        if let Some(bytes) = payload_bytes {
+                            self.metrics.logs_bytes_produced.add(bytes as u64);
+                        }
+                    }
+                };
+                Ok(Ok(count))
+            }
+            Err(e) => {
+                let TypedError::ChannelSendError(SendError::Full(pdata)) = e else {
+                    return Err(Error::ReceiverError {
+                        receiver: handler.receiver_id(),
+                        kind: ReceiverErrorKind::Other,
+                        error: format!("Failed to generate data: {}", e),
+                        source_detail: String::new(),
+                    });
+                };
+
+                Ok(Err(pdata))
+            }
+        }
+    }
+}
+
+/// Builds transport headers from the user-configured map.
+///
+/// Keys with `Some(value)` produce fixed header values.
+/// Keys with `None` produce a random value once at startup: a 16-char
+/// random alphabetical string for text headers, or 16 raw random bytes
+/// for binary headers (keys ending in `-bin`).
+///
+/// Returns `None` when the config map is empty (zero overhead).
+fn build_transport_context(
+    config_headers: &HashMap<String, Option<String>>,
+) -> Result<Option<PdataContextBytes>, ContextBytesError> {
+    if config_headers.is_empty() {
+        return Ok(None);
+    }
+    let mut headers: Vec<(String, Vec<u8>)> = Vec::with_capacity(config_headers.len());
+    let mut rules = Vec::with_capacity(config_headers.len());
+    for (key, value) in config_headers {
+        // Infer the value kind from the key name, matching the convention
+        // used by the header capture policy: keys ending in `-bin` are
+        // treated as binary (the gRPC binary metadata convention).
+        let is_binary = key.ends_with("-bin");
+        let resolved_value = match value {
+            Some(v) => v.as_bytes().to_vec(),
+            None if is_binary => {
+                let mut buf = [0u8; 16];
+                rand::RngExt::fill(&mut rand::rng(), &mut buf);
+                buf.to_vec()
+            }
+            None => {
+                // Generate bytes in ASCII printable range (space..tilde)
+                let mut rng = rand::rng();
+                (0..16)
+                    .map(|_| rand::RngExt::random_range(&mut rng, 32u8..127))
+                    .collect()
+            }
+        };
+        rules.push(CaptureRule {
+            match_names: vec![key.to_ascii_lowercase()],
+            store_as: None,
+            sensitive: false,
+            value_kind: if is_binary {
+                Some(ValueKindConfig::Binary)
+            } else {
+                None
+            },
+        });
+        headers.push((key.clone(), resolved_value));
+    }
+    let defaults = CaptureDefaults {
+        max_entries: headers.len(),
+        max_name_bytes: headers
+            .iter()
+            .map(|(name, _)| name.len())
+            .max()
+            .unwrap_or(0),
+        max_value_bytes: headers
+            .iter()
+            .map(|(_, value)| value.len())
+            .max()
+            .unwrap_or(0),
+        ..CaptureDefaults::default()
+    };
+    let policy = HeaderCapturePolicy::new(defaults, rules)
+        .compile()
+        .map_err(|_| ContextBytesError::TooMany {
+            what: "capture rules",
+        })?;
+    let pairs: Vec<(&str, &[u8])> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_slice()))
+        .collect();
+    let (context, stats) = PdataContextBytes::capture(&policy, pairs)?;
+    if stats.is_some() {
+        return Err(ContextBytesError::TooLarge);
+    }
+    Ok(context)
+}
+
+/// Waits for a terminal control message after the producer has finished.
+///
+/// This is used when `max_signal_count` has been reached and the receiver has
+/// no more data to produce, but must remain alive for graceful shutdown.
+async fn wait_for_terminal(
+    mut ctrl_msg_recv: local::ControlChannel<OtapPdata>,
+    handler: &local::EffectHandler<OtapPdata>,
+    enable_ack_nack: bool,
+    pending_completions: &mut u64,
+    metrics: &mut MetricSet<TrafficGeneratorReceiverMetrics>,
+) -> Result<TerminalState, Error> {
+    loop {
+        let msg = ctrl_msg_recv.recv().await;
+        if let Some(terminal) = handle_control_msg(
+            msg,
+            &mut ctrl_msg_recv,
+            handler,
+            enable_ack_nack,
+            pending_completions,
+            metrics,
+        )
+        .await?
+        {
+            return Ok(terminal);
+        }
+    }
+}
+
+fn record_completion(
+    is_ack: bool,
+    pending_completions: &mut u64,
+    metrics: &mut MetricSet<TrafficGeneratorReceiverMetrics>,
+) {
+    if is_ack {
+        metrics.completion_acks.inc();
+    } else {
+        metrics.completion_nacks.inc();
+    }
+    *pending_completions = pending_completions.saturating_sub(1);
+    metrics.completion_pending.set(*pending_completions);
+}
+
+async fn drain_pending_completions(
+    ctrl_msg_recv: &mut local::ControlChannel<OtapPdata>,
+    effect_handler: &local::EffectHandler<OtapPdata>,
+    deadline: StdInstant,
+    pending_completions: &mut u64,
+    metrics: &mut MetricSet<TrafficGeneratorReceiverMetrics>,
+) -> Result<TerminalState, Error> {
+    while *pending_completions > 0 {
+        tokio::select! {
+            biased;
+
+            msg = ctrl_msg_recv.recv() => match msg {
+                Ok(NodeControlMsg::Ack(_)) => {
+                    record_completion(true, pending_completions, metrics);
+                }
+                Ok(NodeControlMsg::Nack(_)) => {
+                    record_completion(false, pending_completions, metrics);
+                }
+                Ok(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
+                    _ = metrics_reporter.report(metrics);
+                }
+                Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
+                    otel_info!("traffic_generator.shutdown");
+                    return Ok(TerminalState::new(deadline, [metrics.snapshot()]));
+                }
+                Err(e) => return Err(Error::ChannelRecvError(e)),
+                _ => {}
+            },
+
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                metrics.completion_drain_deadline_forced.inc();
+                otel_warn!(
+                    "traffic_generator.completion_drain.deadline_reached",
+                    pending_batches = *pending_completions,
+                    message = "Completion drain deadline reached with unresolved batches"
+                );
+                break;
+            }
+        }
+    }
+
+    effect_handler.notify_receiver_drained().await?;
+    Ok(TerminalState::new(deadline, [metrics.snapshot()]))
+}
+
+/// Handle a control message received on the control channel.
+///
+/// Returns `Ok(Some(terminal_state))` when the receiver should exit,
+/// `Ok(None)` when it should continue the event loop, or `Err` on a
+/// channel error.
+async fn handle_control_msg(
+    ctrl_msg: Result<NodeControlMsg<OtapPdata>, RecvError>,
+    ctrl_msg_recv: &mut local::ControlChannel<OtapPdata>,
+    effect_handler: &local::EffectHandler<OtapPdata>,
+    enable_ack_nack: bool,
+    pending_completions: &mut u64,
+    metrics: &mut MetricSet<TrafficGeneratorReceiverMetrics>,
+) -> Result<Option<TerminalState>, Error> {
+    match ctrl_msg {
+        Ok(NodeControlMsg::CollectTelemetry {
+            mut metrics_reporter,
+        }) => {
+            _ = metrics_reporter.report(metrics);
+            Ok(None)
+        }
+        Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
+            otel_info!("traffic_generator.drain_ingress");
+            if enable_ack_nack && *pending_completions > 0 {
+                return drain_pending_completions(
+                    ctrl_msg_recv,
+                    effect_handler,
+                    deadline,
+                    pending_completions,
+                    metrics,
+                )
+                .await
+                .map(Some);
+            }
+            effect_handler.notify_receiver_drained().await?;
+            Ok(Some(TerminalState::new(deadline, [metrics.snapshot()])))
+        }
+        Ok(NodeControlMsg::Ack(_)) if enable_ack_nack => {
+            record_completion(true, pending_completions, metrics);
+            Ok(None)
+        }
+        Ok(NodeControlMsg::Nack(_)) if enable_ack_nack => {
+            record_completion(false, pending_completions, metrics);
+            Ok(None)
+        }
+        Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
+            otel_info!("traffic_generator.shutdown");
+            Ok(Some(TerminalState::new(deadline, [metrics.snapshot()])))
+        }
+        Err(e) => Err(Error::ChannelRecvError(e)),
+        _ => Ok(None),
+    }
+}
+
+/// Implement the Receiver trait for the TrafficGeneratorReceiver
+#[async_trait(?Send)]
+impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
+    async fn start(
+        mut self: Box<Self>,
+        ctrl_msg_recv: local::ControlChannel<OtapPdata>,
+        effect_handler: local::EffectHandler<OtapPdata>,
+    ) -> Result<TerminalState, Error> {
+        let producer =
+            TrafficProducer::from_config(&self.config).map_err(|e| Error::ReceiverError {
+                receiver: effect_handler.receiver_id(),
+                kind: ReceiverErrorKind::Configuration,
+                error: format!("Failed to generate producer: {}", e),
+                source_detail: String::new(),
+            })?;
+
+        let transport_context =
+            build_transport_context(self.config.transport_headers()).map_err(|error| {
+                Error::ReceiverError {
+                    receiver: effect_handler.receiver_id(),
+                    kind: ReceiverErrorKind::Configuration,
+                    error: "Failed to encode transport context".into(),
+                    source_detail: error.to_string(),
+                }
+            })?;
+
+        let run_len = producer.run_len();
+
+        // We consume one tick here because it's always immediately ready and would
+        // make us think we're lagging;
+        let mut run_ticker = interval(Duration::from_secs(1));
+        run_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        _ = run_ticker.tick().await;
+
+        // When signals_per_second is None (uncapped), always use Open mode
+        // regardless of the configured production_mode, since Smooth pacing
+        // is meaningless without a target rate.
+        let effective_mode = if self
+            .config
+            .get_traffic_config()
+            .signals_per_second
+            .is_none()
+        {
+            config::ProductionMode::Open
+        } else {
+            self.config.get_traffic_config().production_mode.clone()
+        };
+
+        match effective_mode {
+            config::ProductionMode::Smooth => {
+                if let Some(batch_duration) = smooth_batch_interval(run_len) {
+                    self.metrics.smooth_run_batches.set(run_len as u64);
+                    self.metrics
+                        .smooth_batch_interval_ns
+                        .set(batch_duration.as_nanos() as u64);
+                    let mut batch_ticker = interval(batch_duration);
+                    batch_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                    self.run_smooth(
+                        ctrl_msg_recv,
+                        &effect_handler,
+                        producer,
+                        run_ticker,
+                        batch_ticker,
+                        transport_context,
+                    )
+                    .await
+                } else {
+                    otel_warn!(
+                        "traffic_generator.smooth_fallback_open",
+                        reason = "smooth batch interval is zero"
+                    );
+                    self.run_open(
+                        ctrl_msg_recv,
+                        &effect_handler,
+                        producer,
+                        run_ticker,
+                        transport_context,
+                    )
+                    .await
+                }
+            }
+            config::ProductionMode::Open => {
+                self.run_open(
+                    ctrl_msg_recv,
+                    &effect_handler,
+                    producer,
+                    run_ticker,
+                    transport_context,
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// Declares configured generated context names in sorted order.
+fn traffic_generator_declarations(
+    config_value: &Value,
+) -> Result<Vec<ContextDeclaration>, otel_arrow_dfe_config::error::Error> {
+    let config: Config = serde_json::from_value(config_value.clone()).map_err(|e| {
+        otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+            error: format!("traffic generator declaration provider: {e}"),
+        }
+    })?;
+
+    let mut declarations = ContextDeclarationsBuilder::new();
+    let names = config
+        .transport_headers()
+        .keys()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    for name in names {
+        declarations.produce(name)?;
+    }
+    Ok(declarations.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config::{DataSource, GenerationStrategy};
+    use super::*;
+
+    use crate::receivers::traffic_generator::config::{Config, TrafficConfig};
+    use otel_arrow_dfe_config::node::NodeUserConfig;
+    use otel_arrow_dfe_engine::context::ControllerContext;
+    use otel_arrow_dfe_engine::context_declaration::{ContextAccessId, ContextDeclaration};
+    use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
+    use otel_arrow_dfe_engine::testing::{
+        receiver::{NotSendValidateContext, TestContext, TestRuntime},
+        test_node,
+    };
+    use otel_arrow_dfe_pdata::OtlpProtoBytes;
+    use otel_arrow_dfe_pdata::proto::OtlpProtoMessage;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogsData;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::MetricsData;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric::Data;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::TracesData;
+    use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
+    use prost::Message;
+    use std::future::Future;
+    use std::pin::Pin;
+    use tokio::time::{Duration, sleep};
+
+    use std::collections::HashSet;
+    use weaver_common::vdir::VirtualDirectoryPath;
+    use weaver_forge::registry::ResolvedRegistry;
+
+    const RESOURCE_COUNT: usize = 1;
+    const SCOPE_COUNT: usize = 1;
+    const MESSAGE_COUNT: usize = 1;
+    const RUN_TILL_SHUTDOWN: u64 = 999;
+    const MESSAGE_PER_SECOND: usize = 3;
+    const MAX_SIGNALS: u64 = 3;
+    const MAX_BATCH: usize = 30;
+
+    /// Scenario: Configured transport headers exceed the ingress capture defaults.
+    /// Guarantees: The traffic generator retains every configured header.
+    #[test]
+    fn test_build_transport_context_uses_configuration_limits() {
+        let mut headers = (0..33)
+            .map(|index| (format!("x-header-{index}"), Some(index.to_string())))
+            .collect::<HashMap<_, _>>();
+        let long_name = format!("x-{}", "n".repeat(129));
+        let _ = headers.insert(long_name.clone(), Some("long-name".to_string()));
+
+        let context = build_transport_context(&headers)
+            .expect("configured headers should fit")
+            .expect("non-empty headers should produce a context");
+
+        assert_eq!(context.items().count(), headers.len());
+        assert!(
+            context
+                .items()
+                .any(|item| item.stored_name() == Some(long_name.as_str()))
+        );
+    }
+
+    /// Scenario: Ack/Nack tracking is enabled, one generated batch remains
+    /// unresolved when receiver-first shutdown begins, and its Ack arrives later.
+    /// Guarantees: DrainIngress keeps the receiver alive until the Ack resolves
+    /// the pending batch, then reports the receiver as drained.
+    #[test]
+    fn test_drain_ingress_waits_for_pending_ack() {
+        let test_runtime = TestRuntime::new();
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+        let traffic_config = TrafficConfig::new(None, Some(1), 1, 0, 0, 1);
+        let config = Config::new(traffic_config, registry_path)
+            .with_data_source(DataSource::Synthetic)
+            .with_generation_strategy(GenerationStrategy::PreGenerated)
+            .with_ack_nack(true);
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("traffic_generator_ack_drain"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let scenario = |ctx: TestContext<OtapPdata>| async move {
+            sleep(Duration::from_millis(50)).await;
+            ctx.send_control_msg(NodeControlMsg::DrainIngress {
+                deadline: std::time::Instant::now() + Duration::from_secs(2),
+                reason: "test completion drain".to_owned(),
+            })
+            .await
+            .expect("Failed to send DrainIngress");
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation_concurrent(|mut ctx| async move {
+                let pdata = tokio::time::timeout(Duration::from_secs(1), ctx.recv())
+                    .await
+                    .expect("timed out waiting for generated pdata")
+                    .expect("generated pdata channel closed");
+
+                // Send the Ack after DrainIngress. If the receiver reports
+                // drained immediately, its control channel closes and this
+                // completion cannot be delivered.
+                sleep(Duration::from_millis(100)).await;
+                ctx.send_control_msg(NodeControlMsg::Ack(
+                    otel_arrow_dfe_engine::control::AckMsg::new(pdata),
+                ))
+                .await
+                .expect("receiver must remain alive for the pending Ack");
+            });
+    }
+
+    #[test]
+    fn test_smooth_batch_interval_uses_sub_millisecond_precision() {
+        let interval = smooth_batch_interval(2000).expect("interval should exist");
+
+        assert_eq!(interval, Duration::from_micros(500));
+    }
+
+    #[test]
+    fn test_smooth_batch_interval_does_not_overdrive_run() {
+        let interval = smooth_batch_interval(88).expect("interval should exist");
+
+        assert!(interval * 88 >= Duration::from_secs(1));
+        assert!(interval * 87 < Duration::from_secs(1));
+    }
+
+    /// Convert OtapPdata signal to OtlpProtoMessage for testing purposes.
+    fn pdata_to_otlp_message(value: OtapPdata) -> OtlpProtoMessage {
+        let otlp_bytes: OtlpProtoBytes = value
+            .payload()
+            .try_into_with_default()
+            .expect("can convert signal to otlp bytes");
+        match otlp_bytes {
+            OtlpProtoBytes::ExportLogsRequest(bytes) => {
+                OtlpProtoMessage::Logs(LogsData::decode(bytes.as_ref()).expect("can decode bytes"))
+            }
+            OtlpProtoBytes::ExportMetricsRequest(bytes) => OtlpProtoMessage::Metrics(
+                MetricsData::decode(bytes.as_ref()).expect("can decode bytes"),
+            ),
+            OtlpProtoBytes::ExportTracesRequest(bytes) => OtlpProtoMessage::Traces(
+                TracesData::decode(bytes.as_ref()).expect("can decode bytes"),
+            ),
+        }
+    }
+
+    /// Test closure that simulates a typical receiver scenario.
+    fn scenario() -> impl FnOnce(TestContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        move |ctx| {
+            Box::pin(async move {
+                // no scenario to run here as scenario is already defined in the configuration
+                // wait for the scenario to finish running
+                sleep(Duration::from_millis(RUN_TILL_SHUTDOWN)).await;
+                // send a Shutdown event to terminate the receiver.
+                ctx.send_shutdown(std::time::Instant::now(), "Test")
+                    .await
+                    .expect("Failed to send Shutdown");
+            })
+        }
+    }
+
+    /// Validation closure that checks the received message and counters (!Send context).
+    fn validation_procedure(
+        resolved_registry: ResolvedRegistry,
+    ) -> impl FnOnce(NotSendValidateContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        |mut ctx| {
+            Box::pin(async move {
+                // check that messages have been sent through the effect_handler
+                while let Ok(received_signal) = ctx.recv().await {
+                    match pdata_to_otlp_message(received_signal) {
+                        OtlpProtoMessage::Metrics(metric) => {
+                            // loop and check count
+                            let resource_count = metric.resource_metrics.len();
+                            assert!(resource_count == RESOURCE_COUNT);
+                            for resource in metric.resource_metrics.iter() {
+                                let scope_count = resource.scope_metrics.len();
+                                assert!(scope_count == SCOPE_COUNT);
+                                for scope in resource.scope_metrics.iter() {
+                                    let metric_count = scope.metrics.len();
+                                    assert!(metric_count == MESSAGE_COUNT);
+                                    for metric in scope.metrics.iter() {
+                                        let metric_definition = resolved_registry
+                                            .groups
+                                            .iter()
+                                            .find(|group| {
+                                                group.metric_name == Some(metric.name.clone())
+                                            })
+                                            .expect("metric not found in registry");
+                                        assert_eq!(metric.description, metric_definition.brief);
+                                        assert_eq!(
+                                            Some(metric.unit.clone()),
+                                            metric_definition.unit
+                                        );
+
+                                        let keys_metric_definition: HashSet<&str> =
+                                            metric_definition
+                                                .attributes
+                                                .iter()
+                                                .map(|attribute| attribute.name.as_str())
+                                                .collect();
+
+                                        match metric.data.as_ref().expect("metric has no data") {
+                                            Data::Sum(sum) => {
+                                                for datapoints in sum.data_points.iter() {
+                                                    let keys: HashSet<&str> = datapoints
+                                                        .attributes
+                                                        .iter()
+                                                        .map(|attribute| attribute.key.as_str())
+                                                        .collect();
+
+                                                    assert_eq!(keys, keys_metric_definition);
+                                                }
+                                            }
+                                            Data::Gauge(gauge) => {
+                                                for datapoints in gauge.data_points.iter() {
+                                                    let keys: HashSet<&str> = datapoints
+                                                        .attributes
+                                                        .iter()
+                                                        .map(|attribute| attribute.key.as_str())
+                                                        .collect();
+
+                                                    assert_eq!(keys, keys_metric_definition);
+                                                }
+                                            }
+                                            Data::Histogram(histogram) => {
+                                                for datapoints in histogram.data_points.iter() {
+                                                    let keys: HashSet<&str> = datapoints
+                                                        .attributes
+                                                        .iter()
+                                                        .map(|attribute| attribute.key.as_str())
+                                                        .collect();
+
+                                                    assert_eq!(keys, keys_metric_definition);
+                                                }
+                                            }
+                                            _ => unreachable!(),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        OtlpProtoMessage::Traces(span) => {
+                            let resource_count = span.resource_spans.len();
+                            assert!(resource_count == RESOURCE_COUNT);
+                            for resource in span.resource_spans.iter() {
+                                let scope_count = resource.scope_spans.len();
+                                assert!(scope_count == SCOPE_COUNT);
+                                for scope in resource.scope_spans.iter() {
+                                    let span_count = scope.spans.len();
+                                    assert!(span_count == MESSAGE_COUNT);
+                                    for span in scope.spans.iter() {
+                                        let span_definition = resolved_registry
+                                            .groups
+                                            .iter()
+                                            .find(|group| group.id == span.name)
+                                            .expect("span not found in registry");
+                                        let keys: HashSet<&str> = span
+                                            .attributes
+                                            .iter()
+                                            .map(|attribute| attribute.key.as_str())
+                                            .collect();
+                                        let keys_span_definition: HashSet<&str> = span_definition
+                                            .attributes
+                                            .iter()
+                                            .map(|attribute| attribute.name.as_str())
+                                            .collect();
+
+                                        assert_eq!(keys, keys_span_definition);
+
+                                        let events: HashSet<&str> = span
+                                            .events
+                                            .iter()
+                                            .map(|event| event.name.as_str())
+                                            .collect();
+
+                                        let events_span_definition: HashSet<&str> = span_definition
+                                            .events
+                                            .iter()
+                                            .map(|event_name| event_name.as_str())
+                                            .collect();
+                                        assert_eq!(events, events_span_definition);
+                                    }
+                                }
+                            }
+                        }
+                        OtlpProtoMessage::Logs(log) => {
+                            let resource_count = log.resource_logs.len();
+                            assert!(resource_count == RESOURCE_COUNT);
+                            for resource in log.resource_logs.iter() {
+                                let scope_count = resource.scope_logs.len();
+                                assert!(scope_count == SCOPE_COUNT);
+                                for scope in resource.scope_logs.iter() {
+                                    let log_record_count = scope.log_records.len();
+                                    assert!(log_record_count == MESSAGE_COUNT);
+                                    for log_record in scope.log_records.iter() {
+                                        let log_record_definition = resolved_registry
+                                            .groups
+                                            .iter()
+                                            .find(|group| {
+                                                group.name == Some(log_record.event_name.clone())
+                                            })
+                                            .expect("metric not found in registry");
+                                        let keys: HashSet<&str> = log_record
+                                            .attributes
+                                            .iter()
+                                            .map(|attribute| attribute.key.as_str())
+                                            .collect();
+                                        let keys_log_record_definition: HashSet<&str> =
+                                            log_record_definition
+                                                .attributes
+                                                .iter()
+                                                .map(|attribute| attribute.name.as_str())
+                                                .collect();
+
+                                        assert_eq!(keys, keys_log_record_definition);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn test_traffic_generator_receiver() {
+        let test_runtime = TestRuntime::new();
+
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        let traffic_config = TrafficConfig::new(Some(MESSAGE_PER_SECOND), None, MAX_BATCH, 1, 1, 1);
+        let config = Config::new(traffic_config, registry_path);
+        let registry = config
+            .get_registry()
+            .expect("failed to get registry")
+            .expect("registry should be Some for SemanticConventions data source");
+
+        // create our receiver
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle.clone());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        // create our receiver
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+
+        // run the test
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario())
+            .run_validation(validation_procedure(registry));
+    }
+
+    /// Validation closure that checks the received message and counters (!Send context).
+    fn validation_procedure_message_rate()
+    -> impl FnOnce(NotSendValidateContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        |mut ctx| {
+            Box::pin(async move {
+                let mut received_messages = 0;
+
+                while let Ok(received_signal) = ctx.recv().await {
+                    match pdata_to_otlp_message(received_signal) {
+                        OtlpProtoMessage::Metrics(metric) => {
+                            // loop and check count
+                            for resource in metric.resource_metrics.iter() {
+                                for scope in resource.scope_metrics.iter() {
+                                    received_messages += scope.metrics.len();
+                                    assert!(scope.metrics.len() <= MAX_BATCH);
+                                }
+                            }
+                        }
+                        OtlpProtoMessage::Traces(span) => {
+                            for resource in span.resource_spans.iter() {
+                                for scope in resource.scope_spans.iter() {
+                                    received_messages += scope.spans.len();
+                                    assert!(scope.spans.len() <= MAX_BATCH);
+                                }
+                            }
+                        }
+                        OtlpProtoMessage::Logs(log) => {
+                            for resource in log.resource_logs.iter() {
+                                for scope in resource.scope_logs.iter() {
+                                    received_messages += scope.log_records.len();
+                                    assert!(scope.log_records.len() <= MAX_BATCH);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Allow 1 to 2x (observed)
+                assert!(received_messages >= MESSAGE_PER_SECOND);
+                assert!(received_messages <= 2 * MESSAGE_PER_SECOND);
+            })
+        }
+    }
+
+    #[test]
+    fn test_traffic_generator_receiver_message_rate_only() {
+        let test_runtime = TestRuntime::new();
+
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        let traffic_config = TrafficConfig::new(Some(MESSAGE_PER_SECOND), None, MAX_BATCH, 1, 0, 0);
+        let config = Config::new(traffic_config, registry_path);
+
+        // create our receiver
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle.clone());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        // create our receiver
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("fake_receiver"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        // run the test
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario())
+            .run_validation(validation_procedure_message_rate());
+    }
+
+    /// Validation closure that checks the received message and counters (!Send context).
+    fn validation_procedure_max_signal()
+    -> impl FnOnce(NotSendValidateContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        |mut ctx| {
+            Box::pin(async move {
+                let mut received_messages = 0;
+
+                while let Ok(received_signal) = ctx.recv().await {
+                    match pdata_to_otlp_message(received_signal) {
+                        OtlpProtoMessage::Metrics(metric) => {
+                            // loop and check count
+                            for resource in metric.resource_metrics.iter() {
+                                for scope in resource.scope_metrics.iter() {
+                                    received_messages += scope.metrics.len();
+                                    assert!(scope.metrics.len() <= MAX_BATCH);
+                                }
+                            }
+                        }
+                        OtlpProtoMessage::Traces(span) => {
+                            for resource in span.resource_spans.iter() {
+                                for scope in resource.scope_spans.iter() {
+                                    received_messages += scope.spans.len();
+                                    assert!(scope.spans.len() <= MAX_BATCH);
+                                }
+                            }
+                        }
+                        OtlpProtoMessage::Logs(log) => {
+                            for resource in log.resource_logs.iter() {
+                                for scope in resource.scope_logs.iter() {
+                                    received_messages += scope.log_records.len();
+                                    assert!(scope.log_records.len() <= MAX_BATCH);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                assert!(received_messages as u64 == MAX_SIGNALS);
+            })
+        }
+    }
+    #[test]
+    fn test_traffic_generator_receiver_max_signal_count_only() {
+        let test_runtime = TestRuntime::new();
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        let traffic_config = TrafficConfig::new(None, Some(MAX_SIGNALS), MAX_BATCH, 1, 0, 0);
+        let config = Config::new(traffic_config, registry_path);
+
+        // create our receiver
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle.clone());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        // create our receiver
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("fake_receiver"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        // run the test
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario())
+            .run_validation(validation_procedure_max_signal());
+    }
+
+    /// Validation closure for PreGenerated strategy test
+    fn validation_procedure_pregenerated()
+    -> impl FnOnce(NotSendValidateContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        |mut ctx| {
+            Box::pin(async move {
+                let mut received_messages = 0;
+
+                while let Ok(received_signal) = ctx.recv().await {
+                    match pdata_to_otlp_message(received_signal) {
+                        OtlpProtoMessage::Metrics(metric) => {
+                            for resource in metric.resource_metrics.iter() {
+                                for scope in resource.scope_metrics.iter() {
+                                    received_messages += scope.metrics.len();
+                                }
+                            }
+                        }
+                        OtlpProtoMessage::Traces(span) => {
+                            for resource in span.resource_spans.iter() {
+                                for scope in resource.scope_spans.iter() {
+                                    received_messages += scope.spans.len();
+                                }
+                            }
+                        }
+                        OtlpProtoMessage::Logs(log) => {
+                            for resource in log.resource_logs.iter() {
+                                for scope in resource.scope_logs.iter() {
+                                    received_messages += scope.log_records.len();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Should have received at least some messages
+                assert!(
+                    received_messages > 0,
+                    "Should receive messages from pre-generated cache"
+                );
+            })
+        }
+    }
+
+    #[test]
+    fn test_traffic_generator_receiver_static_pregenerated() {
+        let test_runtime = TestRuntime::new();
+
+        // Use Synthetic data source with PreGenerated strategy
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        let traffic_config = TrafficConfig::new(Some(MESSAGE_PER_SECOND), None, MAX_BATCH, 1, 1, 1);
+        let config = Config::new(traffic_config, registry_path)
+            .with_data_source(DataSource::Synthetic)
+            .with_generation_strategy(GenerationStrategy::PreGenerated);
+
+        // create our receiver
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle.clone());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        // create our receiver
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("fake_receiver_pregenerated"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        // run the test
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario())
+            .run_validation(validation_procedure_pregenerated());
+    }
+
+    /// Regression test: verifies that the receiver handles DrainIngress
+    /// promptly instead of stalling until the drain deadline expires.
+    /// Without proper DrainIngress handling the receiver would sleep
+    /// through the entire rate-limit interval, causing DrainDeadlineReached.
+    #[test]
+    fn test_drain_ingress_exits_promptly() {
+        let test_runtime = TestRuntime::new();
+
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        // signals_per_second=1 means the receiver sleeps ~1s between sends.
+        // DrainIngress must interrupt that sleep and exit promptly.
+        let traffic_config = TrafficConfig::new(Some(1), None, 1, 0, 0, 1);
+        let config =
+            Config::new(traffic_config, registry_path).with_data_source(DataSource::Synthetic);
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle.clone());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("fake_receiver_drain"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let drain_scenario =
+            move |ctx: TestContext<OtapPdata>| -> Pin<Box<dyn Future<Output = ()>>> {
+                Box::pin(async move {
+                    // Let the receiver start and enter its rate-limit sleep.
+                    sleep(Duration::from_millis(200)).await;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    ctx.send_control_msg(NodeControlMsg::DrainIngress {
+                        deadline,
+                        reason: "test drain".to_owned(),
+                    })
+                    .await
+                    .expect("Failed to send DrainIngress");
+                })
+            };
+
+        let drain_validation =
+            |_ctx: NotSendValidateContext<OtapPdata>| -> Pin<Box<dyn Future<Output = ()>>> {
+                Box::pin(async {})
+            };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(drain_scenario)
+            .run_validation(drain_validation);
+    }
+
+    /// Scenario: receiver-first shutdown reaches the pre-generated hot path
+    /// while it is sending many batches in one iteration.
+    /// Guarantees: the generated send loop yields often enough for the outer
+    /// control select to observe `DrainIngress` promptly instead of timing out
+    /// behind a long uncapped send burst.
+    #[test]
+    fn test_drain_ingress_exits_promptly_during_high_throughput_send_loop() {
+        let test_runtime = TestRuntime::new();
+
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        let traffic_config = TrafficConfig::new(Some(1000), None, 1, 0, 0, 1);
+        let config = Config::new(traffic_config, registry_path)
+            .with_data_source(DataSource::Synthetic)
+            .with_generation_strategy(GenerationStrategy::PreGenerated);
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle.clone());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("fake_receiver_hot_drain"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let drain_scenario =
+            move |ctx: TestContext<OtapPdata>| -> Pin<Box<dyn Future<Output = ()>>> {
+                Box::pin(async move {
+                    sleep(Duration::from_millis(200)).await;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    ctx.send_control_msg(NodeControlMsg::DrainIngress {
+                        deadline,
+                        reason: "test hot drain".to_owned(),
+                    })
+                    .await
+                    .expect("Failed to send DrainIngress");
+                })
+            };
+
+        let drain_validation =
+            |_ctx: NotSendValidateContext<OtapPdata>| -> Pin<Box<dyn Future<Output = ()>>> {
+                Box::pin(async {})
+            };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(drain_scenario)
+            .run_validation(drain_validation);
+    }
+
+    /// Regression test: verifies that a non-terminal control message
+    /// (CollectTelemetry) arriving during the rate-limit sleep does NOT
+    /// break the sleep early - the receiver should still respect the
+    /// original wait_till deadline.
+    #[test]
+    fn test_non_terminal_ctrl_msg_does_not_break_rate_limit_sleep() {
+        let test_runtime = TestRuntime::new();
+
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        // signals_per_second=1 with a single log per iteration means the
+        // receiver will sleep ~1s between sends. If the non-terminal control
+        // message breaks the sleep, we'd see more than 2 batches in 1.5s.
+        let traffic_config = TrafficConfig::new(Some(1), None, 1, 0, 0, 1);
+        let config =
+            Config::new(traffic_config, registry_path).with_data_source(DataSource::Synthetic);
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle.clone());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("fake_receiver_ctrl_sleep"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let ctrl_scenario =
+            move |ctx: TestContext<OtapPdata>| -> Pin<Box<dyn Future<Output = ()>>> {
+                Box::pin(async move {
+                    // Let the receiver start and enter its rate-limit sleep.
+                    sleep(Duration::from_millis(200)).await;
+                    // Fire a CollectTelemetry message mid-sleep. This is a
+                    // non-terminal control message and must NOT break the
+                    // rate-limit sleep.
+                    let (_rx, metrics_reporter) =
+                        otel_arrow_dfe_telemetry::reporter::MetricsReporter::create_new_and_receiver(1);
+                    ctx.send_control_msg(NodeControlMsg::CollectTelemetry { metrics_reporter })
+                        .await
+                        .expect("Failed to send CollectTelemetry");
+
+                    // Wait long enough for the first sleep to expire plus a
+                    // small margin, but NOT long enough for a third iteration.
+                    sleep(Duration::from_millis(1300)).await;
+
+                    ctx.send_shutdown(std::time::Instant::now(), "Test")
+                        .await
+                        .expect("Failed to send Shutdown");
+                })
+            };
+
+        let ctrl_validation =
+            |mut ctx: NotSendValidateContext<OtapPdata>| -> Pin<Box<dyn Future<Output = ()>>> {
+                Box::pin(async move {
+                    let mut received_batches: u64 = 0;
+
+                    while let Ok(_received_signal) = ctx.recv().await {
+                        received_batches += 1;
+                    }
+
+                    // With 1 signal/sec and ~1.5s total runtime we expect at
+                    // most 2 batches. If the non-terminal control message
+                    // broke the sleep, we would see 3+.
+                    assert!(
+                        received_batches <= 2,
+                        "Non-terminal control message broke the rate-limit sleep: \
+                         expected at most 2 batches, got {received_batches}"
+                    );
+                })
+            };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(ctrl_scenario)
+            .run_validation(ctrl_validation);
+    }
+
+    /// Verifies that pdata messages contain transport headers with fixed values
+    /// when `transport_headers` is configured with explicit values.
+    #[test]
+    fn test_fake_data_transport_headers_fixed_value() {
+        let test_runtime = TestRuntime::new();
+
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        let traffic_config = TrafficConfig::new(
+            Some(MESSAGE_PER_SECOND),
+            Some(MAX_SIGNALS),
+            MAX_BATCH,
+            0,
+            0,
+            1,
+        );
+        let config = Config::new(traffic_config, registry_path)
+            .with_data_source(DataSource::Synthetic)
+            .with_generation_strategy(GenerationStrategy::Fresh)
+            .with_transport_headers(HashMap::from([(
+                "x-tenant-id".to_string(),
+                Some("acme".to_string()),
+            )]));
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("fake_receiver_transport_headers"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                sleep(Duration::from_millis(RUN_TILL_SHUTDOWN)).await;
+                ctx.send_shutdown(std::time::Instant::now(), "Test complete")
+                    .await
+                    .expect("Failed to send shutdown");
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        let validation = |mut ctx: NotSendValidateContext<OtapPdata>| {
+            Box::pin(async move {
+                let pdata = ctx.recv().await.expect("should receive at least one pdata");
+
+                let headers = pdata
+                    .pdata_context_bytes()
+                    .expect("pdata should have transport headers");
+                let tenant: Vec<_> = headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-tenant-id"))
+                    .collect();
+                assert_eq!(
+                    tenant.len(),
+                    1,
+                    "should have exactly one x-tenant-id header"
+                );
+                assert_eq!(
+                    tenant[0]
+                        .value()
+                        .and_then(|(_, value)| std::str::from_utf8(value).ok()),
+                    Some("acme"),
+                    "fixed header value should be 'acme'"
+                );
+                let packed = pdata
+                    .pdata_context_bytes()
+                    .expect("pdata should have packed context");
+                let packed_tenant = packed.items().next().expect("packed tenant header");
+                assert_eq!(packed_tenant.stored_name(), Some("x-tenant-id"));
+                assert_eq!(
+                    packed_tenant.value().map(|(_, value)| value),
+                    Some(b"acme".as_slice())
+                );
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation(validation);
+    }
+
+    /// Verifies that pdata messages contain transport headers with random values
+    /// when `transport_headers` is configured with null values.
+    #[test]
+    fn test_fake_data_transport_headers_random_value() {
+        let test_runtime = TestRuntime::new();
+
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        let traffic_config = TrafficConfig::new(
+            Some(MESSAGE_PER_SECOND),
+            Some(MAX_SIGNALS),
+            MAX_BATCH,
+            0,
+            0,
+            1,
+        );
+        let config = Config::new(traffic_config, registry_path)
+            .with_data_source(DataSource::Synthetic)
+            .with_generation_strategy(GenerationStrategy::Fresh)
+            .with_transport_headers(HashMap::from([("x-request-id".to_string(), None)]));
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("fake_receiver_random_headers"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                sleep(Duration::from_millis(RUN_TILL_SHUTDOWN)).await;
+                ctx.send_shutdown(std::time::Instant::now(), "Test complete")
+                    .await
+                    .expect("Failed to send shutdown");
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        let validation = |mut ctx: NotSendValidateContext<OtapPdata>| {
+            Box::pin(async move {
+                let pdata = ctx.recv().await.expect("should receive at least one pdata");
+
+                let headers = pdata
+                    .pdata_context_bytes()
+                    .expect("pdata should have transport headers");
+                let request_id: Vec<_> = headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-request-id"))
+                    .collect();
+                assert_eq!(
+                    request_id.len(),
+                    1,
+                    "should have exactly one x-request-id header"
+                );
+                assert_eq!(
+                    request_id[0].value().expect("header value").1.len(),
+                    16,
+                    "random value should be 16 bytes"
+                );
+                assert_eq!(
+                    request_id[0].value().expect("header value").0,
+                    HeaderValueKind::Text,
+                    "non-bin key should produce a Text header"
+                );
+                assert!(
+                    request_id[0]
+                        .value()
+                        .and_then(|(_, value)| std::str::from_utf8(value).ok())
+                        .is_some(),
+                    "text header random value should be valid UTF-8 (printable)"
+                );
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation(validation);
+    }
+
+    /// Verifies that pdata messages contain binary transport headers with random
+    /// values when `transport_headers` is configured with null values and keys
+    /// ending in `-bin`.
+    #[test]
+    fn test_fake_data_transport_headers_binary_random_value() {
+        let test_runtime = TestRuntime::new();
+
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        let traffic_config = TrafficConfig::new(
+            Some(MESSAGE_PER_SECOND),
+            Some(MAX_SIGNALS),
+            MAX_BATCH,
+            0,
+            0,
+            1,
+        );
+        let config = Config::new(traffic_config, registry_path)
+            .with_data_source(DataSource::Synthetic)
+            .with_generation_strategy(GenerationStrategy::Fresh)
+            .with_transport_headers(HashMap::from([("x-trace-bin".to_string(), None)]));
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("fake_receiver_binary_headers"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                sleep(Duration::from_millis(RUN_TILL_SHUTDOWN)).await;
+                ctx.send_shutdown(std::time::Instant::now(), "Test complete")
+                    .await
+                    .expect("Failed to send shutdown");
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        let validation = |mut ctx: NotSendValidateContext<OtapPdata>| {
+            Box::pin(async move {
+                let pdata = ctx.recv().await.expect("should receive at least one pdata");
+
+                let headers = pdata
+                    .pdata_context_bytes()
+                    .expect("pdata should have transport headers");
+                let trace_bin: Vec<_> = headers
+                    .items()
+                    .filter(|item| item.stored_name() == Some("x-trace-bin"))
+                    .collect();
+                assert_eq!(
+                    trace_bin.len(),
+                    1,
+                    "should have exactly one x-trace-bin header"
+                );
+                assert_eq!(
+                    trace_bin[0].value().expect("header value").1.len(),
+                    16,
+                    "random binary value should be 16 bytes"
+                );
+                assert_eq!(
+                    trace_bin[0].value().expect("header value").0,
+                    HeaderValueKind::Binary,
+                    "-bin key should produce a Binary header"
+                );
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation(validation);
+    }
+
+    /// Verifies that pdata messages do NOT have transport headers when
+    /// `transport_headers` is absent from the config.
+    #[test]
+    fn test_fake_data_transport_headers_empty_by_default() {
+        let test_runtime = TestRuntime::new();
+
+        let registry_path = VirtualDirectoryPath::GitRepo {
+            url: "https://github.com/open-telemetry/semantic-conventions.git".to_owned(),
+            sub_folder: Some("model".to_owned()),
+            refspec: None,
+        };
+
+        let traffic_config = TrafficConfig::new(
+            Some(MESSAGE_PER_SECOND),
+            Some(MAX_SIGNALS),
+            MAX_BATCH,
+            0,
+            0,
+            1,
+        );
+        let config = Config::new(traffic_config, registry_path)
+            .with_data_source(DataSource::Synthetic)
+            .with_generation_strategy(GenerationStrategy::Fresh);
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+        ));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+
+        let receiver = ReceiverWrapper::local(
+            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            test_node("fake_receiver_no_headers"),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                sleep(Duration::from_millis(RUN_TILL_SHUTDOWN)).await;
+                ctx.send_shutdown(std::time::Instant::now(), "Test complete")
+                    .await
+                    .expect("Failed to send shutdown");
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        let validation = |mut ctx: NotSendValidateContext<OtapPdata>| {
+            Box::pin(async move {
+                let pdata = ctx.recv().await.expect("should receive at least one pdata");
+
+                assert!(
+                    pdata.pdata_context_bytes().is_none(),
+                    "pdata should NOT have transport headers when config has no transport_headers"
+                );
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation(validation);
+    }
+
+    /// Scenario: Traffic generation config contains several context names.
+    /// Guarantees: every name is declared in deterministic order.
+    #[test]
+    fn traffic_gen_declaration_sorted_headers() {
+        let config = serde_json::json!({
+            "traffic_config": {
+                "signals_per_second": 10,
+                "max_batch_size": 5,
+                "metric_weight": 0,
+                "trace_weight": 0,
+                "log_weight": 1
+            },
+            "data_source": "synthetic",
+            "generation_strategy": "fresh",
+            "transport_headers": {
+                "x-tenant-id": "acme",
+                "X-Request-Id": null,
+                "a-first": "val"
+            }
+        });
+        let decls = traffic_generator_declarations(&config).unwrap();
+        assert_eq!(decls.len(), 3);
+
+        let names: Vec<&str> = decls
+            .iter()
+            .map(|d| match d {
+                ContextDeclaration::Produces { name, .. } => name.as_str(),
+                other => panic!("unexpected declaration: {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["a-first", "x-request-id", "x-tenant-id"]);
+    }
+
+    /// Scenario: Configured headers use mixed-case wire names.
+    /// Guarantees: their logical names and binary classification are normalized.
+    #[test]
+    fn traffic_gen_headers_normalize_logical_names() {
+        let context = build_transport_context(&HashMap::from([
+            ("X-Request-Id".to_string(), Some("request".to_string())),
+            ("X-Trace-Bin".to_string(), Some("trace".to_string())),
+        ]))
+        .expect("configured headers fit in context")
+        .expect("configured headers produce context");
+        let request_header = context
+            .items()
+            .find(|item| item.wire_name() == Some("X-Request-Id"))
+            .expect("request header is present");
+        let trace_header = context
+            .items()
+            .find(|item| item.wire_name() == Some("X-Trace-Bin"))
+            .expect("trace header is present");
+
+        assert_eq!(request_header.stored_name(), Some("x-request-id"));
+        assert_eq!(
+            request_header.value().map(|(kind, _)| kind),
+            Some(HeaderValueKind::Text)
+        );
+        assert_eq!(trace_header.stored_name(), Some("x-trace-bin"));
+        assert_eq!(
+            trace_header.value().map(|(kind, _)| kind),
+            Some(HeaderValueKind::Binary)
+        );
+    }
+
+    /// Scenario: Traffic generation config contains no context.
+    /// Guarantees: the factory declares no producers.
+    #[test]
+    fn traffic_gen_declaration_no_headers() {
+        let config = serde_json::json!({
+            "traffic_config": {
+                "signals_per_second": 10,
+                "max_batch_size": 5,
+                "metric_weight": 0,
+                "trace_weight": 0,
+                "log_weight": 1
+            },
+            "data_source": "synthetic",
+            "generation_strategy": "fresh"
+        });
+        let decls = traffic_generator_declarations(&config).unwrap();
+        assert!(decls.is_empty());
+    }
+
+    /// Scenario: Configured header names differ only by casing.
+    /// Guarantees: one declaration represents the shared logical context register.
+    #[test]
+    fn traffic_gen_declaration_deduplicates_normalized_headers() {
+        let config = serde_json::json!({
+            "traffic_config": {
+                "signals_per_second": 10,
+                "max_batch_size": 5,
+                "metric_weight": 0,
+                "trace_weight": 0,
+                "log_weight": 1
+            },
+            "data_source": "synthetic",
+            "generation_strategy": "fresh",
+            "transport_headers": {
+                "X-Tenant-Id": "acme",
+                "x-tenant-id": "contoso"
+            }
+        });
+
+        assert_eq!(
+            traffic_generator_declarations(&config).unwrap(),
+            vec![ContextDeclaration::Produces {
+                access: ContextAccessId::new(0),
+                name: "x-tenant-id".into(),
+            }]
+        );
+    }
+}

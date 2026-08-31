@@ -332,6 +332,9 @@ fn test_runtime_with_log_filter_and_topology(
         tokio::sync::watch::channel(MemoryPressureChanged::initial());
     let (log_filter, log_filter_handle) =
         RuntimeLogFilter::new(&config.engine.telemetry.logs.level);
+    let context_policy = pipeline_factory
+        .compile_context_policy(&config.resolve())
+        .expect("test context policy should compile");
 
     (
         Arc::new(ControllerRuntime::new(
@@ -342,6 +345,7 @@ fn test_runtime_with_log_filter_and_topology(
             engine_event_reporter,
             metrics_reporter,
             declared_topics,
+            context_policy,
             available_core_ids(),
             topology,
             TracingSetup::new(ProviderSetup::Noop, LogLevel::default(), engine_context)
@@ -572,6 +576,7 @@ fn register_runtime_instance(
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let context_policy = Arc::clone(&state.context_policy);
     _ = state.runtime_instances.insert(
         DeployedPipelineKey {
             pipeline_group_id: pipeline_group_id.to_owned().into(),
@@ -581,6 +586,7 @@ fn register_runtime_instance(
         },
         RuntimeInstanceRecord {
             control_sender: Some(control_sender),
+            context_policy,
             lifecycle,
         },
     );
@@ -601,10 +607,12 @@ fn register_runtime_instance_with_sender(
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let context_policy = Arc::clone(&state.context_policy);
     _ = state.runtime_instances.insert(
         pipeline_key,
         RuntimeInstanceRecord {
             control_sender: Some(control_sender),
+            context_policy,
             lifecycle,
         },
     );
@@ -696,6 +704,7 @@ fn deadline_notifying_admin_sender() -> (
 }
 
 fn launched_runtime_instance(
+    runtime: &ControllerRuntime<()>,
     pipeline_group_id: &str,
     pipeline_id: &str,
     core_id: usize,
@@ -703,6 +712,13 @@ fn launched_runtime_instance(
 ) -> LaunchedPipelineThread<()> {
     let (tx, _rx) = runtime_ctrl_msg_channel::<()>(4);
     let control_sender: Arc<dyn PipelineAdminSender> = Arc::new(tx);
+    let context_policy = {
+        let state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&state.context_policy)
+    };
     LaunchedPipelineThread {
         pipeline_key: DeployedPipelineKey {
             pipeline_group_id: pipeline_group_id.to_owned().into(),
@@ -711,6 +727,7 @@ fn launched_runtime_instance(
             deployment_generation: generation,
         },
         control_sender,
+        context_policy,
         _marker: std::marker::PhantomData,
     }
 }
@@ -3465,10 +3482,12 @@ fn rollback_replace_rollout_restores_recovered_serving_generation() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = state.generation_counters.insert(pipeline_key.clone(), 2);
+        let context_policy = Arc::clone(&state.context_policy);
         let _ = state.runtime_recoveries.insert(
             (pipeline_key.clone(), 0),
             RuntimeRecoveryState {
                 serving_generation: 1,
+                context_policy,
                 restart_count: 1,
                 ready_since: Some(Instant::now()),
                 worker_id: None,
@@ -5455,7 +5474,7 @@ fn register_launched_instance_reconciles_early_exit_without_leaking_active_count
     let deployed_key = deployed_key("g1", "p1", 0, 0);
     runtime.note_instance_exit(deployed_key.clone(), RuntimeInstanceExit::Success);
 
-    runtime.register_launched_instance(launched_runtime_instance("g1", "p1", 0, 0));
+    runtime.register_launched_instance(launched_runtime_instance(&runtime, "g1", "p1", 0, 0));
 
     let state = runtime
         .state
@@ -5477,7 +5496,7 @@ fn release_instance_wait_unblocks_wait_with_active_instances() {
     let runtime = test_runtime(&empty_engine_config());
 
     // Simulate a launched, still-active pipeline instance that never exits.
-    runtime.register_launched_instance(launched_runtime_instance("g1", "p1", 0, 0));
+    runtime.register_launched_instance(launched_runtime_instance(&runtime, "g1", "p1", 0, 0));
     assert_eq!(
         runtime
             .state

@@ -10,9 +10,11 @@ use linkme::distributed_slice;
 use otel_arrow_dfe_config::NodeId as NodeName;
 use otel_arrow_dfe_config::error::Error as ConfigError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
-use otel_arrow_dfe_engine::ExporterFactory;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
+use otel_arrow_dfe_engine::context_declaration::{
+    ContextDeclaration, ContextDeclarationProvider, ContextReadSelector,
+};
 use otel_arrow_dfe_engine::control::NodeControlMsg;
 use otel_arrow_dfe_engine::error::Error as EngineError;
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
@@ -20,6 +22,7 @@ use otel_arrow_dfe_engine::local::exporter::{EffectHandler, Exporter};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
+use otel_arrow_dfe_engine::{ExporterFactory, context_access};
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
 use otel_arrow_dfe_otap::context_bytes::{ContextRegisterSetBinding, PdataContextBytes};
 use otel_arrow_dfe_otap::pdata::OtapPdata;
@@ -121,6 +124,78 @@ pub static VALIDATION_EXPORTER_FACTORY: ExporterFactory<OtapPdata> = ExporterFac
         ValidationExporterConfig,
     >,
 };
+
+#[distributed_slice(otel_arrow_dfe_engine::context_declaration::CONTEXT_DECLARATION_PROVIDERS)]
+static VALIDATION_EXPORTER_CONTEXT_DECLARATIONS: ContextDeclarationProvider =
+    ContextDeclarationProvider::from_config(
+        VALIDATION_EXPORTER_URN,
+        validation_exporter_declarations,
+    );
+
+context_access! {
+    struct RequireAccess {
+        keys,
+        key_values,
+    }
+
+    const REQUIRE_ACCESS;
+}
+
+/// Declaration-only projection of validation config.
+#[derive(Deserialize)]
+struct ValidationDeclConfig {
+    #[serde(default)]
+    validations: Vec<ValidationInstructions>,
+}
+
+/// Declares sorted require-key bindings; deny checks remain runtime-only.
+fn validation_exporter_declarations(
+    config: &serde_json::Value,
+) -> Result<Vec<ContextDeclaration>, otel_arrow_dfe_config::error::Error> {
+    let config: ValidationDeclConfig = serde_json::from_value(config.clone()).map_err(|e| {
+        otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+            error: format!("validation exporter declaration provider: {e}"),
+        }
+    })?;
+
+    let mut require_key_names = std::collections::BTreeSet::new();
+    let mut require_key_value_names = std::collections::BTreeSet::new();
+
+    for instruction in &config.validations {
+        match instruction {
+            ValidationInstructions::TransportHeaderRequireKey { keys } => {
+                for key in keys {
+                    let _ = require_key_names.insert(key.clone());
+                }
+            }
+            ValidationInstructions::TransportHeaderRequireKeyValue { pairs } => {
+                for pair in pairs {
+                    let _ = require_key_value_names.insert(pair.key.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut declarations = Vec::new();
+    if !require_key_names.is_empty() {
+        declarations.push(ContextDeclaration::Consumes {
+            access: REQUIRE_ACCESS.keys,
+            selector: ContextReadSelector::Registers {
+                names: require_key_names.into_iter().collect(),
+            },
+        });
+    }
+    if !require_key_value_names.is_empty() {
+        declarations.push(ContextDeclaration::Consumes {
+            access: REQUIRE_ACCESS.key_values,
+            selector: ContextReadSelector::Registers {
+                names: require_key_value_names.into_iter().collect(),
+            },
+        });
+    }
+    Ok(declarations)
+}
 
 impl ValidationExporter {
     /// Run the configured validations and update metrics.
@@ -264,5 +339,70 @@ impl Exporter<OtapPdata> for ValidationExporter {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otel_arrow_dfe_engine::context_declaration::{ContextDeclaration, ContextReadSelector};
+
+    /// Scenario: Validation config requires context keys and key-values.
+    /// Guarantees: each binding is sorted and deduplicated; deny is excluded.
+    #[test]
+    fn validation_requires_produce_consumer_declarations() {
+        let config = serde_json::json!({
+            "suv_input": "suv",
+            "validations": [
+                {
+                    "type": "transport_header_require_key",
+                    "keys": ["x-tenant-id", "x-request-id"]
+                },
+                {
+                    "type": "transport_header_require_key_value",
+                    "pairs": [{"key": "x-tenant-id", "value": "acme"}]
+                },
+                {
+                    "type": "transport_header_deny",
+                    "keys": ["x-secret"]
+                }
+            ]
+        });
+
+        let decls = validation_exporter_declarations(&config).unwrap();
+        assert_eq!(decls.len(), 2);
+        assert_eq!(
+            decls[0],
+            ContextDeclaration::Consumes {
+                access: REQUIRE_ACCESS.keys,
+                selector: ContextReadSelector::Registers {
+                    names: vec!["x-request-id".into(), "x-tenant-id".into()].into_boxed_slice(),
+                },
+            }
+        );
+        assert_eq!(
+            decls[1],
+            ContextDeclaration::Consumes {
+                access: REQUIRE_ACCESS.key_values,
+                selector: ContextReadSelector::Registers {
+                    names: vec!["x-tenant-id".into()].into_boxed_slice(),
+                },
+            }
+        );
+    }
+
+    /// Scenario: Validation config has no context checks.
+    /// Guarantees: the factory declares no context consumers.
+    #[test]
+    fn validation_no_header_instructions_empty() {
+        let config = serde_json::json!({
+            "suv_input": "suv",
+            "validations": [
+                {"type": "equivalence"}
+            ]
+        });
+
+        let decls = validation_exporter_declarations(&config).unwrap();
+        assert!(decls.is_empty());
     }
 }

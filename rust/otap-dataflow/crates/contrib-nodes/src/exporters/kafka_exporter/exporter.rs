@@ -42,10 +42,12 @@ use otel_arrow_dfe_config::transport_headers_policy::{
     CompiledHeaderPropagationPolicy, CompiledHeaderSchema, CompiledSchemaPropagation,
 };
 use otel_arrow_dfe_config::validation::validate_typed_config;
-use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
 use otel_arrow_dfe_engine::ExporterFactory;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
+use otel_arrow_dfe_engine::context_declaration::{
+    ContextDeclaration, ContextDeclarationProvider, ContextReadSelector,
+};
 use otel_arrow_dfe_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otel_arrow_dfe_engine::error::Error as EngineError;
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
@@ -53,6 +55,7 @@ use otel_arrow_dfe_engine::local::exporter::{EffectHandler, Exporter};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
+use otel_arrow_dfe_engine::{ConsumerEffectHandlerExtension, context_access};
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
 use otel_arrow_dfe_otap::context_bytes::ContextRegisterBinding;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
@@ -64,6 +67,7 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::Producer;
 use rdkafka::producer::future_producer::OwnedDeliveryResult;
 use regex::Regex;
+use serde::Deserialize;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -384,6 +388,59 @@ pub static KAFKA_EXPORTER_FACTORY: ExporterFactory<OtapPdata> = ExporterFactory 
     validate_config: validate_typed_config::<KafkaExporterConfig>,
     wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
 };
+
+#[distributed_slice(otel_arrow_dfe_engine::context_declaration::CONTEXT_DECLARATION_PROVIDERS)]
+static KAFKA_EXPORTER_CONTEXT_DECLARATIONS: ContextDeclarationProvider =
+    ContextDeclarationProvider::from_config(KAFKA_EXPORTER_URN, kafka_exporter_declarations);
+
+context_access! {
+    struct KafkaAccess {
+        topic,
+        partition,
+    }
+
+    const TRACES_ACCESS;
+    const METRICS_ACCESS;
+    const LOGS_ACCESS;
+}
+
+/// Declares configured per-signal topic and partition context reads.
+fn kafka_exporter_declarations(
+    config: &serde_json::Value,
+) -> Result<Vec<ContextDeclaration>, otel_arrow_dfe_config::error::Error> {
+    let config =
+        KafkaExporterConfig::deserialize(config).map_err(|e| ConfigError::InvalidUserConfig {
+            error: format!("kafka exporter declaration provider: {e}"),
+        })?;
+
+    let mut decls = Vec::new();
+    let signals = [
+        (TRACES_ACCESS, config.traces()),
+        (METRICS_ACCESS, config.metrics()),
+        (LOGS_ACCESS, config.logs()),
+    ];
+
+    for (access, signal_cfg) in signals {
+        if let Some(cfg) = signal_cfg {
+            if let Some(header) = cfg.topic_from_transport_header() {
+                decls.push(ContextDeclaration::Consumes {
+                    access: access.topic,
+                    selector: ContextReadSelector::Registers {
+                        names: vec![header.to_string()].into_boxed_slice(),
+                    },
+                });
+            }
+            if cfg.partition_by_transport_headers() {
+                decls.push(ContextDeclaration::Consumes {
+                    access: access.partition,
+                    selector: ContextReadSelector::All,
+                });
+            }
+        }
+    }
+
+    Ok(decls)
+}
 
 impl KafkaExporter {
     /// Creates a new Kafka exporter from configuration.
@@ -1692,6 +1749,7 @@ pub mod test_support {
             HeaderPropagationPolicy, PropagationDefault, PropagationSelector,
             PropagationSelectorType,
         };
+        use otel_arrow_dfe_engine::context_declaration::{ContextDeclaration, ContextReadSelector};
         use otel_arrow_dfe_otap::context_bytes::PdataContextBytes;
         use otel_arrow_dfe_otap::pdata::Context;
         use otel_arrow_dfe_pdata::OtlpProtoBytes;
@@ -1785,6 +1843,64 @@ pub mod test_support {
 
             // Expected to fail (no live broker) but should not have compilation/borrow errors
             let _ = result;
+        }
+
+        /// Scenario: Two signals configure different context reads.
+        /// Guarantees: access IDs distinguish reads emitted in signal order.
+        #[test]
+        fn declarations_use_generic_bindings() {
+            let config = serde_json::json!({
+                "brokers": "localhost:9092",
+                "client_id": "test",
+                "traces": {
+                    "topic": "traces-static",
+                    "topic_from_transport_header": "x-traces-topic",
+                    "partition_by_transport_headers": false,
+                    "encoding": "otlp_proto"
+                },
+                "logs": {
+                    "topic": "logs-static",
+                    "partition_by_transport_headers": true,
+                    "encoding": "otlp_proto"
+                }
+            });
+
+            let decls = kafka_exporter_declarations(&config).unwrap();
+            assert_eq!(decls.len(), 2);
+
+            assert_eq!(
+                decls[0],
+                ContextDeclaration::Consumes {
+                    access: TRACES_ACCESS.topic,
+                    selector: ContextReadSelector::Registers {
+                        names: vec!["x-traces-topic".into()].into_boxed_slice(),
+                    },
+                },
+            );
+            assert_eq!(
+                decls[1],
+                ContextDeclaration::Consumes {
+                    access: LOGS_ACCESS.partition,
+                    selector: ContextReadSelector::All,
+                },
+            );
+        }
+
+        /// Scenario: Kafka config has no context reads.
+        /// Guarantees: the factory declares no consumers.
+        #[test]
+        fn declarations_empty_when_no_header_consumption() {
+            let config = serde_json::json!({
+                "brokers": "localhost:9092",
+                "client_id": "test",
+                "logs": {
+                    "topic": "logs-static",
+                    "encoding": "otlp_proto"
+                }
+            });
+
+            let decls = kafka_exporter_declarations(&config).unwrap();
+            assert!(decls.is_empty());
         }
 
         // ---- KafkaExporter::new() validation ----
