@@ -16,7 +16,7 @@ use otel_arrow_dfe_config::node::{NodeKind, NodeUserConfig};
 use otel_arrow_dfe_config::transport_headers_policy::{
     CompiledHeaderCapturePolicy, HeaderCapturePolicy, HeaderPropagationPolicy,
 };
-use otel_arrow_dfe_config::{NodeId as ConfigNodeId, PipelineKey};
+use otel_arrow_dfe_config::{ContextEntryRef, NodeId as ConfigNodeId, PipelineKey};
 
 use crate::PipelineFactory;
 use crate::error::Error as EngineError;
@@ -35,6 +35,18 @@ impl ContextDeclarationProvider {
     #[must_use]
     pub const fn from_config(urn: &'static str, declarations: ContextDeclarationFn) -> Self {
         Self { urn, declarations }
+    }
+
+    /// Creates a provider that derives declarations from a typed component configuration.
+    #[must_use]
+    pub const fn from_typed_config<T>(urn: &'static str) -> Self
+    where
+        T: ContextDeclarationConfig,
+    {
+        Self {
+            urn,
+            declarations: typed_context_declarations::<T>,
+        }
     }
 }
 
@@ -67,10 +79,10 @@ impl ContextAccessId {
 /// Generic context registers selected by one consumer binding.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ContextReadSelector {
-    /// Selects named registers in order; providers canonicalize unordered inputs.
-    Registers {
-        /// Logical context register names.
-        names: Box<[String]>,
+    /// Selects named context entries in order.
+    Entries {
+        /// Logical context entry references.
+        entries: Box<[ContextEntryRef]>,
     },
     /// Selects every context register reachable at this node.
     All,
@@ -83,8 +95,8 @@ pub enum ContextDeclaration {
     Produces {
         /// Provider-local identity used to retrieve the compiled access.
         access: ContextAccessId,
-        /// The logical header name that will be produced.
-        name: String,
+        /// The logical context entry that will be produced.
+        entry: ContextEntryRef,
     },
     /// Reads context through one compiled access.
     Consumes {
@@ -97,6 +109,26 @@ pub enum ContextDeclaration {
 
 /// Deterministically describes a node factory's context access.
 pub type ContextDeclarationFn = fn(&serde_json::Value) -> Result<Vec<ContextDeclaration>, Error>;
+
+/// Extracts context declarations from a component's typed configuration.
+pub trait ContextDeclarationConfig: serde::de::DeserializeOwned {
+    /// Returns the context accesses required by this configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the context declaration is invalid.
+    fn context_declarations(&self) -> Result<Vec<ContextDeclaration>, Error>;
+}
+
+fn typed_context_declarations<T>(
+    config: &serde_json::Value,
+) -> Result<Vec<ContextDeclaration>, Error>
+where
+    T: ContextDeclarationConfig,
+{
+    let config = otel_arrow_dfe_config::validation::deserialize_typed_config::<T>(config)?;
+    config.context_declarations()
+}
 
 /// Generation assigned to a compiled context policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -113,7 +145,7 @@ impl ContextPolicyGeneration {
 /// Builds deterministic producer declarations from configuration-sized inputs.
 #[derive(Default)]
 pub struct ContextDeclarationsBuilder {
-    produced_names: BTreeSet<String>,
+    produced_entries: BTreeSet<ContextEntryRef>,
 }
 
 impl ContextDeclarationsBuilder {
@@ -129,11 +161,10 @@ impl ContextDeclarationsBuilder {
     ///
     /// Returns an error when another configured name has the same normalized
     /// logical name.
-    pub fn produce(&mut self, name: impl AsRef<str>) -> Result<(), Error> {
-        let name = name.as_ref().to_ascii_lowercase();
-        if !self.produced_names.insert(name.clone()) {
+    pub fn produce(&mut self, entry: ContextEntryRef) -> Result<(), Error> {
+        if !self.produced_entries.insert(entry.clone()) {
             return Err(Error::InvalidUserConfig {
-                error: format!("duplicate context register name after normalization: `{name}`"),
+                error: format!("duplicate context entry reference: `{entry}`"),
             });
         }
         Ok(())
@@ -142,12 +173,12 @@ impl ContextDeclarationsBuilder {
     /// Returns produced declarations in normalized-name order with assigned IDs.
     #[must_use]
     pub fn finish(self) -> Vec<ContextDeclaration> {
-        self.produced_names
+        self.produced_entries
             .into_iter()
             .enumerate()
-            .map(|(index, name)| ContextDeclaration::Produces {
+            .map(|(index, entry)| ContextDeclaration::Produces {
                 access: ContextAccessId::new(index),
-                name,
+                entry,
             })
             .collect()
     }
@@ -269,10 +300,10 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                     &node_config.config,
                 )?;
                 for declaration in &node_declarations {
-                    if let ContextDeclaration::Produces { name, .. } = declaration {
+                    if let ContextDeclaration::Produces { entry, .. } = declaration {
                         require_register_name(
                             &mut register_requirements,
-                            name,
+                            entry.as_str(),
                             ContextNameRetention::None,
                         );
                     }
@@ -395,6 +426,7 @@ fn context_declaration_provider(urn: &str) -> Option<ContextDeclarationProvider>
 mod tests {
     use super::*;
     use otel_arrow_dfe_config::engine::OtelDataflowSpec;
+    use serde::Deserialize;
 
     use crate::config::{ExporterConfig, ReceiverConfig};
     use crate::context::PipelineContext;
@@ -440,27 +472,37 @@ mod tests {
         PipelineFactory::new(receivers, &[], exporters, &[])
     }
 
-    /// Scenario: A factory callback receives node config.
-    /// Guarantees: it returns the configured declaration.
-    #[test]
-    fn provider_callback_returns_declarations() {
-        fn test_provider(config: &serde_json::Value) -> Result<Vec<ContextDeclaration>, Error> {
-            let name = config
-                .get("header_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("default");
+    #[derive(Deserialize)]
+    struct TestDeclarationConfig {
+        #[serde(default = "default_test_entry")]
+        entry: ContextEntryRef,
+    }
+
+    fn default_test_entry() -> ContextEntryRef {
+        "default".into()
+    }
+
+    impl ContextDeclarationConfig for TestDeclarationConfig {
+        fn context_declarations(&self) -> Result<Vec<ContextDeclaration>, Error> {
             Ok(vec![ContextDeclaration::Produces {
                 access: ContextAccessId::new(0),
-                name: name.to_string(),
+                entry: self.entry.clone(),
             }])
         }
+    }
 
-        let config = serde_json::json!({"header_name": "x-test"});
-        let decls = test_provider(&config).unwrap();
+    /// Scenario: A typed provider receives valid component configuration.
+    /// Guarantees: parsing and declaration extraction use the registered config type.
+    #[test]
+    fn typed_provider_parses_registered_config() {
+        let provider =
+            ContextDeclarationProvider::from_typed_config::<TestDeclarationConfig>("urn:test");
+        let config = serde_json::json!({"entry": "X-Test"});
+        let decls = (provider.declarations)(&config).unwrap();
         assert_eq!(decls.len(), 1);
         match &decls[0] {
-            ContextDeclaration::Produces { name, .. } => {
-                assert_eq!(name, "x-test");
+            ContextDeclaration::Produces { entry, .. } => {
+                assert_eq!(entry.as_str(), "x-test");
             }
             other => panic!("unexpected declaration: {other:?}"),
         }
@@ -484,11 +526,11 @@ mod tests {
             Ok(vec![
                 ContextDeclaration::Produces {
                     access: ContextAccessId::new(0),
-                    name: "zeta".into(),
+                    entry: "zeta".into(),
                 },
                 ContextDeclaration::Produces {
                     access: ContextAccessId::new(1),
-                    name: "beta".into(),
+                    entry: "beta".into(),
                 },
             ])
         }
@@ -569,6 +611,23 @@ groups:
         );
     }
 
+    /// Scenario: A typed provider receives configuration missing an optional field.
+    /// Guarantees: the registered config type's Serde defaults are applied.
+    #[test]
+    fn typed_provider_applies_config_defaults() {
+        let provider =
+            ContextDeclarationProvider::from_typed_config::<TestDeclarationConfig>("urn:test");
+        let decls = (provider.declarations)(&serde_json::json!({})).unwrap();
+
+        assert_eq!(
+            decls,
+            vec![ContextDeclaration::Produces {
+                access: ContextAccessId::new(0),
+                entry: "default".into(),
+            }]
+        );
+    }
+
     /// Scenario: policy compilation indexes declarations by pipeline and node.
     /// Guarantees: each node retains only its declarations.
     #[test]
@@ -577,7 +636,7 @@ groups:
         let node: ConfigNodeId = "source".into();
         let declaration = ContextDeclaration::Produces {
             access: ContextAccessId::new(0),
-            name: "tenant".into(),
+            entry: "tenant".into(),
         };
         let mut compiler = ContextCompiler::new();
         let _ = compiler
@@ -604,8 +663,8 @@ groups:
     /// Guarantees: the declarations remain distinct.
     #[test]
     fn access_id_distinguishes_consumers() {
-        let selector = ContextReadSelector::Registers {
-            names: vec!["x-topic".into()].into_boxed_slice(),
+        let selector = ContextReadSelector::Entries {
+            entries: vec!["x-topic".into()].into_boxed_slice(),
         };
         let first = ContextDeclaration::Consumes {
             access: ContextAccessId::new(0),
@@ -623,19 +682,19 @@ groups:
     #[test]
     fn selectors_preserve_generic_read_contracts() {
         assert_ne!(
-            ContextReadSelector::Registers {
-                names: vec!["tenant".into()].into_boxed_slice(),
+            ContextReadSelector::Entries {
+                entries: vec!["tenant".into()].into_boxed_slice(),
             },
-            ContextReadSelector::Registers {
-                names: vec!["region".into()].into_boxed_slice(),
+            ContextReadSelector::Entries {
+                entries: vec!["region".into()].into_boxed_slice(),
             }
         );
         assert_ne!(
-            ContextReadSelector::Registers {
-                names: vec!["tenant".into(), "region".into()].into_boxed_slice(),
+            ContextReadSelector::Entries {
+                entries: vec!["tenant".into(), "region".into()].into_boxed_slice(),
             },
-            ContextReadSelector::Registers {
-                names: vec!["region".into(), "tenant".into()].into_boxed_slice(),
+            ContextReadSelector::Entries {
+                entries: vec!["region".into(), "tenant".into()].into_boxed_slice(),
             },
         );
     }
@@ -645,19 +704,21 @@ groups:
     #[test]
     fn builder_normalizes_and_orders_producers() {
         let mut builder = ContextDeclarationsBuilder::new();
-        builder.produce("X-Tenant-Id").unwrap();
-        builder.produce("a-first").unwrap();
+        builder
+            .produce(ContextEntryRef::parse("X-Tenant-Id").unwrap())
+            .unwrap();
+        builder.produce("a-first".into()).unwrap();
 
         assert_eq!(
             builder.finish(),
             vec![
                 ContextDeclaration::Produces {
                     access: ContextAccessId::new(0),
-                    name: "a-first".into(),
+                    entry: "a-first".into(),
                 },
                 ContextDeclaration::Produces {
                     access: ContextAccessId::new(1),
-                    name: "x-tenant-id".into(),
+                    entry: "x-tenant-id".into(),
                 },
             ]
         );
@@ -668,10 +729,12 @@ groups:
     #[test]
     fn builder_rejects_duplicate_normalized_producers() {
         let mut builder = ContextDeclarationsBuilder::new();
-        builder.produce("X-Tenant-Id").unwrap();
+        builder
+            .produce(ContextEntryRef::parse("X-Tenant-Id").unwrap())
+            .unwrap();
 
         assert!(matches!(
-            builder.produce("x-tenant-id"),
+            builder.produce("x-tenant-id".into()),
             Err(Error::InvalidUserConfig { .. })
         ));
     }
