@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use linkme::distributed_slice;
 use metrics::TrafficGeneratorReceiverMetrics;
 use otel_arrow_dfe_channel::error::{RecvError, SendError};
-use otel_arrow_dfe_config::ContextEntryRef;
+use otel_arrow_dfe_config::ContextEntryName;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders};
 use otel_arrow_dfe_engine::MessageSourceLocalEffectHandlerExtension;
@@ -23,7 +23,6 @@ use otel_arrow_dfe_engine::config::ReceiverConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::context_declaration::{
     ContextDeclaration, ContextDeclarationConfig, ContextDeclarationProvider,
-    ContextDeclarationsBuilder,
 };
 use otel_arrow_dfe_engine::control::CallData;
 use otel_arrow_dfe_engine::error::{Error, ReceiverErrorKind, TypedError};
@@ -153,6 +152,8 @@ impl TrafficGeneratorReceiver {
             }
         })?;
         config.get_traffic_config().validate()?;
+        // @@@ HERE YOU ARE
+        config.context_declarations();
         Ok(TrafficGeneratorReceiver::new(pipeline_ctx, config))
     }
 
@@ -504,12 +505,11 @@ fn build_transport_headers(
     }
     let mut headers = TransportHeaders::with_capacity(config_headers.len());
     for (key, value) in config_headers {
-        let entry = transport_header_entry_ref(key)?;
-        let name = entry.as_str().to_owned();
+        let name = ContextEntryName::parse(&key)?;
         // Infer the value kind from the key name, matching the convention
         // used by the header capture policy: keys ending in `-bin` are
         // treated as binary (the gRPC binary metadata convention).
-        if name.ends_with("-bin") {
+        if key.ends_with("-bin") {
             let resolved_value = match value {
                 Some(v) => v.as_bytes().to_vec(),
                 None => {
@@ -538,8 +538,8 @@ fn build_transport_headers(
 
 fn transport_header_entry_ref(
     wire_name: &str,
-) -> Result<ContextEntryRef, otel_arrow_dfe_config::error::Error> {
-    ContextEntryRef::parse(wire_name)
+) -> Result<ContextEntryName, otel_arrow_dfe_config::error::Error> {
+    ContextEntryName::parse(wire_name)
 }
 
 /// Waits for a terminal control message after the producer has finished.
@@ -780,7 +780,8 @@ impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
 impl ContextDeclarationConfig for Config {
     fn context_declarations(
         &self,
-    ) -> Result<Vec<ContextDeclaration>, otel_arrow_dfe_config::error::Error> {
+    ) -> Result<HashMap<ContextAccessId, ContextDeclaration>, otel_arrow_dfe_config::error::Error>
+    {
         let mut declarations = ContextDeclarationsBuilder::new();
         for name in self.transport_headers().keys() {
             declarations.produce(transport_header_entry_ref(name)?)?;

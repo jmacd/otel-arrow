@@ -3,7 +3,7 @@
 
 use std::num::NonZeroUsize;
 
-use otel_arrow_dfe_config::ContextEntryRef;
+use otel_arrow_dfe_config::ContextEntryName;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -12,7 +12,7 @@ pub struct Config {
     pub partition_by: PartitionByConfig,
 
     /// name of the transport header to which the partition value will be written
-    pub partition_header_name: ContextEntryRef,
+    pub partition_header_name: ContextEntryName,
 
     /// strategy to use when serializing partition results.
     #[serde(default)]

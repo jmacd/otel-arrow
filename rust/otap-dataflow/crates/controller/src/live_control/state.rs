@@ -530,10 +530,6 @@ pub(super) struct ControllerRuntimeState {
     pub(super) config_revision: u64,
     /// Policy compiled for the most recently committed live configuration.
     pub(super) context_policy: Arc<CompiledContextPolicy>,
-    /// Next policy generation assigned during planning.
-    ///
-    /// Generations are not interned: equivalent candidates may receive distinct values.
-    pub(super) next_context_policy_generation: u64,
     /// Committed logical pipelines keyed by group/pipeline id.
     pub(super) logical_pipelines: HashMap<PipelineKey, LogicalPipelineRecord>,
     /// Deployed runtime instances keyed by group/pipeline/core/generation.

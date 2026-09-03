@@ -11,18 +11,11 @@
 //!
 //! TODO: Implement the sensitive capability for headers
 
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::Arc;
-
+use crate::context::ContextEntryName;
+use crate::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-use crate::context::{
-    CompiledContext, ContextNameRetention, ContextRegisterId, ContextRegisterLayout,
-    ContextRegisterRequirement,
-};
-use crate::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
+use std::fmt;
 
 // -- Stats types --------------------------------------------------------------
 
@@ -108,21 +101,6 @@ impl HeaderCapturePolicy {
         self.headers.is_empty()
     }
 
-    /// Returns register names and name metadata requirements declared by this policy.
-    pub fn register_requirements(&self) -> impl Iterator<Item = ContextRegisterRequirement<'_>> {
-        self.headers.iter().flat_map(|rule| {
-            let retention = Self::retention(rule);
-            let names = rule
-                .store_as
-                .as_ref()
-                .map(std::slice::from_ref)
-                .unwrap_or(&rule.match_names);
-            names
-                .iter()
-                .map(move |name| ContextRegisterRequirement { name, retention })
-        })
-    }
-
     /// Capture headers from an iterator of `(wire_name, value)` pairs.
     ///
     /// Each pair is matched against the capture rules. Only headers
@@ -174,7 +152,7 @@ impl HeaderCapturePolicy {
                 let name = matched_rule
                     .store_as
                     .clone()
-                    .unwrap_or_else(|| wire_name.to_ascii_lowercase());
+                    .unwrap_or_else(|| ContextEntryName::normalize_from(wire_name));
 
                 let value_kind = match matched_rule.value_kind {
                     Some(ValueKindConfig::Text) => ValueKind::Text,
@@ -190,7 +168,7 @@ impl HeaderCapturePolicy {
 
                 result.push(TransportHeader {
                     name,
-                    wire_name: wire_name.to_string(),
+                    wire_name: wire_name.into(),
                     value_kind,
                     value: value.to_vec(),
                 });
@@ -214,205 +192,20 @@ impl HeaderCapturePolicy {
         self.headers.iter().find(|rule| {
             rule.match_names
                 .iter()
-                .any(|m| wire_name.eq_ignore_ascii_case(m))
+                .any(|m| wire_name.eq_ignore_ascii_case(m.as_str()))
         })
     }
 
-    /// Compiles capture rules against the global context register layout.
-    pub fn compile(
-        &self,
-        compiled_context: Arc<CompiledContext>,
-    ) -> Result<CompiledHeaderCapturePolicy, String> {
-        let mut matches = HashMap::new();
-        let mut schema_items = Vec::new();
-        for rule in &self.headers {
-            let shared_register = rule
-                .store_as
-                .as_deref()
-                .map(|name| compiled_context.resolve(name))
-                .transpose()
-                .map_err(|error| error.to_string())?;
-            for match_name in &rule.match_names {
-                let normalized = match_name.to_ascii_lowercase();
-                if matches.contains_key(normalized.as_str()) {
-                    continue;
-                }
-                let register = match shared_register {
-                    Some(register) => register,
-                    None => compiled_context
-                        .resolve(&normalized)
-                        .map_err(|error| error.to_string())?,
-                };
-                let retention = compiled_context
-                    .register(register)
-                    .map(|descriptor| descriptor.retention())
-                    .unwrap_or_default();
-                if schema_items.len() >= usize::from(u16::MAX) {
-                    return Err("header capture supports at most 65535 matches".to_string());
-                }
-                let schema_item_id = CaptureSchemaItemId::from_u16(
-                    u16::try_from(schema_items.len()).expect("schema item count checked above"),
-                );
-                schema_items.push(CompiledHeaderSchemaItem {
-                    wire_name: normalized.clone(),
-                    register,
-                    retention,
-                    value_kind: rule.value_kind,
-                });
-                let _ = matches.insert(normalized.into_boxed_str(), schema_item_id);
-            }
-        }
-        let schema = Arc::new(CompiledHeaderSchema {
-            items: schema_items.into_boxed_slice(),
-            register_layout: compiled_context.register_layout().clone(),
-        });
-        Ok(CompiledHeaderCapturePolicy {
-            defaults: self.defaults.clone(),
-            matches,
-            schema,
-        })
-    }
-
-    fn retention(rule: &CaptureRule) -> ContextNameRetention {
-        if rule.store_as.is_some() || rule.match_names.len() == 1 {
-            ContextNameRetention::None
-        } else {
-            ContextNameRetention::Canonical
-        }
-    }
-}
-
-/// Identifies one instruction in a compiled capture schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CaptureSchemaItemId(u16);
-
-impl CaptureSchemaItemId {
-    /// Returns the packed representation.
-    #[must_use]
-    pub const fn as_u16(self) -> u16 {
-        self.0
-    }
-
-    /// Restores an identifier from its packed representation.
-    #[must_use]
-    pub const fn from_u16(value: u16) -> Self {
-        Self(value)
-    }
-}
-
-/// Immutable receiver capture plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledHeaderCapturePolicy {
-    defaults: CaptureDefaults,
-    matches: HashMap<Box<str>, CaptureSchemaItemId>,
-    schema: Arc<CompiledHeaderSchema>,
-}
-
-impl CompiledHeaderCapturePolicy {
-    /// Returns the matching capture instruction.
-    #[must_use]
-    pub fn match_header(&self, wire_name: &str) -> Option<CompiledHeaderMatch<'_>> {
-        let normalized;
-        let lookup = if wire_name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            normalized = wire_name.to_ascii_lowercase();
-            normalized.as_str()
-        } else {
-            wire_name
-        };
-        let schema_item_id = self.matches.get(lookup).copied()?;
-        Some(CompiledHeaderMatch {
-            schema_item_id,
-            schema_item: self.schema.item(schema_item_id)?,
-        })
-    }
-
-    /// Returns the configured capture limits.
-    #[must_use]
-    pub const fn defaults(&self) -> &CaptureDefaults {
-        &self.defaults
-    }
-
-    /// Returns the shared capture schema.
-    #[must_use]
-    pub fn schema(&self) -> &Arc<CompiledHeaderSchema> {
-        &self.schema
-    }
-}
-
-/// Immutable schema metadata referenced by packed context items.
-#[derive(Debug, PartialEq, Eq)]
-pub struct CompiledHeaderSchema {
-    items: Box<[CompiledHeaderSchemaItem]>,
-    register_layout: Arc<ContextRegisterLayout>,
-}
-
-impl CompiledHeaderSchema {
-    /// Returns the global register count.
-    #[must_use]
-    pub fn register_count(&self) -> usize {
-        self.register_layout.len()
-    }
-
-    /// Resolves one schema-local capture instruction.
-    #[must_use]
-    pub fn item(&self, id: CaptureSchemaItemId) -> Option<CompiledHeaderSchemaItemRef<'_>> {
-        self.items
-            .get(usize::from(id.as_u16()))
-            .map(|item| CompiledHeaderSchemaItemRef {
-                wire_name: &item.wire_name,
-                register: item.register,
-                retention: item.retention,
-                value_kind: item.value_kind,
+    /// Returns register names and name metadata requirements declared by this policy.
+    pub fn capture_entry_names(&self) -> impl Iterator<Item = ContextEntryName> {
+        self.headers
+            .iter()
+            .flat_map(|rule| match rule.store_as.as_ref() {
+                Some(store_as) => std::slice::from_ref(store_as),
+                None => rule.match_names.as_slice(),
             })
+            .cloned()
     }
-
-    /// Returns the executable register layout.
-    #[must_use]
-    pub fn register_layout(&self) -> &Arc<ContextRegisterLayout> {
-        &self.register_layout
-    }
-
-    /// Returns the number of capture instructions.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    /// Returns whether the schema has no capture instructions.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct CompiledHeaderSchemaItem {
-    wire_name: String,
-    register: ContextRegisterId,
-    retention: ContextNameRetention,
-    value_kind: Option<ValueKindConfig>,
-}
-
-/// Borrowed metadata for one capture instruction.
-#[derive(Debug, Clone, Copy)]
-pub struct CompiledHeaderSchemaItemRef<'a> {
-    /// Normalized configured wire name.
-    pub wire_name: &'a str,
-    /// Global context register.
-    pub register: ContextRegisterId,
-    /// Whether consumers require value-only, canonical-name, or original-name encoding.
-    pub retention: ContextNameRetention,
-    /// Configured value-kind override.
-    pub value_kind: Option<ValueKindConfig>,
-}
-
-/// One receiver-side capture match.
-#[derive(Debug, Clone, Copy)]
-pub struct CompiledHeaderMatch<'a> {
-    /// Identity of the matching capture instruction.
-    pub schema_item_id: CaptureSchemaItemId,
-    /// Matching capture metadata.
-    pub schema_item: CompiledHeaderSchemaItemRef<'a>,
 }
 
 /// Default limits for header capture.
@@ -463,12 +256,13 @@ const fn default_max_value_bytes() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureRule {
-    /// Wire header names to match (case-insensitive).
-    pub match_names: Vec<String>,
-    /// Normalized logical name to store the header under. If omitted,
-    /// defaults to the first matched name lowercased.
+    /// Wire header names to match, normalized.
+    pub match_names: Vec<ContextEntryName>,
+    /// Normalized logical name to store the header under, also known
+    /// as the context entry name. If omitted, defaults to the matched
+    /// name, normalized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub store_as: Option<String>,
+    pub store_as: Option<ContextEntryName>,
     /// Whether this header contains sensitive data (e.g. auth tokens).
     /// Sensitive headers may receive special treatment in logging and
     /// debug output.
@@ -524,18 +318,6 @@ impl HeaderPropagationPolicy {
         self.default.selector.validate()
     }
 
-    /// Returns the header-name retention required to propagate one stored name.
-    #[must_use]
-    pub fn capture_retention(&self, stored_name: &str) -> ContextNameRetention {
-        match self.resolve_action_for_name(stored_name) {
-            (PropagationAction::Propagate, NameStrategy::Preserve) => {
-                ContextNameRetention::Observed
-            }
-            (PropagationAction::Propagate, NameStrategy::StoredName)
-            | (PropagationAction::Drop, _) => ContextNameRetention::None,
-        }
-    }
-
     /// Returns an iterator over headers that should be propagated on
     /// egress. Each [`PropagatedHeader`] borrows from the captured
     /// headers
@@ -555,7 +337,7 @@ impl HeaderPropagationPolicy {
             }
             let header_name = match name_strategy {
                 NameStrategy::Preserve => &header.wire_name,
-                NameStrategy::StoredName => &header.name,
+                NameStrategy::StoredName => header.name.as_str(),
             };
             Some(PropagatedHeader {
                 header_name,
@@ -571,15 +353,13 @@ impl HeaderPropagationPolicy {
         self.resolve_action_for_name(&header.name)
     }
 
-    fn resolve_action_for_name(&self, stored_name: &str) -> (PropagationAction, NameStrategy) {
+    fn resolve_action_for_name(
+        &self,
+        stored_name: &ContextEntryName,
+    ) -> (PropagationAction, NameStrategy) {
         // Check overrides first.
         for ov in &self.overrides {
-            if ov
-                .match_rule
-                .stored_names
-                .iter()
-                .any(|s| stored_name.eq_ignore_ascii_case(s))
-            {
+            if ov.match_rule.stored_names.iter().any(|s| s.eq(stored_name)) {
                 let name_strategy = ov.name.unwrap_or(self.default.name);
                 return (ov.action, name_strategy);
             }
@@ -641,8 +421,9 @@ pub struct PropagationSelector {
 
     /// List of header names to propagate. Required when `type` is `named`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub named: Option<Vec<String>>,
+    pub named: Option<Vec<ContextEntryName>>,
 }
+
 impl PropagationSelector {
     /// Validate the supplied configuration.
     pub fn validate(&self) -> Result<(), String> {
@@ -661,14 +442,14 @@ impl PropagationSelector {
     }
     /// Returns true if the given header name is selected for propagation.
     #[must_use]
-    pub fn selects(&self, header_name: &str) -> bool {
+    pub fn selects(&self, header_name: &ContextEntryName) -> bool {
         match &self.selector_type {
             PropagationSelectorType::AllCaptured => true,
             PropagationSelectorType::None => false,
             PropagationSelectorType::Named => self
                 .named
                 .as_ref()
-                .map(|names| names.iter().any(|n| header_name.eq_ignore_ascii_case(n)))
+                .map(|names| names.iter().any(|n| header_name.eq(n)))
                 .unwrap_or(false),
         }
     }
@@ -727,8 +508,8 @@ pub struct PropagationOverride {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PropagationMatch {
-    /// Match headers whose stored (normalized) name appears in this list.
-    pub stored_names: Vec<String>,
+    /// Match headers whose stored normalized name appears in this list.
+    pub stored_names: Vec<ContextEntryName>,
 }
 
 #[cfg(test)]

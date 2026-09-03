@@ -660,22 +660,16 @@ impl<
             .map_err(|error| ControlPlaneError::InvalidRequest {
                 message: error.to_string(),
             })?;
-        let generation = {
+        {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state
-                .context_policy
-                .equivalent_declarations(&candidate_context_policy)
-            {
+            if state.context_policy.eq(&candidate_context_policy) {
                 return Ok(Arc::clone(&state.context_policy));
             }
-            let generation = state.next_context_policy_generation;
-            state.next_context_policy_generation += 1;
-            ContextPolicyGeneration::new(generation)
         };
-        Ok(candidate_context_policy.with_generation(generation))
+        Ok(candidate_context_policy)
     }
 
     fn prepare_rollout_plan_for_engine_operation(

@@ -14,6 +14,7 @@
 //! - Original wire names for lossless round-tripping
 //! - Normalized logical names for policy matching
 
+use crate::context::ContextEntryName;
 use std::fmt;
 use std::sync::Arc;
 
@@ -43,9 +44,9 @@ impl fmt::Display for ValueKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportHeader {
     /// Normalized logical name used for matching and policy lookup.
-    pub name: String,
+    pub name: ContextEntryName,
     /// Original header or metadata name observed on ingress.
-    pub wire_name: String,
+    pub wire_name: Box<str>,
     /// Whether the value is text or binary.
     pub value_kind: ValueKind,
     /// Raw value bytes.
@@ -56,12 +57,12 @@ impl TransportHeader {
     /// Create a new text transport header.
     #[must_use]
     pub fn text(
-        name: impl Into<String>,
-        wire_name: impl Into<String>,
+        name: ContextEntryName,
+        wire_name: impl Into<Box<str>>,
         value: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
-            name: name.into(),
+            name,
             wire_name: wire_name.into(),
             value_kind: ValueKind::Text,
             value: value.into(),
@@ -71,12 +72,12 @@ impl TransportHeader {
     /// Create a new binary transport header.
     #[must_use]
     pub fn binary(
-        name: impl Into<String>,
-        wire_name: impl Into<String>,
+        name: ContextEntryName,
+        wire_name: impl Into<Box<str>>,
         value: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
-            name: name.into(),
+            name,
             wire_name: wire_name.into(),
             value_kind: ValueKind::Binary,
             value: value.into(),
@@ -151,8 +152,9 @@ impl TransportHeaders {
 
     /// Find all headers matching a normalized name (case-sensitive match on
     /// the logical name).
+    #[cfg(test)]
     pub fn find_by_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a TransportHeader> {
-        self.headers.iter().filter(move |h| h.name == name)
+        self.headers.iter().filter(move |h| *h.name == *name)
     }
 
     /// Returns a slice of all headers.

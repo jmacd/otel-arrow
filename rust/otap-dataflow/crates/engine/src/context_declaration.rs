@@ -3,23 +3,68 @@
 
 //! Component context declarations collected before runtime construction.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, OnceLock};
-
-use linkme::distributed_slice;
-use otel_arrow_dfe_config::context::{
-    CompiledContext, ContextCompiler, ContextNameRetention, ContextRegisterRequirement,
-};
-use otel_arrow_dfe_config::engine::{ResolvedOtelDataflowSpec, ResolvedPipelineConfig};
-use otel_arrow_dfe_config::error::Error;
-use otel_arrow_dfe_config::node::{NodeKind, NodeUserConfig};
-use otel_arrow_dfe_config::transport_headers_policy::{
-    CompiledHeaderCapturePolicy, HeaderCapturePolicy, HeaderPropagationPolicy,
-};
-use otel_arrow_dfe_config::{ContextEntryRef, NodeId as ConfigNodeId, PipelineKey};
-
 use crate::PipelineFactory;
 use crate::error::Error as EngineError;
+use linkme::distributed_slice;
+use otel_arrow_dfe_config::engine::ResolvedOtelDataflowSpec;
+use otel_arrow_dfe_config::error::Error;
+use otel_arrow_dfe_config::node::NodeKind;
+use otel_arrow_dfe_config::{ContextEntryName, NodeId as ConfigNodeId, PipelineKey};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+/// The entry selector
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContextEntrySelector {
+    /// The name
+    pub name: ContextEntryName,
+    /// The form
+    pub read: ContextEntrySelectorForm,
+}
+
+/// When an association list is captured, do we store the associated
+/// field names (e.g., header names)?
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ContextEntrySelectorForm {
+    /// Consumers use only the normalized field name.
+    #[default]
+    Value,
+    /// Associated field names are stored in the original form.
+    NormalizedKeyValue,
+    /// Associated field names are stored in the original form.
+    OriginalKeyValue,
+}
+
+/// Generic context registers selected by one consumer binding.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ContextConsumerSelector {
+    /// Selects named context entries in order.
+    Entries {
+        /// Logical context entry references.
+        entries: Box<[ContextEntrySelector]>,
+    },
+    /// Selects every context register reachable at this node.
+    All,
+}
+
+/// Context access identifier scoped to one node factory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContextAccessId(usize);
+
+/// One component context declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ContextDeclaration {
+    /// Adds one named value to outgoing context.
+    Produces {
+        /// The logical context entry that will be produced.
+        entry: ContextEntryName,
+    },
+    /// Reads context through one compiled access.
+    Consumes {
+        /// Generic register selection.
+        selector: ContextConsumerSelector,
+    },
+}
 
 /// A configuration-dependent declaration provider registered by a component.
 #[derive(Clone, Copy)]
@@ -30,25 +75,9 @@ pub struct ContextDeclarationProvider {
     pub declarations: ContextDeclarationFn,
 }
 
-impl ContextDeclarationProvider {
-    /// Creates a provider that derives declarations from component configuration.
-    #[must_use]
-    pub const fn from_config(urn: &'static str, declarations: ContextDeclarationFn) -> Self {
-        Self { urn, declarations }
-    }
-
-    /// Creates a provider that derives declarations from a typed component configuration.
-    #[must_use]
-    pub const fn from_typed_config<T>(urn: &'static str) -> Self
-    where
-        T: ContextDeclarationConfig,
-    {
-        Self {
-            urn,
-            declarations: typed_context_declarations::<T>,
-        }
-    }
-}
+/// Deterministically describes a node factory's context access.
+pub type ContextDeclarationFn =
+    fn(&serde_json::Value) -> Result<HashMap<ContextAccessId, ContextDeclaration>, Error>;
 
 // `#[allow(unsafe_code)]` is required because `linkme::distributed_slice`
 // emits a static with `#[link_section = "..."]`, which the engine crate's
@@ -58,9 +87,21 @@ impl ContextDeclarationProvider {
 #[distributed_slice]
 pub static CONTEXT_DECLARATION_PROVIDERS: [ContextDeclarationProvider];
 
-/// Context access identifier scoped to one node factory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ContextAccessId(usize);
+/// Builds deterministic producer declarations from configuration-sized inputs.
+#[derive(Default)]
+pub struct ContextDeclarationsBuilder {
+    // producers: BTreeSet<ContextEntryName>,
+    // consumers: BTreeSet<ContextEntryName>,
+}
+
+/// Extracts context declarations from a component's typed configuration.
+pub trait ContextDeclarationConfig: serde::de::DeserializeOwned {
+    /// Returns the context accesses required by this configuration.
+    fn context_declarations(
+        &self,
+        builder: &mut ContextDeclarationsBuilder,
+    ) -> Result<HashMap<ContextAccessId, ContextDeclaration>, Error>;
+}
 
 impl ContextAccessId {
     /// Creates a provider-local access identifier.
@@ -76,204 +117,65 @@ impl ContextAccessId {
     }
 }
 
-/// Generic context registers selected by one consumer binding.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ContextReadSelector {
-    /// Selects named context entries in order.
-    Entries {
-        /// Logical context entry references.
-        entries: Box<[ContextEntryRef]>,
-    },
-    /// Selects every context register reachable at this node.
-    All,
-}
-
-/// One component context declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ContextDeclaration {
-    /// Adds one named value to outgoing context.
-    Produces {
-        /// Provider-local identity used to retrieve the compiled access.
-        access: ContextAccessId,
-        /// The logical context entry that will be produced.
-        entry: ContextEntryRef,
-    },
-    /// Reads context through one compiled access.
-    Consumes {
-        /// Provider-local identity used to retrieve the compiled access.
-        access: ContextAccessId,
-        /// Generic register selection.
-        selector: ContextReadSelector,
-    },
-}
-
-/// Deterministically describes a node factory's context access.
-pub type ContextDeclarationFn = fn(&serde_json::Value) -> Result<Vec<ContextDeclaration>, Error>;
-
-/// Extracts context declarations from a component's typed configuration.
-pub trait ContextDeclarationConfig: serde::de::DeserializeOwned {
-    /// Returns the context accesses required by this configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the context declaration is invalid.
-    fn context_declarations(&self) -> Result<Vec<ContextDeclaration>, Error>;
-}
-
-fn typed_context_declarations<T>(
-    config: &serde_json::Value,
-) -> Result<Vec<ContextDeclaration>, Error>
-where
-    T: ContextDeclarationConfig,
-{
-    let config = otel_arrow_dfe_config::validation::deserialize_typed_config::<T>(config)?;
-    config.context_declarations()
-}
-
-/// Generation assigned to a compiled context policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ContextPolicyGeneration(u64);
-
-impl ContextPolicyGeneration {
-    /// Creates a context policy generation.
+impl ContextDeclarationProvider {
+    /// Creates a provider that derives declarations from component configuration.
     #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
+    pub const fn from_config(urn: &'static str, declarations: ContextDeclarationFn) -> Self {
+        Self { urn, declarations }
     }
+
+    // /// Creates a provider that derives declarations from a typed component configuration.
+    // #[must_use]
+    // pub const fn from_typed_config<T>(urn: &'static str) -> Self
+    // where
+    //     T: ContextDeclarationConfig,
+    // {
+    //     Self {
+    //         urn,
+    //         declarations: typed_context_declarations::<T>,
+    //     }
+    // }
 }
 
-/// Builds deterministic producer declarations from configuration-sized inputs.
-#[derive(Default)]
-pub struct ContextDeclarationsBuilder {
-    produced_entries: BTreeSet<ContextEntryRef>,
-}
+// fn typed_context_declarations<T>(
+//     config: &serde_json::Value,
+// ) -> Result<Vec<ContextDeclaration>, Error>
+// where
+//     T: ContextDeclarationConfig,
+// {
+//     let config = otel_arrow_dfe_config::validation::deserialize_typed_config::<T>(config)?;
+//     config.context_declarations()
+// }
 
-impl ContextDeclarationsBuilder {
-    /// Creates an empty declaration builder.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Adds a produced register, normalizing its logical name.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when another configured name has the same normalized
-    /// logical name.
-    pub fn produce(&mut self, entry: ContextEntryRef) -> Result<(), Error> {
-        if !self.produced_entries.insert(entry.clone()) {
-            return Err(Error::InvalidUserConfig {
-                error: format!("duplicate context entry reference: `{entry}`"),
-            });
-        }
-        Ok(())
-    }
-
-    /// Returns produced declarations in normalized-name order with assigned IDs.
-    #[must_use]
-    pub fn finish(self) -> Vec<ContextDeclaration> {
-        self.produced_entries
-            .into_iter()
-            .enumerate()
-            .map(|(index, entry)| ContextDeclaration::Produces {
-                access: ContextAccessId::new(index),
-                entry,
-            })
-            .collect()
-    }
-}
-
-/// Opaque context policy compiled from the resolved configuration.
+/// Context policy compiled from resolved configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledContextPolicy {
-    generation: ContextPolicyGeneration,
-    compiled_context: Arc<CompiledContext>,
-    receiver_capture: HashMap<PipelineKey, HashMap<ConfigNodeId, CompiledHeaderCapturePolicy>>,
-    // Retained until component bindings are compiled.
     declarations: HashMap<PipelineKey, HashMap<ConfigNodeId, Box<[ContextDeclaration]>>>,
 }
 
 impl CompiledContextPolicy {
-    /// Returns the generation associated with this compiled policy.
-    #[must_use]
-    pub const fn generation(&self) -> ContextPolicyGeneration {
-        self.generation
-    }
+    // /// Returns the generation associated with this compiled policy.
+    // #[must_use]
+    // pub const fn generation(&self) -> ContextPolicyGeneration {
+    //     self.generation
+    // }
 
-    /// Returns a copy carrying the supplied generation.
-    #[must_use]
-    pub fn with_generation(&self, generation: ContextPolicyGeneration) -> Arc<Self> {
-        Arc::new(Self {
-            generation,
-            compiled_context: self.compiled_context.clone(),
-            receiver_capture: self.receiver_capture.clone(),
-            declarations: self.declarations.clone(),
-        })
-    }
+    // /// Returns a copy carrying the supplied generation.
+    // #[must_use]
+    // pub fn with_generation(&self, generation: ContextPolicyGeneration) -> Arc<Self> {
+    //     Arc::new(Self {
+    //         generation,
+    //         compiled_context: self.compiled_context.clone(),
+    //         receiver_capture: self.receiver_capture.clone(),
+    //         declarations: self.declarations.clone(),
+    //     })
+    // }
 
-    /// Returns whether two policies compile the same declarations.
-    #[must_use]
-    pub fn equivalent_declarations(&self, other: &Self) -> bool {
-        self.declarations == other.declarations && self.compiled_context == other.compiled_context
-    }
-}
-
-fn receiver_capture_policy<'a>(
-    pipeline: &'a ResolvedPipelineConfig,
-    node: &'a NodeUserConfig,
-) -> Option<&'a HeaderCapturePolicy> {
-    if node.kind() != NodeKind::Receiver {
-        return None;
-    }
-    node.header_capture.as_ref().or_else(|| {
-        pipeline
-            .policies
-            .transport_headers
-            .as_ref()
-            .map(|policy| &policy.header_capture)
-    })
-}
-
-fn exporter_propagation_policy<'a>(
-    pipeline: &'a ResolvedPipelineConfig,
-    node: &'a NodeUserConfig,
-) -> Option<&'a HeaderPropagationPolicy> {
-    if node.kind() != NodeKind::Exporter {
-        return None;
-    }
-    node.header_propagation.as_ref().or_else(|| {
-        pipeline
-            .policies
-            .transport_headers
-            .as_ref()
-            .map(|policy| &policy.header_propagation)
-    })
-}
-
-fn pipeline_capture_retention(
-    pipeline: &ResolvedPipelineConfig,
-    stored_name: &str,
-) -> ContextNameRetention {
-    pipeline
-        .pipeline
-        .node_iter()
-        .filter_map(|(_, node_config)| exporter_propagation_policy(pipeline, node_config))
-        .map(|policy| policy.capture_retention(stored_name))
-        .max()
-        .unwrap_or(ContextNameRetention::None)
-}
-
-fn require_register_name(
-    requirements: &mut BTreeMap<String, ContextNameRetention>,
-    name: &str,
-    retention: ContextNameRetention,
-) {
-    let canonical = name.trim().to_ascii_lowercase();
-    let _ = requirements
-        .entry(canonical)
-        .and_modify(|existing| *existing = (*existing).max(retention))
-        .or_insert(retention);
+    // /// Returns whether two policies compile the same declarations.
+    // #[must_use]
+    // pub fn equivalent_declarations(&self, other: &Self) -> bool {
+    //     self.declarations == other.declarations
+    // }
 }
 
 impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
@@ -283,7 +185,6 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         resolved: &ResolvedOtelDataflowSpec,
     ) -> Result<Arc<CompiledContextPolicy>, EngineError> {
         let mut declarations = HashMap::new();
-        let mut register_requirements = BTreeMap::new();
 
         for pipeline in &resolved.pipelines {
             let pipeline_key = PipelineKey::new(
@@ -291,81 +192,20 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                 pipeline.pipeline_id.clone(),
             );
             let mut declarations_by_node = HashMap::new();
-            let mut pipeline_capture_names = BTreeSet::new();
 
             for (node_id, node_config) in pipeline.pipeline.node_iter() {
-                let node_declarations = self.node_context_declarations(
+                let declarations = self.node_context_declarations(
                     node_config.kind(),
                     node_config.r#type.as_ref(),
                     &node_config.config,
                 )?;
-                for declaration in &node_declarations {
-                    if let ContextDeclaration::Produces { entry, .. } = declaration {
-                        require_register_name(
-                            &mut register_requirements,
-                            entry.as_str(),
-                            ContextNameRetention::None,
-                        );
-                    }
-                }
-                if let Some(capture) = receiver_capture_policy(pipeline, node_config) {
-                    for requirement in capture.register_requirements() {
-                        require_register_name(
-                            &mut register_requirements,
-                            requirement.name,
-                            requirement.retention,
-                        );
-                        let _ = pipeline_capture_names
-                            .insert(requirement.name.trim().to_ascii_lowercase());
-                    }
-                }
-                let _ = declarations_by_node
-                    .insert(node_id.clone(), node_declarations.into_boxed_slice());
-            }
-
-            for name in pipeline_capture_names {
-                let retention = pipeline_capture_retention(pipeline, &name);
-                require_register_name(&mut register_requirements, &name, retention);
+                let _ =
+                    declarations_by_node.insert(node_id.clone(), declarations.into_boxed_slice());
             }
             let _ = declarations.insert(pipeline_key, declarations_by_node);
         }
 
-        let mut compiler = ContextCompiler::new();
-        for (name, retention) in register_requirements {
-            let _ = compiler
-                .declare(ContextRegisterRequirement::with_retention(&name, retention))
-                .map_err(|error| {
-                    EngineError::ConfigError(Box::new(Error::InvalidUserConfig {
-                        error: error.to_string(),
-                    }))
-                })?;
-        }
-
-        let compiled_context = compiler.finish();
-        let mut receiver_capture = HashMap::new();
-        for pipeline in &resolved.pipelines {
-            let pipeline_key = PipelineKey::new(
-                pipeline.pipeline_group_id.clone(),
-                pipeline.pipeline_id.clone(),
-            );
-            let mut captures_by_node = HashMap::new();
-            for (node_id, node_config) in pipeline.pipeline.node_iter() {
-                if let Some(capture) = receiver_capture_policy(pipeline, node_config) {
-                    let compiled = capture.compile(compiled_context.clone()).map_err(|error| {
-                        EngineError::ConfigError(Box::new(Error::InvalidUserConfig { error }))
-                    })?;
-                    let _ = captures_by_node.insert(node_id.clone(), compiled);
-                }
-            }
-            let _ = receiver_capture.insert(pipeline_key, captures_by_node);
-        }
-
-        Ok(Arc::new(CompiledContextPolicy {
-            generation: ContextPolicyGeneration::default(),
-            compiled_context,
-            receiver_capture,
-            declarations,
-        }))
+        Ok(Arc::new(CompiledContextPolicy { declarations }))
     }
 
     fn node_context_declarations(
@@ -475,10 +315,10 @@ mod tests {
     #[derive(Deserialize)]
     struct TestDeclarationConfig {
         #[serde(default = "default_test_entry")]
-        entry: ContextEntryRef,
+        entry: ContextEntryName,
     }
 
-    fn default_test_entry() -> ContextEntryRef {
+    fn default_test_entry() -> ContextEntryName {
         "default".into()
     }
 
@@ -663,7 +503,7 @@ groups:
     /// Guarantees: the declarations remain distinct.
     #[test]
     fn access_id_distinguishes_consumers() {
-        let selector = ContextReadSelector::Entries {
+        let selector = ContextConsumerSelector::Entries {
             entries: vec!["x-topic".into()].into_boxed_slice(),
         };
         let first = ContextDeclaration::Consumes {
@@ -705,7 +545,7 @@ groups:
     fn builder_normalizes_and_orders_producers() {
         let mut builder = ContextDeclarationsBuilder::new();
         builder
-            .produce(ContextEntryRef::parse("X-Tenant-Id").unwrap())
+            .produce(ContextEntryName::parse("X-Tenant-Id").unwrap())
             .unwrap();
         builder.produce("a-first".into()).unwrap();
 
@@ -730,7 +570,7 @@ groups:
     fn builder_rejects_duplicate_normalized_producers() {
         let mut builder = ContextDeclarationsBuilder::new();
         builder
-            .produce(ContextEntryRef::parse("X-Tenant-Id").unwrap())
+            .produce(ContextEntryName::parse("X-Tenant-Id").unwrap())
             .unwrap();
 
         assert!(matches!(
