@@ -157,7 +157,6 @@ impl<
                 live_config,
                 config_revision: 0,
                 context_policy,
-                next_context_policy_generation: 1,
                 logical_pipelines: HashMap::new(),
                 runtime_instances: HashMap::new(),
                 runtime_recoveries: HashMap::new(),

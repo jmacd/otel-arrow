@@ -15,12 +15,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
-use otel_arrow_dfe_config::SignalType;
-use otel_arrow_dfe_config::node::NodeUserConfig;
+use otel_arrow_dfe_config::{SignalType, context::ContextEntryName, node::NodeUserConfig};
 use otel_arrow_dfe_engine::config::ProcessorConfig;
-use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::context_declaration::{
-    ContextAccessId, ContextDeclaration, ContextDeclarationConfig, ContextDeclarationProvider,
+    ContextDeclaration, ContextDeclarationProvider, NodeContextDeclarations, NodeContextDeclarator,
 };
 use otel_arrow_dfe_engine::control::{AckMsg, NackCause, NackMsg, NodeControlMsg};
 use otel_arrow_dfe_engine::error::ProcessorErrorKind;
@@ -32,6 +30,7 @@ use otel_arrow_dfe_engine::wiring_contract::WiringContract;
 use otel_arrow_dfe_engine::{
     ConsumerEffectHandlerExtension, FlowMetricAccumulation, Interests,
     MessageSourceLocalEffectHandlerExtension, ProcessorFactory, ProducerEffectHandlerExtension,
+    context::PipelineContext,
 };
 use otel_arrow_dfe_otap::OTAP_PROCESSOR_FACTORIES;
 use otel_arrow_dfe_otap::accessory::context::split_contexts::{Contexts, OutboundError};
@@ -118,7 +117,7 @@ pub static PARTITION_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorF
 pub struct PartitionProcessor {
     contexts: Contexts,
     partitioner: Partitioner,
-    header_name: String,
+    header_name: ContextEntryName,
     serialization_strategy: PartitionValueSerializeStrategy,
     metrics: MeasurementMetricSet<Metrics>,
 }
@@ -133,6 +132,13 @@ impl PartitionProcessor {
                 error: format!("Failed to parse PartitionProcessor config: {e}"),
             }
         })?;
+
+        // Check that compiled context policy contains this node's bindings.
+        pipeline_ctx.compiled_context_policy().node_bindings(
+            pipeline_ctx.pipeline_key(),
+            pipeline_ctx.node_id(),
+            config.context_declarations(),
+        )?;
 
         let partitioner = match config.partition_by {
             PartitionByConfig::OplExpression(opl_expression) => {
@@ -153,7 +159,7 @@ impl PartitionProcessor {
         Ok(Self {
             partitioner,
             contexts: Contexts::new(config.inbound_request_limit, config.outbound_request_limit),
-            header_name: config.partition_header_name.into(),
+            header_name: config.partition_header_name,
             serialization_strategy: config.header_serialization_strategy,
             metrics: Metrics::register(pipeline_ctx),
         })
@@ -301,7 +307,7 @@ impl Processor<OtapPdata> for PartitionProcessor {
                         let mut headers =
                             inbound_context.take_transport_headers().unwrap_or_default();
                         headers.push(partition_value_to_transport_header(
-                            self.header_name.clone(),
+                            &self.header_name,
                             &self.serialization_strategy,
                             partition.value,
                         ));
@@ -366,7 +372,7 @@ impl Processor<OtapPdata> for PartitionProcessor {
                             let mut headers =
                                 pdata_context.take_transport_headers().unwrap_or_default();
                             headers.push(partition_value_to_transport_header(
-                                self.header_name.clone(),
+                                &self.header_name,
                                 &self.serialization_strategy,
                                 partition.value,
                             ));
@@ -424,7 +430,7 @@ impl Processor<OtapPdata> for PartitionProcessor {
 }
 
 fn partition_value_to_transport_header(
-    name: String,
+    name: &ContextEntryName,
     strategy: &PartitionValueSerializeStrategy,
     partition_value: PartitionValue,
 ) -> TransportHeader {
@@ -451,8 +457,8 @@ fn partition_value_to_transport_header(
             };
 
             TransportHeader {
-                wire_name: name.clone(),
-                name,
+                name: name.clone(),
+                wire_name: None,
                 value_kind,
                 value: header_bytes,
             }
@@ -489,8 +495,8 @@ fn partition_value_to_transport_header(
             };
 
             TransportHeader {
-                wire_name: name.clone(),
-                name,
+                name: name.clone(),
+                wire_name: None,
                 value_kind: ValueKind::Text,
                 value: header_bytes,
             }
@@ -498,16 +504,12 @@ fn partition_value_to_transport_header(
     }
 }
 
-const PARTITION_OUTPUT_ACCESS: ContextAccessId = ContextAccessId::new(0);
-
-impl ContextDeclarationConfig for Config {
-    fn context_declarations(
-        &self,
-    ) -> Result<Vec<ContextDeclaration>, otel_arrow_dfe_config::error::Error> {
-        Ok(vec![ContextDeclaration::Produces {
-            access: PARTITION_OUTPUT_ACCESS,
+impl NodeContextDeclarator for Config {
+    fn context_declarations(&self) -> NodeContextDeclarations {
+        std::iter::once(ContextDeclaration::Produces {
             entry: self.partition_header_name.clone(),
-        }])
+        })
+        .collect()
     }
 }
 
@@ -724,7 +726,7 @@ mod test {
                         header,
                         &TransportHeader {
                             name: header_name.to_string(),
-                            wire_name: header_name.to_string(),
+                            wire_name: None,
                             value_kind: ValueKind::Text,
                             value: partition_value.as_bytes().to_vec()
                         }
@@ -853,7 +855,7 @@ mod test {
                     header,
                     &TransportHeader {
                         name: header_name.to_string(),
-                        wire_name: header_name.to_string(),
+                        wire_name: None,
                         value_kind: ValueKind::Text,
                         value: "0".as_bytes().to_vec()
                     }
@@ -1246,7 +1248,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Text,
                 value: "test".as_bytes().to_vec()
             }
@@ -1264,7 +1266,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,,
                 value_kind: ValueKind::Binary,
                 value: "test".as_bytes().to_vec()
             }
@@ -1281,7 +1283,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Binary,
                 value: 514i64.to_le_bytes().to_vec()
             }
@@ -1296,7 +1298,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Binary,
                 value: 14.7f64.to_le_bytes().to_vec()
             }
@@ -1311,7 +1313,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Binary,
                 value: vec![1]
             }
@@ -1326,7 +1328,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Binary,
                 value: vec![0]
             }
@@ -1341,7 +1343,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Binary,
                 value: vec![4, 1, 8],
             }
@@ -1356,7 +1358,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Binary,
                 value: vec![]
             }
@@ -1377,7 +1379,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Text,
                 value: "\"test\"".as_bytes().to_vec()
             }
@@ -1392,7 +1394,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Text,
                 value: "514".as_bytes().to_vec()
             }
@@ -1407,7 +1409,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Text,
                 value: "14.7".as_bytes().to_vec()
             }
@@ -1422,7 +1424,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Text,
                 value: "true".as_bytes().to_vec()
             }
@@ -1437,7 +1439,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Text,
                 value: "false".as_bytes().to_vec()
             }
@@ -1452,7 +1454,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Text,
                 value: "[4,1,8]".as_bytes().to_vec()
             }
@@ -1467,7 +1469,7 @@ mod test {
             header,
             TransportHeader {
                 name: header_name.to_string(),
-                wire_name: header_name.to_string(),
+                wire_name: None,
                 value_kind: ValueKind::Text,
                 value: "null".as_bytes().to_vec()
             }

@@ -35,9 +35,9 @@ pub fn deserialize_typed_config<T: serde::de::DeserializeOwned>(
 /// validate_config: validate_typed_config::<MyComponentConfig>,
 /// ```
 pub fn validate_typed_config<T: serde::de::DeserializeOwned>(
-    config: &serde_json::Value,
+    raw: &serde_json::Value,
 ) -> Result<(), Error> {
-    let _: T = deserialize_typed_config(config)?;
+    let _: T = deserialize_typed_config(raw)?;
     Ok(())
 }
 

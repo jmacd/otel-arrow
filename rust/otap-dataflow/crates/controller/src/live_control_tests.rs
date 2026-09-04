@@ -10,7 +10,7 @@ use otel_arrow_dfe_config::observed_state::ObservedStateSettings;
 use otel_arrow_dfe_config::settings::telemetry::logs::LogLevel;
 use otel_arrow_dfe_engine::config::{ExporterConfig, ProcessorConfig, ReceiverConfig};
 use otel_arrow_dfe_engine::context_declaration::{
-    ContextAccessId, ContextDeclaration, ContextDeclarationConfig, ContextDeclarationProvider,
+    ContextDeclaration, ContextDeclarationConfig, ContextDeclarationProvider,
 };
 use otel_arrow_dfe_engine::control::{
     NodeControlMsg, RuntimeControlMsg, RuntimeCtrlMsgReceiver, runtime_ctrl_msg_channel,
@@ -67,7 +67,6 @@ fn test_validate_config(
 }
 
 const CONTEXT_POLICY_TEST_RECEIVER_URN: &str = "urn:test:receiver:context-policy";
-const CONTEXT_POLICY_TEST_ACCESS: ContextAccessId = ContextAccessId::new(0);
 static CONTEXT_POLICY_TEST_CAPTURE: Mutex<Option<std::sync::Weak<CompiledContextPolicy>>> =
     Mutex::new(None);
 

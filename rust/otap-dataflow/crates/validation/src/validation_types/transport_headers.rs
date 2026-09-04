@@ -13,7 +13,7 @@
 //! For **deny** checks, `None` entries are acceptable -- a signal without
 //! headers cannot contain a forbidden key.
 
-use otel_arrow_dfe_config::ContextEntryRef;
+use otel_arrow_dfe_config::ContextEntryName;
 use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use serde::{Deserialize, Serialize};
 

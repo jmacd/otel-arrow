@@ -294,6 +294,11 @@ pub enum Error {
         /// The path that was tried.
         path: String,
     },
+
+    /// An undeclared context declaration.
+    #[error("Context declaration is unrecognized")]
+    #[diagnostic(code(data_plane::unrecognized_context_declaration), url(docsrs))]
+    UnrecognizedContextDeclaration {},
 }
 
 /// Information that all errors provide to help identify

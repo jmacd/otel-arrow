@@ -661,7 +661,7 @@ impl<
                 message: error.to_string(),
             })?;
         {
-            let mut state = self
+            let state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1693,15 +1693,10 @@ impl<
                     });
                 }
             };
-            let context_policy = if state
-                .context_policy
-                .equivalent_declarations(&candidate_context_policy)
-            {
+            let context_policy = if state.context_policy.eq(&candidate_context_policy) {
                 Arc::clone(&state.context_policy)
             } else {
-                let generation = state.next_context_policy_generation;
-                state.next_context_policy_generation += 1;
-                candidate_context_policy.with_generation(ContextPolicyGeneration::new(generation))
+                candidate_context_policy
             };
             let _ = state.logical_pipelines.remove(pipeline_key);
             let _ = state.generation_counters.remove(pipeline_key);

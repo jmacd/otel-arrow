@@ -11,6 +11,7 @@ use crate::attributes::{
     NodeWithCustomTopicAttributeSet, NodeWithTopicAttributeSet, PipelineAttributeSet,
     config_map_to_telemetry,
 };
+use crate::context_declaration::CompiledContextPolicy;
 use crate::entity_context::{current_node_telemetry_handle, node_entity_key};
 use crate::listener_group::ListenerGroupSnapshot;
 use crate::memory_limiter::MemoryPressureState;
@@ -18,7 +19,9 @@ use crate::node::NodeId as EngineNodeId;
 use data_encoding::BASE32_NOPAD;
 use otel_arrow_dfe_config::node::NodeKind;
 use otel_arrow_dfe_config::pipeline::telemetry::TelemetryAttribute;
-use otel_arrow_dfe_config::{NodeId as ConfigNodeId, NodeUrn, PipelineGroupId, PipelineId};
+use otel_arrow_dfe_config::{
+    NodeId as ConfigNodeId, NodeUrn, PipelineGroupId, PipelineId, PipelineKey,
+};
 use otel_arrow_dfe_telemetry::InternalTelemetrySettings;
 use otel_arrow_dfe_telemetry::metrics::MetricSetRegistrar;
 use otel_arrow_dfe_telemetry::metrics::{
@@ -139,7 +142,7 @@ pub struct PipelineContext {
     // or searching this snapshot from the per-record data path.
     listener_group_snapshot: Arc<ListenerGroupSnapshot>,
     /// Compiled context policy shared by every node in this runtime.
-    compiled_context_policy: Option<Arc<crate::context_declaration::CompiledContextPolicy>>,
+    compiled_context_policy: Arc<CompiledContextPolicy>,
 }
 
 /// Registrar that binds generated metric-set registration to an existing entity.
@@ -299,6 +302,12 @@ impl ControllerContext {
     }
 }
 
+impl From<&PipelineContextParams> for PipelineKey {
+    fn from(params: &PipelineContextParams) -> Self {
+        PipelineKey::new(params.pipeline_group_id.clone(), params.pipeline_id.clone())
+    }
+}
+
 impl PipelineContext {
     /// Creates a new `PipelineContext`.
     #[allow(dead_code)]
@@ -329,7 +338,7 @@ impl PipelineContext {
             node_names: Arc::new(HashMap::new()),
             topic_set: None,
             listener_group_snapshot: Arc::new(ListenerGroupSnapshot::empty()),
-            compiled_context_policy: None,
+            compiled_context_policy: Arc::new(CompiledContextPolicy::empty()),
         }
     }
 
@@ -343,6 +352,18 @@ impl PipelineContext {
     #[must_use]
     pub fn pipeline_id(&self) -> PipelineId {
         self.pipeline_context_params.pipeline_id.clone()
+    }
+
+    /// Returns the pipeline key.
+    #[must_use]
+    pub fn pipeline_key(&self) -> PipelineKey {
+        PipelineKey::from(&self.pipeline_context_params)
+    }
+
+    /// Returns the node ID.
+    #[must_use]
+    pub fn node_id(&self) -> ConfigNodeId {
+        self.node_id.clone()
     }
 
     /// Returns the core ID associated with this pipeline context.
@@ -434,30 +455,15 @@ impl PipelineContext {
     }
 
     /// Sets the compiled context policy.
-    pub fn set_compiled_context_policy(
-        &mut self,
-        policy: Arc<crate::context_declaration::CompiledContextPolicy>,
-    ) {
-        self.compiled_context_policy = Some(policy);
+    pub fn set_compiled_context_policy(&mut self, policy: Arc<CompiledContextPolicy>) {
+        self.compiled_context_policy = policy;
     }
 
     /// Returns the compiled context policy, if present.
     #[must_use]
-    pub fn compiled_context_policy(
-        &self,
-    ) -> Option<&Arc<crate::context_declaration::CompiledContextPolicy>> {
-        self.compiled_context_policy.as_ref()
+    pub fn compiled_context_policy(&self) -> &Arc<CompiledContextPolicy> {
+        &self.compiled_context_policy
     }
-
-    // /// Returns the generation of the compiled context policy, if one was injected.
-    // #[must_use]
-    // pub fn context_policy_generation(
-    //     &self,
-    // ) -> Option<crate::context_declaration::ContextPolicyGeneration> {
-    //     self.compiled_context_policy
-    //         .as_ref()
-    //         .map(|policy| policy.generation())
-    // }
 
     /// Returns the pipeline-scoped topic set, if one was injected.
     #[must_use]

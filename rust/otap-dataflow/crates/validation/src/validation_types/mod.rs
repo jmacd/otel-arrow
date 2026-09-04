@@ -13,7 +13,7 @@ use attributes::{
     validate_require_key_values, validate_require_keys,
 };
 use batch::{validate_batch_bytes, validate_batch_items};
-use otel_arrow_dfe_config::ContextEntryRef;
+use otel_arrow_dfe_config::ContextEntryName;
 use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_pdata::proto::OtlpProtoMessage;
 use otel_arrow_dfe_pdata::testing::equiv::validate_equivalent;

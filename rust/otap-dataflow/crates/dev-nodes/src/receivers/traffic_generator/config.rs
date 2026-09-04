@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
+use otel_arrow_dfe_config::context::ContextEntryName;
 use weaver_common::result::WResult;
 use weaver_common::vdir::VirtualDirectoryPath;
 use weaver_forge::registry::ResolvedRegistry;
@@ -153,7 +154,7 @@ pub struct Config {
     ///   x-request-id:
     /// ```
     #[serde(default)]
-    transport_headers: HashMap<String, Option<String>>,
+    transport_headers: HashMap<ContextEntryName, Option<String>>,
 }
 
 /// Configuration to describe the traffic being sent
@@ -259,7 +260,7 @@ impl Config {
     #[must_use]
     pub fn with_transport_headers(
         mut self,
-        transport_headers: HashMap<String, Option<String>>,
+        transport_headers: HashMap<ContextEntryName, Option<String>>,
     ) -> Self {
         self.transport_headers = transport_headers;
         self
@@ -336,7 +337,7 @@ impl Config {
     /// Keys are header names. Entries with a value produce fixed headers;
     /// entries left empty produce a random value generated once at startup.
     #[must_use]
-    pub fn transport_headers(&self) -> &HashMap<String, Option<String>> {
+    pub fn transport_headers(&self) -> &HashMap<ContextEntryName, Option<String>> {
         &self.transport_headers
     }
 }

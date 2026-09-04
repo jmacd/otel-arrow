@@ -15,14 +15,14 @@ use async_trait::async_trait;
 use linkme::distributed_slice;
 use metrics::TrafficGeneratorReceiverMetrics;
 use otel_arrow_dfe_channel::error::{RecvError, SendError};
-use otel_arrow_dfe_config::ContextEntryName;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders};
+use otel_arrow_dfe_config::{ContextEntryName, error::Error as ConfigError};
 use otel_arrow_dfe_engine::MessageSourceLocalEffectHandlerExtension;
 use otel_arrow_dfe_engine::config::ReceiverConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::context_declaration::{
-    ContextDeclaration, ContextDeclarationConfig, ContextDeclarationProvider,
+    ContextDeclaration, ContextDeclarationProvider, NodeContextDeclarations, NodeContextDeclarator,
 };
 use otel_arrow_dfe_engine::control::CallData;
 use otel_arrow_dfe_engine::error::{Error, ReceiverErrorKind, TypedError};
@@ -131,14 +131,20 @@ static TRAFFIC_GENERATOR_CONTEXT_DECLARATIONS: ContextDeclarationProvider =
 
 impl TrafficGeneratorReceiver {
     /// creates a new TrafficGeneratorReceiver
-    #[must_use]
-    pub fn new(pipeline_ctx: PipelineContext, config: Config) -> Self {
+    pub fn new(pipeline_ctx: PipelineContext, config: Config) -> Result<Self, ConfigError> {
+        // Check that compiled context policy contains this node's bindings.
+        pipeline_ctx.compiled_context_policy().node_bindings(
+            pipeline_ctx.pipeline_key(),
+            pipeline_ctx.node_id(),
+            config.context_declarations(),
+        )?;
+
         let metrics = pipeline_ctx.register_metrics::<TrafficGeneratorReceiverMetrics>();
-        Self {
+        Ok(Self {
             config,
             metrics,
             pending_completions: 0,
-        }
+        })
     }
 
     /// Creates a new traffic generator from a configuration object
@@ -152,9 +158,7 @@ impl TrafficGeneratorReceiver {
             }
         })?;
         config.get_traffic_config().validate()?;
-        // @@@ HERE YOU ARE
-        config.context_declarations();
-        Ok(TrafficGeneratorReceiver::new(pipeline_ctx, config))
+        TrafficGeneratorReceiver::new(pipeline_ctx, config)
     }
 
     async fn run_smooth(
@@ -498,18 +502,17 @@ impl TrafficGeneratorReceiver {
 ///
 /// Returns `None` when the config map is empty (zero overhead).
 fn build_transport_headers(
-    config_headers: &HashMap<String, Option<String>>,
+    config_headers: &HashMap<ContextEntryName, Option<String>>,
 ) -> Result<Option<TransportHeaders>, otel_arrow_dfe_config::error::Error> {
     if config_headers.is_empty() {
         return Ok(None);
     }
     let mut headers = TransportHeaders::with_capacity(config_headers.len());
-    for (key, value) in config_headers {
-        let name = ContextEntryName::parse(&key)?;
+    for (name, value) in config_headers {
         // Infer the value kind from the key name, matching the convention
         // used by the header capture policy: keys ending in `-bin` are
         // treated as binary (the gRPC binary metadata convention).
-        if key.ends_with("-bin") {
+        if name.as_str().ends_with("-bin") {
             let resolved_value = match value {
                 Some(v) => v.as_bytes().to_vec(),
                 None => {
@@ -518,7 +521,11 @@ fn build_transport_headers(
                     buf.to_vec()
                 }
             };
-            headers.push(TransportHeader::binary(name, key.clone(), resolved_value));
+            headers.push(TransportHeader::binary(
+                name.clone(),
+                Some(name.clone().as_str().into()),
+                resolved_value,
+            ));
         } else {
             let resolved_value = match value {
                 Some(v) => v.as_bytes().to_vec(),
@@ -530,16 +537,14 @@ fn build_transport_headers(
                         .collect()
                 }
             };
-            headers.push(TransportHeader::text(name, key.clone(), resolved_value));
+            headers.push(TransportHeader::text(
+                name.clone(),
+                Some(name.clone().as_str().into()),
+                resolved_value,
+            ));
         }
     }
     Ok(Some(headers))
-}
-
-fn transport_header_entry_ref(
-    wire_name: &str,
-) -> Result<ContextEntryName, otel_arrow_dfe_config::error::Error> {
-    ContextEntryName::parse(wire_name)
 }
 
 /// Waits for a terminal control message after the producer has finished.
@@ -777,16 +782,13 @@ impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
     }
 }
 
-impl ContextDeclarationConfig for Config {
-    fn context_declarations(
-        &self,
-    ) -> Result<HashMap<ContextAccessId, ContextDeclaration>, otel_arrow_dfe_config::error::Error>
-    {
-        let mut declarations = ContextDeclarationsBuilder::new();
-        for name in self.transport_headers().keys() {
-            declarations.produce(transport_header_entry_ref(name)?)?;
-        }
-        Ok(declarations.finish())
+impl NodeContextDeclarator for Config {
+    fn context_declarations(&self) -> NodeContextDeclarations {
+        self.transport_headers()
+            .keys()
+            .cloned()
+            .map(|entry| ContextDeclaration::Produces { entry })
+            .collect()
     }
 }
 

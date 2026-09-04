@@ -45,8 +45,8 @@ impl fmt::Display for ValueKind {
 pub struct TransportHeader {
     /// Normalized logical name used for matching and policy lookup.
     pub name: ContextEntryName,
-    /// Original header or metadata name observed on ingress.
-    pub wire_name: Box<str>,
+    /// Original header or metadata name observed on ingress, when different.
+    pub wire_name: Option<Box<str>>,
     /// Whether the value is text or binary.
     pub value_kind: ValueKind,
     /// Raw value bytes.
@@ -58,12 +58,12 @@ impl TransportHeader {
     #[must_use]
     pub fn text(
         name: ContextEntryName,
-        wire_name: impl Into<Box<str>>,
+        wire_name: Option<Box<str>>,
         value: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
             name,
-            wire_name: wire_name.into(),
+            wire_name,
             value_kind: ValueKind::Text,
             value: value.into(),
         }
@@ -73,12 +73,12 @@ impl TransportHeader {
     #[must_use]
     pub fn binary(
         name: ContextEntryName,
-        wire_name: impl Into<Box<str>>,
+        wire_name: Option<Box<str>>,
         value: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
             name,
-            wire_name: wire_name.into(),
+            wire_name,
             value_kind: ValueKind::Binary,
             value: value.into(),
         }

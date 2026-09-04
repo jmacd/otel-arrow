@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 /// The entry selector
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ContextEntrySelector {
     /// The name
     pub name: ContextEntryName,
@@ -36,7 +36,7 @@ pub enum ContextEntrySelectorForm {
 }
 
 /// Generic context registers selected by one consumer binding.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ContextConsumerSelector {
     /// Selects named context entries in order.
     Entries {
@@ -52,7 +52,7 @@ pub enum ContextConsumerSelector {
 pub struct ContextAccessId(usize);
 
 /// One component context declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ContextDeclaration {
     /// Adds one named value to outgoing context.
     Produces {
@@ -76,8 +76,13 @@ pub struct ContextDeclarationProvider {
 }
 
 /// Deterministically describes a node factory's context access.
-pub type ContextDeclarationFn =
-    fn(&serde_json::Value) -> Result<HashMap<ContextAccessId, ContextDeclaration>, Error>;
+pub type ContextDeclarationFn = fn(&serde_json::Value) -> Result<NodeContextDeclarations, Error>;
+
+/// Implemented by node Config structs.
+pub trait NodeContextDeclarator: serde::de::DeserializeOwned {
+    /// Returns the context accesses required by this configuration.
+    fn context_declarations(&self) -> NodeContextDeclarations;
+}
 
 // `#[allow(unsafe_code)]` is required because `linkme::distributed_slice`
 // emits a static with `#[link_section = "..."]`, which the engine crate's
@@ -87,20 +92,24 @@ pub type ContextDeclarationFn =
 #[distributed_slice]
 pub static CONTEXT_DECLARATION_PROVIDERS: [ContextDeclarationProvider];
 
-/// Builds deterministic producer declarations from configuration-sized inputs.
-#[derive(Default)]
-pub struct ContextDeclarationsBuilder {
-    // producers: BTreeSet<ContextEntryName>,
-    // consumers: BTreeSet<ContextEntryName>,
+/// A fixed set of context bindings, equals a bi-directional mapping
+/// from ContextAccessId to/from ContextDeclaration. Created by
+/// collecting FromIterator<ContextDeclaration>.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeContextDeclarations {
+    /// Indexed by ContextAccessId; sorted in the builder
+    byid: Vec<ContextDeclaration>,
 }
 
-/// Extracts context declarations from a component's typed configuration.
-pub trait ContextDeclarationConfig: serde::de::DeserializeOwned {
-    /// Returns the context accesses required by this configuration.
-    fn context_declarations(
-        &self,
-        builder: &mut ContextDeclarationsBuilder,
-    ) -> Result<HashMap<ContextAccessId, ContextDeclaration>, Error>;
+impl FromIterator<ContextDeclaration> for NodeContextDeclarations {
+    fn from_iter<T>(iter: T) -> Self
+    where
+        T: IntoIterator<Item = ContextDeclaration>,
+    {
+        let mut uniq: Vec<_> = iter.into_iter().collect();
+        uniq.sort();
+        Self { byid: uniq }
+    }
 }
 
 impl ContextAccessId {
@@ -124,58 +133,66 @@ impl ContextDeclarationProvider {
         Self { urn, declarations }
     }
 
-    // /// Creates a provider that derives declarations from a typed component configuration.
-    // #[must_use]
-    // pub const fn from_typed_config<T>(urn: &'static str) -> Self
-    // where
-    //     T: ContextDeclarationConfig,
-    // {
-    //     Self {
-    //         urn,
-    //         declarations: typed_context_declarations::<T>,
-    //     }
-    // }
+    /// Creates a provider that derives declarations from a typed component configuration.
+    #[must_use]
+    pub const fn from_typed_config<T>(urn: &'static str) -> Self
+    where
+        T: NodeContextDeclarator,
+    {
+        Self {
+            urn,
+            declarations: typed_context_declarations::<T>,
+        }
+    }
 }
 
-// fn typed_context_declarations<T>(
-//     config: &serde_json::Value,
-// ) -> Result<Vec<ContextDeclaration>, Error>
-// where
-//     T: ContextDeclarationConfig,
-// {
-//     let config = otel_arrow_dfe_config::validation::deserialize_typed_config::<T>(config)?;
-//     config.context_declarations()
-// }
+/// Generic function used in from_typed_config.
+fn typed_context_declarations<T>(
+    config: &serde_json::Value,
+) -> Result<NodeContextDeclarations, Error>
+where
+    T: NodeContextDeclarator,
+{
+    Ok(
+        otel_arrow_dfe_config::validation::deserialize_typed_config::<T>(config)?
+            .context_declarations(),
+    )
+}
 
 /// Context policy compiled from resolved configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledContextPolicy {
-    declarations: HashMap<PipelineKey, HashMap<ConfigNodeId, Box<[ContextDeclaration]>>>,
+    declarations: HashMap<PipelineKey, HashMap<ConfigNodeId, NodeContextDeclarations>>,
 }
 
 impl CompiledContextPolicy {
-    // /// Returns the generation associated with this compiled policy.
-    // #[must_use]
-    // pub const fn generation(&self) -> ContextPolicyGeneration {
-    //     self.generation
-    // }
+    /// The empty state has no declarations, bind always fails.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            declarations: HashMap::new(),
+        }
+    }
 
-    // /// Returns a copy carrying the supplied generation.
-    // #[must_use]
-    // pub fn with_generation(&self, generation: ContextPolicyGeneration) -> Arc<Self> {
-    //     Arc::new(Self {
-    //         generation,
-    //         compiled_context: self.compiled_context.clone(),
-    //         receiver_capture: self.receiver_capture.clone(),
-    //         declarations: self.declarations.clone(),
-    //     })
-    // }
-
-    // /// Returns whether two policies compile the same declarations.
-    // #[must_use]
-    // pub fn equivalent_declarations(&self, other: &Self) -> bool {
-    //     self.declarations == other.declarations
-    // }
+    /// Binds the declarations to a node.
+    pub fn node_bindings(
+        &self,
+        pipeline: PipelineKey,
+        node: ConfigNodeId,
+        decls: NodeContextDeclarations,
+    ) -> Result<(), Error> {
+        // Note: This is where the current compiler ends. It checks that
+        // that the context declarations the node wants to configure equal
+        // what is present in the compiled policy.
+        self.declarations
+            .get(&pipeline)
+            .ok_or(Error::UnrecognizedContextDeclaration {})?
+            .get(&node)
+            .ok_or(Error::UnrecognizedContextDeclaration {})?
+            .eq(&decls)
+            .then_some(())
+            .ok_or(Error::UnrecognizedContextDeclaration {})
+    }
 }
 
 impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
@@ -184,6 +201,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         &self,
         resolved: &ResolvedOtelDataflowSpec,
     ) -> Result<Arc<CompiledContextPolicy>, EngineError> {
+        // @@@
         let mut declarations = HashMap::new();
 
         for pipeline in &resolved.pipelines {
@@ -199,8 +217,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                     node_config.r#type.as_ref(),
                     &node_config.config,
                 )?;
-                let _ =
-                    declarations_by_node.insert(node_id.clone(), declarations.into_boxed_slice());
+                let _ = declarations_by_node.insert(node_id.clone(), declarations);
             }
             let _ = declarations.insert(pipeline_key, declarations_by_node);
         }
@@ -208,44 +225,47 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         Ok(Arc::new(CompiledContextPolicy { declarations }))
     }
 
+    /// Returns context declarations for a single node.
     fn node_context_declarations(
         &self,
         kind: NodeKind,
         urn: &str,
         config: &serde_json::Value,
-    ) -> Result<Vec<ContextDeclaration>, EngineError> {
+    ) -> Result<NodeContextDeclarations, EngineError> {
         let missing_factory = || {
             EngineError::ConfigError(Box::new(Error::InvalidUserConfig {
                 error: format!("node factory `{urn}` is not registered"),
             }))
         };
-        let _ = match kind {
+        let validate_config = match kind {
             NodeKind::Receiver => {
                 self.get_receiver_factory_map()
                     .get(urn)
                     .ok_or_else(&missing_factory)?
-                    .name
+                    .validate_config
             }
             NodeKind::Processor => {
                 self.get_processor_factory_map()
                     .get(urn)
                     .ok_or_else(&missing_factory)?
-                    .name
+                    .validate_config
             }
             NodeKind::Exporter => {
                 self.get_exporter_factory_map()
                     .get(urn)
                     .ok_or_else(&missing_factory)?
-                    .name
+                    .validate_config
             }
         };
-        context_declaration_provider(urn).map_or_else(
-            || Ok(Vec::new()),
-            |provider| {
+        validate_config(config).map_err(|error| EngineError::ConfigError(Box::new(error)))?;
+
+        Ok(context_declaration_provider(urn)
+            .map(|provider| {
                 (provider.declarations)(config)
                     .map_err(|error| EngineError::ConfigError(Box::new(error)))
-            },
-        )
+            })
+            .transpose()?
+            .unwrap_or_default())
     }
 }
 

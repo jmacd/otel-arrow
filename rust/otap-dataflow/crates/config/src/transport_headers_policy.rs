@@ -168,7 +168,7 @@ impl HeaderCapturePolicy {
 
                 result.push(TransportHeader {
                     name,
-                    wire_name: wire_name.into(),
+                    wire_name: Some(wire_name.into()),
                     value_kind,
                     value: value.to_vec(),
                 });
@@ -336,7 +336,10 @@ impl HeaderPropagationPolicy {
                 return None;
             }
             let header_name = match name_strategy {
-                NameStrategy::Preserve => &header.wire_name,
+                NameStrategy::Preserve => header
+                    .wire_name
+                    .as_deref()
+                    .unwrap_or_else(|| header.name.as_str()),
                 NameStrategy::StoredName => header.name.as_str(),
             };
             Some(PropagatedHeader {
