@@ -1,22 +1,10 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Protocol-neutral transport header abstraction for end-to-end header
-//! propagation through the pipeline.
-//!
-//! Core types and engines are defined in [`otel_arrow_dfe_config::transport_headers`]
-//! and re-exported here for backward compatibility and convenience.
-
-// Re-export all public items from the config crate's transport_headers module.
-pub use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
-// Re-export policy types that include capture and propagation logic.
-pub use otel_arrow_dfe_config::transport_headers_policy::{
-    CaptureStats, HeaderCapturePolicy, HeaderPropagationPolicy, PropagatedHeader,
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otel_arrow_dfe_config::transport_headers::TransportHeaders;
     use otel_arrow_dfe_config::transport_headers_policy::{
         CaptureDefaults, CaptureRule, PropagationAction, PropagationDefault, PropagationMatch,
         PropagationOverride, PropagationSelector, PropagationSelectorType,

@@ -18,6 +18,7 @@ use std::num::NonZeroU64;
 
 use async_trait::async_trait;
 use otel_arrow_dfe_config::PortName;
+use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_config::{SignalFormat, SignalType};
 use otel_arrow_dfe_engine::_private::AckNackRouting;
 use otel_arrow_dfe_engine::control::{
@@ -33,8 +34,6 @@ use otel_arrow_dfe_engine::{
 };
 use otel_arrow_dfe_pdata::OtapPayload;
 
-use crate::transport_headers::TransportHeaders;
-
 /// Context for OTAP requests.
 ///
 /// Carries three independent concerns:
@@ -47,7 +46,7 @@ use crate::transport_headers::TransportHeaders;
 ///   real socket (OTLP gRPC/HTTP, OTAP gRPC, syslog/CEF) and left `None` by
 ///   sourceless receivers (file-based, journald). Preserved across transport
 ///   boundaries.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct Context {
     stack: Vec<Frame>,
     /// Transport headers captured from inbound protocol metadata.

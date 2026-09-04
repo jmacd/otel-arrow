@@ -12,9 +12,10 @@
 //! TODO: Implement the sensitive capability for headers
 
 use crate::context::ContextEntryName;
-use crate::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
+use crate::transport_headers::{HeaderName, TransportHeader, TransportHeaders, ValueKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fmt;
 
 // -- Stats types --------------------------------------------------------------
@@ -46,12 +47,8 @@ impl std::error::Error for CaptureStats {}
 /// A single header selected for propagation
 #[derive(Debug)]
 pub struct PropagatedHeader<'a> {
-    /// The wire name to use on the outbound request.
-    ///
-    /// Points to `TransportHeader::wire_name` when the name strategy
-    /// is [`NameStrategy::Preserve`], or `TransportHeader::name` when
-    /// [`NameStrategy::StoredName`].
-    pub header_name: &'a str,
+    /// The name to use on the outbound request.
+    pub header_name: Cow<'a, str>,
     /// Whether the value is text or binary.
     pub value_kind: &'a ValueKind,
     /// Raw value bytes.
@@ -149,10 +146,11 @@ impl HeaderCapturePolicy {
                     continue;
                 }
 
-                let name = matched_rule
-                    .store_as
-                    .clone()
-                    .unwrap_or_else(|| ContextEntryName::normalize_from(wire_name));
+                let name = if let Some(store_as) = matched_rule.store_as.as_ref() {
+                    HeaderName::from_config(store_as)
+                } else {
+                    HeaderName::from_wire(wire_name)
+                };
 
                 let value_kind = match matched_rule.value_kind {
                     Some(ValueKindConfig::Text) => ValueKind::Text,
@@ -166,12 +164,7 @@ impl HeaderCapturePolicy {
                     }
                 };
 
-                result.push(TransportHeader {
-                    name,
-                    wire_name: Some(wire_name.into()),
-                    value_kind,
-                    value: value.to_vec(),
-                });
+                result.push(TransportHeader::new(name, value_kind, value.to_vec()));
             }
         }
 
@@ -336,11 +329,8 @@ impl HeaderPropagationPolicy {
                 return None;
             }
             let header_name = match name_strategy {
-                NameStrategy::Preserve => header
-                    .wire_name
-                    .as_deref()
-                    .unwrap_or_else(|| header.name.as_str()),
-                NameStrategy::StoredName => header.name.as_str(),
+                NameStrategy::StoredName => header.name.normalized().clone().inner(),
+                NameStrategy::Preserve => header.name.original(),
             };
             Some(PropagatedHeader {
                 header_name,
@@ -356,20 +346,17 @@ impl HeaderPropagationPolicy {
         self.resolve_action_for_name(&header.name)
     }
 
-    fn resolve_action_for_name(
-        &self,
-        stored_name: &ContextEntryName,
-    ) -> (PropagationAction, NameStrategy) {
+    fn resolve_action_for_name(&self, name: &HeaderName) -> (PropagationAction, NameStrategy) {
         // Check overrides first.
         for ov in &self.overrides {
-            if ov.match_rule.stored_names.iter().any(|s| s.eq(stored_name)) {
+            if ov.match_rule.stored_names.iter().any(|s| name.normal_eq(s)) {
                 let name_strategy = ov.name.unwrap_or(self.default.name);
                 return (ov.action, name_strategy);
             }
         }
 
         // Check whether the header passes the default selector.
-        let selected = self.default.selector.selects(stored_name);
+        let selected = self.default.selector.selects(name.normalized());
 
         if selected {
             (self.default.action, self.default.name)

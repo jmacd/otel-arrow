@@ -65,7 +65,7 @@ pub fn validate_transport_header_require_keys(
         };
         for key in keys {
             // check that key exists
-            if headers.find_by_name(key.as_str()).next().is_none() {
+            if headers.find_by_name(key).next().is_none() {
                 return false;
             }
         }
@@ -104,9 +104,9 @@ pub fn validate_transport_header_require_key_values(
             None => return false,
         };
         'pairs: for pair in pairs {
-            for header in headers.find_by_name(pair.key.as_str()) {
-                match std::str::from_utf8(&header.value) {
-                    Ok(value_str) if value_str == pair.value => continue 'pairs,
+            for header in headers.find_by_name(&pair.key) {
+                match header.value_as_str() {
+                    Some(value_str) if value_str == pair.value => continue 'pairs,
                     _ => continue,
                 }
             }
@@ -133,7 +133,7 @@ pub fn validate_transport_header_deny_keys(
 
     for headers in suv.iter().flatten() {
         for key in keys {
-            if headers.find_by_name(key.as_str()).next().is_some() {
+            if headers.find_by_name(key).next().is_some() {
                 return false;
             }
         }

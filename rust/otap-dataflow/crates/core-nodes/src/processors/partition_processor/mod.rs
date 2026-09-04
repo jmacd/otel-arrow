@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
+use otel_arrow_dfe_config::transport_headers::{HeaderName, TransportHeader, ValueKind};
 use otel_arrow_dfe_config::{SignalType, context::ContextEntryName, node::NodeUserConfig};
 use otel_arrow_dfe_engine::config::ProcessorConfig;
 use otel_arrow_dfe_engine::context_declaration::{
@@ -37,7 +38,6 @@ use otel_arrow_dfe_otap::OTAP_PROCESSOR_FACTORIES;
 use otel_arrow_dfe_otap::accessory::context::split_contexts::{Contexts, OutboundError};
 use otel_arrow_dfe_otap::accessory::slots::Key;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
-use otel_arrow_dfe_otap::transport_headers::{TransportHeader, ValueKind};
 use otel_arrow_dfe_pdata::{OtapArrowRecords, OtapPayload, TryIntoWithOptions};
 use otel_arrow_dfe_query_engine::parser::default_parser_options;
 use otel_arrow_dfe_query_engine::pipeline::partition::{PartitionValue, Partitioner};
@@ -435,7 +435,7 @@ fn partition_value_to_transport_header(
     strategy: &PartitionValueSerializeStrategy,
     partition_value: PartitionValue,
 ) -> TransportHeader {
-    match strategy {
+    let (value_kind, value_bytes) = match strategy {
         PartitionValueSerializeStrategy::ToBytesLossy {
             text_as_binary_header,
         } => {
@@ -457,12 +457,7 @@ fn partition_value_to_transport_header(
                 PartitionValue::Null => Vec::new(),
             };
 
-            TransportHeader {
-                name: name.clone(),
-                wire_name: None,
-                value_kind,
-                value: header_bytes,
-            }
+            (value_kind, header_bytes)
         }
         PartitionValueSerializeStrategy::Json => {
             let header_bytes = match partition_value {
@@ -495,14 +490,10 @@ fn partition_value_to_transport_header(
                 }
             };
 
-            TransportHeader {
-                name: name.clone(),
-                wire_name: None,
-                value_kind: ValueKind::Text,
-                value: header_bytes,
-            }
+            (ValueKind::Text, header_bytes)
         }
-    }
+    };
+    TransportHeader::new(HeaderName::from_config(name), value_kind, value_bytes)
 }
 
 impl ConfigNodeContextDeclaration for Config {

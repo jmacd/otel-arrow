@@ -15,6 +15,7 @@
 //! - Normalized logical names for policy matching
 
 use crate::context::ContextEntryName;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
@@ -36,52 +37,111 @@ impl fmt::Display for ValueKind {
     }
 }
 
+/// Un-normalized header name.
+pub type OriginalHeaderName = Cow<'static, str>;
+
+/// A header name, either in original or normalized form.
+#[derive(Clone, Debug)]
+pub enum HeaderName {
+    /// Prepared form from a config entry, partition name. Only
+    /// the normalized form is stored.
+    Prepared(ContextEntryName),
+    /// Preserved form from an incoming HTTP request. Both the
+    /// normalized and original are stored.
+    Preserved {
+        /// Normalized
+        normal: ContextEntryName,
+        /// Wire name
+        original: OriginalHeaderName,
+    },
+}
+
+impl HeaderName {
+    /// Header from configuration name in cases w/o a wire_name.
+    #[must_use]
+    pub fn from_config(config_name: &ContextEntryName) -> Self {
+        HeaderName::Prepared(config_name.clone())
+    }
+
+    /// Header from wire name where original is requested.
+    #[must_use]
+    pub fn from_wire(wire_name: &str) -> Self {
+        let normal = ContextEntryName::normalize_from(wire_name);
+
+        // Note that here, if we know that there are no consumers that
+        // care for the original, we can skip to the Prepared
+        // case. Otherwise, only store two copies when they differ.
+        if normal.as_str().eq(wire_name) {
+            HeaderName::Prepared(normal)
+        } else {
+            HeaderName::Preserved {
+                normal,
+                original: wire_name.to_owned().into(),
+            }
+        }
+    }
+
+    /// Same as str::eq_ignore_ascii_case
+    #[must_use]
+    pub fn normal_eq(&self, other: &ContextEntryName) -> bool {
+        other.eq(self.normalized())
+    }
+
+    /// Get the normalized form.
+    #[must_use]
+    pub fn normalized(&self) -> &ContextEntryName {
+        match self {
+            Self::Prepared(name) => name,
+            Self::Preserved { normal, .. } => normal,
+        }
+    }
+
+    /// Get the original form.
+    #[must_use]
+    pub fn original(&self) -> OriginalHeaderName {
+        match self {
+            Self::Prepared(name) => name.clone().inner(),
+            Self::Preserved { original, .. } => original.clone(),
+        }
+    }
+}
+
 /// A single captured transport header.
 ///
 /// Each entry records both the normalized logical name (used for policy
 /// matching) and the original wire name observed on ingress (used for
 /// lossless re-emission on egress).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct TransportHeader {
-    /// Normalized logical name used for matching and policy lookup.
-    pub name: ContextEntryName,
-    /// Original header or metadata name observed on ingress, when different.
-    pub wire_name: Option<Box<str>>,
+    /// Normalized or original name.
+    pub name: HeaderName,
     /// Whether the value is text or binary.
     pub value_kind: ValueKind,
     /// Raw value bytes.
-    pub value: Vec<u8>,
+    pub value: Box<[u8]>,
 }
 
 impl TransportHeader {
-    /// Create a new text transport header.
+    /// Create a new header with given value kind.
     #[must_use]
-    pub fn text(
-        name: ContextEntryName,
-        wire_name: Option<Box<str>>,
-        value: impl Into<Vec<u8>>,
-    ) -> Self {
-        Self {
+    pub fn new<V: Into<Box<[u8]>>>(name: HeaderName, value_kind: ValueKind, value: V) -> Self {
+        TransportHeader {
             name,
-            wire_name,
-            value_kind: ValueKind::Text,
+            value_kind,
             value: value.into(),
         }
     }
 
+    /// Create a new text transport header.
+    #[must_use]
+    pub fn text(name: HeaderName, value: impl Into<Vec<u8>>) -> Self {
+        Self::new(name, ValueKind::Text, value.into())
+    }
+
     /// Create a new binary transport header.
     #[must_use]
-    pub fn binary(
-        name: ContextEntryName,
-        wire_name: Option<Box<str>>,
-        value: impl Into<Vec<u8>>,
-    ) -> Self {
-        Self {
-            name,
-            wire_name,
-            value_kind: ValueKind::Binary,
-            value: value.into(),
-        }
+    pub fn binary(name: HeaderName, value: impl Into<Vec<u8>>) -> Self {
+        Self::new(name, ValueKind::Binary, value.into())
     }
 
     /// Returns the value as a UTF-8 string, if it is valid text.
@@ -101,7 +161,7 @@ impl TransportHeader {
 /// `TransportHeaders` (e.g. when cloning a pipeline `Context`) is a
 /// cheap reference-count bump instead of a deep copy.  Mutation
 /// methods (`push`, `clear`) use copy-on-write via `Arc::make_mut`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct TransportHeaders {
     headers: Arc<Vec<TransportHeader>>,
 }
@@ -150,10 +210,14 @@ impl TransportHeaders {
         self.headers.iter()
     }
 
-    /// Find all headers matching a normalized name (case-sensitive match on
-    /// the logical name). Note this is not an efficient lookup.
-    pub fn find_by_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a TransportHeader> {
-        self.headers.iter().filter(move |h| name == h.name.as_ref())
+    /// Find all headers matching a normalized name (case-sensitive
+    /// match on the logical name). Note this is NOT an efficient
+    /// lookup, used for validation.
+    pub fn find_by_name<'a>(
+        &'a self,
+        name: &'a ContextEntryName,
+    ) -> impl Iterator<Item = &'a TransportHeader> {
+        self.headers.iter().filter(move |h| h.name.normal_eq(name))
     }
 
     /// Returns a slice of all headers.

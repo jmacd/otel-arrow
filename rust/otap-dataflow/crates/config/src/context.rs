@@ -40,6 +40,13 @@ impl ContextEntryName {
     /// Returns the name of the context entry, e.g., the value
     /// in the `store_as` field of a transport header capture.
     #[must_use]
+    pub fn inner(self) -> Cow<'static, str> {
+        self.0.clone()
+    }
+
+    /// Returns the name of the context entry, e.g., the value
+    /// in the `store_as` field of a transport header capture.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }

@@ -16,7 +16,7 @@ use linkme::distributed_slice;
 use metrics::TrafficGeneratorReceiverMetrics;
 use otel_arrow_dfe_channel::error::{RecvError, SendError};
 use otel_arrow_dfe_config::node::NodeUserConfig;
-use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders};
+use otel_arrow_dfe_config::transport_headers::{HeaderName, TransportHeader, TransportHeaders};
 use otel_arrow_dfe_config::{ContextEntryName, error::Error as ConfigError};
 use otel_arrow_dfe_engine::MessageSourceLocalEffectHandlerExtension;
 use otel_arrow_dfe_engine::config::ReceiverConfig;
@@ -513,6 +513,7 @@ fn build_transport_headers(
         // Infer the value kind from the key name, matching the convention
         // used by the header capture policy: keys ending in `-bin` are
         // treated as binary (the gRPC binary metadata convention).
+        let hname = HeaderName::from_config(name);
         if name.as_str().ends_with("-bin") {
             let resolved_value = match value {
                 Some(v) => v.as_bytes().to_vec(),
@@ -522,11 +523,7 @@ fn build_transport_headers(
                     buf.to_vec()
                 }
             };
-            headers.push(TransportHeader::binary(
-                name.clone(),
-                Some(name.clone().as_str().into()),
-                resolved_value,
-            ));
+            headers.push(TransportHeader::binary(hname, resolved_value));
         } else {
             let resolved_value = match value {
                 Some(v) => v.as_bytes().to_vec(),
@@ -538,11 +535,7 @@ fn build_transport_headers(
                         .collect()
                 }
             };
-            headers.push(TransportHeader::text(
-                name.clone(),
-                Some(name.clone().as_str().into()),
-                resolved_value,
-            ));
+            headers.push(TransportHeader::text(hname, resolved_value));
         }
     }
     Ok(Some(headers))

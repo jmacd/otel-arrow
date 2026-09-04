@@ -22,6 +22,7 @@ use http::HeaderValue;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_config::node::NodeUserConfig;
+use otel_arrow_dfe_config::transport_headers::ValueKind;
 use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
 use otel_arrow_dfe_engine::ExporterFactory;
 use otel_arrow_dfe_engine::config::ExporterConfig;
@@ -40,7 +41,6 @@ use otel_arrow_dfe_otap::otap_grpc::otlp::client::{
     LogsServiceClient, MetricsServiceClient, TraceServiceClient,
 };
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
-use otel_arrow_dfe_otap::transport_headers::ValueKind;
 use otel_arrow_dfe_pdata::otlp::logs::LogsProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::metrics::MetricsProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::traces::TracesProtoBytesEncoder;
@@ -1118,7 +1118,7 @@ fn build_grpc_metadata(
                         otel_debug!(
                             "otlp.exporter.grpc.header_skip",
                             reason = "invalid ascii metadata key",
-                            header_name = header.header_name
+                            header_name = %header.header_name
                         );
                         continue;
                     };
@@ -1126,7 +1126,7 @@ fn build_grpc_metadata(
                         otel_debug!(
                             "otlp.exporter.grpc.header_skip",
                             reason = "invalid ascii metadata value",
-                            header_name = header.header_name
+                            header_name = %header.header_name
                         );
                         continue;
                     };
@@ -1138,7 +1138,7 @@ fn build_grpc_metadata(
                         otel_debug!(
                             "otlp.exporter.grpc.header_skip",
                             reason = "static header takes precedence over propagated header",
-                            header_name = header.header_name
+                            header_name = %header.header_name
                         );
                         continue;
                     }
@@ -1156,7 +1156,7 @@ fn build_grpc_metadata(
                         otel_debug!(
                             "otlp.exporter.grpc.header_skip",
                             reason = "invalid binary metadata key",
-                            header_name = header.header_name
+                            header_name = %header.header_name
                         );
                         continue;
                     };
