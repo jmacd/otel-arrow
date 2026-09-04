@@ -89,7 +89,7 @@ pub enum ValidationInstructions {
     /// Require specific transport header keys to be present on SUV messages.
     TransportHeaderRequireKey {
         /// Header keys (stored/logical names) that must be present.
-        keys: Vec<ContextEntryRef>,
+        keys: Vec<ContextEntryName>,
     },
     /// Require specific transport header key/value pairs on SUV messages.
     TransportHeaderRequireKeyValue {
@@ -99,7 +99,7 @@ pub enum ValidationInstructions {
     /// Forbid specific transport header keys on SUV messages.
     TransportHeaderDeny {
         /// Header keys (stored/logical names) that must NOT be present.
-        keys: Vec<ContextEntryRef>,
+        keys: Vec<ContextEntryName>,
     },
 }
 impl ValidationInstructions {

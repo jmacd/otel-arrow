@@ -11,10 +11,13 @@ use otel_arrow_dfe_config::NodeId as NodeName;
 use otel_arrow_dfe_config::error::Error as ConfigError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::transport_headers::TransportHeaders;
+use otel_arrow_dfe_engine::ExporterFactory;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::context_declaration::{
-    ContextDeclaration, ContextDeclarationConfig, ContextDeclarationProvider, ContextReadSelector,
+    ConfigNodeContextDeclaration, ContextConsumerSelector, ContextDeclaration,
+    ContextDeclarationProvider, ContextEntrySelector, ContextEntrySelectorForm,
+    NodeContextDeclarations,
 };
 use otel_arrow_dfe_engine::control::NodeControlMsg;
 use otel_arrow_dfe_engine::error::Error as EngineError;
@@ -23,7 +26,6 @@ use otel_arrow_dfe_engine::local::exporter::{EffectHandler, Exporter};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
-use otel_arrow_dfe_engine::{ExporterFactory, context_access};
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::TryFromWithOptions;
@@ -130,20 +132,8 @@ static VALIDATION_EXPORTER_CONTEXT_DECLARATIONS: ContextDeclarationProvider =
         VALIDATION_EXPORTER_URN,
     );
 
-context_access! {
-    struct ValidationAccess {
-        keys,
-        key_values,
-        deny,
-    }
-
-    const VALIDATION_ACCESS;
-}
-
-impl ContextDeclarationConfig for ValidationExporterConfig {
-    fn context_declarations(
-        &self,
-    ) -> Result<Vec<ContextDeclaration>, otel_arrow_dfe_config::error::Error> {
+impl ConfigNodeContextDeclaration for ValidationExporterConfig {
+    fn context_declarations(&self) -> NodeContextDeclarations {
         let mut require_key_names = std::collections::BTreeSet::new();
         let mut require_key_value_names = std::collections::BTreeSet::new();
         let mut deny_names = std::collections::BTreeSet::new();
@@ -177,29 +167,45 @@ impl ContextDeclarationConfig for ValidationExporterConfig {
         let mut declarations = Vec::new();
         if !require_key_names.is_empty() {
             declarations.push(ContextDeclaration::Consumes {
-                access: VALIDATION_ACCESS.keys,
-                selector: ContextReadSelector::Entries {
-                    entries: require_key_names.into_iter().collect(),
+                selector: ContextConsumerSelector::Entries {
+                    entries: require_key_names
+                        .into_iter()
+                        .map(|name| ContextEntrySelector {
+                            name,
+                            read: ContextEntrySelectorForm::Value,
+                        })
+                        .collect(),
                 },
             });
         }
         if !require_key_value_names.is_empty() {
             declarations.push(ContextDeclaration::Consumes {
-                access: VALIDATION_ACCESS.key_values,
-                selector: ContextReadSelector::Entries {
-                    entries: require_key_value_names.into_iter().collect(),
+                selector: ContextConsumerSelector::Entries {
+                    entries: require_key_value_names
+                        .into_iter()
+                        .map(|name| ContextEntrySelector {
+                            name,
+                            read: ContextEntrySelectorForm::Value,
+                        })
+                        .collect(),
                 },
             });
         }
         if !deny_names.is_empty() {
             declarations.push(ContextDeclaration::Consumes {
-                access: VALIDATION_ACCESS.deny,
-                selector: ContextReadSelector::Entries {
-                    entries: deny_names.into_iter().collect(),
+                selector: ContextConsumerSelector::Entries {
+                    entries: deny_names
+                        .into_iter()
+                        .map(|name| ContextEntrySelector {
+                            name,
+                            read: ContextEntrySelectorForm::Value,
+                        })
+                        .collect(),
                 },
             });
         }
-        Ok(declarations)
+
+        declarations.into_iter().collect()
     }
 }
 
@@ -338,7 +344,7 @@ impl Exporter<OtapPdata> for ValidationExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otel_arrow_dfe_engine::context_declaration::{ContextDeclaration, ContextReadSelector};
+    use otel_arrow_dfe_engine::context_declaration::{ContextConsumerSelector, ContextDeclaration};
 
     /// Scenario: Validation config requires context keys and key-values.
     /// Guarantees: each context-reading validation has a sorted, deduplicated binding.
@@ -367,8 +373,7 @@ mod tests {
         assert_eq!(
             decls[0],
             ContextDeclaration::Consumes {
-                access: VALIDATION_ACCESS.keys,
-                selector: ContextReadSelector::Entries {
+                selector: ContextConsumerSelector::Entries {
                     entries: vec!["x-request-id".into(), "x-tenant-id".into()].into_boxed_slice(),
                 },
             }
@@ -376,8 +381,7 @@ mod tests {
         assert_eq!(
             decls[1],
             ContextDeclaration::Consumes {
-                access: VALIDATION_ACCESS.key_values,
-                selector: ContextReadSelector::Entries {
+                selector: ContextConsumerSelector::Entries {
                     entries: vec!["x-tenant-id".into()].into_boxed_slice(),
                 },
             }
@@ -385,8 +389,7 @@ mod tests {
         assert_eq!(
             decls[2],
             ContextDeclaration::Consumes {
-                access: VALIDATION_ACCESS.deny,
-                selector: ContextReadSelector::Entries {
+                selector: ContextConsumerSelector::Entries {
                     entries: vec!["x-secret".into()].into_boxed_slice(),
                 },
             }
@@ -410,8 +413,7 @@ mod tests {
         assert_eq!(
             (VALIDATION_EXPORTER_CONTEXT_DECLARATIONS.declarations)(&config).unwrap(),
             vec![ContextDeclaration::Consumes {
-                access: VALIDATION_ACCESS.deny,
-                selector: ContextReadSelector::Entries {
+                selector: ContextConsumerSelector::Entries {
                     entries: vec!["x-secret".into()].into_boxed_slice(),
                 },
             }]

@@ -47,10 +47,6 @@ pub enum ContextConsumerSelector {
     All,
 }
 
-/// Context access identifier scoped to one node factory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ContextAccessId(usize);
-
 /// One component context declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ContextDeclaration {
@@ -78,8 +74,8 @@ pub struct ContextDeclarationProvider {
 /// Deterministically describes a node factory's context access.
 pub type ContextDeclarationFn = fn(&serde_json::Value) -> Result<NodeContextDeclarations, Error>;
 
-/// Implemented by node Config structs.
-pub trait NodeContextDeclarator: serde::de::DeserializeOwned {
+/// How Config structs declare node context bindings.
+pub trait ConfigNodeContextDeclaration: serde::de::DeserializeOwned {
     /// Returns the context accesses required by this configuration.
     fn context_declarations(&self) -> NodeContextDeclarations;
 }
@@ -100,6 +96,10 @@ pub struct NodeContextDeclarations {
     /// Indexed by ContextAccessId; sorted in the builder
     byid: Vec<ContextDeclaration>,
 }
+
+/// Context access identifier scoped to one node factory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContextAccessId(usize);
 
 impl FromIterator<ContextDeclaration> for NodeContextDeclarations {
     fn from_iter<T>(iter: T) -> Self
@@ -137,7 +137,7 @@ impl ContextDeclarationProvider {
     #[must_use]
     pub const fn from_typed_config<T>(urn: &'static str) -> Self
     where
-        T: NodeContextDeclarator,
+        T: ConfigNodeContextDeclaration,
     {
         Self {
             urn,
@@ -151,7 +151,7 @@ fn typed_context_declarations<T>(
     config: &serde_json::Value,
 ) -> Result<NodeContextDeclarations, Error>
 where
-    T: NodeContextDeclarator,
+    T: ConfigNodeContextDeclaration,
 {
     Ok(
         otel_arrow_dfe_config::validation::deserialize_typed_config::<T>(config)?
@@ -201,7 +201,6 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         &self,
         resolved: &ResolvedOtelDataflowSpec,
     ) -> Result<Arc<CompiledContextPolicy>, EngineError> {
-        // @@@
         let mut declarations = HashMap::new();
 
         for pipeline in &resolved.pipelines {

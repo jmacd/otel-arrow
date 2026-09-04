@@ -22,7 +22,8 @@ use otel_arrow_dfe_engine::MessageSourceLocalEffectHandlerExtension;
 use otel_arrow_dfe_engine::config::ReceiverConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::context_declaration::{
-    ContextDeclaration, ContextDeclarationProvider, NodeContextDeclarations, NodeContextDeclarator,
+    ConfigNodeContextDeclaration, ContextDeclaration, ContextDeclarationProvider,
+    NodeContextDeclarations,
 };
 use otel_arrow_dfe_engine::control::CallData;
 use otel_arrow_dfe_engine::error::{Error, ReceiverErrorKind, TypedError};
@@ -782,7 +783,7 @@ impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
     }
 }
 
-impl NodeContextDeclarator for Config {
+impl ConfigNodeContextDeclaration for Config {
     fn context_declarations(&self) -> NodeContextDeclarations {
         self.transport_headers()
             .keys()

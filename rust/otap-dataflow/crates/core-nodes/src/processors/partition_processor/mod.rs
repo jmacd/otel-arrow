@@ -18,7 +18,8 @@ use linkme::distributed_slice;
 use otel_arrow_dfe_config::{SignalType, context::ContextEntryName, node::NodeUserConfig};
 use otel_arrow_dfe_engine::config::ProcessorConfig;
 use otel_arrow_dfe_engine::context_declaration::{
-    ContextDeclaration, ContextDeclarationProvider, NodeContextDeclarations, NodeContextDeclarator,
+    ConfigNodeContextDeclaration, ContextDeclaration, ContextDeclarationProvider,
+    NodeContextDeclarations,
 };
 use otel_arrow_dfe_engine::control::{AckMsg, NackCause, NackMsg, NodeControlMsg};
 use otel_arrow_dfe_engine::error::ProcessorErrorKind;
@@ -504,7 +505,7 @@ fn partition_value_to_transport_header(
     }
 }
 
-impl NodeContextDeclarator for Config {
+impl ConfigNodeContextDeclaration for Config {
     fn context_declarations(&self) -> NodeContextDeclarations {
         std::iter::once(ContextDeclaration::Produces {
             entry: self.partition_header_name.clone(),

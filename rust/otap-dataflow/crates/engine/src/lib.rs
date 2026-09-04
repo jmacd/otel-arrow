@@ -69,7 +69,7 @@ pub mod extension;
 mod extension_lifecycle;
 mod extension_monitor;
 pub mod inventory;
-pub use otel_arrow_dfe_engine_macros::{component_inventory, context_access};
+pub use otel_arrow_dfe_engine_macros::component_inventory;
 pub mod message;
 pub mod processor;
 pub mod receiver;

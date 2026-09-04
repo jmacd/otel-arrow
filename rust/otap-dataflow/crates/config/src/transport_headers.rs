@@ -151,10 +151,9 @@ impl TransportHeaders {
     }
 
     /// Find all headers matching a normalized name (case-sensitive match on
-    /// the logical name).
-    #[cfg(test)]
+    /// the logical name). Note this is not an efficient lookup.
     pub fn find_by_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a TransportHeader> {
-        self.headers.iter().filter(move |h| *h.name == *name)
+        self.headers.iter().filter(move |h| name == h.name.as_ref())
     }
 
     /// Returns a slice of all headers.

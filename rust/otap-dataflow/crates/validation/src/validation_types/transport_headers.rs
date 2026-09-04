@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransportHeaderKeyValue {
     /// Header key (stored/logical name).
-    pub key: ContextEntryRef,
+    pub key: ContextEntryName,
     /// Expected header value (UTF-8 text).
     pub value: String,
 }
@@ -31,7 +31,7 @@ impl TransportHeaderKeyValue {
     #[must_use]
     pub fn new(key: impl AsRef<str>, value: impl Into<String>) -> Self {
         Self {
-            key: ContextEntryRef::parse(key.as_ref()).expect("invalid context entry reference"),
+            key: ContextEntryName::parse(key.as_ref()).expect("invalid context entry reference"),
             value: value.into(),
         }
     }
@@ -49,7 +49,7 @@ impl TransportHeaderKeyValue {
 #[must_use]
 pub fn validate_transport_header_require_keys(
     suv: &[Option<TransportHeaders>],
-    keys: &[ContextEntryRef],
+    keys: &[ContextEntryName],
 ) -> bool {
     if keys.is_empty() {
         return true;
@@ -125,7 +125,7 @@ pub fn validate_transport_header_require_key_values(
 #[must_use]
 pub fn validate_transport_header_deny_keys(
     suv: &[Option<TransportHeaders>],
-    keys: &[ContextEntryRef],
+    keys: &[ContextEntryName],
 ) -> bool {
     if keys.is_empty() {
         return true;
