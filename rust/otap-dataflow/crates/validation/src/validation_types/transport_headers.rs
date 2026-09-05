@@ -31,7 +31,7 @@ impl TransportHeaderKeyValue {
     #[must_use]
     pub fn new(key: impl AsRef<str>, value: impl Into<String>) -> Self {
         Self {
-            key: ContextEntryName::parse(key.as_ref()).expect("invalid context entry reference"),
+            key: ContextEntryName::try_from(key.as_ref()).expect("invalid context entry reference"),
             value: value.into(),
         }
     }
@@ -65,7 +65,7 @@ pub fn validate_transport_header_require_keys(
         };
         for key in keys {
             // check that key exists
-            if headers.find_by_name(key).next().is_none() {
+            if headers.find_by_name(key.as_ref()).next().is_none() {
                 return false;
             }
         }
@@ -104,7 +104,7 @@ pub fn validate_transport_header_require_key_values(
             None => return false,
         };
         'pairs: for pair in pairs {
-            for header in headers.find_by_name(&pair.key) {
+            for header in headers.find_by_name(pair.key.as_ref()) {
                 match header.value_as_str() {
                     Some(value_str) if value_str == pair.value => continue 'pairs,
                     _ => continue,
@@ -133,7 +133,7 @@ pub fn validate_transport_header_deny_keys(
 
     for headers in suv.iter().flatten() {
         for key in keys {
-            if headers.find_by_name(key).next().is_some() {
+            if headers.find_by_name(key.as_ref()).next().is_some() {
                 return false;
             }
         }
@@ -145,12 +145,24 @@ pub fn validate_transport_header_deny_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders};
+    use otel_arrow_dfe_config::transport_headers::{HeaderName, TransportHeader, TransportHeaders};
+
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
+    }
+
+    fn context_names(raw: &[&str]) -> Vec<ContextEntryName> {
+        raw.iter().map(|name| context_name(name)).collect()
+    }
+
+    fn header_name(raw: &str) -> HeaderName {
+        HeaderName::from_config(&context_name(raw))
+    }
 
     fn make_headers(entries: &[(&str, &str)]) -> TransportHeaders {
         let mut headers = TransportHeaders::default();
         for (name, value) in entries {
-            headers.push(TransportHeader::text(*name, *name, value.as_bytes()));
+            headers.push(TransportHeader::text(header_name(name), value.as_bytes()));
         }
         headers
     }
@@ -161,7 +173,7 @@ mod tests {
         let suv = vec![Some(headers)];
         assert!(validate_transport_header_require_keys(
             &suv,
-            &["x-tenant-id".into(), "x-request-id".into()],
+            &context_names(&["x-tenant-id", "x-request-id"]),
         ));
     }
 
@@ -171,7 +183,7 @@ mod tests {
         let suv = vec![Some(headers)];
         assert!(!validate_transport_header_require_keys(
             &suv,
-            &["x-tenant-id".into(), "x-missing".into()],
+            &context_names(&["x-tenant-id", "x-missing"]),
         ));
     }
 
@@ -180,7 +192,7 @@ mod tests {
         let suv: Vec<Option<TransportHeaders>> = vec![None, None];
         assert!(!validate_transport_header_require_keys(
             &suv,
-            &["x-tenant-id".into()],
+            &context_names(&["x-tenant-id"]),
         ));
     }
 
@@ -220,7 +232,7 @@ mod tests {
         let suv = vec![Some(headers)];
         assert!(validate_transport_header_deny_keys(
             &suv,
-            &["x-secret".into()],
+            &context_names(&["x-secret"]),
         ));
     }
 
@@ -230,7 +242,7 @@ mod tests {
         let suv = vec![Some(headers)];
         assert!(!validate_transport_header_deny_keys(
             &suv,
-            &["x-tenant-id".into()],
+            &context_names(&["x-tenant-id"]),
         ));
     }
 
@@ -239,7 +251,7 @@ mod tests {
         let suv: Vec<Option<TransportHeaders>> = vec![None];
         assert!(validate_transport_header_deny_keys(
             &suv,
-            &["x-tenant-id".into()],
+            &context_names(&["x-tenant-id"]),
         ));
     }
 
@@ -258,7 +270,7 @@ mod tests {
         let suv = vec![Some(h1), Some(h2)];
         assert!(!validate_transport_header_require_keys(
             &suv,
-            &["x-tenant-id".into(), "x-request-id".into()],
+            &context_names(&["x-tenant-id", "x-request-id"]),
         ));
     }
 
@@ -268,7 +280,7 @@ mod tests {
         let suv = vec![Some(headers), None];
         assert!(!validate_transport_header_require_keys(
             &suv,
-            &["x-tenant-id".into()],
+            &context_names(&["x-tenant-id"]),
         ));
     }
 
@@ -287,7 +299,7 @@ mod tests {
         let suv: Vec<Option<TransportHeaders>> = vec![];
         assert!(!validate_transport_header_require_keys(
             &suv,
-            &["x-tenant-id".into()],
+            &context_names(&["x-tenant-id"]),
         ));
     }
 
@@ -306,7 +318,7 @@ mod tests {
         let suv = vec![Some(headers), None];
         assert!(validate_transport_header_deny_keys(
             &suv,
-            &["x-secret".into()],
+            &context_names(&["x-secret"]),
         ));
     }
 

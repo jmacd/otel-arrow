@@ -133,12 +133,13 @@ static TRAFFIC_GENERATOR_CONTEXT_DECLARATIONS: ContextDeclarationProvider =
 impl TrafficGeneratorReceiver {
     /// creates a new TrafficGeneratorReceiver
     pub fn new(pipeline_ctx: PipelineContext, config: Config) -> Result<Self, ConfigError> {
-        // Check that compiled context policy contains this node's bindings.
-        pipeline_ctx.compiled_context_policy().node_bindings(
-            pipeline_ctx.pipeline_key(),
-            pipeline_ctx.node_id(),
-            config.context_declarations(),
-        )?;
+        pipeline_ctx
+            .compiled_context_policy()
+            .validate_node_declarations(
+                pipeline_ctx.pipeline_key(),
+                pipeline_ctx.node_id(),
+                config.context_declarations(),
+            )?;
 
         let metrics = pipeline_ctx.register_metrics::<TrafficGeneratorReceiverMetrics>();
         Ok(Self {
@@ -497,16 +498,12 @@ impl TrafficGeneratorReceiver {
 /// random alphabetical string for text headers, or 16 raw random bytes
 /// for binary headers (keys ending in `-bin`).
 ///
-/// # Errors
-///
-/// Returns an error when a configured header is not a valid context entry reference.
-///
 /// Returns `None` when the config map is empty (zero overhead).
 fn build_transport_headers(
     config_headers: &HashMap<ContextEntryName, Option<String>>,
-) -> Result<Option<TransportHeaders>, otel_arrow_dfe_config::error::Error> {
+) -> Option<TransportHeaders> {
     if config_headers.is_empty() {
-        return Ok(None);
+        return None;
     }
     let mut headers = TransportHeaders::with_capacity(config_headers.len());
     for (name, value) in config_headers {
@@ -538,7 +535,7 @@ fn build_transport_headers(
             headers.push(TransportHeader::text(hname, resolved_value));
         }
     }
-    Ok(Some(headers))
+    Some(headers)
 }
 
 /// Waits for a terminal control message after the producer has finished.
@@ -697,15 +694,7 @@ impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
                 source_detail: String::new(),
             })?;
 
-        let transport_headers =
-            build_transport_headers(self.config.transport_headers()).map_err(|error| {
-                Error::ReceiverError {
-                    receiver: effect_handler.receiver_id(),
-                    kind: ReceiverErrorKind::Configuration,
-                    error: error.to_string(),
-                    source_detail: String::new(),
-                }
-            })?;
+        let transport_headers = build_transport_headers(self.config.transport_headers());
 
         let run_len = producer.run_len();
 
@@ -825,6 +814,15 @@ mod tests {
     const MAX_SIGNALS: u64 = 3;
     const MAX_BATCH: usize = 30;
 
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
+    }
+
+    fn traffic_receiver(pipeline_ctx: PipelineContext, config: Config) -> TrafficGeneratorReceiver {
+        TrafficGeneratorReceiver::new(pipeline_ctx, config)
+            .expect("valid traffic generator configuration")
+    }
+
     /// Scenario: Ack/Nack tracking is enabled, one generated batch remains
     /// unresolved when receiver-first shutdown begins, and its Ack arrives later.
     /// Guarantees: DrainIngress keeps the receiver alive until the Ack resolves
@@ -851,7 +849,7 @@ mod tests {
         let pipeline_ctx =
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("traffic_generator_ack_drain"),
             node_config,
             test_runtime.config(),
@@ -1128,7 +1126,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
         // create our receiver
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -1208,7 +1206,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
         // create our receiver
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("fake_receiver"),
             node_config,
             test_runtime.config(),
@@ -1284,7 +1282,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
         // create our receiver
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("fake_receiver"),
             node_config,
             test_runtime.config(),
@@ -1365,7 +1363,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
         // create our receiver
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("fake_receiver_pregenerated"),
             node_config,
             test_runtime.config(),
@@ -1406,7 +1404,7 @@ mod tests {
         let pipeline_ctx =
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("fake_receiver_drain"),
             node_config,
             test_runtime.config(),
@@ -1466,7 +1464,7 @@ mod tests {
         let pipeline_ctx =
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("fake_receiver_hot_drain"),
             node_config,
             test_runtime.config(),
@@ -1526,7 +1524,7 @@ mod tests {
         let pipeline_ctx =
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("fake_receiver_ctrl_sleep"),
             node_config,
             test_runtime.config(),
@@ -1606,7 +1604,7 @@ mod tests {
             .with_data_source(DataSource::Synthetic)
             .with_generation_strategy(GenerationStrategy::Fresh)
             .with_transport_headers(HashMap::from([(
-                "x-tenant-id".to_string(),
+                context_name("x-tenant-id"),
                 Some("acme".to_string()),
             )]));
 
@@ -1619,7 +1617,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("fake_receiver_transport_headers"),
             node_config,
             test_runtime.config(),
@@ -1684,7 +1682,7 @@ mod tests {
         let config = Config::new(traffic_config, registry_path)
             .with_data_source(DataSource::Synthetic)
             .with_generation_strategy(GenerationStrategy::Fresh)
-            .with_transport_headers(HashMap::from([("x-request-id".to_string(), None)]));
+            .with_transport_headers(HashMap::from([(context_name("x-request-id"), None)]));
 
         let node_config = Arc::new(NodeUserConfig::new_receiver_config(
             TRAFFIC_GENERATOR_RECEIVER_URN,
@@ -1695,7 +1693,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("fake_receiver_random_headers"),
             node_config,
             test_runtime.config(),
@@ -1770,7 +1768,7 @@ mod tests {
         let config = Config::new(traffic_config, registry_path)
             .with_data_source(DataSource::Synthetic)
             .with_generation_strategy(GenerationStrategy::Fresh)
-            .with_transport_headers(HashMap::from([("x-trace-bin".to_string(), None)]));
+            .with_transport_headers(HashMap::from([(context_name("x-trace-bin"), None)]));
 
         let node_config = Arc::new(NodeUserConfig::new_receiver_config(
             TRAFFIC_GENERATOR_RECEIVER_URN,
@@ -1781,7 +1779,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("fake_receiver_binary_headers"),
             node_config,
             test_runtime.config(),
@@ -1861,7 +1859,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::local(
-            TrafficGeneratorReceiver::new(pipeline_ctx, config),
+            traffic_receiver(pipeline_ctx, config),
             test_node("fake_receiver_no_headers"),
             node_config,
             test_runtime.config(),
@@ -1927,11 +1925,10 @@ mod tests {
 
         let config: Config = serde_json::from_value(config).unwrap();
         let headers = build_transport_headers(config.transport_headers())
-            .unwrap()
             .expect("configured headers produce transport headers");
         let mut runtime_names = headers
             .iter()
-            .map(|header| header.name.as_str())
+            .map(|header| header.name.normalized().as_str())
             .collect::<Vec<_>>();
         runtime_names.sort_unstable();
         assert_eq!(runtime_names, names);
@@ -1942,23 +1939,22 @@ mod tests {
     #[test]
     fn traffic_gen_headers_normalize_logical_names() {
         let headers = build_transport_headers(&HashMap::from([
-            ("X-Request-Id".to_string(), Some("request".to_string())),
-            ("X-Trace-Bin".to_string(), Some("trace".to_string())),
+            (context_name("X-Request-Id"), Some("request".to_string())),
+            (context_name("X-Trace-Bin"), Some("trace".to_string())),
         ]))
-        .unwrap()
         .expect("configured headers produce transport headers");
         let request_header = headers
             .iter()
-            .find(|header| header.wire_name == "X-Request-Id")
+            .find(|header| header.name.normalized().as_str() == "x-request-id")
             .expect("request header is present");
         let trace_header = headers
             .iter()
-            .find(|header| header.wire_name == "X-Trace-Bin")
+            .find(|header| header.name.normalized().as_str() == "x-trace-bin")
             .expect("trace header is present");
 
-        assert_eq!(request_header.name, "x-request-id");
+        assert_eq!(request_header.name.normalized().as_str(), "x-request-id");
         assert_eq!(request_header.value_kind, ValueKind::Text);
-        assert_eq!(trace_header.name, "x-trace-bin");
+        assert_eq!(trace_header.name.normalized().as_str(), "x-trace-bin");
         assert_eq!(trace_header.value_kind, ValueKind::Binary);
     }
 

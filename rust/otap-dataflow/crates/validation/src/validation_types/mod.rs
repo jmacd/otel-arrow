@@ -155,7 +155,7 @@ mod tests {
     use super::*;
     use crate::validation_types::attributes::{AnyValue, KeyValue};
     use crate::validation_types::transport_headers::TransportHeaderKeyValue;
-    use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders};
+    use otel_arrow_dfe_config::transport_headers::{HeaderName, TransportHeader, TransportHeaders};
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
         AnyValue as ProtoAny, KeyValue as ProtoKV, any_value::Value as ProtoVal,
     };
@@ -186,6 +186,10 @@ mod tests {
 
     fn no_headers(count: usize) -> Vec<Option<TransportHeaders>> {
         vec![None; count]
+    }
+
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
     }
 
     #[test]
@@ -428,7 +432,7 @@ mod tests {
     #[test]
     fn transport_header_require_key_serialization_check() {
         let instruction = ValidationInstructions::TransportHeaderRequireKey {
-            keys: vec!["x-tenant-id".into()],
+            keys: vec![context_name("x-tenant-id")],
         };
         let yaml = serde_yaml::to_string(&instruction).expect("serialize");
         let back: ValidationInstructions = serde_yaml::from_str(&yaml).expect("deserialize");
@@ -437,7 +441,11 @@ mod tests {
         // Validate that both the original and round-tripped instruction
         // produce identical results when executed.
         let mut headers = TransportHeaders::default();
-        headers.push(TransportHeader::text("x-tenant-id", "x-tenant-id", b"acme"));
+        let name = context_name("x-tenant-id");
+        headers.push(TransportHeader::text(
+            HeaderName::from_config(&name),
+            b"acme",
+        ));
         let transport = vec![Some(headers)];
         let control: Vec<OtlpProtoMessage> = vec![];
         let suv_msgs: Vec<OtlpProtoMessage> = vec![];
@@ -462,7 +470,7 @@ mod tests {
     #[test]
     fn transport_header_deny_serialization_check() {
         let instruction = ValidationInstructions::TransportHeaderDeny {
-            keys: vec!["x-secret".into()],
+            keys: vec![context_name("x-secret")],
         };
         let yaml = serde_yaml::to_string(&instruction).expect("serialize");
         let back: ValidationInstructions = serde_yaml::from_str(&yaml).expect("deserialize");

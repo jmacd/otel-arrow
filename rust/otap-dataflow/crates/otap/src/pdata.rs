@@ -46,7 +46,7 @@ use otel_arrow_dfe_pdata::OtapPayload;
 ///   real socket (OTLP gRPC/HTTP, OTAP gRPC, syslog/CEF) and left `None` by
 ///   sourceless receivers (file-based, journald). Preserved across transport
 ///   boundaries.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Context {
     stack: Vec<Frame>,
     /// Transport headers captured from inbound protocol metadata.
@@ -1150,8 +1150,9 @@ mod test {
     use crate::testing::{
         TestCallData, create_empty_test_pdata, create_test_pdata, next_ack, next_nack,
     };
-    use crate::transport_headers::TransportHeader;
     use otel_arrow_dfe_channel::mpsc::Channel as LocalChannel;
+    use otel_arrow_dfe_config::ContextEntryName;
+    use otel_arrow_dfe_config::transport_headers::{HeaderName, TransportHeader};
     use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
     use otel_arrow_dfe_engine::control::{
         PipelineCompletionMsg, pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
@@ -2403,7 +2404,11 @@ mod test {
     fn clone_detached_keeps_request_metadata_and_drops_routing_state() {
         let addr: SocketAddr = "10.0.0.1:5005".parse().unwrap();
         let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader::text("tenant", "x-tenant", "acme"));
+        let name = ContextEntryName::try_from("tenant").expect("valid test context entry name");
+        headers.push(TransportHeader::text(
+            HeaderName::from_pair(name, "x-tenant"),
+            "acme",
+        ));
 
         let (test_data, pdata) = create_test();
         let mut pdata = pdata

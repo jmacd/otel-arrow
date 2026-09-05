@@ -6,6 +6,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use otel_arrow_dfe_config::ContextEntryName;
 use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_config::transport_headers_policy::{
     CaptureDefaults, CaptureRule, HeaderCapturePolicy, HeaderPropagationPolicy, PropagationDefault,
@@ -14,6 +15,10 @@ use otel_arrow_dfe_config::transport_headers_policy::{
 use tonic::metadata::{KeyAndValueRef, MetadataKey, MetadataMap, MetadataValue};
 
 const HEADER_COUNTS: [usize; 4] = [1, 4, 16, 32];
+
+fn context_name(raw: impl AsRef<str>) -> ContextEntryName {
+    ContextEntryName::try_from(raw.as_ref()).expect("valid benchmark context entry name")
+}
 
 fn main_benchmarks(c: &mut Criterion) {
     bench_receive(c);
@@ -64,8 +69,8 @@ fn bench_end_to_end(c: &mut Criterion) {
 fn capture_policy(header_count: usize) -> HeaderCapturePolicy {
     let rules = (0..header_count)
         .map(|index| CaptureRule {
-            match_names: vec![format!("x-context-{index}")],
-            store_as: Some(format!("context_{index}")),
+            match_names: vec![context_name(format!("x-context-{index}"))],
+            store_as: Some(context_name(format!("context_{index}"))),
             sensitive: false,
             value_kind: None,
         })
@@ -128,7 +133,7 @@ fn receive_metadata(policy: &HeaderCapturePolicy, metadata: &MetadataMap) -> Tra
 fn propagate_metadata(context: &TransportHeaders, policy: &HeaderPropagationPolicy) -> MetadataMap {
     let mut metadata = MetadataMap::new();
     for header in policy.propagate(context) {
-        append_text_metadata(&mut metadata, header.header_name, header.value);
+        append_text_metadata(&mut metadata, &header.header_name, header.value);
     }
     metadata
 }

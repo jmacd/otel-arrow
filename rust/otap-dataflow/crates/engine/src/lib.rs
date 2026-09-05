@@ -2661,15 +2661,25 @@ fn stable_hash64(value: &str) -> u64 {
 #[cfg(test)]
 mod test {
     use super::*;
+    use otel_arrow_dfe_config::ContextEntryName;
     use otel_arrow_dfe_config::policy::{
         RateLimitAggregation, RateLimitEnforcement, RateLimitPressure, RateLimitUnit,
         TokenBucketPolicy,
     };
+    use otel_arrow_dfe_config::transport_headers::{HeaderName, TransportHeader, TransportHeaders};
     use otel_arrow_dfe_config::transport_headers_policy::{
         CaptureDefaults, CaptureRule, HeaderCapturePolicy, HeaderPropagationPolicy,
         PropagationAction, PropagationDefault, PropagationSelector, PropagationSelectorType,
     };
     use std::time::Duration;
+
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
+    }
+
+    fn header_name(normal: &str, wire_name: &str) -> HeaderName {
+        HeaderName::from_pair(context_name(normal), wire_name)
+    }
 
     /// Scenario: runtime metric levels resolve the optional payload measurements.
     /// Guarantees: detailed metrics enable both item counts and size while normal metrics enable neither by default.
@@ -2788,7 +2798,7 @@ mod test {
         HeaderCapturePolicy::new(
             CaptureDefaults::default(),
             vec![CaptureRule {
-                match_names: vec![name.to_owned()],
+                match_names: vec![context_name(name)],
                 store_as: None,
                 sensitive: false,
                 value_kind: None,
@@ -2815,7 +2825,7 @@ mod test {
         // Verify the node-level policy was used by checking that a
         // "x-node-header" is captured while "x-pipeline-header" is not.
         let policy = policy.unwrap();
-        let mut captured = otel_arrow_dfe_config::transport_headers::TransportHeaders::new();
+        let mut captured = TransportHeaders::new();
         let _ = policy.capture_from_pairs(
             [("x-node-header", b"val" as &[u8])].into_iter(),
             &mut captured,
@@ -2844,7 +2854,7 @@ mod test {
         assert!(policy.is_some(), "should fall back to pipeline policy");
 
         let policy = policy.unwrap();
-        let mut captured = otel_arrow_dfe_config::transport_headers::TransportHeaders::new();
+        let mut captured = TransportHeaders::new();
         let _ = policy.capture_from_pairs(
             [("x-pipeline-header", b"val" as &[u8])].into_iter(),
             &mut captured,
@@ -2895,12 +2905,11 @@ mod test {
 
         // Verify node-level policy (Propagate) was used, not pipeline (Drop).
         let policy = policy.unwrap();
-        let mut headers = otel_arrow_dfe_config::transport_headers::TransportHeaders::new();
-        headers.push(
-            otel_arrow_dfe_config::transport_headers::TransportHeader::text(
-                "x-test", "x-test", b"val",
-            ),
-        );
+        let mut headers = TransportHeaders::new();
+        headers.push(TransportHeader::text(
+            header_name("x-test", "x-test"),
+            b"val",
+        ));
         let propagated: Vec<_> = policy.propagate(&headers).collect();
         assert_eq!(propagated.len(), 1, "node policy should propagate");
     }
@@ -2921,12 +2930,11 @@ mod test {
         assert!(policy.is_some(), "should fall back to pipeline policy");
 
         let policy = policy.unwrap();
-        let mut headers = otel_arrow_dfe_config::transport_headers::TransportHeaders::new();
-        headers.push(
-            otel_arrow_dfe_config::transport_headers::TransportHeader::text(
-                "x-test", "x-test", b"val",
-            ),
-        );
+        let mut headers = TransportHeaders::new();
+        headers.push(TransportHeader::text(
+            HeaderName::from_wire("x-test").unwrap(),
+            b"val",
+        ));
         let propagated: Vec<_> = policy.propagate(&headers).collect();
         assert_eq!(propagated.len(), 1, "pipeline policy should propagate");
     }

@@ -107,9 +107,6 @@ impl HeaderCapturePolicy {
     /// Returns `None` when all matching headers were captured successfully,
     /// or `Some(CaptureStats)` when one or more matching headers had to be
     /// skipped due to policy limits.
-    ///
-    /// TODO(#3917): Delete this legacy path when receivers capture directly
-    /// into PdataContextBytes.
     pub fn capture_from_pairs<'a>(
         &self,
         pairs: impl Iterator<Item = (&'a str, &'a [u8])>,
@@ -147,9 +144,16 @@ impl HeaderCapturePolicy {
                 }
 
                 let name = if let Some(store_as) = matched_rule.store_as.as_ref() {
-                    HeaderName::from_config(store_as)
+                    HeaderName::from_pair(store_as.clone(), wire_name)
                 } else {
-                    HeaderName::from_wire(wire_name)
+                    match HeaderName::from_wire(wire_name) {
+                        Some(name) => name,
+                        None => {
+                            // e.g., empty wire-name TODO new metric?
+                            skipped_name_too_long += 1;
+                            continue;
+                        }
+                    }
                 };
 
                 let value_kind = match matched_rule.value_kind {
@@ -329,7 +333,7 @@ impl HeaderPropagationPolicy {
                 return None;
             }
             let header_name = match name_strategy {
-                NameStrategy::StoredName => header.name.normalized().clone().inner(),
+                NameStrategy::StoredName => header.name.normalized().clone().into_inner(),
                 NameStrategy::Preserve => header.name.original(),
             };
             Some(PropagatedHeader {
@@ -349,7 +353,12 @@ impl HeaderPropagationPolicy {
     fn resolve_action_for_name(&self, name: &HeaderName) -> (PropagationAction, NameStrategy) {
         // Check overrides first.
         for ov in &self.overrides {
-            if ov.match_rule.stored_names.iter().any(|s| name.normal_eq(s)) {
+            if ov
+                .match_rule
+                .stored_names
+                .iter()
+                .any(|stored| name.normalized() == stored)
+            {
                 let name_strategy = ov.name.unwrap_or(self.default.name);
                 return (ov.action, name_strategy);
             }
@@ -410,6 +419,7 @@ pub struct PropagationSelector {
     pub selector_type: PropagationSelectorType,
 
     /// List of header names to propagate. Required when `type` is `named`.
+    /// Note: can be Vec<_>.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub named: Option<Vec<ContextEntryName>>,
 }
@@ -506,6 +516,10 @@ pub struct PropagationMatch {
 mod tests {
     use super::*;
 
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
+    }
+
     #[test]
     fn default_capture_policy_captures_nothing() {
         let policy = HeaderCapturePolicy::default();
@@ -548,9 +562,12 @@ headers:
         assert_eq!(policy.defaults.max_entries, 16);
         assert_eq!(policy.defaults.on_error, ErrorAction::Drop);
         assert_eq!(policy.headers.len(), 3);
-        assert_eq!(policy.headers[0].store_as.as_deref(), Some("tenant_id"));
+        assert_eq!(policy.headers[0].store_as, Some(context_name("tenant_id")),);
         assert!(policy.headers[1].sensitive);
-        assert_eq!(policy.headers[2].match_names, vec!["x-request-id"]);
+        assert_eq!(
+            policy.headers[2].match_names,
+            vec![context_name("x-request-id")]
+        );
 
         // roundtrip
         let json = serde_json::to_string(&policy).expect("serialize");
@@ -620,7 +637,12 @@ named:
         assert_eq!(selector.selector_type, PropagationSelectorType::Named);
         assert_eq!(
             selector.named,
-            Some(vec!["tenant_id".to_string(), "request_id".to_string()])
+            Some(
+                ["tenant_id", "request_id"]
+                    .iter()
+                    .map(|x| context_name(x))
+                    .collect()
+            )
         );
     }
 
@@ -646,7 +668,7 @@ named:
     fn selector_validate_named_valid() {
         let selector = PropagationSelector {
             selector_type: PropagationSelectorType::Named,
-            named: Some(vec!["tenant_id".to_string()]),
+            named: Some(vec![context_name("tenant_id")]),
         };
         assert!(selector.validate().is_ok());
     }
@@ -675,7 +697,7 @@ named:
     fn selector_validate_all_captured_with_named_field() {
         let selector = PropagationSelector {
             selector_type: PropagationSelectorType::AllCaptured,
-            named: Some(vec!["tenant_id".to_string()]),
+            named: Some(vec![context_name("tenant_id")]),
         };
         let err = selector.validate().unwrap_err();
         assert!(err.contains("'named' must not be set"));
@@ -685,7 +707,7 @@ named:
     fn selector_validate_none_with_named_field() {
         let selector = PropagationSelector {
             selector_type: PropagationSelectorType::None,
-            named: Some(vec!["tenant_id".to_string()]),
+            named: Some(vec![context_name("tenant_id")]),
         };
         let err = selector.validate().unwrap_err();
         assert!(err.contains("'named' must not be set"));

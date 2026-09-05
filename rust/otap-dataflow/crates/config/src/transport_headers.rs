@@ -41,7 +41,7 @@ impl fmt::Display for ValueKind {
 pub type OriginalHeaderName = Cow<'static, str>;
 
 /// A header name, either in original or normalized form.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeaderName {
     /// Prepared form from a config entry, partition name. Only
     /// the normalized form is stored.
@@ -65,12 +65,13 @@ impl HeaderName {
 
     /// Header from wire name where original is requested.
     #[must_use]
-    pub fn from_wire(wire_name: &str) -> Self {
-        let normal = ContextEntryName::normalize_from(wire_name);
+    pub fn from_wire(wire_name: &str) -> Option<Self> {
+        Some(Self::from_pair(wire_name.try_into().ok()?, wire_name))
+    }
 
-        // Note that here, if we know that there are no consumers that
-        // care for the original, we can skip to the Prepared
-        // case. Otherwise, only store two copies when they differ.
+    /// Header from configuration name with wire_name.
+    #[must_use]
+    pub fn from_pair(normal: ContextEntryName, wire_name: &str) -> Self {
         if normal.as_str().eq(wire_name) {
             HeaderName::Prepared(normal)
         } else {
@@ -79,12 +80,6 @@ impl HeaderName {
                 original: wire_name.to_owned().into(),
             }
         }
-    }
-
-    /// Same as str::eq_ignore_ascii_case
-    #[must_use]
-    pub fn normal_eq(&self, other: &ContextEntryName) -> bool {
-        other.eq(self.normalized())
     }
 
     /// Get the normalized form.
@@ -100,7 +95,7 @@ impl HeaderName {
     #[must_use]
     pub fn original(&self) -> OriginalHeaderName {
         match self {
-            Self::Prepared(name) => name.clone().inner(),
+            Self::Prepared(name) => name.clone().into_inner(),
             Self::Preserved { original, .. } => original.clone(),
         }
     }
@@ -111,7 +106,7 @@ impl HeaderName {
 /// Each entry records both the normalized logical name (used for policy
 /// matching) and the original wire name observed on ingress (used for
 /// lossless re-emission on egress).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportHeader {
     /// Normalized or original name.
     pub name: HeaderName,
@@ -161,7 +156,7 @@ impl TransportHeader {
 /// `TransportHeaders` (e.g. when cloning a pipeline `Context`) is a
 /// cheap reference-count bump instead of a deep copy.  Mutation
 /// methods (`push`, `clear`) use copy-on-write via `Arc::make_mut`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransportHeaders {
     headers: Arc<Vec<TransportHeader>>,
 }
@@ -213,11 +208,10 @@ impl TransportHeaders {
     /// Find all headers matching a normalized name (case-sensitive
     /// match on the logical name). Note this is NOT an efficient
     /// lookup, used for validation.
-    pub fn find_by_name<'a>(
-        &'a self,
-        name: &'a ContextEntryName,
-    ) -> impl Iterator<Item = &'a TransportHeader> {
-        self.headers.iter().filter(move |h| h.name.normal_eq(name))
+    pub fn find_by_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a TransportHeader> {
+        self.headers
+            .iter()
+            .filter(move |h| h.name.normalized().as_str() == name)
     }
 
     /// Returns a slice of all headers.
@@ -236,40 +230,59 @@ mod tests {
         PropagationSelector, PropagationSelectorType,
     };
 
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
+    }
+
+    fn header_name(normal: &str, wire_name: &str) -> HeaderName {
+        HeaderName::from_pair(context_name(normal), wire_name)
+    }
+
     #[test]
     fn find_by_name_returns_matching_headers() {
         let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader::text("tenant", "X-Tenant", b"a".to_vec()));
         headers.push(TransportHeader::text(
-            "request-id",
-            "X-Request-Id",
+            header_name("tenant", "X-Tenant"),
+            b"a".to_vec(),
+        ));
+        headers.push(TransportHeader::text(
+            header_name("request-id", "X-Request-Id"),
             b"b".to_vec(),
         ));
-        headers.push(TransportHeader::text("tenant", "X-Tenant", b"c".to_vec()));
+        headers.push(TransportHeader::text(
+            header_name("tenant", "X-Tenant"),
+            b"c".to_vec(),
+        ));
 
         let tenants: Vec<_> = headers.find_by_name("tenant").collect();
         assert_eq!(tenants.len(), 2);
-        assert_eq!(tenants[0].value, b"a");
-        assert_eq!(tenants[1].value, b"c");
+        assert_eq!(&*tenants[0].value, b"a");
+        assert_eq!(&*tenants[1].value, b"c");
     }
 
     #[test]
     fn duplicate_names_preserved() {
         let mut headers = TransportHeaders::new();
-        headers.push(TransportHeader::text("key", "Key", b"val1".to_vec()));
-        headers.push(TransportHeader::text("key", "Key", b"val2".to_vec()));
+        headers.push(TransportHeader::text(
+            header_name("key", "Key"),
+            b"val1".to_vec(),
+        ));
+        headers.push(TransportHeader::text(
+            header_name("key", "Key"),
+            b"val2".to_vec(),
+        ));
         assert_eq!(headers.len(), 2);
     }
 
     #[test]
     fn value_as_str_for_text() {
-        let h = TransportHeader::text("name", "Name", b"hello".to_vec());
+        let h = TransportHeader::text(header_name("name", "Name"), b"hello".to_vec());
         assert_eq!(h.value_as_str(), Some("hello"));
     }
 
     #[test]
     fn value_as_str_for_invalid_utf8() {
-        let h = TransportHeader::binary("name-bin", "name-bin", vec![0xFF, 0xFE]);
+        let h = TransportHeader::binary(header_name("name-bin", "name-bin"), vec![0xFF, 0xFE]);
         assert_eq!(h.value_as_str(), None);
     }
 
@@ -284,8 +297,8 @@ mod tests {
 
     fn rule(names: &[&str], store_as: Option<&str>) -> CaptureRule {
         CaptureRule {
-            match_names: names.iter().map(|s| s.to_string()).collect(),
-            store_as: store_as.map(|s| s.to_string()),
+            match_names: names.iter().map(|n| context_name(n)).collect(),
+            store_as: store_as.map(context_name),
             sensitive: false,
             value_kind: None,
         }
@@ -317,10 +330,10 @@ mod tests {
         let stats = policy.capture_from_pairs(pairs.into_iter(), &mut result);
         assert!(stats.is_none());
         assert_eq!(result.len(), 2);
-        assert_eq!(result.as_slice()[0].name, "tenant_id");
-        assert_eq!(result.as_slice()[0].wire_name, "X-Tenant-Id");
-        assert_eq!(result.as_slice()[0].value, b"t-123");
-        assert_eq!(result.as_slice()[1].name, "x-request-id");
+        assert_eq!(result.as_slice()[0].name.normalized(), "tenant_id");
+        assert_eq!(result.as_slice()[0].name.original(), "X-Tenant-Id");
+        assert_eq!(&*result.as_slice()[0].value, b"t-123");
+        assert_eq!(result.as_slice()[1].name.normalized(), "x-request-id");
     }
 
     #[test]
@@ -332,8 +345,8 @@ mod tests {
         let stats = policy.capture_from_pairs(pairs.into_iter(), &mut result);
         assert!(stats.is_none());
         assert_eq!(result.len(), 1);
-        assert_eq!(result.as_slice()[0].name, "x-tenant-id");
-        assert_eq!(result.as_slice()[0].wire_name, "X-TENANT-ID");
+        assert_eq!(result.as_slice()[0].name.normalized(), "x-tenant-id");
+        assert_eq!(result.as_slice()[0].name.original(), "X-TENANT-ID");
     }
 
     #[test]
@@ -360,7 +373,7 @@ mod tests {
         let mut result = TransportHeaders::new();
         let stats = policy.capture_from_pairs(pairs.into_iter(), &mut result);
         assert_eq!(result.len(), 1);
-        assert_eq!(result.as_slice()[0].value, b"ok");
+        assert_eq!(&*result.as_slice()[0].value, b"ok");
         let stats = stats.expect("should report skipped headers");
         assert_eq!(stats.skipped_value_too_long, 1);
         assert_eq!(stats.skipped_max_entries, 0);
@@ -395,13 +408,11 @@ mod tests {
         );
         let mut headers = TransportHeaders::new();
         headers.push(TransportHeader::text(
-            "tenant_id",
-            "X-Tenant-Id",
+            header_name("tenant_id", "X-Tenant-Id"),
             b"t-1".to_vec(),
         ));
         headers.push(TransportHeader::text(
-            "request_id",
-            "X-Request-Id",
+            header_name("request_id", "X-Request-Id"),
             b"r-1".to_vec(),
         ));
 
@@ -423,7 +434,7 @@ mod tests {
             },
             vec![PropagationOverride {
                 match_rule: PropagationMatch {
-                    stored_names: vec!["authorization".to_string()],
+                    stored_names: vec![context_name("authorization")],
                 },
                 action: PropagationAction::Drop,
                 name: None,
@@ -433,13 +444,11 @@ mod tests {
 
         let mut headers = TransportHeaders::new();
         headers.push(TransportHeader::text(
-            "tenant_id",
-            "X-Tenant-Id",
+            header_name("tenant_id", "X-Tenant-Id"),
             b"t-1".to_vec(),
         ));
         headers.push(TransportHeader::text(
-            "authorization",
-            "Authorization",
+            header_name("authorization", "Authorization"),
             b"Bearer secret".to_vec(),
         ));
 
@@ -460,7 +469,7 @@ mod tests {
             },
             overrides: vec![PropagationOverride {
                 match_rule: PropagationMatch {
-                    stored_names: vec!["tenant_id".to_string()],
+                    stored_names: vec![context_name("tenant_id")],
                 },
                 action: PropagationAction::Propagate,
                 name: None,
@@ -470,13 +479,11 @@ mod tests {
 
         let mut headers = TransportHeaders::new();
         headers.push(TransportHeader::text(
-            "tenant_id",
-            "X-Tenant-Id",
+            header_name("tenant_id", "X-Tenant-Id"),
             b"t-1".to_vec(),
         ));
         headers.push(TransportHeader::text(
-            "request_id",
-            "X-Request-Id",
+            header_name("request_id", "X-Request-Id"),
             b"r-1".to_vec(),
         ));
 
@@ -501,8 +508,7 @@ mod tests {
 
         let mut headers = TransportHeaders::new();
         headers.push(TransportHeader::text(
-            "tenant_id",
-            "X-Tenant-Id",
+            header_name("tenant_id", "X-Tenant-Id"),
             b"t-1".to_vec(),
         ));
 
@@ -517,7 +523,7 @@ mod tests {
             default: PropagationDefault {
                 selector: PropagationSelector {
                     selector_type: PropagationSelectorType::Named,
-                    named: Some(vec!["tenant_id".to_string()]),
+                    named: Some(vec![context_name("tenant_id")]),
                 },
                 ..PropagationDefault::default()
             },
@@ -526,13 +532,11 @@ mod tests {
 
         let mut headers = TransportHeaders::new();
         headers.push(TransportHeader::text(
-            "tenant_id",
-            "X-Tenant-Id",
+            header_name("tenant_id", "X-Tenant-Id"),
             b"t-1".to_vec(),
         ));
         headers.push(TransportHeader::text(
-            "request_id",
-            "X-Request-Id",
+            header_name("request_id", "X-Request-Id"),
             b"r-1".to_vec(),
         ));
 

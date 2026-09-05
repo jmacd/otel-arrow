@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-use otel_arrow_dfe_config::context::ContextEntryName;
+use otel_arrow_dfe_config::ContextEntryName;
 use weaver_common::result::WResult;
 use weaver_common::vdir::VirtualDirectoryPath;
 use weaver_forge::registry::ResolvedRegistry;
@@ -548,7 +548,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{Config, DataSource, GenerationStrategy, build_rotation_table};
+    use otel_arrow_dfe_config::ContextEntryName;
     use serde_json::json;
+
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
+    }
 
     #[test]
     fn parse_config_defaults_enable_ack_nack_to_false() {
@@ -775,12 +780,12 @@ mod tests {
         let headers = cfg.transport_headers();
         assert_eq!(headers.len(), 2);
         assert_eq!(
-            headers.get("x-tenant-id"),
+            headers.get(&context_name("x-tenant-id")),
             Some(&Some("acme".to_string())),
             "fixed value should be preserved"
         );
         assert_eq!(
-            headers.get("x-request-id"),
+            headers.get(&context_name("x-request-id")),
             Some(&None),
             "null value should parse as None"
         );

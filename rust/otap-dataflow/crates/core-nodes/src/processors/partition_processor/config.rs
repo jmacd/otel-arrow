@@ -98,6 +98,10 @@ const fn default_outbound_request_limit() -> NonZeroUsize {
 mod test {
     use super::*;
 
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
+    }
+
     #[test]
     fn test_deserialize_defaults() {
         let config: Config = serde_json::from_value(serde_json::json!({
@@ -110,7 +114,7 @@ mod test {
             config,
             Config {
                 partition_by: PartitionByConfig::OplExpression("name".to_string()),
-                partition_header_name: "part.name".into(),
+                partition_header_name: context_name("part.name"),
                 header_serialization_strategy: PartitionValueSerializeStrategy::ToBytesLossy {
                     text_as_binary_header: false,
                 },

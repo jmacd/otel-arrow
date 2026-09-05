@@ -141,14 +141,10 @@ impl ConfigNodeContextDeclaration for ValidationExporterConfig {
         for instruction in &self.validations {
             match instruction {
                 ValidationInstructions::TransportHeaderRequireKey { keys } => {
-                    for key in keys {
-                        let _ = require_key_names.insert(key.clone());
-                    }
+                    require_key_names.extend(keys.iter().cloned());
                 }
                 ValidationInstructions::TransportHeaderRequireKeyValue { pairs } => {
-                    for pair in pairs {
-                        let _ = require_key_value_names.insert(pair.key.clone());
-                    }
+                    require_key_value_names.extend(pairs.iter().map(|pair| pair.key.clone()));
                 }
                 ValidationInstructions::TransportHeaderDeny { keys } => {
                     deny_names.extend(keys.iter().cloned());
@@ -164,11 +160,12 @@ impl ConfigNodeContextDeclaration for ValidationExporterConfig {
             }
         }
 
-        let mut declarations = Vec::new();
-        if !require_key_names.is_empty() {
-            declarations.push(ContextDeclaration::Consumes {
+        [require_key_names, require_key_value_names, deny_names]
+            .into_iter()
+            .filter(|names| !names.is_empty())
+            .map(|names| ContextDeclaration::Consumes {
                 selector: ContextConsumerSelector::Entries {
-                    entries: require_key_names
+                    entries: names
                         .into_iter()
                         .map(|name| ContextEntrySelector {
                             name,
@@ -176,36 +173,8 @@ impl ConfigNodeContextDeclaration for ValidationExporterConfig {
                         })
                         .collect(),
                 },
-            });
-        }
-        if !require_key_value_names.is_empty() {
-            declarations.push(ContextDeclaration::Consumes {
-                selector: ContextConsumerSelector::Entries {
-                    entries: require_key_value_names
-                        .into_iter()
-                        .map(|name| ContextEntrySelector {
-                            name,
-                            read: ContextEntrySelectorForm::Value,
-                        })
-                        .collect(),
-                },
-            });
-        }
-        if !deny_names.is_empty() {
-            declarations.push(ContextDeclaration::Consumes {
-                selector: ContextConsumerSelector::Entries {
-                    entries: deny_names
-                        .into_iter()
-                        .map(|name| ContextEntrySelector {
-                            name,
-                            read: ContextEntrySelectorForm::Value,
-                        })
-                        .collect(),
-                },
-            });
-        }
-
-        declarations.into_iter().collect()
+            })
+            .collect()
     }
 }
 
@@ -344,7 +313,32 @@ impl Exporter<OtapPdata> for ValidationExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otel_arrow_dfe_engine::context_declaration::{ContextConsumerSelector, ContextDeclaration};
+    use otel_arrow_dfe_config::ContextEntryName;
+    use otel_arrow_dfe_engine::context_declaration::{
+        ContextConsumerSelector, ContextDeclaration, ContextEntrySelector,
+    };
+
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
+    }
+
+    fn entries(names: &[&str]) -> Box<[ContextEntrySelector]> {
+        names
+            .iter()
+            .map(|name| ContextEntrySelector {
+                name: context_name(name),
+                read: Default::default(),
+            })
+            .collect()
+    }
+
+    fn consumes(names: &[&str]) -> ContextDeclaration {
+        ContextDeclaration::Consumes {
+            selector: ContextConsumerSelector::Entries {
+                entries: entries(names),
+            },
+        }
+    }
 
     /// Scenario: Validation config requires context keys and key-values.
     /// Guarantees: each context-reading validation has a sorted, deduplicated binding.
@@ -369,30 +363,15 @@ mod tests {
         });
 
         let decls = (VALIDATION_EXPORTER_CONTEXT_DECLARATIONS.declarations)(&config).unwrap();
-        assert_eq!(decls.len(), 3);
         assert_eq!(
-            decls[0],
-            ContextDeclaration::Consumes {
-                selector: ContextConsumerSelector::Entries {
-                    entries: vec!["x-request-id".into(), "x-tenant-id".into()].into_boxed_slice(),
-                },
-            }
-        );
-        assert_eq!(
-            decls[1],
-            ContextDeclaration::Consumes {
-                selector: ContextConsumerSelector::Entries {
-                    entries: vec!["x-tenant-id".into()].into_boxed_slice(),
-                },
-            }
-        );
-        assert_eq!(
-            decls[2],
-            ContextDeclaration::Consumes {
-                selector: ContextConsumerSelector::Entries {
-                    entries: vec!["x-secret".into()].into_boxed_slice(),
-                },
-            }
+            decls,
+            [
+                consumes(&["x-request-id", "x-tenant-id"]),
+                consumes(&["x-tenant-id"]),
+                consumes(&["x-secret"]),
+            ]
+            .into_iter()
+            .collect()
         );
     }
 
@@ -412,11 +391,7 @@ mod tests {
 
         assert_eq!(
             (VALIDATION_EXPORTER_CONTEXT_DECLARATIONS.declarations)(&config).unwrap(),
-            vec![ContextDeclaration::Consumes {
-                selector: ContextConsumerSelector::Entries {
-                    entries: vec!["x-secret".into()].into_boxed_slice(),
-                },
-            }]
+            [consumes(&["x-secret"])].into_iter().collect()
         );
     }
 

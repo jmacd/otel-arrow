@@ -517,7 +517,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ContextEntryName;
     use std::collections::BTreeSet;
+
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
+    }
 
     #[test]
     fn node_user_config_minimal_valid() {
@@ -835,7 +840,7 @@ capabilities:
             PropagationDefault {
                 selector: PropagationSelector {
                     selector_type: PropagationSelectorType::Named,
-                    named: Some(vec!["tenant_id".to_string()]),
+                    named: Some(vec![context_name("tenant_id")]),
                 },
                 ..Default::default()
             },

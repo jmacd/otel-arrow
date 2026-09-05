@@ -1198,10 +1198,7 @@ mod tests {
             HashMap::new(),
         );
 
-        assert!(Arc::ptr_eq(
-            node.compiled_context_policy().expect("context policy"),
-            &policy
-        ));
+        assert!(Arc::ptr_eq(node.compiled_context_policy(), &policy));
     }
 
     fn pipeline_ctx_with_custom_attrs(

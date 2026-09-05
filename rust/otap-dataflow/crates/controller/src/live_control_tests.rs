@@ -4,13 +4,14 @@
 use super::*;
 use async_trait::async_trait;
 use linkme::distributed_slice;
-use otel_arrow_dfe_config::ContextEntryRef;
+use otel_arrow_dfe_config::ContextEntryName;
 use otel_arrow_dfe_config::engine::ResolvedPipelineRole;
 use otel_arrow_dfe_config::observed_state::ObservedStateSettings;
 use otel_arrow_dfe_config::settings::telemetry::logs::LogLevel;
 use otel_arrow_dfe_engine::config::{ExporterConfig, ProcessorConfig, ReceiverConfig};
 use otel_arrow_dfe_engine::context_declaration::{
-    ContextDeclaration, ContextDeclarationConfig, ContextDeclarationProvider,
+    ConfigNodeContextDeclaration, ContextDeclaration, ContextDeclarationProvider,
+    NodeContextDeclarations,
 };
 use otel_arrow_dfe_engine::control::{
     NodeControlMsg, RuntimeControlMsg, RuntimeCtrlMsgReceiver, runtime_ctrl_msg_channel,
@@ -72,17 +73,16 @@ static CONTEXT_POLICY_TEST_CAPTURE: Mutex<Option<std::sync::Weak<CompiledContext
 
 #[derive(Deserialize)]
 struct ContextPolicyTestConfig {
-    produces: ContextEntryRef,
+    produces: ContextEntryName,
 }
 
-impl ContextDeclarationConfig for ContextPolicyTestConfig {
-    fn context_declarations(
-        &self,
-    ) -> Result<Vec<ContextDeclaration>, otel_arrow_dfe_config::error::Error> {
-        Ok(vec![ContextDeclaration::Produces {
-            access: CONTEXT_POLICY_TEST_ACCESS,
+impl ConfigNodeContextDeclaration for ContextPolicyTestConfig {
+    fn context_declarations(&self) -> NodeContextDeclarations {
+        vec![ContextDeclaration::Produces {
             entry: self.produces.clone(),
-        }])
+        }]
+        .into_iter()
+        .collect()
     }
 }
 
@@ -100,9 +100,7 @@ fn context_policy_test_receiver_create(
     receiver_config: &ReceiverConfig,
     _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
 ) -> Result<ReceiverWrapper<()>, otel_arrow_dfe_config::error::Error> {
-    let policy = pipeline_ctx
-        .compiled_context_policy()
-        .expect("compiled context policy should be installed");
+    let policy = pipeline_ctx.compiled_context_policy();
     *CONTEXT_POLICY_TEST_CAPTURE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::downgrade(policy));
@@ -3915,7 +3913,7 @@ fn delete_pipeline_recompiles_context_policy_without_removed_declarations() {
         .compile_context_policy(&committed_config.resolve())
         .expect("post-delete policy should compile");
 
-    assert!(committed_policy.equivalent_declarations(&expected_policy));
+    assert!(committed_policy.eq(&expected_policy));
     assert!(
         installed_policy.upgrade().is_none(),
         "deleted pipeline policy should be released"

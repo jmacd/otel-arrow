@@ -821,13 +821,18 @@ mod test {
         testing::round_trip::{otap_to_otlp, otlp_to_otap, to_logs_data, to_otap_logs},
     };
 
+    use otel_arrow_dfe_config::ContextEntryName;
+    use otel_arrow_dfe_config::transport_headers::{HeaderName, TransportHeader, TransportHeaders};
     use otel_arrow_dfe_otap::{
         pdata::{Context, OtapPdata},
         testing::{TestCallData, next_ack, next_nack},
-        transport_headers::{TransportHeader, TransportHeaders},
     };
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
     use std::net::SocketAddr;
+
+    fn context_name(raw: &str) -> ContextEntryName {
+        ContextEntryName::try_from(raw).expect("valid test context entry name")
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct TransformMetricPoint {
@@ -2633,7 +2638,10 @@ mod test {
             .run_test(|mut ctx| async move {
                 let peer_addr: SocketAddr = "10.0.0.1:5005".parse().unwrap();
                 let mut headers = TransportHeaders::new();
-                headers.push(TransportHeader::text("tenant", "x-tenant", "acme"));
+                headers.push(TransportHeader::text(
+                    HeaderName::from_pair(context_name("tenant"), "x-tenant"),
+                    "acme",
+                ));
 
                 let upstream_node_id = 999;
                 let pdata = create_pdata_with_subscriber(

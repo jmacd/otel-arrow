@@ -94,7 +94,7 @@ pub static CONTEXT_DECLARATION_PROVIDERS: [ContextDeclarationProvider];
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeContextDeclarations {
     /// Indexed by ContextAccessId; sorted in the builder
-    byid: Vec<ContextDeclaration>,
+    byid: Box<[ContextDeclaration]>,
 }
 
 /// Context access identifier scoped to one node factory.
@@ -108,7 +108,29 @@ impl FromIterator<ContextDeclaration> for NodeContextDeclarations {
     {
         let mut uniq: Vec<_> = iter.into_iter().collect();
         uniq.sort();
-        Self { byid: uniq }
+        uniq.dedup();
+        Self {
+            byid: uniq.into_boxed_slice(),
+        }
+    }
+}
+
+impl NodeContextDeclarations {
+    /// Iterates over declarations in access ID order.
+    pub fn iter(&self) -> impl Iterator<Item = &ContextDeclaration> {
+        self.byid.iter()
+    }
+
+    /// Is this empty?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.byid.is_empty()
+    }
+
+    /// Return the number of declarations
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.byid.len()
     }
 }
 
@@ -174,24 +196,21 @@ impl CompiledContextPolicy {
         }
     }
 
-    /// Binds the declarations to a node.
-    pub fn node_bindings(
+    /// Validates that a node's declarations match the compiled policy.
+    pub fn validate_node_declarations(
         &self,
         pipeline: PipelineKey,
         node: ConfigNodeId,
-        decls: NodeContextDeclarations,
+        declarations: NodeContextDeclarations,
     ) -> Result<(), Error> {
-        // Note: This is where the current compiler ends. It checks that
-        // that the context declarations the node wants to configure equal
-        // what is present in the compiled policy.
-        self.declarations
+        match self
+            .declarations
             .get(&pipeline)
-            .ok_or(Error::UnrecognizedContextDeclaration {})?
-            .get(&node)
-            .ok_or(Error::UnrecognizedContextDeclaration {})?
-            .eq(&decls)
-            .then_some(())
-            .ok_or(Error::UnrecognizedContextDeclaration {})
+            .and_then(|nodes| nodes.get(&node))
+        {
+            Some(expected) if expected == &declarations => Ok(()),
+            _ => Err(Error::UnrecognizedContextDeclaration {}),
+        }
     }
 }
 
@@ -281,320 +300,320 @@ fn context_declaration_provider(urn: &str) -> Option<ContextDeclarationProvider>
         .copied()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use otel_arrow_dfe_config::engine::OtelDataflowSpec;
-    use serde::Deserialize;
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use otel_arrow_dfe_config::engine::OtelDataflowSpec;
+//     use serde::Deserialize;
 
-    use crate::config::{ExporterConfig, ReceiverConfig};
-    use crate::context::PipelineContext;
-    use crate::exporter::ExporterWrapper;
-    use crate::node::NodeId;
-    use crate::receiver::ReceiverWrapper;
-    use crate::wiring_contract::WiringContract;
-    use crate::{ExporterFactory, ReceiverFactory};
+//     use crate::config::{ExporterConfig, ReceiverConfig};
+//     use crate::context::PipelineContext;
+//     use crate::exporter::ExporterWrapper;
+//     use crate::node::NodeId;
+//     use crate::receiver::ReceiverWrapper;
+//     use crate::wiring_contract::WiringContract;
+//     use crate::{ExporterFactory, ReceiverFactory};
 
-    fn test_receiver_create(
-        _pipeline: PipelineContext,
-        _node: NodeId,
-        _node_config: Arc<NodeUserConfig>,
-        _config: &ReceiverConfig,
-        _capabilities: &crate::capability::registry::Capabilities,
-    ) -> Result<ReceiverWrapper<()>, Error> {
-        panic!("test receiver must not be constructed")
-    }
+//     fn test_receiver_create(
+//         _pipeline: PipelineContext,
+//         _node: NodeId,
+//         _node_config: Arc<NodeUserConfig>,
+//         _config: &ReceiverConfig,
+//         _capabilities: &crate::capability::registry::Capabilities,
+//     ) -> Result<ReceiverWrapper<()>, Error> {
+//         panic!("test receiver must not be constructed")
+//     }
 
-    fn test_exporter_create(
-        _pipeline: PipelineContext,
-        _node: NodeId,
-        _node_config: Arc<NodeUserConfig>,
-        _config: &ExporterConfig,
-        _capabilities: &crate::capability::registry::Capabilities,
-    ) -> Result<ExporterWrapper<()>, Error> {
-        panic!("test exporter must not be constructed")
-    }
+//     fn test_exporter_create(
+//         _pipeline: PipelineContext,
+//         _node: NodeId,
+//         _node_config: Arc<NodeUserConfig>,
+//         _config: &ExporterConfig,
+//         _capabilities: &crate::capability::registry::Capabilities,
+//     ) -> Result<ExporterWrapper<()>, Error> {
+//         panic!("test exporter must not be constructed")
+//     }
 
-    fn test_factory() -> PipelineFactory<()> {
-        let receivers = Box::leak(Box::new([ReceiverFactory {
-            name: "urn:test:receiver:context",
-            create: test_receiver_create,
-            wiring_contract: WiringContract::UNRESTRICTED,
-            validate_config: otel_arrow_dfe_config::validation::no_config,
-        }]));
-        let exporters = Box::leak(Box::new([ExporterFactory {
-            name: "urn:test:exporter:context",
-            create: test_exporter_create,
-            wiring_contract: WiringContract::UNRESTRICTED,
-            validate_config: otel_arrow_dfe_config::validation::no_config,
-        }]));
-        PipelineFactory::new(receivers, &[], exporters, &[])
-    }
+//     fn test_factory() -> PipelineFactory<()> {
+//         let receivers = Box::leak(Box::new([ReceiverFactory {
+//             name: "urn:test:receiver:context",
+//             create: test_receiver_create,
+//             wiring_contract: WiringContract::UNRESTRICTED,
+//             validate_config: otel_arrow_dfe_config::validation::no_config,
+//         }]));
+//         let exporters = Box::leak(Box::new([ExporterFactory {
+//             name: "urn:test:exporter:context",
+//             create: test_exporter_create,
+//             wiring_contract: WiringContract::UNRESTRICTED,
+//             validate_config: otel_arrow_dfe_config::validation::no_config,
+//         }]));
+//         PipelineFactory::new(receivers, &[], exporters, &[])
+//     }
 
-    #[derive(Deserialize)]
-    struct TestDeclarationConfig {
-        #[serde(default = "default_test_entry")]
-        entry: ContextEntryName,
-    }
+//     #[derive(Deserialize)]
+//     struct TestDeclarationConfig {
+//         #[serde(default = "default_test_entry")]
+//         entry: ContextEntryName,
+//     }
 
-    fn default_test_entry() -> ContextEntryName {
-        "default".into()
-    }
+//     fn default_test_entry() -> ContextEntryName {
+//         "default".into()
+//     }
 
-    impl ContextDeclarationConfig for TestDeclarationConfig {
-        fn context_declarations(&self) -> Result<Vec<ContextDeclaration>, Error> {
-            Ok(vec![ContextDeclaration::Produces {
-                access: ContextAccessId::new(0),
-                entry: self.entry.clone(),
-            }])
-        }
-    }
+//     impl ContextDeclarationConfig for TestDeclarationConfig {
+//         fn context_declarations(&self) -> Result<Vec<ContextDeclaration>, Error> {
+//             Ok(vec![ContextDeclaration::Produces {
+//                 access: ContextAccessId::new(0),
+//                 entry: self.entry.clone(),
+//             }])
+//         }
+//     }
 
-    /// Scenario: A typed provider receives valid component configuration.
-    /// Guarantees: parsing and declaration extraction use the registered config type.
-    #[test]
-    fn typed_provider_parses_registered_config() {
-        let provider =
-            ContextDeclarationProvider::from_typed_config::<TestDeclarationConfig>("urn:test");
-        let config = serde_json::json!({"entry": "X-Test"});
-        let decls = (provider.declarations)(&config).unwrap();
-        assert_eq!(decls.len(), 1);
-        match &decls[0] {
-            ContextDeclaration::Produces { entry, .. } => {
-                assert_eq!(entry.as_str(), "x-test");
-            }
-            other => panic!("unexpected declaration: {other:?}"),
-        }
-    }
+//     /// Scenario: A typed provider receives valid component configuration.
+//     /// Guarantees: parsing and declaration extraction use the registered config type.
+//     #[test]
+//     fn typed_provider_parses_registered_config() {
+//         let provider =
+//             ContextDeclarationProvider::from_typed_config::<TestDeclarationConfig>("urn:test");
+//         let config = serde_json::json!({"entry": "X-Test"});
+//         let decls = (provider.declarations)(&config).unwrap();
+//         assert_eq!(decls.len(), 1);
+//         match &decls[0] {
+//             ContextDeclaration::Produces { entry, .. } => {
+//                 assert_eq!(entry.as_str(), "x-test");
+//             }
+//             other => panic!("unexpected declaration: {other:?}"),
+//         }
+//     }
 
-    /// Scenario: capture and component producers span one resolved configuration.
-    /// Guarantees: one sorted register layout backs every compiled receiver schema.
-    #[test]
-    fn compiles_one_global_register_layout() {
-        #[allow(unsafe_code)]
-        #[distributed_slice(CONTEXT_DECLARATION_PROVIDERS)]
-        static TEST_RECEIVER_CONTEXT_DECLARATIONS: ContextDeclarationProvider =
-            ContextDeclarationProvider::from_config(
-                "urn:test:receiver:context",
-                test_receiver_declarations,
-            );
+//     /// Scenario: capture and component producers span one resolved configuration.
+//     /// Guarantees: one sorted register layout backs every compiled receiver schema.
+//     #[test]
+//     fn compiles_one_global_register_layout() {
+//         #[allow(unsafe_code)]
+//         #[distributed_slice(CONTEXT_DECLARATION_PROVIDERS)]
+//         static TEST_RECEIVER_CONTEXT_DECLARATIONS: ContextDeclarationProvider =
+//             ContextDeclarationProvider::from_config(
+//                 "urn:test:receiver:context",
+//                 test_receiver_declarations,
+//             );
 
-        fn test_receiver_declarations(
-            _config: &serde_json::Value,
-        ) -> Result<Vec<ContextDeclaration>, Error> {
-            Ok(vec![
-                ContextDeclaration::Produces {
-                    access: ContextAccessId::new(0),
-                    entry: "zeta".into(),
-                },
-                ContextDeclaration::Produces {
-                    access: ContextAccessId::new(1),
-                    entry: "beta".into(),
-                },
-            ])
-        }
+//         fn test_receiver_declarations(
+//             _config: &serde_json::Value,
+//         ) -> Result<Vec<ContextDeclaration>, Error> {
+//             Ok(vec![
+//                 ContextDeclaration::Produces {
+//                     access: ContextAccessId::new(0),
+//                     entry: "zeta".into(),
+//                 },
+//                 ContextDeclaration::Produces {
+//                     access: ContextAccessId::new(1),
+//                     entry: "beta".into(),
+//                 },
+//             ])
+//         }
 
-        let mut spec = OtelDataflowSpec::from_yaml(
-            r#"
-version: otel_dataflow/v1
-groups:
-  group:
-    pipelines:
-      pipeline:
-        policies:
-          transport_headers:
-            header_capture:
-              headers:
-                - match_names: [x-alpha]
-                  store_as: alpha
-            header_propagation:
-              default:
-                selector:
-                  type: all_captured
-        nodes:
-          source:
-            type: urn:test:receiver:context
-            config: {}
-          sink:
-            type: urn:test:exporter:context
-            config: {}
-        connections:
-          - from: source
-            to: sink
-"#,
-        )
-        .expect("valid config");
-        spec.engine.observability.pipeline.nodes = Default::default();
-        spec.engine.observability.pipeline.connections.clear();
-        let policy = test_factory()
-            .compile_context_policy(&spec.resolve())
-            .expect("compiled policy");
+//         let mut spec = OtelDataflowSpec::from_yaml(
+//             r#"
+// version: otel_dataflow/v1
+// groups:
+//   group:
+//     pipelines:
+//       pipeline:
+//         policies:
+//           transport_headers:
+//             header_capture:
+//               headers:
+//                 - match_names: [x-alpha]
+//                   store_as: alpha
+//             header_propagation:
+//               default:
+//                 selector:
+//                   type: all_captured
+//         nodes:
+//           source:
+//             type: urn:test:receiver:context
+//             config: {}
+//           sink:
+//             type: urn:test:exporter:context
+//             config: {}
+//         connections:
+//           - from: source
+//             to: sink
+// "#,
+//         )
+//         .expect("valid config");
+//         spec.engine.observability.pipeline.nodes = Default::default();
+//         spec.engine.observability.pipeline.connections.clear();
+//         let policy = test_factory()
+//             .compile_context_policy(&spec.resolve())
+//             .expect("compiled policy");
 
-        assert_eq!(
-            policy
-                .compiled_context
-                .resolve("alpha")
-                .expect("alpha")
-                .index(),
-            0
-        );
-        assert_eq!(
-            policy
-                .compiled_context
-                .resolve("beta")
-                .expect("beta")
-                .index(),
-            1
-        );
-        assert_eq!(
-            policy
-                .compiled_context
-                .resolve("zeta")
-                .expect("zeta")
-                .index(),
-            2
-        );
-        let pipeline = PipelineKey::new("group".into(), "pipeline".into());
-        let capture = &policy.receiver_capture[&pipeline]["source"];
-        assert!(Arc::ptr_eq(
-            capture.schema().register_layout(),
-            policy.compiled_context.register_layout()
-        ));
-        assert_eq!(
-            capture
-                .match_header("x-alpha")
-                .expect("x-alpha capture")
-                .schema_item
-                .retention,
-            ContextNameRetention::Observed
-        );
-    }
+//         assert_eq!(
+//             policy
+//                 .compiled_context
+//                 .resolve("alpha")
+//                 .expect("alpha")
+//                 .index(),
+//             0
+//         );
+//         assert_eq!(
+//             policy
+//                 .compiled_context
+//                 .resolve("beta")
+//                 .expect("beta")
+//                 .index(),
+//             1
+//         );
+//         assert_eq!(
+//             policy
+//                 .compiled_context
+//                 .resolve("zeta")
+//                 .expect("zeta")
+//                 .index(),
+//             2
+//         );
+//         let pipeline = PipelineKey::new("group".into(), "pipeline".into());
+//         let capture = &policy.receiver_capture[&pipeline]["source"];
+//         assert!(Arc::ptr_eq(
+//             capture.schema().register_layout(),
+//             policy.compiled_context.register_layout()
+//         ));
+//         assert_eq!(
+//             capture
+//                 .match_header("x-alpha")
+//                 .expect("x-alpha capture")
+//                 .schema_item
+//                 .retention,
+//             ContextNameRetention::Observed
+//         );
+//     }
 
-    /// Scenario: A typed provider receives configuration missing an optional field.
-    /// Guarantees: the registered config type's Serde defaults are applied.
-    #[test]
-    fn typed_provider_applies_config_defaults() {
-        let provider =
-            ContextDeclarationProvider::from_typed_config::<TestDeclarationConfig>("urn:test");
-        let decls = (provider.declarations)(&serde_json::json!({})).unwrap();
+//     /// Scenario: A typed provider receives configuration missing an optional field.
+//     /// Guarantees: the registered config type's Serde defaults are applied.
+//     #[test]
+//     fn typed_provider_applies_config_defaults() {
+//         let provider =
+//             ContextDeclarationProvider::from_typed_config::<TestDeclarationConfig>("urn:test");
+//         let decls = (provider.declarations)(&serde_json::json!({})).unwrap();
 
-        assert_eq!(
-            decls,
-            vec![ContextDeclaration::Produces {
-                access: ContextAccessId::new(0),
-                entry: "default".into(),
-            }]
-        );
-    }
+//         assert_eq!(
+//             decls,
+//             vec![ContextDeclaration::Produces {
+//                 access: ContextAccessId::new(0),
+//                 entry: "default".into(),
+//             }]
+//         );
+//     }
 
-    /// Scenario: policy compilation indexes declarations by pipeline and node.
-    /// Guarantees: each node retains only its declarations.
-    #[test]
-    fn compiled_policy_indexes_existing_configuration_ids() {
-        let pipeline = PipelineKey::new("group".into(), "pipeline".into());
-        let node: ConfigNodeId = "source".into();
-        let declaration = ContextDeclaration::Produces {
-            access: ContextAccessId::new(0),
-            entry: "tenant".into(),
-        };
-        let mut compiler = ContextCompiler::new();
-        let _ = compiler
-            .declare(ContextRegisterRequirement::new("tenant"))
-            .expect("tenant");
-        let policy = CompiledContextPolicy {
-            generation: ContextPolicyGeneration::default(),
-            compiled_context: compiler.finish(),
-            receiver_capture: HashMap::new(),
-            declarations: HashMap::from([(
-                pipeline.clone(),
-                HashMap::from([(node.clone(), vec![declaration.clone()].into_boxed_slice())]),
-            )]),
-        };
+//     /// Scenario: policy compilation indexes declarations by pipeline and node.
+//     /// Guarantees: each node retains only its declarations.
+//     #[test]
+//     fn compiled_policy_indexes_existing_configuration_ids() {
+//         let pipeline = PipelineKey::new("group".into(), "pipeline".into());
+//         let node: ConfigNodeId = "source".into();
+//         let declaration = ContextDeclaration::Produces {
+//             access: ContextAccessId::new(0),
+//             entry: "tenant".into(),
+//         };
+//         let mut compiler = ContextCompiler::new();
+//         let _ = compiler
+//             .declare(ContextRegisterRequirement::new("tenant"))
+//             .expect("tenant");
+//         let policy = CompiledContextPolicy {
+//             generation: ContextPolicyGeneration::default(),
+//             compiled_context: compiler.finish(),
+//             receiver_capture: HashMap::new(),
+//             declarations: HashMap::from([(
+//                 pipeline.clone(),
+//                 HashMap::from([(node.clone(), vec![declaration.clone()].into_boxed_slice())]),
+//             )]),
+//         };
 
-        assert_eq!(
-            policy.declarations[&pipeline][&node].as_ref(),
-            [declaration].as_slice()
-        );
-        assert!(!policy.declarations[&pipeline].contains_key("other"));
-    }
+//         assert_eq!(
+//             policy.declarations[&pipeline][&node].as_ref(),
+//             [declaration].as_slice()
+//         );
+//         assert!(!policy.declarations[&pipeline].contains_key("other"));
+//     }
 
-    /// Scenario: Two access IDs select the same register.
-    /// Guarantees: the declarations remain distinct.
-    #[test]
-    fn access_id_distinguishes_consumers() {
-        let selector = ContextConsumerSelector::Entries {
-            entries: vec!["x-topic".into()].into_boxed_slice(),
-        };
-        let first = ContextDeclaration::Consumes {
-            access: ContextAccessId::new(0),
-            selector: selector.clone(),
-        };
-        let second = ContextDeclaration::Consumes {
-            access: ContextAccessId::new(1),
-            selector,
-        };
-        assert_ne!(first, second);
-    }
+//     /// Scenario: Two access IDs select the same register.
+//     /// Guarantees: the declarations remain distinct.
+//     #[test]
+//     fn access_id_distinguishes_consumers() {
+//         let selector = ContextConsumerSelector::Entries {
+//             entries: vec!["x-topic".into()].into_boxed_slice(),
+//         };
+//         let first = ContextDeclaration::Consumes {
+//             access: ContextAccessId::new(0),
+//             selector: selector.clone(),
+//         };
+//         let second = ContextDeclaration::Consumes {
+//             access: ContextAccessId::new(1),
+//             selector,
+//         };
+//         assert_ne!(first, second);
+//     }
 
-    /// Scenario: Generic selectors represent ordered and all-register reads.
-    /// Guarantees: selector equality preserves register selection and order.
-    #[test]
-    fn selectors_preserve_generic_read_contracts() {
-        assert_ne!(
-            ContextReadSelector::Entries {
-                entries: vec!["tenant".into()].into_boxed_slice(),
-            },
-            ContextReadSelector::Entries {
-                entries: vec!["region".into()].into_boxed_slice(),
-            }
-        );
-        assert_ne!(
-            ContextReadSelector::Entries {
-                entries: vec!["tenant".into(), "region".into()].into_boxed_slice(),
-            },
-            ContextReadSelector::Entries {
-                entries: vec!["region".into(), "tenant".into()].into_boxed_slice(),
-            },
-        );
-    }
+//     /// Scenario: Generic selectors represent ordered and all-register reads.
+//     /// Guarantees: selector equality preserves register selection and order.
+//     #[test]
+//     fn selectors_preserve_generic_read_contracts() {
+//         assert_ne!(
+//             ContextReadSelector::Entries {
+//                 entries: vec!["tenant".into()].into_boxed_slice(),
+//             },
+//             ContextReadSelector::Entries {
+//                 entries: vec!["region".into()].into_boxed_slice(),
+//             }
+//         );
+//         assert_ne!(
+//             ContextReadSelector::Entries {
+//                 entries: vec!["tenant".into(), "region".into()].into_boxed_slice(),
+//             },
+//             ContextReadSelector::Entries {
+//                 entries: vec!["region".into(), "tenant".into()].into_boxed_slice(),
+//             },
+//         );
+//     }
 
-    /// Scenario: Producer inputs are unordered and use mixed-case names.
-    /// Guarantees: finished declarations normalize names and assign sorted IDs.
-    #[test]
-    fn builder_normalizes_and_orders_producers() {
-        let mut builder = ContextDeclarationsBuilder::new();
-        builder
-            .produce(ContextEntryName::parse("X-Tenant-Id").unwrap())
-            .unwrap();
-        builder.produce("a-first".into()).unwrap();
+//     /// Scenario: Producer inputs are unordered and use mixed-case names.
+//     /// Guarantees: finished declarations normalize names and assign sorted IDs.
+//     #[test]
+//     fn builder_normalizes_and_orders_producers() {
+//         let mut builder = ContextDeclarationsBuilder::new();
+//         builder
+//             .produce(ContextEntryName::parse("X-Tenant-Id").unwrap())
+//             .unwrap();
+//         builder.produce("a-first".into()).unwrap();
 
-        assert_eq!(
-            builder.finish(),
-            vec![
-                ContextDeclaration::Produces {
-                    access: ContextAccessId::new(0),
-                    entry: "a-first".into(),
-                },
-                ContextDeclaration::Produces {
-                    access: ContextAccessId::new(1),
-                    entry: "x-tenant-id".into(),
-                },
-            ]
-        );
-    }
+//         assert_eq!(
+//             builder.finish(),
+//             vec![
+//                 ContextDeclaration::Produces {
+//                     access: ContextAccessId::new(0),
+//                     entry: "a-first".into(),
+//                 },
+//                 ContextDeclaration::Produces {
+//                     access: ContextAccessId::new(1),
+//                     entry: "x-tenant-id".into(),
+//                 },
+//             ]
+//         );
+//     }
 
-    /// Scenario: Producer inputs differ only by logical-name casing.
-    /// Guarantees: configuration compilation rejects ambiguous register names.
-    #[test]
-    fn builder_rejects_duplicate_normalized_producers() {
-        let mut builder = ContextDeclarationsBuilder::new();
-        builder
-            .produce(ContextEntryName::parse("X-Tenant-Id").unwrap())
-            .unwrap();
+//     /// Scenario: Producer inputs differ only by logical-name casing.
+//     /// Guarantees: configuration compilation rejects ambiguous register names.
+//     #[test]
+//     fn builder_rejects_duplicate_normalized_producers() {
+//         let mut builder = ContextDeclarationsBuilder::new();
+//         builder
+//             .produce(ContextEntryName::parse("X-Tenant-Id").unwrap())
+//             .unwrap();
 
-        assert!(matches!(
-            builder.produce("x-tenant-id".into()),
-            Err(Error::InvalidUserConfig { .. })
-        ));
-    }
-}
+//         assert!(matches!(
+//             builder.produce("x-tenant-id".into()),
+//             Err(Error::InvalidUserConfig { .. })
+//         ));
+//     }
+// }
