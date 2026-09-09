@@ -80,6 +80,8 @@ pub struct TrafficGeneratorReceiver {
 
     /// Successfully admitted batches still waiting for Ack/Nack completion.
     pending_completions: u64,
+    context_layout: Arc<otel_arrow_dfe_config::context_bindings::ContextLayout>,
+    context_pipeline: otel_arrow_dfe_config::PipelineKey,
 }
 
 fn smooth_batch_interval(run_len: usize) -> Option<Duration> {
@@ -159,6 +161,8 @@ impl TrafficGeneratorReceiver {
             config,
             metrics,
             pending_completions: 0,
+            context_layout: pipeline_ctx.compiled_context_policy().layout().clone(),
+            context_pipeline: pipeline_ctx.pipeline_key(),
         })
     }
 
@@ -702,7 +706,12 @@ impl local::Receiver<OtapPdata> for TrafficGeneratorReceiver {
                 source_detail: String::new(),
             })?;
 
-        let transport_headers = build_transport_headers(self.config.transport_headers());
+        let mut transport_headers = build_transport_headers(self.config.transport_headers());
+        if let Some(headers) = &mut transport_headers {
+            self.context_layout
+                .bind_headers(headers, &self.context_pipeline)
+                .map_err(|error| Error::ConfigError(Box::new(error)))?;
+        }
 
         let run_len = producer.run_len();
 
@@ -828,7 +837,22 @@ mod tests {
         ContextEntryName::try_from(raw).expect("valid test context entry name")
     }
 
-    fn traffic_receiver(pipeline_ctx: PipelineContext, config: Config) -> TrafficGeneratorReceiver {
+    fn traffic_receiver(
+        mut pipeline_ctx: PipelineContext,
+        config: Config,
+    ) -> TrafficGeneratorReceiver {
+        use otel_arrow_dfe_engine::context_declaration::{
+            CompiledContextPolicy, DeclaredContextPolicy,
+        };
+        let policy = CompiledContextPolicy::compile(DeclaredContextPolicy {
+            nodes: HashMap::from([(
+                pipeline_ctx.pipeline_key(),
+                HashMap::from([(pipeline_ctx.node_id(), config.context_declarations())]),
+            )]),
+            ..Default::default()
+        })
+        .expect("compiled traffic generator context");
+        pipeline_ctx.set_compiled_context_policy(Arc::new(policy));
         TrafficGeneratorReceiver::new(pipeline_ctx, config)
             .expect("valid traffic generator configuration")
     }

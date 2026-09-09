@@ -3,10 +3,10 @@
 
 //! Implementation of the traffic generator receiver configuration
 
-use serde::de::{Deserializer, MapAccess, Visitor};
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 use otel_arrow_dfe_config::ContextEntryName;
@@ -154,7 +154,10 @@ pub struct Config {
     ///   x-tenant-id: "acme"
     ///   x-request-id:
     /// ```
-    #[serde(default, deserialize_with = "deserialize_transport_headers")]
+    #[serde(
+        default,
+        deserialize_with = "otel_arrow_dfe_config::context_policy::deserialize_context_entries"
+    )]
     transport_headers: HashMap<ContextEntryName, Option<String>>,
 }
 
@@ -490,43 +493,6 @@ pub(crate) fn build_rotation_table(entries: &[ResourceAttributeSet]) -> Vec<usiz
         .enumerate()
         .flat_map(|(i, e)| std::iter::repeat_n(i, e.weight.get() as usize))
         .collect()
-}
-
-fn deserialize_transport_headers<'de, D>(
-    deserializer: D,
-) -> Result<HashMap<ContextEntryName, Option<String>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct TransportHeadersVisitor;
-
-    impl<'de> Visitor<'de> for TransportHeadersVisitor {
-        type Value = HashMap<ContextEntryName, Option<String>>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("transport headers with unique case-insensitive names")
-        }
-
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-            let mut headers = HashMap::new();
-            while let Some((name, value)) = map.next_entry::<ContextEntryName, Option<String>>()? {
-                match headers.entry(name) {
-                    Entry::Vacant(entry) => {
-                        let _ = entry.insert(value);
-                    }
-                    Entry::Occupied(entry) => {
-                        return Err(serde::de::Error::custom(format!(
-                            "duplicate normalized transport header name '{}'",
-                            entry.key()
-                        )));
-                    }
-                }
-            }
-            Ok(headers)
-        }
-    }
-
-    deserializer.deserialize_map(TransportHeadersVisitor)
 }
 
 /// Accepts a plain map, a list of plain maps, a list of weighted structs, or a

@@ -296,12 +296,17 @@ groups: {{}}
     let channel_capacity = observability_pipeline.policies.channel_capacity.clone();
     let telemetry_policy = observability_pipeline.policies.telemetry.clone();
     let controller_context = ControllerContext::new(registry.clone());
-    let pipeline_context = controller_context.pipeline_context_with(
+    let mut pipeline_context = controller_context.pipeline_context_with(
         pipeline_group_id.clone(),
         pipeline_id.clone(),
         0,
         1,
         0,
+    );
+    pipeline_context.set_compiled_context_policy(
+        OTAP_PIPELINE_FACTORY
+            .compile_context_policy(&spec.resolve())
+            .expect("compiled observability context policy"),
     );
     let pipeline_entity_key = pipeline_context.register_pipeline_entity();
     let runtime_pipeline = OTAP_PIPELINE_FACTORY

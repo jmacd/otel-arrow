@@ -1961,7 +1961,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                 (
                     ContextDeclaration::HeaderCapture { .. },
                     CompiledContextAccess::HeaderCapture(policy),
-                ) => Some(policy.clone()),
+                ) => Some(policy.as_ref().clone()),
                 _ => None,
             });
 
@@ -2121,9 +2121,9 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             .flatten()
             .find_map(|binding| match (&binding.declaration, &binding.access) {
                 (
-                    ContextDeclaration::HeaderPropagation { policy },
-                    CompiledContextAccess::HeaderPropagation,
-                ) => Some(policy.clone()),
+                    ContextDeclaration::HeaderPropagation { .. },
+                    CompiledContextAccess::HeaderPropagation(policy),
+                ) => Some(policy.as_ref().clone()),
                 _ => None,
             });
 

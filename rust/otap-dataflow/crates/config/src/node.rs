@@ -536,12 +536,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ContextEntryName;
     use std::collections::BTreeSet;
-
-    fn context_name(raw: &str) -> ContextEntryName {
-        ContextEntryName::try_from(raw).expect("valid test context entry name")
-    }
 
     #[test]
     fn node_user_config_minimal_valid() {
@@ -799,7 +794,7 @@ config:
         assert_eq!(propagation.overrides.len(), 1);
         assert_eq!(
             propagation.overrides[0].match_rule.stored_names,
-            vec!["authorization"]
+            vec![crate::ContextEntryRef::try_from("authorization").expect("valid reference")]
         );
     }
 
@@ -898,7 +893,9 @@ capabilities:
             PropagationDefault {
                 selector: PropagationSelector {
                     selector_type: PropagationSelectorType::Named,
-                    named: Some(vec![context_name("tenant_id")]),
+                    named: Some(vec![
+                        crate::ContextEntryRef::try_from("tenant_id").expect("valid reference"),
+                    ]),
                 },
                 ..Default::default()
             },

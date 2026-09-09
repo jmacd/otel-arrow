@@ -6,6 +6,10 @@
 use crate::PipelineFactory;
 use crate::error::Error as EngineError;
 use linkme::distributed_slice;
+use otel_arrow_dfe_config::context_bindings::{
+    CompiledHeaderPropagationPolicy, ContextFieldId, ContextLayout, ContextPrimitive,
+};
+use otel_arrow_dfe_config::context_policy::ContextEntryDeclaration;
 use otel_arrow_dfe_config::engine::ResolvedOtelDataflowSpec;
 use otel_arrow_dfe_config::error::Error;
 use otel_arrow_dfe_config::node::{NodeKind, NodeUserConfig};
@@ -14,7 +18,7 @@ use otel_arrow_dfe_config::transport_headers_policy::{
     TransportHeadersPolicy,
 };
 use otel_arrow_dfe_config::{ContextEntryName, NodeId as ConfigNodeId, PipelineKey};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
 /// A context entry and its requested representation.
@@ -77,26 +81,6 @@ pub enum ContextDeclaration {
 impl ContextDeclaration {
     fn is_component_declaration(&self) -> bool {
         matches!(self, Self::Produces { .. } | Self::Consumes { .. })
-    }
-
-    fn contributes_original_name_requirement(&self) -> bool {
-        matches!(self, Self::Consumes { .. } | Self::HeaderPropagation { .. })
-    }
-
-    fn requires_original_name(&self, name: &ContextEntryName) -> bool {
-        match self {
-            Self::Consumes {
-                selector: ContextConsumerSelector::Entries { entries },
-            } => entries.iter().any(|entry| {
-                entry.form == ContextEntrySelectorForm::OriginalKeyValue && &entry.name == name
-            }),
-            Self::Consumes {
-                selector: ContextConsumerSelector::AllNormalized,
-            }
-            | Self::Produces { .. }
-            | Self::HeaderCapture { .. } => false,
-            Self::HeaderPropagation { policy } => policy.propagates_original_name(name),
-        }
     }
 }
 
@@ -217,6 +201,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledContextPolicy {
     nodes: HashMap<PipelineKey, HashMap<ConfigNodeId, CompiledNodeContext>>,
+    layout: Arc<ContextLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,26 +210,44 @@ struct CompiledNodeContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompiledContextBinding {
-    pub(crate) declaration: ContextDeclaration,
-    pub(crate) access: CompiledContextAccess,
+/// Compiled behavior and the complete declaration from which it was derived.
+pub struct CompiledContextBinding {
+    /// Source declaration, retained for construction-time contract validation.
+    pub declaration: ContextDeclaration,
+    /// Runtime access cached by the owning wrapper or component.
+    pub access: CompiledContextAccess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CompiledContextAccess {
+/// Access families currently implemented by the engine's context compiler.
+pub enum CompiledContextAccess {
+    /// Component output whose typed producer can bind through the layout.
     Produces,
+    /// Component consumption used in global retention analysis.
     Consumes,
-    HeaderCapture(CompiledHeaderCapturePolicy),
-    HeaderPropagation,
+    /// Compiled source program including conditional entry construction.
+    HeaderCapture(Box<CompiledHeaderCapturePolicy>),
+    /// Compiled multi-valued entry/member propagation.
+    HeaderPropagation(Box<CompiledHeaderPropagationPolicy>),
 }
 
-type DeclaredContextPolicy = HashMap<PipelineKey, HashMap<ConfigNodeId, NodeContextDeclarations>>;
+#[derive(Default)]
+/// Complete compiler input: node behavior and scoped entry definitions.
+pub struct DeclaredContextPolicy {
+    /// Component and wrapper declarations keyed by their owning node.
+    pub nodes: HashMap<PipelineKey, HashMap<ConfigNodeId, NodeContextDeclarations>>,
+    /// Definitions retain their owning scope and are never interpreted as policy overrides.
+    pub entries: BTreeSet<ContextEntryDeclaration>,
+}
 
 impl CompiledNodeContext {
     fn compile(
         declarations: NodeContextDeclarations,
-        original_name_requirements: &[ContextDeclaration],
-    ) -> Self {
+        original_name_requirements: &BTreeSet<ContextFieldId>,
+        layout: &Arc<ContextLayout>,
+        pipeline: &PipelineKey,
+        propagation: &HashMap<ContextDeclaration, CompiledHeaderPropagationPolicy>,
+    ) -> Result<Self, Error> {
         let bindings = declarations
             .into_iter()
             .map(|declaration| {
@@ -252,24 +255,28 @@ impl CompiledNodeContext {
                     ContextDeclaration::Produces { .. } => CompiledContextAccess::Produces,
                     ContextDeclaration::Consumes { .. } => CompiledContextAccess::Consumes,
                     ContextDeclaration::HeaderCapture { policy } => {
-                        CompiledContextAccess::HeaderCapture(policy.clone().compile(|name| {
-                            original_name_requirements
-                                .iter()
-                                .any(|declaration| declaration.requires_original_name(name))
-                        }))
+                        CompiledContextAccess::HeaderCapture(Box::new(
+                            policy
+                                .clone()
+                                .compile_bound(layout.clone(), pipeline, |field| {
+                                    original_name_requirements.contains(&field)
+                                })?,
+                        ))
                     }
                     ContextDeclaration::HeaderPropagation { .. } => {
-                        CompiledContextAccess::HeaderPropagation
+                        CompiledContextAccess::HeaderPropagation(Box::new(
+                            propagation[&declaration].clone(),
+                        ))
                     }
                 };
-                CompiledContextBinding {
+                Ok(CompiledContextBinding {
                     declaration,
                     access,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
 
-        Self { bindings }
+        Ok(Self { bindings })
     }
 }
 
@@ -279,39 +286,94 @@ impl CompiledContextPolicy {
     pub fn empty() -> Self {
         Self {
             nodes: HashMap::new(),
+            layout: Arc::new(ContextLayout::default()),
         }
     }
 
-    fn compile(declarations: DeclaredContextPolicy) -> Self {
-        let original_name_requirements: Vec<_> = declarations
+    /// Returns the immutable layout used by typed component bindings.
+    #[must_use]
+    pub fn layout(&self) -> &Arc<ContextLayout> {
+        &self.layout
+    }
+
+    /// Compiles complete declarations into immutable construction and consumption bindings.
+    pub fn compile(declarations: DeclaredContextPolicy) -> Result<Self, Error> {
+        let mut primitives = BTreeSet::new();
+        for declaration in declarations
+            .nodes
             .values()
             .flat_map(HashMap::values)
             .flat_map(NodeContextDeclarations::iter)
-            .filter(|declaration| declaration.contributes_original_name_requirement())
-            .cloned()
-            .collect();
+        {
+            match declaration {
+                ContextDeclaration::Produces { entry } => {
+                    let _ = primitives.insert(ContextPrimitive::standalone(entry.clone()));
+                }
+                ContextDeclaration::HeaderCapture { policy } => {
+                    primitives.extend(policy.context_primitives());
+                }
+                _ => {}
+            }
+        }
+        let layout = ContextLayout::compile(primitives, declarations.entries)?;
+        let mut original_name_requirements = BTreeSet::new();
+        let mut propagation = HashMap::new();
+        for (pipeline, nodes) in &declarations.nodes {
+            let mut pipeline_propagation = HashMap::new();
+            for declaration in nodes.values().flat_map(NodeContextDeclarations::iter) {
+                match declaration {
+                    ContextDeclaration::HeaderPropagation { policy } => {
+                        let compiled = policy.compile(layout.clone(), pipeline)?;
+                        original_name_requirements.extend(compiled.original_name_fields());
+                        let _ = pipeline_propagation.insert(declaration.clone(), compiled);
+                    }
+                    ContextDeclaration::Consumes {
+                        selector: ContextConsumerSelector::Entries { entries },
+                    } => {
+                        for entry in entries {
+                            if entry.form == ContextEntrySelectorForm::OriginalKeyValue {
+                                let reference = entry.name.as_str().try_into()?;
+                                let (_, fields) = layout.resolve(&reference, pipeline)?;
+                                original_name_requirements.extend(fields);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let _ = propagation.insert(pipeline.clone(), pipeline_propagation);
+        }
 
         let nodes = declarations
+            .nodes
             .into_iter()
             .map(|(pipeline, nodes)| {
+                let propagation = &propagation[&pipeline];
                 let nodes = nodes
                     .into_iter()
                     .map(|(node, declarations)| {
-                        (
+                        Ok((
                             node,
-                            CompiledNodeContext::compile(declarations, &original_name_requirements),
-                        )
+                            CompiledNodeContext::compile(
+                                declarations,
+                                &original_name_requirements,
+                                &layout,
+                                &pipeline,
+                                propagation,
+                            )?,
+                        ))
                     })
-                    .collect();
-                (pipeline, nodes)
+                    .collect::<Result<_, Error>>()?;
+                Ok((pipeline, nodes))
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
 
-        Self { nodes }
+        Ok(Self { nodes, layout })
     }
 
-    /// Returns the node's compiled bindings.
-    pub(crate) fn node_bindings(
+    /// Returns all compiled context bindings declared for one node.
+    #[must_use]
+    pub fn node_bindings(
         &self,
         pipeline: &PipelineKey,
         node: &ConfigNodeId,
@@ -349,9 +411,12 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         &self,
         resolved: &ResolvedOtelDataflowSpec,
     ) -> Result<Arc<CompiledContextPolicy>, EngineError> {
-        let mut declarations = DeclaredContextPolicy::new();
+        let mut declarations = DeclaredContextPolicy::default();
 
         for pipeline in &resolved.pipelines {
+            declarations
+                .entries
+                .extend(pipeline.policies.context.iter().cloned());
             let pipeline_key = PipelineKey::new(
                 pipeline.pipeline_group_id.clone(),
                 pipeline.pipeline_id.clone(),
@@ -373,10 +438,15 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                     .collect();
                 let _ = declarations_by_node.insert(node_id.clone(), declarations);
             }
-            let _ = declarations.insert(pipeline_key, declarations_by_node);
+            let _ = declarations
+                .nodes
+                .insert(pipeline_key, declarations_by_node);
         }
 
-        Ok(Arc::new(CompiledContextPolicy::compile(declarations)))
+        Ok(Arc::new(
+            CompiledContextPolicy::compile(declarations)
+                .map_err(|error| EngineError::ConfigError(Box::new(error)))?,
+        ))
     }
 
     fn wrapper_context_declaration(
@@ -525,10 +595,14 @@ mod preserve_original_name_tests {
     }
 
     fn compiled_policy(effective: NodeContextDeclarations) -> CompiledContextPolicy {
-        CompiledContextPolicy::compile(HashMap::from([(
-            pipeline("group", "pipeline"),
-            HashMap::from([(ConfigNodeId::from("node"), effective)]),
-        )]))
+        CompiledContextPolicy::compile(DeclaredContextPolicy {
+            nodes: HashMap::from([(
+                pipeline("group", "pipeline"),
+                HashMap::from([(ConfigNodeId::from("node"), effective)]),
+            )]),
+            entries: BTreeSet::new(),
+        })
+        .expect("valid declared context")
     }
 
     /// Scenario: capture aliases share a stored name.
@@ -602,6 +676,17 @@ mod preserve_original_name_tests {
     #[test]
     fn declarations_require_only_the_requested_name_form() {
         let declarations: NodeContextDeclarations = [
+            ContextDeclaration::HeaderCapture {
+                policy: HeaderCapturePolicy::new(
+                    CaptureDefaults::default(),
+                    vec![CaptureRule {
+                        match_names: vec![context_name("original"), context_name("value")],
+                        store_as: None,
+                        sensitive: false,
+                        value_kind: None,
+                    }],
+                ),
+            },
             ContextDeclaration::Consumes {
                 selector: ContextConsumerSelector::Entries {
                     entries: vec![ContextEntrySelector {
@@ -623,16 +708,30 @@ mod preserve_original_name_tests {
         ]
         .into_iter()
         .collect();
-        assert!(
-            declarations
-                .iter()
-                .any(|declaration| declaration.requires_original_name(&context_name("original")))
+        let compiled = compiled_policy(declarations);
+        let source = compiled
+            .node_bindings(&pipeline("group", "pipeline"), &"node".into())
+            .unwrap()
+            .iter()
+            .find_map(|binding| match &binding.access {
+                CompiledContextAccess::HeaderCapture(source) => Some(source),
+                _ => None,
+            })
+            .unwrap();
+        let mut headers = TransportHeaders::new();
+        let _ = source.capture_from_pairs(
+            [
+                ("Original", b"one".as_slice()),
+                ("Value", b"two".as_slice()),
+            ]
+            .into_iter(),
+            &mut headers,
         );
-        assert!(
-            !declarations
-                .iter()
-                .any(|declaration| declaration.requires_original_name(&context_name("value")))
+        assert_eq!(
+            headers.as_slice()[0].value.original_name.as_deref(),
+            Some("Original")
         );
+        assert!(headers.as_slice()[1].value.original_name.is_none());
     }
 
     /// Scenario: a propagation declaration selects one original header name.
@@ -649,23 +748,18 @@ mod preserve_original_name_tests {
             }
         }))
         .expect("valid propagation policy");
-        let declarations: NodeContextDeclarations = [ContextDeclaration::HeaderPropagation {
-            policy: policy.clone(),
-        }]
+        let declarations: NodeContextDeclarations = [
+            ContextDeclaration::Produces {
+                entry: context_name("preserved"),
+            },
+            ContextDeclaration::HeaderPropagation {
+                policy: policy.clone(),
+            },
+        ]
         .into_iter()
         .collect();
         let compiled = compiled_policy(declarations.clone());
 
-        assert!(
-            declarations
-                .iter()
-                .any(|declaration| declaration.requires_original_name(&context_name("preserved")))
-        );
-        assert!(
-            !declarations
-                .iter()
-                .any(|declaration| declaration.requires_original_name(&context_name("other")))
-        );
         assert_eq!(
             compiled
                 .node_bindings(&pipeline("group", "pipeline"), &ConfigNodeId::from("node"))
@@ -674,7 +768,7 @@ mod preserve_original_name_tests {
                 .find_map(|binding| match (&binding.declaration, &binding.access) {
                     (
                         ContextDeclaration::HeaderPropagation { policy },
-                        CompiledContextAccess::HeaderPropagation,
+                        CompiledContextAccess::HeaderPropagation(_),
                     ) => Some(policy),
                     _ => None,
                 }),
@@ -776,10 +870,14 @@ mod preserve_original_name_tests {
             .into_iter()
             .chain(std::iter::once(propagation_declaration.clone()))
             .collect();
-        let policy = CompiledContextPolicy::compile(HashMap::from([(
-            pipeline.clone(),
-            HashMap::from([(node.clone(), declarations)]),
-        )]));
+        let policy = CompiledContextPolicy::compile(DeclaredContextPolicy {
+            nodes: HashMap::from([(
+                pipeline.clone(),
+                HashMap::from([(node.clone(), declarations)]),
+            )]),
+            entries: BTreeSet::new(),
+        })
+        .expect("compiled declarations");
 
         assert!(
             policy
