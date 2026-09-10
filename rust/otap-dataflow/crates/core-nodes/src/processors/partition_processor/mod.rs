@@ -558,7 +558,6 @@ mod test {
             PipelineCompletionMsg, pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
         },
         testing::{
-            install_test_context_policy,
             processor::{TestContext, TestRuntime},
             test_node,
         },
@@ -576,7 +575,6 @@ mod test {
         TransportHeader::new(context_name(name.as_ref()), value_kind, value)
     }
     use otel_arrow_dfe_otap::{
-        OTAP_PIPELINE_FACTORY,
         pdata::Context,
         testing::{TestCallData, next_ack, next_nack},
     };
@@ -600,17 +598,37 @@ mod test {
         config: Value,
         runtime: &TestRuntime<OtapPdata>,
     ) -> Result<ProcessorWrapper<OtapPdata>, otel_arrow_dfe_config::error::Error> {
+        create_processor_with_config_and_layout(config, runtime).map(|(processor, _)| processor)
+    }
+
+    fn create_processor_with_config_and_layout(
+        config: Value,
+        runtime: &TestRuntime<OtapPdata>,
+    ) -> Result<
+        (
+            ProcessorWrapper<OtapPdata>,
+            Arc<otel_arrow_dfe_config::context_bindings::ContextLayout>,
+        ),
+        otel_arrow_dfe_config::error::Error,
+    > {
         let mut node_config = NodeUserConfig::new_processor_config(PARTITION_PROCESSOR_URN);
         node_config.config = config;
 
         let telemetry_registry_handle = runtime.metrics_registry();
         let controller_context = ControllerContext::new(telemetry_registry_handle);
-        let mut pipeline_context = controller_context.pipeline_context_with(
+        let pipeline_context = controller_context.pipeline_context_with(
             "group_id".into(),
             "pipeline_id".into(),
             0,
             1,
             0,
+        );
+        let node_id = test_node("partition_processor");
+        let mut pipeline_context = pipeline_context.with_node_context(
+            "partition_processor".into(),
+            node_config.r#type.clone(),
+            node_config.kind(),
+            HashMap::new(),
         );
         let typed: Config =
             serde_json::from_value(node_config.config.clone()).map_err(|error| {
@@ -618,32 +636,17 @@ mod test {
                     error: error.to_string(),
                 }
             })?;
-        let policy = partition_test_context(&typed, &pipeline_context)?;
-        pipeline_context.set_compiled_context_policy(Arc::new(policy));
-        let node_id = test_node("partition_processor");
-        let pipeline_config = serde_json::from_value(serde_json::json!({
-            "nodes": { "partition_processor": &node_config }
-        }))
-        .expect("test pipeline configuration");
-        install_test_context_policy(
-            &mut pipeline_context,
-            &OTAP_PIPELINE_FACTORY,
-            pipeline_config,
-        )
-        .expect("test context policy should compile");
-        let pipeline_context = pipeline_context.with_node_context(
-            "partition_processor".into(),
-            node_config.r#type.clone(),
-            node_config.kind(),
-            HashMap::new(),
-        );
-        create_partition_processor(
+        let policy = Arc::new(partition_test_context(&typed, &pipeline_context)?);
+        let layout = policy.layout().clone();
+        pipeline_context.set_compiled_context_policy(policy);
+        let processor = create_partition_processor(
             pipeline_context,
             node_id,
             Arc::new(node_config),
             runtime.config(),
             &Capabilities::empty(),
-        )
+        )?;
+        Ok((processor, layout))
     }
 
     fn partition_test_context(
@@ -657,9 +660,9 @@ mod test {
             CompiledContextPolicy, DeclaredContextPolicy,
         };
         CompiledContextPolicy::compile(DeclaredContextPolicy {
-            nodes: std::collections::HashMap::from([(
+            nodes: HashMap::from([(
                 context.pipeline_key(),
-                std::collections::HashMap::from([
+                HashMap::from([
                     (context.node_id(), config.context_declarations()),
                     (
                         "input".into(),
@@ -1123,19 +1126,7 @@ mod test {
         let runtime = TestRuntime::<OtapPdata>::new();
         let expression = "attributes[\"x\"]";
         let header_name = "partition-header";
-        let layout = otel_arrow_dfe_config::context_bindings::ContextLayout::compile(
-            [header_name, "h1"]
-                .map(|name| {
-                    otel_arrow_dfe_config::context_bindings::ContextPrimitive::standalone(
-                        context_name(name),
-                    )
-                })
-                .into_iter()
-                .collect(),
-            Default::default(),
-        )
-        .unwrap();
-        let processor = create_processor_with_config(
+        let (processor, layout) = create_processor_with_config_and_layout(
             serde_json::json!({
                 "partition_by": { "opl_expression": expression },
                 "partition_header_name": header_name,

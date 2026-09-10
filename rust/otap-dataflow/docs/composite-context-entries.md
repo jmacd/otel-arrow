@@ -104,18 +104,18 @@ This rule emits workspace headers only through the conditional composite:
 | Repeated workspace values | All occurrences, in input order |
 | Workspace but no customer | Nothing |
 | Development environment | Nothing |
-| Both production and development environment values | Nothing with `match: all` |
+| Both production and development values | Nothing with `match: all` |
 
 An independent propagation rule can explicitly select a primitive field.
 The qualified rule itself never bypasses its parent's presence condition.
 
 Selection and naming are independent:
 
-| Selection | `name: stored_name` | `name: preserve` |
+| Selection | Stored name | Preserved name |
 | --- | --- | --- |
-| `request_identity` | Every selected value uses `request_identity` | Original header names |
-| `request_identity:x-workspace` | Workspace values use `request_identity` | Original workspace header name |
-| `production_workspace:workspace` | Workspace values use `production_workspace` | Original workspace header name |
+| `request_identity` | `request_identity` | Original header names |
+| `request_identity:x-workspace` | `request_identity` | Original workspace name |
+| `production_workspace:workspace` | `production_workspace` | Original name |
 
 Both the default `named` list and override `match.stored_names` accept these
 references. Overrides retain first-match order; a qualified override does not
