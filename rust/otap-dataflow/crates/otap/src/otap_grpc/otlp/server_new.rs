@@ -28,7 +28,6 @@ use bytes::{BufMut, Bytes};
 use futures::future::BoxFuture;
 use http::{Request, Response};
 use otel_arrow_dfe_config::SignalType;
-use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_engine::admission::{AdmissionContext, AdmissionDecision, SharedAdmissionGate};
 use otel_arrow_dfe_engine::capability::auth::AuthorizedIdentity;
 use otel_arrow_dfe_engine::control::{CallData, NackMsg};
@@ -460,32 +459,22 @@ impl UnaryService<OtapPdata> for OtapBatchService {
             .take()
             .expect("`OtapBatchService` is not reused for multiple calls");
 
-        // Capture transport headers synchronously before moving the effect handler
-        // into the async block, avoiding a clone of the capture policy.
-        if let Some(policy) = effect_handler.capture_policy() {
-            let mut transport_headers = TransportHeaders::new();
-
-            // Decode binary metadata before capture to prevent double encoding on propagation.
-            let pairs = metadata.iter().filter_map(|kv| match kv {
-                tonic::metadata::KeyAndValueRef::Ascii(key, value) => {
-                    Some((key.as_str(), Cow::Borrowed(value.as_bytes())))
-                }
-                tonic::metadata::KeyAndValueRef::Binary(key, value) => value
-                    .to_bytes()
-                    .ok()
-                    .map(|decoded| (key.as_str(), Cow::Owned(decoded.to_vec()))),
-            });
-
-            let _stats = policy.capture_from_pairs(pairs, &mut transport_headers);
-            if !transport_headers.is_empty() {
-                otap_batch.set_transport_headers(transport_headers);
+        // Decode binary metadata before capture to prevent double encoding on propagation.
+        let pairs = metadata.iter().filter_map(|kv| match kv {
+            tonic::metadata::KeyAndValueRef::Ascii(key, value) => {
+                Some((key.as_str(), Cow::Borrowed(value.as_bytes())))
             }
-        }
-        if let Some(policy) = effect_handler.authorized_identity_policy()
-            && let Some(identity) = extensions.get::<AuthorizedIdentity>()
-        {
-            otap_batch.capture_authorized_identity(policy, identity);
-        }
+            tonic::metadata::KeyAndValueRef::Binary(key, value) => value
+                .to_bytes()
+                .ok()
+                .map(|decoded| (key.as_str(), Cow::Owned(decoded.to_vec()))),
+        });
+        let _stats = otap_batch.context_mut().capture_arrival_context(
+            effect_handler.capture_policy(),
+            pairs,
+            effect_handler.authorized_identity_policy(),
+            extensions.get::<AuthorizedIdentity>(),
+        );
 
         let state = self.state.clone();
         let metrics = self.metrics.clone();

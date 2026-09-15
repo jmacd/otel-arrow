@@ -80,6 +80,7 @@ otel-arrow-dfe-quiver = { workspace = true }
 rustls-symcrypt = { workspace = true, optional = true }
 
 [features]
+bench = []
 test-utils = ["rustls/ring", "otel-arrow-dfe-pdata/testing"]
 crypto-ring = ["rustls/ring", "tokio-rustls/ring"]
 crypto-aws-lc = ["rustls/aws_lc_rs", "tokio-rustls/aws-lc-rs"]

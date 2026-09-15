@@ -2672,8 +2672,8 @@ mod test {
                     ("info_port", &info_ctx),
                 ] {
                     assert_eq!(
-                        context.transport_headers(),
-                        Some(&headers),
+                        context.transport_headers().map(|view| view.to_owned()),
+                        Some(headers.clone()),
                         "{port} lost the inbound transport headers"
                     );
                     assert_eq!(

@@ -541,7 +541,7 @@ impl KafkaExporter {
         if let Some(policy) = effect_handler.and_then(|eh| eh.propagation_policy())
             && let Some(transport_headers) = context.transport_headers()
         {
-            for propagated in policy.propagate(transport_headers) {
+            for propagated in policy.propagate(transport_headers.iter()) {
                 // Skip propagated headers that collide with the format header.
                 if propagated.header_name == format_header_key {
                     continue;

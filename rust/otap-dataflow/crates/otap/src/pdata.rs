@@ -13,6 +13,7 @@
 //! encountered issues (Nack) downstream, optionally preserving the payload for retry or logging.
 //! This functionality is exposed through various traits implemented by effect handlers.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -20,7 +21,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
-use otel_arrow_dfe_config::transport_headers::TransportHeaders;
+use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders};
+use otel_arrow_dfe_config::transport_headers_policy::{
+    CaptureStats, CompiledHeaderCapturePolicy, TransportHeaderCaptureSink,
+};
 use otel_arrow_dfe_config::{ContextEntryName, PortName, SignalFormat, SignalType};
 use otel_arrow_dfe_engine::_private::AckNackRouting;
 use otel_arrow_dfe_engine::capability::auth::{AuthorizedIdentity, ClaimValue};
@@ -67,60 +71,212 @@ impl AuthorizedIdentityEntry {
     }
 }
 
-/// Immutable authorization-derived context entries.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct AuthorizedIdentityEntries {
-    entries: Arc<Vec<AuthorizedIdentityEntry>>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ContextEntry {
+    TransportHeader(TransportHeader),
+    AuthorizedIdentity(AuthorizedIdentityEntry),
 }
 
-impl fmt::Debug for AuthorizedIdentityEntries {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AuthorizedIdentityEntries")
-            .field("entries", &self.entries)
-            .finish()
-    }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ContextEntries {
+    entries: Arc<Vec<ContextEntry>>,
 }
 
-impl AuthorizedIdentityEntries {
-    fn capture(policy: &AuthorizedIdentityPolicy, identity: &AuthorizedIdentity) -> Option<Self> {
-        let entries = policy
-            .iter()
-            .filter_map(|projection| {
-                identity
-                    .claim(&projection.claim)
-                    .cloned()
-                    .map(|value| AuthorizedIdentityEntry {
-                        name: projection.store_as.clone(),
-                        value,
-                    })
-            })
+impl ContextEntries {
+    fn from_transport_headers(headers: TransportHeaders) -> Option<Self> {
+        let entries = headers
+            .into_vec()
+            .into_iter()
+            .map(ContextEntry::TransportHeader)
             .collect::<Vec<_>>();
         (!entries.is_empty()).then(|| Self {
             entries: Arc::new(entries),
         })
     }
 
+    fn replace_transport_headers(&mut self, headers: TransportHeaders) {
+        let entries = Arc::make_mut(&mut self.entries);
+        entries.retain(|entry| !matches!(entry, ContextEntry::TransportHeader(_)));
+        _ = entries.splice(
+            0..0,
+            headers
+                .into_vec()
+                .into_iter()
+                .map(ContextEntry::TransportHeader),
+        );
+    }
+
+    fn take_transport_headers(&mut self) -> Option<TransportHeaders> {
+        let entries = Arc::make_mut(&mut self.entries);
+        let old_entries = std::mem::take(entries);
+        let mut headers = TransportHeaders::new();
+        let mut retained = Vec::with_capacity(old_entries.len());
+        for entry in old_entries {
+            match entry {
+                ContextEntry::TransportHeader(header) => headers.push(header),
+                entry => retained.push(entry),
+            }
+        }
+        *entries = retained;
+        (!headers.is_empty()).then_some(headers)
+    }
+
+    #[cfg(test)]
+    fn replace_authorized_identity(
+        &mut self,
+        policy: &AuthorizedIdentityPolicy,
+        identity: &AuthorizedIdentity,
+    ) {
+        let entries = Arc::make_mut(&mut self.entries);
+        entries.retain(|entry| !matches!(entry, ContextEntry::AuthorizedIdentity(_)));
+        entries.extend(policy.iter().filter_map(|projection| {
+            identity.claim(&projection.claim).cloned().map(|value| {
+                ContextEntry::AuthorizedIdentity(AuthorizedIdentityEntry {
+                    name: projection.store_as.clone(),
+                    value,
+                })
+            })
+        }));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+struct ContextEntriesBuilder {
+    entries: Vec<ContextEntry>,
+    identity_capacity: usize,
+    header_count: usize,
+}
+
+impl ContextEntriesBuilder {
+    fn new(identity_capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(identity_capacity),
+            identity_capacity,
+            header_count: 0,
+        }
+    }
+
+    fn capture_authorized_identity(
+        &mut self,
+        policy: &AuthorizedIdentityPolicy,
+        identity: &AuthorizedIdentity,
+    ) {
+        self.entries.extend(policy.iter().filter_map(|projection| {
+            identity.claim(&projection.claim).cloned().map(|value| {
+                ContextEntry::AuthorizedIdentity(AuthorizedIdentityEntry {
+                    name: projection.store_as.clone(),
+                    value,
+                })
+            })
+        }));
+    }
+
+    fn finish(self) -> Option<ContextEntries> {
+        (!self.entries.is_empty()).then(|| ContextEntries {
+            entries: Arc::new(self.entries),
+        })
+    }
+}
+
+impl TransportHeaderCaptureSink for ContextEntriesBuilder {
+    fn clear_and_reserve(&mut self, capacity: usize) {
+        self.entries.clear();
+        self.header_count = 0;
+        self.entries.reserve(capacity + self.identity_capacity);
+    }
+
+    fn len(&self) -> usize {
+        self.header_count
+    }
+
+    fn push(&mut self, header: TransportHeader) {
+        self.entries.push(ContextEntry::TransportHeader(header));
+        self.header_count += 1;
+    }
+}
+
+/// Borrowed view of transport-header entries in a pdata context.
+#[derive(Clone, Copy, Debug)]
+pub struct ContextTransportHeaders<'a> {
+    entries: &'a [ContextEntry],
+}
+
+impl ContextTransportHeaders<'_> {
+    /// Returns the number of captured transport headers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    /// Returns whether no transport headers were captured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.iter().next().is_none()
+    }
+
+    /// Iterates over captured transport headers.
+    pub fn iter(&self) -> impl Iterator<Item = &TransportHeader> {
+        self.entries.iter().filter_map(|entry| match entry {
+            ContextEntry::TransportHeader(header) => Some(header),
+            ContextEntry::AuthorizedIdentity(_) => None,
+        })
+    }
+
+    /// Finds headers by exact stored name.
+    pub fn find_by_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a TransportHeader> {
+        self.iter()
+            .filter(move |header| header.name.as_str() == name)
+    }
+
+    /// Copies the view into a standalone transport-header collection.
+    #[must_use]
+    pub fn to_owned(self) -> TransportHeaders {
+        self.iter().cloned().collect()
+    }
+}
+
+/// Borrowed view of authorization-derived context entries.
+#[derive(Clone, Copy)]
+pub struct AuthorizedIdentityEntries<'a> {
+    entries: &'a [ContextEntry],
+}
+
+impl fmt::Debug for AuthorizedIdentityEntries<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthorizedIdentityEntries")
+            .field("entries", &self.iter().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl AuthorizedIdentityEntries<'_> {
     /// Returns the number of captured entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.iter().count()
     }
 
     /// Returns whether no entries were captured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.iter().next().is_none()
     }
 
     /// Iterates over captured entries in policy order.
     pub fn iter(&self) -> impl Iterator<Item = &AuthorizedIdentityEntry> {
-        self.entries.iter()
+        self.entries.iter().filter_map(|entry| match entry {
+            ContextEntry::TransportHeader(_) => None,
+            ContextEntry::AuthorizedIdentity(identity) => Some(identity),
+        })
     }
 
     /// Finds an entry by exact configured name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&AuthorizedIdentityEntry> {
-        self.entries.iter().find(|entry| entry.name == name)
+        self.iter().find(|entry| entry.name == name)
     }
 }
 
@@ -142,13 +298,12 @@ impl AuthorizedIdentityEntries {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Context {
     stack: Vec<Frame>,
-    /// Transport headers captured from inbound protocol metadata.
+    /// Typed entries captured from inbound request metadata.
     ///
-    /// `None` when no headers have been captured (the common case, zero
-    /// additional allocation).
-    transport_headers: Option<TransportHeaders>,
-    /// Verified authorization claims selected by policy.
-    authorized_identity: Option<AuthorizedIdentityEntries>,
+    /// `None` when no entries have been captured (the common case, zero
+    /// additional allocation). Transport headers and verified authorization
+    /// claims share one immutable allocation while retaining distinct variants.
+    entries: Option<ContextEntries>,
     /// Peer address observed by the receiving socket at request acceptance
     /// time. `None` for receivers without a real socket.
     peer_addr: Option<SocketAddr>,
@@ -178,8 +333,7 @@ impl Context {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             stack: Vec::with_capacity(capacity),
-            transport_headers: None,
-            authorized_identity: None,
+            entries: None,
             peer_addr: None,
             flow_compute_ns: None,
             signal: None,
@@ -503,33 +657,115 @@ impl Context {
 
     /// Returns a reference to the captured transport headers, if any.
     #[must_use]
-    pub fn transport_headers(&self) -> Option<&TransportHeaders> {
-        self.transport_headers.as_ref()
+    pub fn transport_headers(&self) -> Option<ContextTransportHeaders<'_>> {
+        let entries = self.entries.as_ref()?;
+        let view = ContextTransportHeaders {
+            entries: &entries.entries,
+        };
+        (!view.is_empty()).then_some(view)
     }
 
     /// Takes and returns the captured transport headers, if any.
     #[must_use]
     pub fn take_transport_headers(&mut self) -> Option<TransportHeaders> {
-        self.transport_headers.take()
+        let headers = self.entries.as_mut()?.take_transport_headers();
+        if self.entries.as_ref().is_some_and(ContextEntries::is_empty) {
+            self.entries = None;
+        }
+        headers
     }
 
     /// Set the transport headers for this context.
     pub fn set_transport_headers(&mut self, headers: TransportHeaders) {
-        self.transport_headers = Some(headers);
+        match &mut self.entries {
+            Some(entries) => entries.replace_transport_headers(headers),
+            None => self.entries = ContextEntries::from_transport_headers(headers),
+        }
     }
 
     /// Returns the authorization-derived context entries, if any.
     #[must_use]
-    pub fn authorized_identity_entries(&self) -> Option<&AuthorizedIdentityEntries> {
-        self.authorized_identity.as_ref()
+    pub fn authorized_identity_entries(&self) -> Option<AuthorizedIdentityEntries<'_>> {
+        let entries = self.entries.as_ref()?;
+        let view = AuthorizedIdentityEntries {
+            entries: &entries.entries,
+        };
+        (!view.is_empty()).then_some(view)
     }
 
+    #[cfg(test)]
     fn capture_authorized_identity(
         &mut self,
         policy: &AuthorizedIdentityPolicy,
         identity: &AuthorizedIdentity,
     ) {
-        self.authorized_identity = AuthorizedIdentityEntries::capture(policy, identity);
+        match &mut self.entries {
+            Some(entries) => entries.replace_authorized_identity(policy, identity),
+            None => {
+                let mut builder = ContextEntriesBuilder::new(policy.len());
+                builder.capture_authorized_identity(policy, identity);
+                self.entries = builder.finish();
+            }
+        }
+    }
+
+    pub(crate) fn capture_arrival_context<'a, V>(
+        &mut self,
+        header_policy: Option<&CompiledHeaderCapturePolicy>,
+        header_pairs: impl Iterator<Item = (&'a str, V)>,
+        identity_policy: Option<&AuthorizedIdentityPolicy>,
+        identity: Option<&AuthorizedIdentity>,
+    ) -> Option<CaptureStats>
+    where
+        V: Into<Cow<'a, [u8]>>,
+    {
+        let identity_capacity = identity_policy
+            .zip(identity)
+            .map_or(0, |(policy, _)| policy.len());
+        let mut builder = ContextEntriesBuilder::new(identity_capacity);
+        let stats =
+            header_policy.and_then(|policy| policy.capture_from_pairs(header_pairs, &mut builder));
+        if let Some((policy, identity)) = identity_policy.zip(identity) {
+            builder.capture_authorized_identity(policy, identity);
+        }
+        self.entries = builder.finish();
+        stats
+    }
+
+    /// Captures authorized identity entries for benchmarks.
+    #[cfg(feature = "bench")]
+    pub fn capture_authorized_identity_for_bench(
+        &mut self,
+        policy: &AuthorizedIdentityPolicy,
+        identity: &AuthorizedIdentity,
+    ) {
+        let _ = self.capture_arrival_context(
+            None,
+            std::iter::empty::<(&str, &[u8])>(),
+            Some(policy),
+            Some(identity),
+        );
+    }
+
+    /// Captures arrival entries for benchmarks.
+    #[cfg(feature = "bench")]
+    pub fn capture_arrival_context_for_bench<'a, V>(
+        &mut self,
+        header_policy: Option<&CompiledHeaderCapturePolicy>,
+        header_pairs: impl Iterator<Item = (&'a str, V)>,
+        identity_policy: Option<&AuthorizedIdentityPolicy>,
+        identity: Option<&AuthorizedIdentity>,
+    ) where
+        V: Into<Cow<'a, [u8]>>,
+    {
+        let _ =
+            self.capture_arrival_context(header_policy, header_pairs, identity_policy, identity);
+    }
+
+    /// Clones only the shared entry store for benchmarks.
+    #[cfg(feature = "bench")]
+    pub fn clone_entries_for_bench(&self) -> impl Clone {
+        self.entries.clone()
     }
 
     /// Returns the peer address observed by the receiving socket, if any.
@@ -594,8 +830,7 @@ impl Context {
     pub fn clone_detached(&self) -> Self {
         Self {
             stack: Vec::new(),
-            transport_headers: self.transport_headers.clone(),
-            authorized_identity: self.authorized_identity.clone(),
+            entries: self.entries.clone(),
             peer_addr: self.peer_addr,
             flow_compute_ns: None,
             signal: None,
@@ -698,6 +933,7 @@ impl FlowMetricAccumulation for OtapPdata {
                  overlapping ranges are not supported \u{2014} previous accumulator discarded"
             );
         }
+
         // Use a 1ns active sentinel because flow_metric duration measurements
         // are required to be greater than 0ns.
         self.context.flow_compute_ns = Some(NonZeroU64::new(1).expect("1 is non-zero"));
@@ -952,17 +1188,18 @@ impl OtapPdata {
 
     /// Returns a reference to the captured transport headers, if any.
     #[must_use]
-    pub fn transport_headers(&self) -> Option<&TransportHeaders> {
+    pub fn transport_headers(&self) -> Option<ContextTransportHeaders<'_>> {
         self.context.transport_headers()
     }
 
     /// Returns the authorization-derived context entries, if any.
     #[must_use]
-    pub fn authorized_identity_entries(&self) -> Option<&AuthorizedIdentityEntries> {
+    pub fn authorized_identity_entries(&self) -> Option<AuthorizedIdentityEntries<'_>> {
         self.context.authorized_identity_entries()
     }
 
-    pub(crate) fn capture_authorized_identity(
+    #[cfg(test)]
+    fn capture_authorized_identity(
         &mut self,
         policy: &AuthorizedIdentityPolicy,
         identity: &AuthorizedIdentity,
@@ -1350,13 +1587,12 @@ mod test {
     use std::mem::size_of;
     use tokio::sync::mpsc;
 
-    /// Scenario: queued OTAP pdata includes optional authorization-derived context.
-    /// Guarantees: the 64-bit queued-message layout reflects only one additional
-    /// pointer for the optional trusted context collection.
+    /// Scenario: queued OTAP pdata stores transport and authorization entries together.
+    /// Guarantees: unified entry storage avoids growing the 64-bit queued-message layout.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn otap_pdata_layout_is_stable() {
-        assert_eq!(size_of::<OtapPdata>(), 160);
+        assert_eq!(size_of::<OtapPdata>(), 152);
     }
 
     fn create_test() -> (TestCallData, OtapPdata) {
@@ -2709,7 +2945,10 @@ mod test {
 
         let detached = context.clone_detached();
 
-        assert_eq!(detached.transport_headers(), Some(&headers));
+        assert_eq!(
+            detached.transport_headers().map(|view| view.to_owned()),
+            Some(headers.clone())
+        );
         let authorized = detached
             .authorized_identity_entries()
             .expect("authorized identity retained");
