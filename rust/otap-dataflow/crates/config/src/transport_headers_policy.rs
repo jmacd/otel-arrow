@@ -20,6 +20,32 @@ use std::borrow::Cow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+/// Destination for transport headers selected by a compiled capture policy.
+pub trait TransportHeaderCaptureSink {
+    /// Clears the destination and reserves space for at least `capacity` headers.
+    fn clear_and_reserve(&mut self, capacity: usize);
+
+    /// Returns the number of headers captured so far.
+    fn len(&self) -> usize;
+
+    /// Adds one captured header.
+    fn push(&mut self, header: TransportHeader);
+}
+
+impl TransportHeaderCaptureSink for TransportHeaders {
+    fn clear_and_reserve(&mut self, capacity: usize) {
+        let _ = TransportHeaders::clear_and_reserve(self, capacity);
+    }
+
+    fn len(&self) -> usize {
+        TransportHeaders::len(self)
+    }
+
+    fn push(&mut self, header: TransportHeader) {
+        TransportHeaders::push(self, header);
+    }
+}
+
 // -- Stats types --------------------------------------------------------------
 
 /// Counts headers skipped by capture limits.
@@ -194,16 +220,17 @@ impl CompiledHeaderCapturePolicy {
     /// Returns `None` when all matching headers were captured successfully,
     /// or `Some(CaptureStats)` when one or more matching headers had to be
     /// skipped due to policy limits.
-    pub fn capture_from_pairs<'a, V>(
+    pub fn capture_from_pairs<'a, V, S>(
         &self,
         pairs: impl Iterator<Item = (&'a str, V)>,
-        result: &mut TransportHeaders,
+        result: &mut S,
     ) -> Option<CaptureStats>
     where
         V: Into<Cow<'a, [u8]>>,
+        S: TransportHeaderCaptureSink,
     {
         if self.captures.is_empty() {
-            let _ = result.clear_and_reserve(0);
+            result.clear_and_reserve(0);
             return None;
         }
 
@@ -211,7 +238,7 @@ impl CompiledHeaderCapturePolicy {
         let pairs = pairs;
         let (lower, upper) = pairs.size_hint();
         let capacity = upper.unwrap_or(lower).min(defaults.max_entries);
-        let result = result.clear_and_reserve(capacity);
+        result.clear_and_reserve(capacity);
         let mut skipped_max_entries: usize = 0;
         let mut skipped_name_too_long: usize = 0;
         let mut skipped_value_too_long: usize = 0;
@@ -433,9 +460,9 @@ impl HeaderPropagationPolicy {
     /// Headers with [`PropagationAction::Drop`] are omitted.
     pub fn propagate<'a>(
         &'a self,
-        headers: &'a TransportHeaders,
+        headers: impl Iterator<Item = &'a TransportHeader> + 'a,
     ) -> impl Iterator<Item = PropagatedHeader<'a>> {
-        headers.iter().filter_map(move |header| {
+        headers.filter_map(move |header| {
             let (action, name_strategy) = self.resolve_action(header);
             if action == PropagationAction::Drop {
                 return None;

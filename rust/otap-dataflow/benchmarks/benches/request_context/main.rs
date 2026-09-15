@@ -8,14 +8,17 @@ use std::hint::black_box;
 use std::mem::size_of;
 use std::sync::Arc;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use otel_arrow_dfe_config::ContextEntryName;
+use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
 use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
 use otel_arrow_dfe_config::transport_headers_policy::{
     CaptureDefaults, CaptureRule, CompiledHeaderCapturePolicy, HeaderCapturePolicy,
     HeaderPropagationPolicy, NameStrategy, PropagationDefault, PropagationSelector,
     PropagationSelectorType,
 };
+use otel_arrow_dfe_engine::capability::auth::{AuthorizedIdentity, ClaimValue};
+use otel_arrow_dfe_otap::pdata::Context;
 use rdkafka::message::{Header, Headers, OwnedHeaders};
 use tonic::metadata::{KeyAndValueRef, MetadataKey, MetadataMap, MetadataValue};
 
@@ -93,10 +96,33 @@ fn context_name(raw: impl AsRef<str>) -> ContextEntryName {
 }
 
 fn main_benchmarks(c: &mut Criterion) {
+    bench_disabled_identity(c);
+    bench_authorized_identity_capture(c);
+    bench_combined_arrival_capture(c);
+    bench_combined_context_clone(c);
     bench_receive(c);
     bench_end_to_end(c);
     bench_receive_kafka_original(c);
     bench_end_to_end_kafka_original(c);
+}
+
+fn bench_disabled_identity(c: &mut Criterion) {
+    let mut group = c.benchmark_group("request_context/disabled_identity");
+
+    let _ = group.bench_function("context_default", |b| {
+        b.iter(|| black_box(Context::default()));
+    });
+
+    let context = Context::default();
+    let _ = group.bench_function("context_clone", |b| {
+        b.iter(|| black_box(black_box(&context).clone()));
+    });
+
+    let _ = group.bench_function("context_clone_detached", |b| {
+        b.iter(|| black_box(black_box(&context).clone_detached()));
+    });
+
+    group.finish();
 }
 
 #[derive(Clone)]
@@ -136,6 +162,151 @@ struct LegacyTransportHeader {
     name: LegacyHeaderName,
     value_kind: ValueKind,
     value: Box<[u8]>,
+}
+
+fn bench_authorized_identity_capture(c: &mut Criterion) {
+    let mut group = c.benchmark_group("request_context/authorized_identity_capture");
+    let identity = AuthorizedIdentity::new()
+        .with_subject("customer-42")
+        .with_claim_str("tenant", "acme");
+
+    for entry_count in [1, 2] {
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(match entry_count {
+            1 => serde_json::json!([
+                {"claim": "sub", "store_as": "customer_id"}
+            ]),
+            2 => serde_json::json!([
+                {"claim": "sub", "store_as": "customer_id"},
+                {"claim": "tenant", "store_as": "tenant_id"}
+            ]),
+            _ => unreachable!("benchmark only defines one- and two-entry policies"),
+        })
+        .expect("valid authorized identity benchmark policy");
+
+        let _ = group.bench_with_input(
+            BenchmarkId::new("legacy_sidecar", entry_count),
+            &entry_count,
+            |b, _| {
+                b.iter(|| {
+                    black_box(capture_authorized_identity_sidecar(
+                        black_box(&policy),
+                        black_box(&identity),
+                    ))
+                });
+            },
+        );
+
+        let _ = group.bench_with_input(
+            BenchmarkId::new("unified_store", entry_count),
+            &entry_count,
+            |b, _| {
+                b.iter_batched(
+                    Context::default,
+                    |mut context| {
+                        context.capture_authorized_identity_for_bench(
+                            black_box(&policy),
+                            black_box(&identity),
+                        );
+                        black_box(context)
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn capture_authorized_identity_sidecar(
+    policy: &AuthorizedIdentityPolicy,
+    identity: &AuthorizedIdentity,
+) -> Option<Arc<Vec<(ContextEntryName, ClaimValue)>>> {
+    let entries = policy
+        .iter()
+        .filter_map(|projection| {
+            identity
+                .claim(&projection.claim)
+                .cloned()
+                .map(|value| (projection.store_as.clone(), value))
+        })
+        .collect::<Vec<_>>();
+    (!entries.is_empty()).then(|| Arc::new(entries))
+}
+
+fn bench_combined_arrival_capture(c: &mut Criterion) {
+    let mut group = c.benchmark_group("request_context/combined_arrival_capture");
+    let header_policy = capture_policy(1, ProducerCase::Unrenamed).compile(|_| false);
+    let identity_policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
+        {"claim": "sub", "store_as": "customer_id"}
+    ]))
+    .expect("valid authorized identity benchmark policy");
+    let identity = AuthorizedIdentity::new().with_subject("customer-42");
+    let header_pairs = [("x-context-0", b"value-00-0123456789abcdef".as_slice())];
+
+    let _ = group.bench_function("legacy_separate_sidecars", |b| {
+        b.iter(|| {
+            let mut headers = TransportHeaders::new();
+            let _ = header_policy
+                .capture_from_pairs(black_box(header_pairs.iter().copied()), &mut headers);
+            let identity_entries = capture_authorized_identity_sidecar(
+                black_box(&identity_policy),
+                black_box(&identity),
+            );
+            black_box((headers, identity_entries))
+        });
+    });
+
+    let _ = group.bench_function("unified_store", |b| {
+        b.iter_batched(
+            Context::default,
+            |mut context| {
+                context.capture_arrival_context_for_bench(
+                    Some(black_box(&header_policy)),
+                    black_box(header_pairs.iter().copied()),
+                    Some(black_box(&identity_policy)),
+                    Some(black_box(&identity)),
+                );
+                black_box(context)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+fn bench_combined_context_clone(c: &mut Criterion) {
+    let mut group = c.benchmark_group("request_context/combined_context_clone");
+    let header_policy = capture_policy(1, ProducerCase::Unrenamed).compile(|_| false);
+    let identity_policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
+        {"claim": "sub", "store_as": "customer_id"}
+    ]))
+    .expect("valid authorized identity benchmark policy");
+    let identity = AuthorizedIdentity::new().with_subject("customer-42");
+    let header_pairs = [("x-context-0", b"value-00-0123456789abcdef".as_slice())];
+
+    let mut headers = TransportHeaders::new();
+    let _ = header_policy.capture_from_pairs(header_pairs.iter().copied(), &mut headers);
+    let identity_entries = capture_authorized_identity_sidecar(&identity_policy, &identity);
+    let legacy = (headers, identity_entries);
+
+    let mut unified = Context::default();
+    unified.capture_arrival_context_for_bench(
+        Some(&header_policy),
+        header_pairs.iter().copied(),
+        Some(&identity_policy),
+        Some(&identity),
+    );
+
+    let _ = group.bench_function("legacy_separate_sidecars", |b| {
+        b.iter(|| black_box(black_box(&legacy).clone()));
+    });
+    let _ = group.bench_function("unified_store", |b| {
+        b.iter(|| black_box(black_box(&unified).clone_entries_for_bench()));
+    });
+
+    group.finish();
 }
 
 fn bench_receive(c: &mut Criterion) {
@@ -415,7 +586,7 @@ fn capture_kafka_headers<T>(
 
 fn propagate_metadata(context: &TransportHeaders, policy: &HeaderPropagationPolicy) -> MetadataMap {
     let mut metadata = MetadataMap::new();
-    for header in policy.propagate(context) {
+    for header in policy.propagate(context.iter()) {
         append_text_metadata(&mut metadata, header.header_name, header.value);
     }
     metadata

@@ -97,9 +97,10 @@ mod tests {
         );
         let headers_after = pdata_after_processor.transport_headers().unwrap();
         assert_eq!(headers_after.len(), 3);
-        assert_eq!(headers_after.as_slice()[0].name.as_str(), "tenant_id");
-        assert_eq!(headers_after.as_slice()[1].name.as_str(), "x-request-id");
-        assert_eq!(headers_after.as_slice()[2].name.as_str(), "authorization");
+        let header_values = headers_after.iter().collect::<Vec<_>>();
+        assert_eq!(header_values[0].name.as_str(), "tenant_id");
+        assert_eq!(header_values[1].name.as_str(), "x-request-id");
+        assert_eq!(header_values[2].name.as_str(), "authorization");
 
         // ========== Step 4: Simulate exporter propagation ==========
 
@@ -121,7 +122,7 @@ mod tests {
             }],
         );
 
-        let propagated: Vec<_> = propagation_policy.propagate(headers_after).collect();
+        let propagated: Vec<_> = propagation_policy.propagate(headers_after.iter()).collect();
 
         assert_eq!(
             propagated.len(),
@@ -180,7 +181,7 @@ mod tests {
             },
             vec![],
         );
-        let propagated: Vec<_> = propagation_policy.propagate(headers).collect();
+        let propagated: Vec<_> = propagation_policy.propagate(headers.iter()).collect();
         assert_eq!(propagated.len(), 3, "duplicates must survive propagation");
 
         let values: Vec<&[u8]> = propagated.iter().map(|h| h.value).collect();
@@ -217,7 +218,7 @@ mod tests {
             },
             vec![],
         );
-        let propagated: Vec<_> = propagation_policy.propagate(headers).collect();
+        let propagated: Vec<_> = propagation_policy.propagate(headers.iter()).collect();
 
         assert_eq!(*propagated[0].value_kind, ValueKind::Binary);
         assert_eq!(propagated[0].value, binary_value.as_slice());

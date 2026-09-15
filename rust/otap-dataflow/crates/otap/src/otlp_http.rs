@@ -29,7 +29,6 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_config::byte_units;
-use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_engine::memory_limiter::SharedReceiverAdmissionState;
 use otel_arrow_dfe_engine::shared::receiver::EffectHandler;
 use otel_arrow_dfe_engine::{
@@ -834,23 +833,15 @@ impl HttpHandler {
             let mut pdata = OtapPdata::new(context, payload.into());
             pdata.set_peer_addr(self.peer_addr);
 
-            // Capture transport headers from HTTP headers when a capture policy is configured.
-            if let Some(policy) = self.effect_handler.capture_policy() {
-                let mut transport_headers = TransportHeaders::new();
-                let pairs = headers
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), value.as_bytes()));
-                let _stats = policy.capture_from_pairs(pairs, &mut transport_headers);
-                if !transport_headers.is_empty() {
-                    pdata.set_transport_headers(transport_headers);
-                }
-            }
-            if let (Some(policy), Some(identity)) = (
+            let pairs = headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes()));
+            let _stats = pdata.context_mut().capture_arrival_context(
+                self.effect_handler.capture_policy(),
+                pairs,
                 self.effect_handler.authorized_identity_policy(),
                 authorized_identity.as_ref(),
-            ) {
-                pdata.capture_authorized_identity(policy, identity);
-            }
+            );
 
             let cancel_rx = if self.settings.wait_for_result {
                 let state = match signal {

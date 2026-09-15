@@ -193,6 +193,20 @@ impl TransportHeaders {
     pub fn as_slice(&self) -> &[TransportHeader] {
         &self.headers
     }
+
+    /// Consumes the collection and returns its headers.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<TransportHeader> {
+        Arc::unwrap_or_clone(self.headers)
+    }
+}
+
+impl FromIterator<TransportHeader> for TransportHeaders {
+    fn from_iter<T: IntoIterator<Item = TransportHeader>>(iter: T) -> Self {
+        Self {
+            headers: Arc::new(iter.into_iter().collect()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -419,7 +433,7 @@ mod tests {
         headers.push(header("tenant_id", "X-Tenant-Id", b"t-1"));
         headers.push(header("request_id", "X-Request-Id", b"r-1"));
 
-        let propagated: Vec<_> = policy.propagate(&headers).collect();
+        let propagated: Vec<_> = policy.propagate(headers.iter()).collect();
         assert_eq!(propagated.len(), 2);
         assert_eq!(propagated[0].header_name, "X-Tenant-Id");
         assert_eq!(propagated[1].header_name, "X-Request-Id");
@@ -451,7 +465,7 @@ mod tests {
         headers.push(header("tenant_id", "X-Tenant-Id", b"t-1"));
         headers.push(header("authorization", "Authorization", b"Bearer secret"));
 
-        let propagated: Vec<_> = policy.propagate(&headers).collect();
+        let propagated: Vec<_> = policy.propagate(headers.iter()).collect();
         assert_eq!(propagated.len(), 1);
         assert_eq!(propagated[0].header_name, "X-Tenant-Id");
     }
@@ -482,7 +496,7 @@ mod tests {
         headers.push(header("tenant_id", "X-Tenant-Id", b"t-1"));
         headers.push(header("request_id", "X-Request-Id", b"r-1"));
 
-        let propagated: Vec<_> = policy.propagate(&headers).collect();
+        let propagated: Vec<_> = policy.propagate(headers.iter()).collect();
         assert_eq!(propagated.len(), 1);
         assert_eq!(propagated[0].header_name, "X-Tenant-Id");
     }
@@ -506,7 +520,7 @@ mod tests {
         let mut headers = TransportHeaders::new();
         headers.push(header("tenant_id", "X-Tenant-Id", b"t-1"));
 
-        let propagated: Vec<_> = policy.propagate(&headers).collect();
+        let propagated: Vec<_> = policy.propagate(headers.iter()).collect();
         assert_eq!(propagated.len(), 1);
         assert_eq!(propagated[0].header_name, "tenant_id");
     }
@@ -530,7 +544,7 @@ mod tests {
         headers.push(header("tenant_id", "X-Tenant-Id", b"t-1"));
         headers.push(header("request_id", "X-Request-Id", b"r-1"));
 
-        let propagated: Vec<_> = policy.propagate(&headers).collect();
+        let propagated: Vec<_> = policy.propagate(headers.iter()).collect();
         assert_eq!(propagated.len(), 1);
         assert_eq!(propagated[0].header_name, "X-Tenant-Id");
     }
