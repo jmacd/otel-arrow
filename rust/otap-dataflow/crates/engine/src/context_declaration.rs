@@ -24,9 +24,12 @@
 
 use crate::PipelineFactory;
 use crate::error::Error as EngineError;
-use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
+use otel_arrow_dfe_config::authorized_identity_policy::{
+    AuthorizedIdentityPolicy, CompiledAuthorizedIdentityPolicy,
+};
 use otel_arrow_dfe_config::context_bindings::{
     CompiledHeaderPropagationPolicy, ContextFieldId, ContextLayout, ContextPrimitive,
+    ContextPrimitiveSource,
 };
 use otel_arrow_dfe_config::context_policy::ContextEntryDeclaration;
 use otel_arrow_dfe_config::engine::ResolvedOtelDataflowSpec;
@@ -36,15 +39,17 @@ use otel_arrow_dfe_config::transport_headers_policy::{
     CompiledHeaderCapturePolicy, HeaderCapturePolicy, HeaderPropagationPolicy,
     TransportHeadersPolicy,
 };
-use otel_arrow_dfe_config::{ContextEntryName, NodeId as ConfigNodeId, PipelineKey};
+use otel_arrow_dfe_config::{
+    ContextEntryName, ContextEntryRef, NodeId as ConfigNodeId, PipelineKey,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// A context entry and its requested representation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ContextEntrySelector {
-    /// Configured entry name.
-    pub name: ContextEntryName,
+    /// Configured whole-entry or member reference.
+    pub reference: ContextEntryRef,
     /// Requested representation.
     pub form: ContextEntrySelectorForm,
 }
@@ -227,7 +232,7 @@ struct CompiledNodeBindings {
     component_declarations: NodeContextDeclarations,
     header_capture: Option<CompiledHeaderCapturePolicy>,
     header_propagation: Option<CompiledHeaderPropagationPolicy>,
-    authorized_identity_capture: Option<AuthorizedIdentityPolicy>,
+    authorized_identity_capture: Option<CompiledAuthorizedIdentityPolicy>,
 }
 
 #[derive(Default)]
@@ -292,9 +297,13 @@ impl PreparedDeclarations {
                 ContextDeclaration::HeaderCapture { policy } => {
                     primitives.extend(policy.context_primitives());
                 }
+                ContextDeclaration::AuthorizedIdentityCapture { policy } => {
+                    primitives.extend(policy.iter().map(|claim| {
+                        ContextPrimitive::authorized_identity(claim.store_as.clone())
+                    }));
+                }
                 ContextDeclaration::Consumes { .. }
-                | ContextDeclaration::HeaderPropagation { .. }
-                | ContextDeclaration::AuthorizedIdentityCapture { .. } => {}
+                | ContextDeclaration::HeaderPropagation { .. } => {}
             }
         }
         let layout = ContextLayout::compile(primitives, declarations.entries.clone())?;
@@ -317,9 +326,19 @@ impl PreparedDeclarations {
                         selector: ContextConsumerSelector::Entries { entries },
                     } => {
                         for entry in entries {
+                            let (_, fields) = layout.resolve(&entry.reference, pipeline)?;
                             if entry.form == ContextEntrySelectorForm::OriginalKeyValue {
-                                let reference = entry.name.as_str().try_into()?;
-                                let (_, fields) = layout.resolve(&reference, pipeline)?;
+                                if fields.iter().any(|field| {
+                                    layout.primitive(*field).source
+                                        != ContextPrimitiveSource::TransportHeader
+                                }) {
+                                    return Err(Error::InvalidUserConfig {
+                                        error: format!(
+                                            "original-name access cannot select authorized identity entry `{}`",
+                                            entry.reference
+                                        ),
+                                    });
+                                }
                                 original_names.extend(
                                     fields
                                         .into_iter()
@@ -410,7 +429,8 @@ impl CompiledNodeBindings {
                     header_propagation = Some(propagation[&declaration].clone());
                 }
                 ContextDeclaration::AuthorizedIdentityCapture { policy } => {
-                    authorized_identity_capture = Some(policy.clone());
+                    authorized_identity_capture =
+                        Some(policy.clone().compile_bound(layout.clone()));
                 }
             }
         }
@@ -486,7 +506,7 @@ impl CompiledContextBindings {
         &self,
         pipeline: &PipelineKey,
         node: &ConfigNodeId,
-    ) -> Option<&AuthorizedIdentityPolicy> {
+    ) -> Option<&CompiledAuthorizedIdentityPolicy> {
         self.by_pipeline
             .get(pipeline)?
             .get(node)?
@@ -726,6 +746,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otel_arrow_dfe_config::context_policy::{ContextPolicy, ContextScope};
     use otel_arrow_dfe_config::transport_headers::TransportHeaders;
     use otel_arrow_dfe_config::transport_headers_policy::{CaptureDefaults, CaptureRule};
 
@@ -740,7 +761,7 @@ mod tests {
             [ContextDeclaration::Consumes {
                 selector: ContextConsumerSelector::Entries {
                     entries: vec![ContextEntrySelector {
-                        name: self.entry.clone(),
+                        reference: self.entry.clone().into(),
                         form: ContextEntrySelectorForm::Value,
                     }]
                     .into_boxed_slice(),
@@ -774,6 +795,97 @@ mod tests {
             PreparedDeclarations::prepare(declared_policy(effective)).expect("valid declarations");
         let requirements = prepared.runtime_requirements.clone();
         prepared.compile(&requirements).expect("valid bindings")
+    }
+
+    /// Scenario: one receiver captures a transport header and a verified
+    /// claim used together by a processor's composite entry binding.
+    /// Guarantees: authorized claim destinations participate in the shared
+    /// compiled layout with distinct provenance and the whole composite
+    /// resolves for the processor.
+    #[test]
+    fn authorized_and_transport_primitives_compile_into_one_composite() {
+        let pipeline = pipeline("group", "pipeline");
+        let identity_policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
+            {"claim": "sub", "store_as": "customer_id"}
+        ]))
+        .expect("valid identity policy");
+        let capture_policy: HeaderCapturePolicy = serde_json::from_value(serde_json::json!({
+            "headers": [
+                {"match_names": ["x-workspace-id"], "store_as": "workspace_id"}
+            ]
+        }))
+        .expect("valid capture policy");
+        let context_policy: ContextPolicy = serde_json::from_value(serde_json::json!({
+            "entries": {
+                "product_user": [
+                    {"type": "authorized_identity", "name": "customer_id"},
+                    {
+                        "type": "transport_header",
+                        "name": "workspace_id:x-workspace-id",
+                        "as": "workspace_id"
+                    }
+                ]
+            }
+        }))
+        .expect("valid mixed composite");
+        let processor_declarations: NodeContextDeclarations = [ContextDeclaration::Consumes {
+            selector: ContextConsumerSelector::Entries {
+                entries: vec![ContextEntrySelector {
+                    reference: "product_user".try_into().expect("valid reference"),
+                    form: ContextEntrySelectorForm::Value,
+                }]
+                .into_boxed_slice(),
+            },
+        }]
+        .into_iter()
+        .collect();
+        let receiver_declarations = [
+            ContextDeclaration::HeaderCapture {
+                policy: capture_policy,
+            },
+            ContextDeclaration::AuthorizedIdentityCapture {
+                policy: identity_policy,
+            },
+        ]
+        .into_iter()
+        .collect();
+        let prepared = PreparedDeclarations::prepare(DeclaredContextPolicy {
+            nodes: HashMap::from([(
+                pipeline.clone(),
+                HashMap::from([
+                    (ConfigNodeId::from("receiver"), receiver_declarations),
+                    (ConfigNodeId::from("batch"), processor_declarations),
+                ]),
+            )]),
+            entries: context_policy
+                .entries
+                .into_iter()
+                .map(|(name, definition)| ContextEntryDeclaration {
+                    scope: ContextScope::Engine,
+                    name,
+                    definition,
+                })
+                .collect(),
+        })
+        .expect("compiled mixed declarations");
+
+        let binding = prepared
+            .layout
+            .bind_entry(
+                &"product_user".try_into().expect("valid reference"),
+                &pipeline,
+            )
+            .expect("mixed composite binding");
+        assert_eq!(
+            binding
+                .primitives()
+                .map(|primitive| primitive.source)
+                .collect::<Vec<_>>(),
+            vec![
+                ContextPrimitiveSource::AuthorizedIdentity,
+                ContextPrimitiveSource::TransportHeader,
+            ]
+        );
     }
 
     fn context_runtime_requirements(
@@ -811,7 +923,7 @@ mod tests {
                     selector: ContextConsumerSelector::Entries {
                         entries: ["x-first", "canonical"]
                             .map(|name| ContextEntrySelector {
-                                name: context_name(name),
+                                reference: context_name(name).into(),
                                 form: ContextEntrySelectorForm::OriginalKeyValue,
                             })
                             .into(),
@@ -863,7 +975,7 @@ mod tests {
             ContextDeclaration::Consumes {
                 selector: ContextConsumerSelector::Entries {
                     entries: vec![ContextEntrySelector {
-                        name: context_name("original"),
+                        reference: context_name("original").into(),
                         form: ContextEntrySelectorForm::OriginalKeyValue,
                     }]
                     .into_boxed_slice(),
@@ -872,7 +984,7 @@ mod tests {
             ContextDeclaration::Consumes {
                 selector: ContextConsumerSelector::Entries {
                     entries: vec![ContextEntrySelector {
-                        name: context_name("value"),
+                        reference: context_name("value").into(),
                         form: ContextEntrySelectorForm::Value,
                     }]
                     .into_boxed_slice(),
@@ -1128,10 +1240,10 @@ mod tests {
         );
         let pipeline = pipeline("group", "pipeline");
 
-        assert_eq!(
-            compiled.authorized_identity_policy(&pipeline, &ConfigNodeId::from("node")),
-            Some(&policy),
-        );
+        let compiled_policy = compiled
+            .authorized_identity_policy(&pipeline, &ConfigNodeId::from("node"))
+            .expect("compiled authorized identity policy");
+        assert!(compiled_policy.iter().eq(policy.iter()));
         assert!(!compiled.pipeline_bindings_match(&changed, &pipeline));
         assert!(!changed.pipeline_bindings_match(&compiled, &pipeline));
     }
@@ -1151,9 +1263,21 @@ mod tests {
         let propagation_declaration = ContextDeclaration::HeaderPropagation {
             policy: HeaderPropagationPolicy::default(),
         };
+        let capture_declaration = ContextDeclaration::HeaderCapture {
+            policy: HeaderCapturePolicy::new(
+                CaptureDefaults::default(),
+                vec![CaptureRule {
+                    match_names: vec![context_name("expected")],
+                    store_as: None,
+                    sensitive: false,
+                    value_kind: None,
+                }],
+            ),
+        };
         let declarations = matching
             .context_declarations()
             .into_iter()
+            .chain(std::iter::once(capture_declaration))
             .chain(std::iter::once(propagation_declaration.clone()))
             .collect();
         let bindings = compiled_bindings(declarations);

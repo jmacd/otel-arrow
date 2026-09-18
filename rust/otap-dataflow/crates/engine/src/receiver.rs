@@ -29,7 +29,7 @@ use crate::terminal_state::TerminalState;
 use otel_arrow_dfe_channel::error::SendError;
 use otel_arrow_dfe_channel::mpsc;
 use otel_arrow_dfe_config::PortName;
-use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
+use otel_arrow_dfe_config::authorized_identity_policy::CompiledAuthorizedIdentityPolicy;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::transport_headers_policy::CompiledHeaderCapturePolicy;
 use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
@@ -68,7 +68,7 @@ pub enum ReceiverWrapper<PData> {
         /// Pre-resolved capture policy for transport header extraction.
         capture_policy: Option<CompiledHeaderCapturePolicy>,
         /// Pre-resolved authorized identity claim projection policy.
-        authorized_identity_policy: Option<AuthorizedIdentityPolicy>,
+        authorized_identity_policy: Option<CompiledAuthorizedIdentityPolicy>,
     },
     /// A receiver with a `Send` implementation.
     Shared {
@@ -96,7 +96,7 @@ pub enum ReceiverWrapper<PData> {
         /// Pre-resolved capture policy for transport header extraction.
         capture_policy: Option<CompiledHeaderCapturePolicy>,
         /// Pre-resolved authorized identity claim projection policy.
-        authorized_identity_policy: Option<AuthorizedIdentityPolicy>,
+        authorized_identity_policy: Option<CompiledAuthorizedIdentityPolicy>,
     },
 }
 
@@ -582,7 +582,7 @@ impl<PData> ReceiverWrapper<PData> {
     /// Returns the wrapper with the authorized identity claim projection policy.
     pub(crate) fn with_authorized_identity_policy(
         self,
-        policy: Option<AuthorizedIdentityPolicy>,
+        policy: Option<CompiledAuthorizedIdentityPolicy>,
     ) -> Self {
         match self {
             ReceiverWrapper::Local {

@@ -2,16 +2,18 @@
 
 ## Implementation status
 
-The first conditional transport-based composite slice is documented in
+The implemented composite and batching slices are documented in
 [Conditional composite context entries](../docs/composite-context-entries.md).
-It supports exact entry/member references, explicit multi-value conditions,
-binding-specific scalar versus repeated-value access, and conditional member
-propagation through OTLP/gRPC and Kafka.
+They support exact entry/member references, transport and verified-claim
+members, explicit multi-value conditions, conditional transport propagation
+through OTLP/gRPC and Kafka, and bounded batch accumulation by one complete
+primitive or composite entry.
 
 The examples below describe the broader RFC direction. The implementation guide
 is authoritative for the currently supported syntax and its explicit `match`
-quantifiers. Identity/network sources, nested derived entries, general projector
-semantics, and routing/batching/resource-control integrations remain future work.
+quantifiers. Network sources, nested derived entries, general projector
+semantics, and additional routing and resource-control integrations remain
+future work.
 
 ## Overview
 
@@ -478,7 +480,10 @@ fn create_otlp_receiver(
 }
 
 impl OtlpReceiver {
-    fn accept(&mut self, request: Request<ExportRequest>) -> Result<OtapPdata, Error> {
+    fn accept(
+        &mut self,
+        request: Request<ExportRequest>,
+    ) -> Result<OtapPdata, Error> {
         let identity = request.auth_extension.authorize(request)?;
         let context = self.context_binding.from_arrival(PdataArrival {
             peer_addr: request.remote_addr(),
@@ -547,12 +552,19 @@ pub trait PdataContextSink {
 /// Adapter implemented by an HTTP or gRPC request builder.
 pub trait ContextOutput {
     /// Sets an individual context entry with its typed value reference.
-    fn set(&mut self, name: &str, value: ContextValueRef<'_>) -> Result<(), ContextError>;
+    fn set(
+        &mut self,
+        name: &str,
+        value: ContextValueRef<'_>,
+    ) -> Result<(), ContextError>;
 }
 
 impl OtlpExporter {
     /// Encodes a request and injects the context into HTTP headers.
-    fn encode(&mut self, pdata: OtapPdata) -> Result<Request<ExportRequest>, Error> {
+    fn encode(
+        &mut self,
+        pdata: OtapPdata,
+    ) -> Result<Request<ExportRequest>, Error> {
         let mut request = Request::new(encode(pdata.payload())?);
         self.context.write_to(
             pdata.context(),

@@ -46,7 +46,7 @@ use crate::terminal_state::TerminalState;
 use async_trait::async_trait;
 use otel_arrow_dfe_channel::error::RecvError;
 use otel_arrow_dfe_config::PortName;
-use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
+use otel_arrow_dfe_config::authorized_identity_policy::CompiledAuthorizedIdentityPolicy;
 use otel_arrow_dfe_config::transport_headers_policy::CompiledHeaderCapturePolicy;
 use otel_arrow_dfe_pdata_codec::CodecService;
 use otel_arrow_dfe_telemetry::error::Error as TelemetryError;
@@ -143,7 +143,7 @@ pub struct EffectHandler<PData> {
     /// `None` disables capture.
     capture_policy: Option<Rc<CompiledHeaderCapturePolicy>>,
     /// Immutable authorized identity policy shared by local handler clones.
-    authorized_identity_policy: Option<Rc<AuthorizedIdentityPolicy>>,
+    authorized_identity_policy: Option<Rc<CompiledAuthorizedIdentityPolicy>>,
 }
 
 /// Implementation for the `!Send` effect handler.
@@ -214,12 +214,15 @@ impl<PData> EffectHandler<PData> {
 
     /// Returns the authorized identity claim projection policy.
     #[must_use]
-    pub fn authorized_identity_policy(&self) -> Option<&AuthorizedIdentityPolicy> {
+    pub fn authorized_identity_policy(&self) -> Option<&CompiledAuthorizedIdentityPolicy> {
         self.authorized_identity_policy.as_deref()
     }
 
     /// Sets the authorized identity claim projection policy.
-    pub fn set_authorized_identity_policy(&mut self, policy: Option<AuthorizedIdentityPolicy>) {
+    pub fn set_authorized_identity_policy(
+        &mut self,
+        policy: Option<CompiledAuthorizedIdentityPolicy>,
+    ) {
         self.authorized_identity_policy = policy.map(Rc::new);
     }
 

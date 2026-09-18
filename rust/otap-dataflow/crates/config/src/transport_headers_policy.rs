@@ -151,6 +151,7 @@ impl HeaderCapturePolicy {
     pub fn context_primitives(&self) -> impl Iterator<Item = ContextPrimitive> + '_ {
         self.headers.iter().flat_map(|rule| {
             rule.match_names.iter().map(|name| ContextPrimitive {
+                source: crate::context_bindings::ContextPrimitiveSource::TransportHeader,
                 entry: rule.store_as.as_ref().unwrap_or(name).clone(),
                 field: name.clone(),
                 grouped: rule.store_as.is_some(),

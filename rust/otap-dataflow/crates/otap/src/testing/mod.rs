@@ -145,6 +145,15 @@ pub fn create_empty_test_pdata() -> OtapPdata {
     OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(Bytes::from(otlp_bytes)).into())
 }
 
+/// Attach authorization-derived context entries as a receiver would after authorization.
+pub fn capture_test_authorized_identity(
+    pdata: &mut OtapPdata,
+    policy: &otel_arrow_dfe_config::authorized_identity_policy::CompiledAuthorizedIdentityPolicy,
+    identity: &otel_arrow_dfe_engine::capability::auth::AuthorizedIdentity,
+) {
+    pdata.capture_authorized_identity(policy, identity);
+}
+
 /// Simple exporter test where there is NO subscribe_to() in the context.
 pub fn test_exporter_no_subscription(factory: &ExporterFactory<OtapPdata>, config: Value) {
     let test_runtime = TestRuntime::new();

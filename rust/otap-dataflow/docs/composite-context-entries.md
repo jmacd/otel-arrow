@@ -1,9 +1,9 @@
 # Conditional composite context entries
 
-Context entries can group request metadata and make that group available only
-under explicit conditions. OTLP/gRPC and Kafka propagation policies can select
-a specific member of that group. The member is not propagated when its parent
-entry is absent, even if the underlying header exists independently.
+Context entries can group transport metadata and verified authorization claims
+and make that group available only under explicit conditions. OTLP/gRPC and
+Kafka propagation policies can select transport members. The batch processor
+can use a complete primitive or composite entry as an accumulation key.
 
 See the runnable configuration in
 [`examples/composite-context.yaml`](../examples/composite-context.yaml).
@@ -86,6 +86,69 @@ may reuse names, but definitions visible to the same pipeline cannot conflict.
 Primitive transport entry names are collected engine-wide from capture and
 component producer declarations.
 
+## Verified claim members
+
+`policies.authorized_identity` projects verified claims into primitive context
+entries. A composite can combine one of those trusted entries with transport
+metadata without converting either source type:
+
+```yaml
+policies:
+  authorized_identity:
+    - claim: sub
+      store_as: customer_id
+  transport_headers:
+    header_capture:
+      headers:
+        - match_names: [x-workspace-id]
+          store_as: workspace_id
+  context:
+    entries:
+      product_user:
+        - type: authorized_identity
+          name: customer_id
+        - type: transport_header
+          name: workspace_id:x-workspace-id
+          as: workspace_id
+```
+
+The compiler rejects a source reference whose declared type does not match the
+primitive's provenance. Header propagation cannot select authorization-derived
+members; this prevents verified claims from entering an untrusted transport
+carrier through the transport-header policy.
+
+## Partitioning batch accumulation
+
+The batch processor accepts zero or one complete entry reference:
+
+```yaml
+type: processor:batch
+config:
+  partition_by: [product_user]
+  max_active_partitions: 1024
+```
+
+Each distinct ordered value tuple gets a separate accumulation buffer while
+using the same OTAP or OTLP size configuration. Repeated values retain their
+order and transport text and binary values remain distinct. An absent primitive,
+an incomplete composite, or a failed composite condition uses one shared
+missing-entry buffer.
+
+A present partition emits a detached context containing only the primitive
+entries represented in its partition key. It does not copy unrelated transport
+headers, authorization claims, peer address, or routing state. The shared
+missing-entry partition emits an empty context. This ensures an output never
+claims context metadata that was not common to everything in its batch.
+
+`max_active_partitions` bounds pending keys independently for each signal and
+payload format. A request introducing another key after the limit is reached is
+nacked rather than merged into another partition. One timer is shared by all
+keys for a signal and format; when the oldest pending data reaches
+`max_batch_duration`, every active key in that signal and format is flushed.
+It defaults to `1`, preserving single-batch behavior when `partition_by` is
+empty. Partitioned configurations must set it high enough for their expected
+number of concurrently pending values.
+
 ## Propagating a conditional member
 
 ```yaml
@@ -106,18 +169,18 @@ This rule emits workspace headers only through the conditional composite:
 | Repeated workspace values | All occurrences, in input order |
 | Workspace but no customer | Nothing |
 | Development environment | Nothing |
-| Both production and development environment values | Nothing with `match: all` |
+| Production and development values | Nothing (`match: all`) |
 
 An independent propagation rule can explicitly select a primitive field.
 The qualified rule itself never bypasses its parent's presence condition.
 
 Selection and naming are independent:
 
-| Selection | `name: stored_name` | `name: preserve` |
+| Selection | Stored name | Original name |
 | --- | --- | --- |
-| `request_identity` | Every selected value uses `request_identity` | Original header names |
-| `request_identity:x-workspace` | Workspace values use `request_identity` | Original workspace header name |
-| `production_workspace:workspace` | Workspace values use `production_workspace` | Original workspace header name |
+| `request_identity` | `request_identity` | Preserve |
+| `request_identity:x-workspace` | `request_identity` | Preserve |
+| `production_workspace:workspace` | `production_workspace` | Preserve |
 
 Both the default `named` list and override `match.stored_names` accept these
 references. Overrides retain first-match order; a qualified override does not
@@ -153,7 +216,8 @@ selected value if the earlier capture deliberately omitted that information.
 Retrying the unchanged message against the same incompatible binding
 does not repair it; these propagation failures are permanently nacked.
 
-This slice implements transport-based composites and their propagation.
-Authorized-identity sources, network sources, nested derived entries, general
-N:M projection, and routing/batching/resource-control integrations remain future
-work under RFC 0004.
+This slice implements transport and authorized-identity composites,
+transport-member propagation, and bounded batch accumulation by one complete
+entry. Network sources, nested derived entries, general N:M projection, and
+other routing and resource-control integrations remain future work under RFC
+0004.

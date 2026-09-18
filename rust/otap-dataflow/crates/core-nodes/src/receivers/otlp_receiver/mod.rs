@@ -893,7 +893,10 @@ mod tests {
 
     use otel_arrow_dfe_channel::error::RecvError;
     use otel_arrow_dfe_config::{ContextEntryName, SignalType};
-    use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
+    use otel_arrow_dfe_config::authorized_identity_policy::{
+        AuthorizedIdentityPolicy, CompiledAuthorizedIdentityPolicy,
+    };
+    use otel_arrow_dfe_config::context_bindings::{ContextLayout, ContextPrimitive};
     use otel_arrow_dfe_config::node::NodeUserConfig;
     use otel_arrow_dfe_config::policy::{
         MemoryLimiterMode, RateLimitAggregation, RateLimitEnforcement, RateLimitPressure,
@@ -955,7 +958,7 @@ mod tests {
     use otel_arrow_dfe_telemetry::common_attributes::ReceiverRejectionErrorType;
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
     use prost::Message;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1012,14 +1015,22 @@ mod tests {
         }
     }
 
-    fn authorized_identity_policy() -> AuthorizedIdentityPolicy {
-        serde_json::from_value(serde_json::json!([
+    fn authorized_identity_policy() -> CompiledAuthorizedIdentityPolicy {
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
             {
                 "claim": "sub",
                 "store_as": "customer_id"
             }
         ]))
-        .expect("valid authorized identity policy")
+        .expect("valid authorized identity policy");
+        let layout = ContextLayout::compile(
+            BTreeSet::from([ContextPrimitive::authorized_identity(context_name(
+                "customer_id",
+            ))]),
+            BTreeSet::new(),
+        )
+        .expect("valid authorized identity layout");
+        policy.compile_bound(layout)
     }
 
     fn test_config(addr: SocketAddr) -> Config {

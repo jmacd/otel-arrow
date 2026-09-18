@@ -8,6 +8,9 @@ use crate::error::Error;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::Arc;
+
+use crate::context_bindings::ContextLayout;
 
 /// Policy selecting verified authorization claims for pdata context storage.
 #[derive(
@@ -16,6 +19,13 @@ use std::collections::HashSet;
 #[serde(transparent)]
 pub struct AuthorizedIdentityPolicy {
     entries: Vec<AuthorizedIdentityClaim>,
+}
+
+/// Authorized claim capture resolved against one immutable context layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledAuthorizedIdentityPolicy {
+    policy: AuthorizedIdentityPolicy,
+    layout: Arc<ContextLayout>,
 }
 
 impl AuthorizedIdentityPolicy {
@@ -56,6 +66,28 @@ impl AuthorizedIdentityPolicy {
             }
         }
         Ok(())
+    }
+
+    /// Binds claim capture to the context configuration generation.
+    #[must_use]
+    pub fn compile_bound(self, layout: Arc<ContextLayout>) -> CompiledAuthorizedIdentityPolicy {
+        CompiledAuthorizedIdentityPolicy {
+            policy: self,
+            layout,
+        }
+    }
+}
+
+impl CompiledAuthorizedIdentityPolicy {
+    /// Returns configured claim projections in policy order.
+    pub fn iter(&self) -> impl Iterator<Item = &AuthorizedIdentityClaim> {
+        self.policy.iter()
+    }
+
+    /// Returns the immutable layout associated with captured claim values.
+    #[must_use]
+    pub fn layout(&self) -> &Arc<ContextLayout> {
+        &self.layout
     }
 }
 

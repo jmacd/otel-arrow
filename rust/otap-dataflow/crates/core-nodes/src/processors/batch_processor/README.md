@@ -62,6 +62,12 @@ config:
 
   # Output format: "otap", "otlp", or "preserve" (default: preserve).
   format: preserve
+
+  # Optional complete context entry used to isolate accumulation buffers.
+  partition_by: [product_user]
+
+  # Maximum pending keys per signal and payload format (default: 1).
+  max_active_partitions: 1
 ```
 
 Each format object contains:
@@ -112,6 +118,31 @@ Each format object contains:
 
 ## Examples
 
+### Partition by request context
+
+Use one primitive or composite context entry to keep distinct request
+populations in separate batches:
+
+```yaml
+type: processor:batch
+config:
+  partition_by: [product_user]
+  max_active_partitions: 1024
+  max_batch_duration: 500ms
+```
+
+The entry reference is compiled when the pipeline is built. Each distinct
+ordered value tuple uses the existing format-specific sizing configuration.
+Incomplete or absent entries share one fallback batch.
+
+Outputs for present keys contain only the primitive context entries represented
+by the key. Unrelated context is not copied. The missing-entry fallback carries
+an empty context. When `max_active_partitions` is exhausted, a request with a
+new key is nacked rather than mixed with another partition.
+The default is `1`, preserving the original single-batch behavior when
+`partition_by` is empty. Set a larger value explicitly when enabling
+partitioning across multiple values.
+
 Flush every incoming message:
 
 ```yaml
@@ -149,6 +180,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 | `otap.processor.batch.batching_errors` | `{error}` | Number of batches for which errors encountered. |
 | `otap.processor.batch.nacked_inbound_slots` | `{msg}` | Number of requests nacked due to inbound slot exhaustion. |
 | `otap.processor.batch.nacked_outbound_slots` | `{msg}` | Number of requests nacked due to outbound slot exhaustion. |
+| `otap.processor.batch.nacked_partition_limit` | `{msg}` | Number of requests nacked because a new context key exceeded `max_active_partitions`. |
 | `otap.processor.batch.split_budget_fallbacks` | `{entry}` | Number of oversize resource entries emitted whole because splitting would have exceeded `max_split_fragments`, `max_split_overhead_bytes`, or the per-flush `max_split_fragments_per_flush` threshold. |
 
 ### Events
@@ -163,6 +195,9 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 - `bytes` sizing depends on payload formats that can report encoded size.
 - `max_batch_duration: 0s` disables time-based accumulation and flushes
   immediately.
+- `partition_by` accepts at most one complete entry reference.
+- `max_active_partitions` defaults to `1` and applies independently to each
+  signal and payload format.
 
 ## Related Docs
 

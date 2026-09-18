@@ -111,6 +111,12 @@ impl ContextEntryRef {
     }
 }
 
+impl From<ContextEntryName> for ContextEntryRef {
+    fn from(entry: ContextEntryName) -> Self {
+        Self { entry, field: None }
+    }
+}
+
 impl TryFrom<&str> for ContextEntryRef {
     type Error = Error;
 

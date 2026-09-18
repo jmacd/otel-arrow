@@ -31,6 +31,8 @@ pub struct ContextEntryId(pub(crate) usize);
 /// A primitive transport field declared by capture or a component producer.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContextPrimitive {
+    /// Trusted provenance and physical storage domain.
+    pub source: ContextPrimitiveSource,
     /// Logical entry name (the capture rule's `store_as`, when supplied).
     pub entry: ContextEntryName,
     /// Normalized member identity, independent of retained wire-name spelling.
@@ -39,11 +41,32 @@ pub struct ContextPrimitive {
     pub grouped: bool,
 }
 
+/// Provenance and physical storage domain of a primitive context field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContextPrimitiveSource {
+    /// Untrusted metadata captured from a transport carrier.
+    TransportHeader,
+    /// A verified claim projected from an authorized identity.
+    AuthorizedIdentity,
+}
+
 impl ContextPrimitive {
     /// Declares a standalone, singleton-field transport entry.
     #[must_use]
     pub fn standalone(name: ContextEntryName) -> Self {
         Self {
+            source: ContextPrimitiveSource::TransportHeader,
+            entry: name.clone(),
+            field: name,
+            grouped: false,
+        }
+    }
+
+    /// Declares a standalone verified authorized identity entry.
+    #[must_use]
+    pub fn authorized_identity(name: ContextEntryName) -> Self {
+        Self {
+            source: ContextPrimitiveSource::AuthorizedIdentity,
             entry: name.clone(),
             field: name,
             grouped: false,
@@ -160,6 +183,12 @@ impl ContextLayout {
                     primitive.entry
                 )));
             }
+            if members.iter().any(|member| member.name == primitive.field) {
+                return Err(config_error(format!(
+                    "context field `{}:{}` is declared by multiple source domains",
+                    primitive.entry, primitive.field
+                )));
+            }
             members.push(ContextMember {
                 name: primitive.field.clone(),
                 source: ContextFieldId(index),
@@ -201,27 +230,42 @@ impl ContextLayout {
             for part in &declaration.definition.0 {
                 match part {
                     ContextEntryPart::TransportHeader { name, alias } => {
-                        let (_, source) = layout.resolve_primitive_field(name)?;
-                        let member_name = alias
-                            .as_ref()
-                            .unwrap_or_else(|| name.field().unwrap_or(name.entry()));
-                        if member_name.contains(':') || !names.insert(member_name.clone()) {
-                            return Err(config_error(format!(
-                                "invalid or duplicate member `{member_name}` in `{}`",
-                                declaration.name
-                            )));
-                        }
-                        members.push(ContextMember {
-                            name: member_name.clone(),
+                        let (_, source) = layout.resolve_primitive_field(
+                            name,
+                            ContextPrimitiveSource::TransportHeader,
+                        )?;
+                        Self::append_member(
+                            &declaration.name,
+                            name,
+                            alias.as_ref(),
                             source,
-                        });
+                            &mut names,
+                            &mut members,
+                        )?;
+                    }
+                    ContextEntryPart::AuthorizedIdentity { name, alias } => {
+                        let (_, source) = layout.resolve_primitive_field(
+                            name,
+                            ContextPrimitiveSource::AuthorizedIdentity,
+                        )?;
+                        Self::append_member(
+                            &declaration.name,
+                            name,
+                            alias.as_ref(),
+                            source,
+                            &mut names,
+                            &mut members,
+                        )?;
                     }
                     ContextEntryPart::TransportHeaderMatch {
                         name,
                         value,
                         multiplicity,
                     } => {
-                        let (_, field) = layout.resolve_primitive_field(name)?;
+                        let (_, field) = layout.resolve_primitive_field(
+                            name,
+                            ContextPrimitiveSource::TransportHeader,
+                        )?;
                         guards.push(ContextGuard {
                             field,
                             value: value.as_bytes().into(),
@@ -252,13 +296,26 @@ impl ContextLayout {
     fn resolve_primitive_field(
         &self,
         reference: &ContextEntryRef,
+        source: ContextPrimitiveSource,
     ) -> Result<(ContextEntryId, ContextFieldId), Error> {
-        let entry_id = self.entries.iter().position(|entry| {
-            !entry.derived && &entry.name == reference.entry()
-        }).ok_or_else(|| config_error(format!(
-            "unknown primitive context entry `{}`; derived entries cannot be composite inputs",
-            reference.entry()
-        )))?;
+        let entry_id = self
+            .entries
+            .iter()
+            .position(|entry| {
+                !entry.derived
+                    && &entry.name == reference.entry()
+                    && entry
+                        .members
+                        .iter()
+                        .all(|member| self.fields[member.source.0].source == source)
+            })
+            .ok_or_else(|| {
+                config_error(format!(
+                    "unknown {:?} context entry `{}`; derived entries cannot be composite inputs",
+                    source,
+                    reference.entry()
+                ))
+            })?;
         let field = self.resolve_member(ContextEntryId(entry_id), reference)?;
         Ok((ContextEntryId(entry_id), field))
     }
@@ -334,10 +391,34 @@ impl ContextLayout {
     ) -> Result<ContextFieldBinding, Error> {
         let (entry, _) = self.resolve(reference, pipeline)?;
         let field = self.resolve_member(entry, reference)?;
+        if self.fields[field.0].source != ContextPrimitiveSource::TransportHeader {
+            return Err(config_error(format!(
+                "`{reference}` is not a transport-header context field"
+            )));
+        }
         Ok(ContextFieldBinding {
             layout: self.clone(),
             entry,
             field,
+        })
+    }
+
+    /// Binds one complete primitive or composite entry for value-based decisions.
+    pub fn bind_entry(
+        self: &Arc<Self>,
+        reference: &ContextEntryRef,
+        pipeline: &crate::PipelineKey,
+    ) -> Result<ContextEntryBinding, Error> {
+        if reference.field().is_some() {
+            return Err(config_error(format!(
+                "`{reference}` selects a field; this binding requires a complete context entry"
+            )));
+        }
+        let (entry, fields) = self.resolve(reference, pipeline)?;
+        Ok(ContextEntryBinding {
+            layout: self.clone(),
+            entry,
+            fields: fields.into_boxed_slice(),
         })
     }
 
@@ -352,6 +433,27 @@ impl ContextLayout {
                     primitive.entry, primitive.field
                 ))
             })
+    }
+
+    fn append_member(
+        entry_name: &ContextEntryName,
+        reference: &ContextEntryRef,
+        alias: Option<&ContextEntryName>,
+        source: ContextFieldId,
+        names: &mut BTreeSet<ContextEntryName>,
+        members: &mut Vec<ContextMember>,
+    ) -> Result<(), Error> {
+        let member_name = alias.unwrap_or_else(|| reference.field().unwrap_or(reference.entry()));
+        if member_name.contains(':') || !names.insert(member_name.clone()) {
+            return Err(config_error(format!(
+                "invalid or duplicate member `{member_name}` in `{entry_name}`"
+            )));
+        }
+        members.push(ContextMember {
+            name: member_name.clone(),
+            source,
+        });
+        Ok(())
     }
 
     /// Binds a component's declared standalone transport-field output.
@@ -453,6 +555,143 @@ pub struct ContextFieldBinding {
     layout: Arc<ContextLayout>,
     entry: ContextEntryId,
     field: ContextFieldId,
+}
+
+/// A complete primitive or composite entry resolved before message processing.
+#[derive(Debug, Clone)]
+pub struct ContextEntryBinding {
+    layout: Arc<ContextLayout>,
+    entry: ContextEntryId,
+    fields: Box<[ContextFieldId]>,
+}
+
+impl ContextEntryBinding {
+    /// Returns the immutable layout associated with this binding.
+    #[must_use]
+    pub fn layout(&self) -> &Arc<ContextLayout> {
+        &self.layout
+    }
+
+    /// Returns whether a captured context uses this binding's layout generation.
+    #[must_use]
+    pub fn is_compatible_layout(&self, layout: &Arc<ContextLayout>) -> bool {
+        Arc::ptr_eq(&self.layout, layout)
+    }
+
+    /// Returns the selected primitive fields in composite declaration order.
+    pub fn primitives(&self) -> impl Iterator<Item = &ContextPrimitive> {
+        self.fields.iter().map(|field| &self.layout.fields[field.0])
+    }
+
+    /// Returns all transport values for one selected primitive by ordinal.
+    pub fn transport_values<'a>(
+        &self,
+        ordinal: usize,
+        headers: Option<&'a TransportHeaders>,
+    ) -> Result<ContextTransportValues<'a>, ContextAccessError> {
+        let field = self.fields[ordinal];
+        debug_assert_eq!(
+            self.layout.fields[field.0].source,
+            ContextPrimitiveSource::TransportHeader
+        );
+        let index = match headers {
+            Some(headers) if !headers.is_empty() => {
+                Some((headers.context_index(&self.layout)?, headers.as_slice()))
+            }
+            _ => None,
+        };
+        Ok(ContextTransportValues {
+            field,
+            next: index.and_then(|(index, _)| index.head(field)),
+            index: index.map(|(index, _)| index),
+            headers: index.map_or(&[], |(_, headers)| headers),
+        })
+    }
+
+    /// Evaluates the selected entry's transport-based presence guards.
+    pub fn guards_match(
+        &self,
+        headers: Option<&TransportHeaders>,
+    ) -> Result<bool, ContextAccessError> {
+        let entry = &self.layout.entries[self.entry.0];
+        if entry.guards.is_empty() {
+            return Ok(true);
+        }
+        let Some(headers) = headers.filter(|headers| !headers.is_empty()) else {
+            return Ok(false);
+        };
+        let index = headers.context_index(&self.layout)?;
+        Ok(entry.guards.iter().all(|guard| {
+            let mut values = index.values(guard.field, headers.as_slice()).peekable();
+            if values.peek().is_none() {
+                return false;
+            }
+            let matches = |header: &TransportHeader| {
+                header.value.value_kind == ValueKind::Text && header.value.bytes == guard.value
+            };
+            match guard.multiplicity {
+                ContextMatchMultiplicity::Any => values.any(matches),
+                ContextMatchMultiplicity::All => values.all(matches),
+            }
+        }))
+    }
+
+    /// Rebuilds transport storage with only selected transport primitive values.
+    pub fn project_transport(
+        &self,
+        headers: Option<&TransportHeaders>,
+    ) -> Result<Option<TransportHeaders>, ContextAccessError> {
+        let mut projected = TransportHeaders::new();
+        let mut projected_fields = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (ordinal, primitive) in self.primitives().enumerate() {
+            if primitive.source != ContextPrimitiveSource::TransportHeader {
+                continue;
+            }
+            let field = self.fields[ordinal];
+            if !seen.insert(field) {
+                continue;
+            }
+            for header in self.transport_values(ordinal, headers)? {
+                projected_fields.push(field);
+                projected.push(TransportHeader::new(
+                    primitive.entry.clone(),
+                    header.value.value_kind.clone(),
+                    header.value.bytes.clone(),
+                ));
+            }
+        }
+        if projected.is_empty() {
+            return Ok(None);
+        }
+        projected.bind_fields(
+            self.layout.clone(),
+            Arc::from([self.entry]),
+            projected_fields,
+            Arc::default(),
+        );
+        Ok(Some(projected))
+    }
+}
+
+/// Zero-allocation iterator over one bound transport primitive's repeated values.
+pub struct ContextTransportValues<'a> {
+    field: ContextFieldId,
+    next: Option<usize>,
+    index: Option<&'a ContextIndex>,
+    headers: &'a [TransportHeader],
+}
+
+impl<'a> Iterator for ContextTransportValues<'a> {
+    type Item = &'a TransportHeader;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let offset = self.next?;
+        let index = self.index?;
+        self.next = (index.next[offset] != usize::MAX).then_some(index.next[offset]);
+        debug_assert_eq!(index.fields[offset], self.field);
+        Some(&self.headers[offset])
+    }
 }
 
 impl ContextFieldBinding {
@@ -606,6 +845,11 @@ impl HeaderPropagationPolicy {
         let mut append = |reference: &ContextEntryRef, action, naming| -> Result<(), Error> {
             let (entry, selected) = layout.resolve(reference, pipeline)?;
             for field in selected {
+                if layout.fields[field.0].source != ContextPrimitiveSource::TransportHeader {
+                    return Err(config_error(format!(
+                        "header propagation cannot select authorized identity entry `{reference}`"
+                    )));
+                }
                 let steps = fields.entry(field).or_default();
                 // A primitive selection is unconditional whenever this source field exists.
                 if !steps
@@ -641,7 +885,13 @@ impl HeaderPropagationPolicy {
                 }
             }
             PropagationSelectorType::AllCaptured => {
-                for entry in layout.entries.iter().filter(|entry| !entry.derived) {
+                for entry in layout.entries.iter().filter(|entry| {
+                    !entry.derived
+                        && entry.members.iter().all(|member| {
+                            layout.fields[member.source.0].source
+                                == ContextPrimitiveSource::TransportHeader
+                        })
+                }) {
                     append(
                         &ContextEntryRef::try_from(entry.name.as_str())?,
                         self.default.action,

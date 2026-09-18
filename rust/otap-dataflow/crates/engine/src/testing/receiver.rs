@@ -20,7 +20,7 @@ use crate::receiver::ReceiverWrapper;
 use crate::shared::message::{SharedReceiver, SharedSender};
 use crate::testing::{CtrlMsgCounters, setup_test_runtime};
 use otel_arrow_dfe_channel::error::RecvError;
-use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
+use otel_arrow_dfe_config::authorized_identity_policy::CompiledAuthorizedIdentityPolicy;
 use otel_arrow_dfe_config::transport_headers_policy::HeaderCapturePolicy;
 use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
 use serde_json::Value;
@@ -249,7 +249,7 @@ impl<PData: Debug + 'static> TestPhase<PData> {
     #[must_use]
     pub fn with_authorized_identity_policy(
         mut self,
-        policy: Option<AuthorizedIdentityPolicy>,
+        policy: Option<CompiledAuthorizedIdentityPolicy>,
     ) -> Self {
         self.receiver = self.receiver.with_authorized_identity_policy(policy);
         self

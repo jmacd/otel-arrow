@@ -165,7 +165,7 @@ impl ConfigNodeContextDeclaration for ValidationExporterConfig {
                     entries: names
                         .into_iter()
                         .map(|name| ContextEntrySelector {
-                            name,
+                            reference: name.into(),
                             form: ContextEntrySelectorForm::Value,
                         })
                         .collect(),
@@ -324,7 +324,7 @@ mod tests {
         names
             .iter()
             .map(|name| ContextEntrySelector {
-                name: context_name(name),
+                reference: context_name(name).into(),
                 form: ContextEntrySelectorForm::Value,
             })
             .collect()

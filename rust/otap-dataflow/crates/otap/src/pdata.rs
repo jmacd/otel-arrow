@@ -19,8 +19,13 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(test)]
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
-use otel_arrow_dfe_config::transport_headers::TransportHeaders;
+use otel_arrow_dfe_config::authorized_identity_policy::CompiledAuthorizedIdentityPolicy;
+use otel_arrow_dfe_config::context_bindings::{
+    ContextAccessError, ContextEntryBinding, ContextPrimitiveSource,
+};
+use otel_arrow_dfe_config::transport_headers::{TransportHeaders, ValueKind};
 use otel_arrow_dfe_config::{ContextEntryName, PortName, SignalFormat, SignalType};
 use otel_arrow_dfe_engine::_private::AckNackRouting;
 use otel_arrow_dfe_engine::capability::auth::{AuthorizedIdentity, ClaimValue};
@@ -70,19 +75,46 @@ impl AuthorizedIdentityEntry {
 /// Immutable authorization-derived context entries.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct AuthorizedIdentityEntries {
-    entries: Arc<Vec<AuthorizedIdentityEntry>>,
+    inner: Arc<AuthorizedIdentityEntriesInner>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct AuthorizedIdentityEntriesInner {
+    entries: Vec<AuthorizedIdentityEntry>,
+    layout: Arc<otel_arrow_dfe_config::context_bindings::ContextLayout>,
+}
+
+/// Collision-safe value tuple used to select one batch accumulation buffer.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ContextPartitionKey {
+    /// The selected entry was absent; all absent selections share this key.
+    Missing,
+    /// The selected primitive or composite entry was present.
+    Present(Box<[u8]>),
+}
+
+/// A partition key and the only pdata context permitted on its output batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedContextPartition {
+    /// Key used to multiplex accumulation buffers.
+    pub key: ContextPartitionKey,
+    /// Detached projection containing exactly the selected entry, or empty when missing.
+    pub output_context: Context,
 }
 
 impl fmt::Debug for AuthorizedIdentityEntries {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthorizedIdentityEntries")
-            .field("entries", &self.entries)
+            .field("entries", &self.inner.entries)
             .finish()
     }
 }
 
 impl AuthorizedIdentityEntries {
-    fn capture(policy: &AuthorizedIdentityPolicy, identity: &AuthorizedIdentity) -> Option<Self> {
+    fn capture(
+        policy: &CompiledAuthorizedIdentityPolicy,
+        identity: &AuthorizedIdentity,
+    ) -> Option<Self> {
         let entries = policy
             .iter()
             .filter_map(|projection| {
@@ -96,31 +128,38 @@ impl AuthorizedIdentityEntries {
             })
             .collect::<Vec<_>>();
         (!entries.is_empty()).then(|| Self {
-            entries: Arc::new(entries),
+            inner: Arc::new(AuthorizedIdentityEntriesInner {
+                entries,
+                layout: policy.layout().clone(),
+            }),
         })
     }
 
     /// Returns the number of captured entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.inner.entries.len()
     }
 
     /// Returns whether no entries were captured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.inner.entries.is_empty()
     }
 
     /// Iterates over captured entries in policy order.
     pub fn iter(&self) -> impl Iterator<Item = &AuthorizedIdentityEntry> {
-        self.entries.iter()
+        self.inner.entries.iter()
     }
 
     /// Finds an entry by exact configured name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&AuthorizedIdentityEntry> {
-        self.entries.iter().find(|entry| entry.name == name)
+        self.inner.entries.iter().find(|entry| entry.name == name)
+    }
+
+    fn layout(&self) -> &Arc<otel_arrow_dfe_config::context_bindings::ContextLayout> {
+        &self.inner.layout
     }
 }
 
@@ -518,15 +557,116 @@ impl Context {
         self.transport_headers = Some(headers);
     }
 
+    /// Resolves a compiled partition entry and projects only its primitive values.
+    ///
+    /// A missing entry maps to the shared missing key and an empty output context.
+    /// A present entry maps to a collision-safe ordered value tuple. The projected
+    /// context deliberately excludes every field not used in that tuple, along
+    /// with routing frames, peer address, and flow-metric state.
+    pub fn resolve_partition(
+        &self,
+        binding: &ContextEntryBinding,
+    ) -> Result<ResolvedContextPartition, ContextAccessError> {
+        if !binding.guards_match(self.transport_headers())? {
+            return Ok(ResolvedContextPartition {
+                key: ContextPartitionKey::Missing,
+                output_context: Self::default(),
+            });
+        }
+        if binding
+            .primitives()
+            .any(|primitive| primitive.source == ContextPrimitiveSource::AuthorizedIdentity)
+            && let Some(entries) = self.authorized_identity_entries()
+            && !binding.is_compatible_layout(entries.layout())
+        {
+            return Err(ContextAccessError::IncompatibleLayout);
+        }
+
+        let mut key = Vec::new();
+        let mut projected_authorized = Vec::new();
+        for (ordinal, primitive) in binding.primitives().enumerate() {
+            let count_offset = key.len();
+            key.extend_from_slice(&0_u64.to_le_bytes());
+            let mut count = 0_u64;
+            match primitive.source {
+                ContextPrimitiveSource::TransportHeader => {
+                    for header in binding.transport_values(ordinal, self.transport_headers())? {
+                        count += 1;
+                        key.push(match header.value.value_kind {
+                            ValueKind::Text => 0,
+                            ValueKind::Binary => 1,
+                        });
+                        Self::append_partition_value(&mut key, &header.value.bytes);
+                    }
+                }
+                ContextPrimitiveSource::AuthorizedIdentity => {
+                    let Some(entry) = self
+                        .authorized_identity_entries()
+                        .and_then(|entries| entries.get(primitive.entry.as_str()))
+                    else {
+                        return Ok(ResolvedContextPartition {
+                            key: ContextPartitionKey::Missing,
+                            output_context: Self::default(),
+                        });
+                    };
+                    let value_tag = match entry.value() {
+                        ClaimValue::One(_) => 2,
+                        ClaimValue::Many(_) => 3,
+                    };
+                    for value in entry.value().as_slice() {
+                        count += 1;
+                        key.push(value_tag);
+                        Self::append_partition_value(&mut key, value.as_bytes());
+                    }
+                    if !projected_authorized
+                        .iter()
+                        .any(|projected: &AuthorizedIdentityEntry| projected.name == entry.name)
+                    {
+                        projected_authorized.push(entry.clone());
+                    }
+                }
+            }
+            if count == 0 {
+                return Ok(ResolvedContextPartition {
+                    key: ContextPartitionKey::Missing,
+                    output_context: Self::default(),
+                });
+            }
+            key[count_offset..count_offset + 8].copy_from_slice(&count.to_le_bytes());
+        }
+
+        let mut output_context = Self::default();
+        if let Some(headers) = binding.project_transport(self.transport_headers())? {
+            output_context.transport_headers = Some(headers);
+        }
+        if !projected_authorized.is_empty() {
+            output_context.authorized_identity = Some(AuthorizedIdentityEntries {
+                inner: Arc::new(AuthorizedIdentityEntriesInner {
+                    entries: projected_authorized,
+                    layout: binding.layout().clone(),
+                }),
+            });
+        }
+        Ok(ResolvedContextPartition {
+            key: ContextPartitionKey::Present(key.into_boxed_slice()),
+            output_context,
+        })
+    }
+
     /// Returns the authorization-derived context entries, if any.
     #[must_use]
     pub fn authorized_identity_entries(&self) -> Option<&AuthorizedIdentityEntries> {
         self.authorized_identity.as_ref()
     }
 
-    fn capture_authorized_identity(
+    fn append_partition_value(key: &mut Vec<u8>, value: &[u8]) {
+        key.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        key.extend_from_slice(value);
+    }
+
+    fn capture_compiled_authorized_identity(
         &mut self,
-        policy: &AuthorizedIdentityPolicy,
+        policy: &CompiledAuthorizedIdentityPolicy,
         identity: &AuthorizedIdentity,
     ) {
         self.authorized_identity = AuthorizedIdentityEntries::capture(policy, identity);
@@ -966,10 +1106,11 @@ impl OtapPdata {
 
     pub(crate) fn capture_authorized_identity(
         &mut self,
-        policy: &AuthorizedIdentityPolicy,
+        policy: &CompiledAuthorizedIdentityPolicy,
         identity: &AuthorizedIdentity,
     ) {
-        self.context.capture_authorized_identity(policy, identity);
+        self.context
+            .capture_compiled_authorized_identity(policy, identity);
     }
 
     /// Set transport headers on this pdata's context.
@@ -1328,8 +1469,12 @@ mod test {
         TestCallData, create_empty_test_pdata, create_test_pdata, next_ack, next_nack,
     };
     use otel_arrow_dfe_channel::mpsc::Channel as LocalChannel;
-    use otel_arrow_dfe_config::ContextEntryName;
+    use otel_arrow_dfe_config::context_bindings::{ContextLayout, ContextPrimitive};
+    use otel_arrow_dfe_config::context_policy::{
+        ContextEntryDeclaration, ContextPolicy, ContextScope,
+    };
     use otel_arrow_dfe_config::transport_headers::{TransportHeader, ValueKind};
+    use otel_arrow_dfe_config::{ContextEntryName, PipelineKey};
     use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
     use otel_arrow_dfe_engine::control::{
         PipelineCompletionMsg, pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
@@ -1348,7 +1493,7 @@ mod test {
     use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
     use pretty_assertions::assert_eq;
     use std::cell::Cell;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::mem::size_of;
     use tokio::sync::mpsc;
 
@@ -1359,6 +1504,203 @@ mod test {
     #[cfg(target_pointer_width = "64")]
     fn otap_pdata_layout_is_stable() {
         assert_eq!(size_of::<OtapPdata>(), 160);
+    }
+
+    /// Scenario: a partition binding selects a composite made from one
+    /// transport header and one verified authorization claim while unrelated
+    /// transport and authorization entries are also present.
+    /// Guarantees: the key includes both selected values, the output context
+    /// contains only those selected primitives, and an incomplete composite
+    /// maps to the shared missing key with an empty context.
+    #[test]
+    fn mixed_composite_partition_projects_only_key_fields() {
+        let pipeline = PipelineKey::new("group".into(), "pipeline".into());
+        let policy: ContextPolicy = serde_json::from_value(serde_json::json!({
+            "entries": {
+                "product_user": [
+                    {"type": "authorized_identity", "name": "customer_id"},
+                    {"type": "transport_header", "name": "workspace_id"}
+                ]
+            }
+        }))
+        .expect("valid mixed composite");
+        let definitions = policy
+            .entries
+            .into_iter()
+            .map(|(name, definition)| ContextEntryDeclaration {
+                scope: ContextScope::Engine,
+                name,
+                definition,
+            })
+            .collect();
+        let layout = ContextLayout::compile(
+            BTreeSet::from([
+                ContextPrimitive::authorized_identity(
+                    ContextEntryName::try_from("customer_id").unwrap(),
+                ),
+                ContextPrimitive::authorized_identity(
+                    ContextEntryName::try_from("access_role").unwrap(),
+                ),
+                ContextPrimitive::standalone(ContextEntryName::try_from("workspace_id").unwrap()),
+                ContextPrimitive::standalone(ContextEntryName::try_from("unrelated").unwrap()),
+            ]),
+            definitions,
+        )
+        .expect("compiled mixed layout");
+        let binding = layout
+            .bind_entry(
+                &"product_user".try_into().expect("valid reference"),
+                &pipeline,
+            )
+            .expect("bound mixed composite");
+
+        let mut headers = TransportHeaders::new();
+        headers.push(TransportHeader::captured(
+            ContextEntryName::try_from("workspace_id").unwrap(),
+            "X-Workspace-ID",
+            true,
+            ValueKind::Text,
+            b"workspace-a".as_slice(),
+        ));
+        headers.push(TransportHeader::text(
+            ContextEntryName::try_from("unrelated").unwrap(),
+            b"must-not-pass".to_vec(),
+        ));
+        layout
+            .bind_headers(&mut headers, &pipeline)
+            .expect("bound input headers");
+        let identity_policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
+            {"claim": "sub", "store_as": "customer_id"},
+            {"claim": "role", "store_as": "access_role"}
+        ]))
+        .expect("valid identity projection");
+        let identity = AuthorizedIdentity::new()
+            .with_subject("customer-a")
+            .with_claim_str("role", "must-not-pass");
+        let mut input = Context::default();
+        input.set_transport_headers(headers);
+        input.capture_compiled_authorized_identity(
+            &identity_policy.compile_bound(layout.clone()),
+            &identity,
+        );
+        input.set_peer_addr("127.0.0.1:4317".parse().unwrap());
+
+        let resolved = input.resolve_partition(&binding).expect("resolved key");
+        assert!(matches!(resolved.key, ContextPartitionKey::Present(_)));
+        assert_eq!(
+            resolved
+                .output_context
+                .transport_headers()
+                .expect("selected transport field")
+                .iter()
+                .map(|header| (
+                    header.name.as_str(),
+                    header.value.bytes.as_ref(),
+                    header.value.original_name.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("workspace_id", b"workspace-a".as_slice(), None)]
+        );
+        let projected_identity = resolved
+            .output_context
+            .authorized_identity_entries()
+            .expect("selected identity field");
+        assert_eq!(projected_identity.len(), 1);
+        assert_eq!(
+            projected_identity
+                .get("customer_id")
+                .and_then(|entry| entry.value().as_str()),
+            Some("customer-a")
+        );
+        assert!(projected_identity.get("access_role").is_none());
+        assert_eq!(resolved.output_context.peer_addr(), None);
+        assert!(!resolved.output_context.has_context_frames());
+
+        let missing = Context::default()
+            .resolve_partition(&binding)
+            .expect("missing is not an access error");
+        assert_eq!(missing.key, ContextPartitionKey::Missing);
+        assert_eq!(missing.output_context, Context::default());
+    }
+
+    /// Scenario: an authorization-only partition binding reads entries captured
+    /// against a different compiled context layout.
+    /// Guarantees: partition resolution fails closed instead of interpreting
+    /// authorization entries under the current layout.
+    #[test]
+    fn authorization_partition_rejects_incompatible_layout() {
+        let pipeline = PipelineKey::new("group".into(), "pipeline".into());
+        let customer_id = ContextEntryName::try_from("customer_id").unwrap();
+        let layout = ContextLayout::compile(
+            BTreeSet::from([ContextPrimitive::authorized_identity(customer_id.clone())]),
+            BTreeSet::new(),
+        )
+        .expect("compiled partition layout");
+        let binding = layout
+            .bind_entry(&customer_id.clone().into(), &pipeline)
+            .expect("bound authorization entry");
+        let separately_compiled_layout = ContextLayout::compile(
+            BTreeSet::from([ContextPrimitive::authorized_identity(customer_id)]),
+            BTreeSet::new(),
+        )
+        .expect("compiled structurally equal layout");
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
+            {"claim": "sub", "store_as": "customer_id"}
+        ]))
+        .expect("valid identity projection");
+        let mut context = Context::default();
+        context.capture_compiled_authorized_identity(
+            &policy.compile_bound(separately_compiled_layout),
+            &AuthorizedIdentity::new().with_subject("customer-a"),
+        );
+
+        assert!(matches!(
+            context.resolve_partition(&binding),
+            Err(ContextAccessError::IncompatibleLayout)
+        ));
+    }
+
+    /// Scenario: two authorization-only partition values have identical text
+    /// but one was captured as a scalar and the other as a one-element list.
+    /// Guarantees: scalar and repeated claim cardinalities produce distinct
+    /// partition keys.
+    #[test]
+    fn authorization_partition_key_preserves_claim_cardinality() {
+        let pipeline = PipelineKey::new("group".into(), "pipeline".into());
+        let customer_id = ContextEntryName::try_from("customer_id").unwrap();
+        let layout = ContextLayout::compile(
+            BTreeSet::from([ContextPrimitive::authorized_identity(customer_id.clone())]),
+            BTreeSet::new(),
+        )
+        .expect("compiled partition layout");
+        let binding = layout
+            .bind_entry(&customer_id.into(), &pipeline)
+            .expect("bound authorization entry");
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
+            {"claim": "customer", "store_as": "customer_id"}
+        ]))
+        .expect("valid identity projection");
+        let compiled_policy = policy.compile_bound(layout);
+        let mut scalar = Context::default();
+        scalar.capture_compiled_authorized_identity(
+            &compiled_policy,
+            &AuthorizedIdentity::new().with_claim_str("customer", "same"),
+        );
+        let mut repeated = Context::default();
+        repeated.capture_compiled_authorized_identity(
+            &compiled_policy,
+            &AuthorizedIdentity::new().with_claim_values("customer", ["same"]),
+        );
+
+        let scalar_key = scalar
+            .resolve_partition(&binding)
+            .expect("resolved scalar key")
+            .key;
+        let repeated_key = repeated
+            .resolve_partition(&binding)
+            .expect("resolved repeated key")
+            .key;
+        assert_ne!(scalar_key, repeated_key);
     }
 
     fn create_test() -> (TestCallData, OtapPdata) {
@@ -2697,6 +3039,7 @@ mod test {
             serde_json::json!([{"claim": "sub", "store_as": "customer_id"}]),
         )
         .expect("valid authorized identity policy");
+        let identity_policy = identity_policy.compile_bound(Arc::new(ContextLayout::default()));
         let identity = AuthorizedIdentity::new().with_subject("customer-42");
         pdata.capture_authorized_identity(&identity_policy, &identity);
         pdata.start_flow_metric();
@@ -2750,6 +3093,7 @@ mod test {
             {"claim": "missing", "store_as": "missing_entry"}
         ]))
         .expect("valid authorized identity policy");
+        let policy = policy.compile_bound(Arc::new(ContextLayout::default()));
         let identity = AuthorizedIdentity::new().with_claim_values("groups", ["reader", "writer"]);
         let mut pdata = create_test_pdata();
 
@@ -2781,6 +3125,7 @@ mod test {
             {"claim": "groups", "store_as": "access_groups"}
         ]))
         .expect("valid authorized identity policy");
+        let policy = policy.compile_bound(Arc::new(ContextLayout::default()));
         let identity = AuthorizedIdentity::new()
             .with_subject("sensitive-subject")
             .with_claim_values("groups", ["sensitive-reader", "sensitive-writer"]);

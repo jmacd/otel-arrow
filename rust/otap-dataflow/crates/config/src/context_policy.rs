@@ -80,6 +80,14 @@ pub enum ContextEntryPart {
         #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
         alias: Option<ContextEntryName>,
     },
+    /// Includes every value of a verified authorized identity claim entry.
+    AuthorizedIdentity {
+        /// A standalone entry populated by `policies.authorized_identity`.
+        name: ContextEntryRef,
+        /// Optional member name within the new composite.
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        alias: Option<ContextEntryName>,
+    },
     /// Requires a text field to satisfy an explicit multi-value matching rule.
     TransportHeaderMatch {
         /// A standalone field or a qualified member of a capture group.
@@ -103,7 +111,7 @@ impl JsonSchema for ContextEntryPart {
         schemars::json_schema!({
             "type": "object",
             "properties": {
-                "type": {"type": "string", "enum": ["transport_header", "transport_header_match"]},
+                "type": {"type": "string", "enum": ["transport_header", "authorized_identity", "transport_header_match"]},
                 "name": generator.subschema_for::<ContextEntryRef>(),
                 "as": generator.subschema_for::<ContextEntryName>(),
                 "value": {"type": "string"},
@@ -113,8 +121,8 @@ impl JsonSchema for ContextEntryPart {
             "additionalProperties": false,
             "x-kubernetes-validations": [
                 {
-                    "rule": "self.type == 'transport_header' ? (!has(self.value) && !has(self.match)) : (has(self.value) && has(self.match))",
-                    "message": "transport_header_match requires value and match; transport_header accepts neither"
+                    "rule": "self.type == 'transport_header_match' ? (has(self.value) && has(self.match)) : (!has(self.value) && !has(self.match))",
+                    "message": "transport_header_match requires value and match; member entries accept neither"
                 }
             ]
         })
@@ -209,5 +217,45 @@ mod tests {
         assert!(serde_yaml::from_str::<ContextPolicy>(missing).is_err());
         let explicit = "entries: {p: [{type: transport_header_match, name: env, value: production, match: all}]}";
         assert!(serde_yaml::from_str::<ContextPolicy>(explicit).is_ok());
+    }
+
+    /// Scenario: a composite declares one verified claim and one transport member.
+    /// Guarantees: both source types deserialize with aliases while source-specific
+    /// match fields remain forbidden on ordinary members.
+    #[test]
+    fn mixed_authorized_and_transport_members_deserialize() {
+        let policy: ContextPolicy = serde_yaml::from_str(
+            "entries:
+  product_user:
+    - type: authorized_identity
+      name: customer_id
+      as: customer
+    - type: transport_header
+      name: workspace_id
+      as: workspace
+",
+        )
+        .expect("valid mixed composite");
+        assert_eq!(
+            policy
+                .entries
+                .values()
+                .next()
+                .expect("product_user entry")
+                .0
+                .len(),
+            2
+        );
+        assert!(
+            serde_yaml::from_str::<ContextPolicy>(
+                "entries:
+  invalid:
+    - type: authorized_identity
+      name: customer_id
+      value: forbidden
+"
+            )
+            .is_err()
+        );
     }
 }

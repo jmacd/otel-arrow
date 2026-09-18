@@ -368,7 +368,7 @@ impl ConfigNodeContextDeclaration for KafkaExporterConfig {
                         .map(|name| ContextDeclaration::Consumes {
                             selector: ContextConsumerSelector::Entries {
                                 entries: vec![ContextEntrySelector {
-                                    name: name.clone(),
+                                    reference: name.clone().into(),
                                     form: ContextEntrySelectorForm::Value,
                                 }]
                                 .into_boxed_slice(),
@@ -1759,7 +1759,7 @@ pub mod test_support {
                 ContextDeclaration::Consumes {
                     selector: ContextConsumerSelector::Entries {
                         entries: vec![ContextEntrySelector {
-                            name: context_name("x-traces-topic"),
+                            reference: context_name("x-traces-topic").into(),
                             form: ContextEntrySelectorForm::Value,
                         }]
                         .into_boxed_slice(),
