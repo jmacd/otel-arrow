@@ -139,6 +139,21 @@ enum ContextEntryPartKind {
 }
 
 impl ContextEntryPart {
+    /// Returns the exact source reference of a grouping member.
+    #[must_use]
+    pub fn source(&self) -> &ContextEntryRef {
+        match self {
+            Self::TransportHeader { name, .. } | Self::AuthorizedIdentity { name, .. } => name,
+        }
+    }
+
+    /// Returns the resulting member name after applying `store_as`.
+    #[must_use]
+    pub fn member_name(&self) -> &ContextEntryName {
+        let (_, _, name) = self.kind_ref_and_name();
+        name
+    }
+
     fn kind_ref_and_name(
         &self,
     ) -> (
