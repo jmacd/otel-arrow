@@ -24,7 +24,11 @@
 
 use crate::PipelineFactory;
 use crate::error::Error as EngineError;
+use otel_arrow_dfe_config::ContextEntryRef;
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
+use otel_arrow_dfe_config::context_layout::{
+    ContextBinding, ContextLayout, ContextPrimitive, ContextSource,
+};
 use otel_arrow_dfe_config::engine::ResolvedOtelDataflowSpec;
 use otel_arrow_dfe_config::error::Error;
 use otel_arrow_dfe_config::node::{NodeKind, NodeUserConfig};
@@ -81,6 +85,11 @@ pub enum ContextDeclaration {
         /// Entries to read.
         selector: ContextConsumerSelector,
     },
+    /// Binds one complete primitive or grouping entry for keyed processing.
+    ConsumesEntry {
+        /// Exact entry reference (not a qualified member).
+        reference: ContextEntryRef,
+    },
     /// Declares the receiver's header capture policy.
     HeaderCapture {
         /// Resolved capture policy.
@@ -100,7 +109,10 @@ pub enum ContextDeclaration {
 
 impl ContextDeclaration {
     fn is_component_declaration(&self) -> bool {
-        matches!(self, Self::Produces { .. } | Self::Consumes { .. })
+        matches!(
+            self,
+            Self::Produces { .. } | Self::Consumes { .. } | Self::ConsumesEntry { .. }
+        )
     }
 
     fn context_runtime_requirements(&self) -> ContextRuntimeRequirements {
@@ -121,6 +133,7 @@ impl ContextDeclaration {
             Self::Consumes {
                 selector: ContextConsumerSelector::AllStored,
             }
+            | Self::ConsumesEntry { .. }
             | Self::Produces { .. }
             | Self::HeaderCapture { .. }
             | Self::AuthorizedIdentityCapture { .. } => {}
@@ -256,6 +269,41 @@ where
 pub struct CompiledContextBindings {
     /// Compiled node bindings indexed first by pipeline, then by node.
     by_pipeline: HashMap<PipelineKey, HashMap<ConfigNodeId, CompiledNodeBindings>>,
+    entry_bindings: HashMap<PipelineKey, HashMap<ConfigNodeId, BoundContextEntry>>,
+}
+
+/// One node's exact entry binding and its immutable pipeline layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundContextEntry {
+    layout: Arc<ContextLayout>,
+    binding: ContextBinding,
+}
+
+impl BoundContextEntry {
+    /// Bind one complete entry to a compiled pipeline layout.
+    pub fn new(layout: Arc<ContextLayout>, reference: &ContextEntryRef) -> Result<Self, Error> {
+        if reference.scope().is_some() {
+            return Err(Error::InvalidUserConfig {
+                error: format!(
+                    "batch partition_by requires one complete context entry, not `{reference}`"
+                ),
+            });
+        }
+        let binding = layout.bind(reference)?;
+        Ok(Self { layout, binding })
+    }
+
+    /// Returns the compiled entry and its parent-presence gate.
+    #[must_use]
+    pub fn binding(&self) -> &ContextBinding {
+        &self.binding
+    }
+
+    /// Returns the source fields resolved for this pipeline generation.
+    #[must_use]
+    pub fn layout(&self) -> &ContextLayout {
+        &self.layout
+    }
 }
 
 /// Declarations and transport-header policies compiled for one node.
@@ -409,7 +457,8 @@ impl CompiledNodeBindings {
         for declaration in declarations {
             match declaration {
                 declaration @ (ContextDeclaration::Produces { .. }
-                | ContextDeclaration::Consumes { .. }) => {
+                | ContextDeclaration::Consumes { .. }
+                | ContextDeclaration::ConsumesEntry { .. }) => {
                     component_declarations.push(declaration);
                 }
                 ContextDeclaration::HeaderCapture { policy } => {
@@ -447,6 +496,7 @@ impl CompiledContextBindings {
     pub fn empty() -> Self {
         Self {
             by_pipeline: HashMap::new(),
+            entry_bindings: HashMap::new(),
         }
     }
 
@@ -470,7 +520,106 @@ impl CompiledContextBindings {
             })
             .collect();
 
-        Self { by_pipeline }
+        Self {
+            by_pipeline,
+            entry_bindings: HashMap::new(),
+        }
+    }
+
+    /// Returns one compiled whole-entry selection for this node.
+    #[must_use]
+    pub fn entry_binding(
+        &self,
+        pipeline: &PipelineKey,
+        node: &ConfigNodeId,
+    ) -> Option<&BoundContextEntry> {
+        self.entry_bindings.get(pipeline)?.get(node)
+    }
+
+    fn compile_entry_bindings(
+        &mut self,
+        resolved: &ResolvedOtelDataflowSpec,
+        declarations: &ContextDeclarationsByPipeline,
+    ) -> Result<(), Error> {
+        for pipeline in &resolved.pipelines {
+            let key = PipelineKey::new(
+                pipeline.pipeline_group_id.clone(),
+                pipeline.pipeline_id.clone(),
+            );
+            let Some(nodes) = declarations.get(&key) else {
+                continue;
+            };
+            let selected: Vec<_> = nodes
+                .iter()
+                .flat_map(|(node, declarations)| {
+                    declarations
+                        .iter()
+                        .filter_map(move |declaration| match declaration {
+                            ContextDeclaration::ConsumesEntry { reference } => {
+                                Some((node, reference))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            let mut sources = Vec::new();
+            for declarations in nodes.values() {
+                for declaration in declarations.iter() {
+                    match declaration {
+                        ContextDeclaration::Produces { entry } => {
+                            sources.push(ContextPrimitive {
+                                source: ContextSource::TransportHeader,
+                                name: entry.clone(),
+                            });
+                        }
+                        ContextDeclaration::HeaderCapture { policy } => {
+                            sources.extend(policy.stored_entry_names().map(|name| {
+                                ContextPrimitive {
+                                    source: ContextSource::TransportHeader,
+                                    name,
+                                }
+                            }));
+                        }
+                        ContextDeclaration::AuthorizedIdentityCapture { policy } => {
+                            sources.extend(policy.iter().map(|claim| ContextPrimitive {
+                                source: ContextSource::AuthorizedIdentity,
+                                name: claim.store_as.clone(),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let definitions = pipeline
+                .policies
+                .context
+                .iter()
+                .filter(|declaration| {
+                    selected.iter().any(|(_, reference)| {
+                        reference.scope().is_none() && reference.name() == &declaration.name
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let layout = Arc::new(ContextLayout::compile(sources, &definitions)?);
+            let mut bindings = HashMap::new();
+            for (node, reference) in selected {
+                if bindings.contains_key(node) {
+                    return Err(Error::InvalidUserConfig {
+                        error: format!("node `{node}` selects multiple context entries"),
+                    });
+                }
+                _ = bindings.insert(
+                    node.clone(),
+                    BoundContextEntry::new(Arc::clone(&layout), reference)?,
+                );
+            }
+            _ = self.entry_bindings.insert(key, bindings);
+        }
+        Ok(())
     }
 
     /// Returns the node's compiled header capture policy.
@@ -518,6 +667,9 @@ impl CompiledContextBindings {
     /// may be added, removed, or renamed during an otherwise safe live update.
     #[must_use]
     pub fn pipeline_bindings_match(&self, other: &Self, pipeline: &PipelineKey) -> bool {
+        if self.entry_bindings.get(pipeline) != other.entry_bindings.get(pipeline) {
+            return false;
+        }
         let current = self.by_pipeline.get(pipeline);
         let candidate = other.by_pipeline.get(pipeline);
         let current_binding_count = current
@@ -570,7 +722,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
     ) -> Result<PreparedContext, EngineError> {
         let declarations = self.context_declarations(resolved)?;
         let runtime_requirements = ContextRuntimeRequirements::compile(&declarations);
-        let bindings = Self::compile_bindings(declarations, &runtime_requirements);
+        let bindings = Self::compile_bindings(declarations, &runtime_requirements, resolved)?;
         Ok(PreparedContext {
             runtime_requirements,
             bindings,
@@ -585,7 +737,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
     ) -> Result<PreparedContext, EngineError> {
         let declarations = self.context_declarations(resolved)?;
         let runtime_requirements = ContextRuntimeRequirements::compile(&declarations);
-        let bindings = Self::compile_bindings(declarations, installed_requirements);
+        let bindings = Self::compile_bindings(declarations, installed_requirements, resolved)?;
         Ok(PreparedContext {
             runtime_requirements,
             bindings,
@@ -595,8 +747,13 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
     fn compile_bindings(
         declarations: ContextDeclarationsByPipeline,
         requirements: &ContextRuntimeRequirements,
-    ) -> Arc<CompiledContextBindings> {
-        Arc::new(CompiledContextBindings::compile(declarations, requirements))
+        resolved: &ResolvedOtelDataflowSpec,
+    ) -> Result<Arc<CompiledContextBindings>, EngineError> {
+        let mut bindings = CompiledContextBindings::compile(declarations.clone(), requirements);
+        bindings
+            .compile_entry_bindings(resolved, &declarations)
+            .map_err(|error| EngineError::ConfigError(Box::new(error)))?;
+        Ok(Arc::new(bindings))
     }
 
     fn context_declarations(
@@ -740,6 +897,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otel_arrow_dfe_config::engine::OtelDataflowSpec;
     use otel_arrow_dfe_config::transport_headers::TransportHeaders;
     use otel_arrow_dfe_config::transport_headers_policy::{CaptureDefaults, CaptureRule};
 
@@ -786,6 +944,110 @@ mod tests {
         let declarations = declarations_by_pipeline(effective);
         let requirements = ContextRuntimeRequirements::compile(&declarations);
         CompiledContextBindings::compile(declarations, &requirements)
+    }
+
+    /// Scenario: a batch node selects a complete authorized/header grouping
+    /// declared by policy, with effective receiver capture policies.
+    /// Guarantees: startup resolves one node binding to typed ordered fields;
+    /// unused groupings remain inert, but selected missing sources fail startup.
+    #[test]
+    fn batch_partition_binding_compiles_selected_group_only() {
+        let spec = OtelDataflowSpec::from_yaml(
+            r#"
+version: otel_dataflow/v1
+policies:
+  context:
+    entries:
+      product_user:
+        - type: authorized_identity
+          name: customer_id
+        - type: transport_header
+          name: workspace_id
+      unused:
+        - type: authorized_identity
+          name: not_produced
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+          batch:
+            type: "urn:otel:processor:batch"
+            config:
+              partition_by: [product_user]
+          sink:
+            type: "urn:test:exporter:example"
+        connections:
+          - from: receiver
+            to: batch
+          - from: batch
+            to: sink
+"#,
+        )
+        .expect("valid pipeline spec");
+        let resolved = spec.resolve();
+        let key = PipelineKey::new("default".into(), "main".into());
+        let capture: HeaderCapturePolicy = serde_json::from_value(serde_json::json!({
+            "headers": [{"match_names": ["x-workspace"], "store_as": "workspace_id"}]
+        }))
+        .expect("valid capture");
+        let identity: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
+            {"claim": "sub", "store_as": "customer_id"}
+        ]))
+        .expect("valid identity policy");
+        let declarations = HashMap::from([(
+            key.clone(),
+            HashMap::from([
+                (
+                    ConfigNodeId::from("receiver"),
+                    [
+                        ContextDeclaration::HeaderCapture { policy: capture },
+                        ContextDeclaration::AuthorizedIdentityCapture { policy: identity },
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                (
+                    ConfigNodeId::from("batch"),
+                    [ContextDeclaration::ConsumesEntry {
+                        reference: "product_user".try_into().expect("valid reference"),
+                    }]
+                    .into_iter()
+                    .collect(),
+                ),
+            ]),
+        )]);
+        let requirements = ContextRuntimeRequirements::compile(&declarations);
+        let mut bindings = CompiledContextBindings::compile(declarations.clone(), &requirements);
+        bindings
+            .compile_entry_bindings(&resolved, &declarations)
+            .expect("selected grouping resolves");
+        let binding = bindings
+            .entry_binding(&key, &ConfigNodeId::from("batch"))
+            .expect("batch binding");
+        assert_eq!(binding.binding().fields.len(), 2);
+        assert_eq!(
+            binding.layout().fields()[binding.binding().fields[0].index()].source,
+            ContextSource::AuthorizedIdentity
+        );
+        assert_eq!(
+            binding.layout().fields()[binding.binding().fields[1].index()].source,
+            ContextSource::TransportHeader
+        );
+
+        let mut unavailable = declarations.clone();
+        _ = unavailable
+            .get_mut(&key)
+            .expect("pipeline declarations")
+            .remove(&ConfigNodeId::from("receiver"));
+        let mut invalid = CompiledContextBindings::compile(unavailable.clone(), &requirements);
+        assert!(
+            invalid
+                .compile_entry_bindings(&resolved, &unavailable)
+                .is_err()
+        );
     }
 
     fn context_runtime_requirements(

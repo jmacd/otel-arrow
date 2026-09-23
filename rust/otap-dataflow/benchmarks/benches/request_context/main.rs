@@ -11,7 +11,7 @@ use std::sync::Arc;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use otel_arrow_dfe_config::ContextEntryName;
-use otel_arrow_dfe_config::context_layout::{ContextPrimitive, ContextSource};
+use otel_arrow_dfe_config::context_layout::{ContextLayout, ContextPrimitive, ContextSource};
 use otel_arrow_dfe_config::context_policy::{
     ContextEntryDeclaration, ContextEntryDefinition, ContextEntryPart, ContextScope,
 };
@@ -22,10 +22,12 @@ use otel_arrow_dfe_config::transport_headers_policy::{
     PropagationSelectorType,
 };
 use otel_arrow_dfe_engine::capability::auth::ClaimValue;
+use otel_arrow_dfe_engine::context_declaration::BoundContextEntry;
 use otel_arrow_dfe_engine::retained_work::{LocalRetainedAccount, LocalRetainedBuckets};
 use otel_arrow_dfe_otap::packed_context_experiment::{
     CapturedClaim, CapturedHeader, CompiledLayout, PackedContext,
 };
+use otel_arrow_dfe_otap::pdata::Context;
 use rdkafka::message::{Header, Headers, OwnedHeaders};
 use tonic::metadata::{KeyAndValueRef, MetadataKey, MetadataMap, MetadataValue};
 
@@ -104,12 +106,70 @@ fn context_name(raw: impl AsRef<str>) -> ContextEntryName {
 
 fn main_benchmarks(c: &mut Criterion) {
     bench_mixed_context(c);
+    bench_batch_partition_lookup(c);
     bench_receive(c);
     bench_receive_http(c);
     bench_end_to_end(c);
     bench_lookup_clone_and_append(c);
     bench_receive_kafka_original(c);
     bench_end_to_end_kafka_original(c);
+}
+
+fn bench_batch_partition_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("request_context/batch_partition_lookup");
+    for header_count in [1, 4, 16] {
+        let (headers, _, name) = comparison_headers(header_count);
+        let name = context_name(name);
+        let layout = Arc::new(
+            ContextLayout::compile(
+                [ContextPrimitive {
+                    name: name.clone(),
+                    source: ContextSource::TransportHeader,
+                }],
+                &[],
+            )
+            .expect("valid layout"),
+        );
+        let binding =
+            BoundContextEntry::new(layout, &name.clone().into()).expect("primitive entry");
+        let mut context = Context::default();
+        context.set_transport_headers(headers);
+        let selection = context.partition_selection(&binding);
+        let key = selection.into_key();
+        let state = std::collections::hash_map::RandomState::new();
+        let mut partitions = hashbrown::HashMap::new();
+        _ = partitions.insert(key.clone(), 1usize);
+        let _ = group.bench_with_input(
+            BenchmarkId::new("existing_key", header_count),
+            &header_count,
+            |b, _| {
+                b.iter(|| {
+                    let selected = black_box(&context).partition_selection(black_box(&binding));
+                    black_box((
+                        selected.table_hash(black_box(&state)),
+                        selected.matches(black_box(&key)),
+                    ))
+                });
+            },
+        );
+        let _ = group.bench_with_input(
+            BenchmarkId::new("active_partition_hit", header_count),
+            &header_count,
+            |b, _| {
+                b.iter(|| {
+                    let selected = black_box(&context).partition_selection(black_box(&binding));
+                    let hash = selected.table_hash(partitions.hasher());
+                    black_box(
+                        partitions
+                            .raw_entry()
+                            .from_hash(hash, |candidate| selected.matches(candidate))
+                            .map(|(_, pending)| *pending),
+                    )
+                });
+            },
+        );
+    }
+    group.finish();
 }
 
 fn bench_mixed_context(c: &mut Criterion) {

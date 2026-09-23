@@ -14,6 +14,7 @@
 //! This functionality is exposed through various traits implemented by effect handlers.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -21,10 +22,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
+use otel_arrow_dfe_config::context_layout::ContextSource;
+use otel_arrow_dfe_config::transport_headers::TransportHeader;
 use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_config::{PortName, SignalFormat, SignalType};
 use otel_arrow_dfe_engine::_private::AckNackRouting;
 use otel_arrow_dfe_engine::capability::auth::{AuthorizedIdentity, ClaimValue};
+use otel_arrow_dfe_engine::context_declaration::BoundContextEntry;
 use otel_arrow_dfe_engine::control::{
     AckMsg, CallData, Frame, NackMsg, RouteData, nanos_since_birth,
 };
@@ -37,6 +41,7 @@ use otel_arrow_dfe_engine::{
     ProducerEffectHandlerExtension,
 };
 use otel_arrow_dfe_pdata::OtapPayload;
+use smallvec::SmallVec;
 
 const AUTHORIZED_ENTRY_LEN: usize = 20;
 const AUTHORIZED_VALUE_LEN: usize = 8;
@@ -161,6 +166,56 @@ impl fmt::Debug for AuthorizedIdentityEntries {
 }
 
 impl AuthorizedIdentityEntries {
+    fn select(&self, names: &[&str]) -> Self {
+        if self.iter().all(|entry| names.contains(&entry.name())) {
+            return self.clone();
+        }
+        let selected = || self.iter().filter(|entry| names.contains(&entry.name()));
+        let entry_count = selected().count();
+        if entry_count == 0 {
+            return Self::default();
+        }
+        let value_count: usize = selected().map(|entry| entry.value().len()).sum();
+        let blob_len: usize = selected()
+            .map(|entry| entry.name().len() + entry.value().values().map(str::len).sum::<usize>())
+            .sum();
+        let entry_bytes = entry_count * AUTHORIZED_ENTRY_LEN;
+        let descriptor_len = entry_bytes + value_count * AUTHORIZED_VALUE_LEN;
+        let mut bytes = vec![0; descriptor_len + blob_len];
+        let mut blob_at = descriptor_len;
+        let mut value_index = 0;
+        for (entry_index, entry) in selected().enumerate() {
+            let at = entry_index * AUTHORIZED_ENTRY_LEN;
+            let name = write_context_blob(&mut bytes, &mut blob_at, entry.name().as_bytes())
+                .expect("selected identity name fits packed storage");
+            write_context_range(&mut bytes, at, name).expect("selected identity name range fits");
+            write_context_u32(&mut bytes, at + 8, value_index)
+                .expect("selected identity value offset fits");
+            write_context_u32(&mut bytes, at + 12, entry.value().len())
+                .expect("selected identity value count fits");
+            bytes[at + 16] = u8::from(entry.value().is_many());
+            for value in entry.value().values() {
+                let range = write_context_blob(&mut bytes, &mut blob_at, value.as_bytes())
+                    .expect("selected identity value fits");
+                write_context_range(
+                    &mut bytes,
+                    entry_bytes + value_index * AUTHORIZED_VALUE_LEN,
+                    range,
+                )
+                .expect("selected identity value range fits");
+                value_index += 1;
+            }
+        }
+        debug_assert_eq!(blob_at, bytes.len());
+        Self {
+            packed: Some(Arc::new(PackedAuthorizedIdentity {
+                bytes: bytes.into_boxed_slice(),
+                entry_count,
+                value_count,
+            })),
+        }
+    }
+
     /// Estimates the heap storage kept alive by the selected claims.
     ///
     /// Clones share the allocation; per-request estimates are not additive.
@@ -424,6 +479,69 @@ pub struct Context {
 }
 
 impl Context {
+    /// Projects one configured whole entry into a collision-safe batch key.
+    ///
+    /// The small common key stays on the stack. An absent member maps to one
+    /// shared missing partition; no unrelated context is copied on lookup.
+    #[must_use]
+    pub fn partition_selection<'a>(
+        &'a self,
+        binding: &'a BoundContextEntry,
+    ) -> ContextPartitionSelection<'a> {
+        let mut bytes = SmallVec::<[u8; 128]>::new();
+        for field in binding.binding().fields.iter() {
+            let primitive = &binding.layout().fields()[field.index()];
+            let count_offset = bytes.len();
+            bytes.extend_from_slice(&0_u64.to_le_bytes());
+            let mut count = 0_u64;
+            match primitive.source {
+                ContextSource::TransportHeader => {
+                    for header in self.transport_headers.find_by_name(primitive.name.as_str()) {
+                        count += 1;
+                        bytes.push(match header.value.value_kind {
+                            otel_arrow_dfe_config::transport_headers::ValueKind::Text => 0,
+                            otel_arrow_dfe_config::transport_headers::ValueKind::Binary => 1,
+                        });
+                        append_partition_value(&mut bytes, header.value.bytes);
+                    }
+                }
+                ContextSource::AuthorizedIdentity => {
+                    let Some(entry) = self.authorized_identity.get(primitive.name.as_str()) else {
+                        return ContextPartitionSelection {
+                            bytes: None,
+                            hash: 0,
+                            context: self,
+                            binding,
+                        };
+                    };
+                    let tag = if entry.value().is_many() { 3 } else { 2 };
+                    for value in entry.value().values() {
+                        count += 1;
+                        bytes.push(tag);
+                        append_partition_value(&mut bytes, value.as_bytes());
+                    }
+                }
+            }
+            if count == 0 {
+                return ContextPartitionSelection {
+                    bytes: None,
+                    hash: 0,
+                    context: self,
+                    binding,
+                };
+            }
+            bytes[count_offset..count_offset + 8].copy_from_slice(&count.to_le_bytes());
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        ContextPartitionSelection {
+            bytes: Some(bytes),
+            hash: hasher.finish(),
+            context: self,
+            binding,
+        }
+    }
+
     /// Estimates request-context heap storage, excluding the inline `Context`.
     ///
     /// Includes routing frame capacity and captured metadata. It does not
@@ -866,6 +984,114 @@ impl Context {
             flow_compute_ns: None,
             signal: None,
         }
+    }
+}
+
+fn append_partition_value(bytes: &mut SmallVec<[u8; 128]>, value: &[u8]) {
+    bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(value);
+}
+
+/// Owned collision-safe key stored only for active batch partitions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextPartitionKey {
+    /// Any absent primitive or incomplete composite.
+    Missing,
+    /// Complete ordered value tuple with its precomputed projection hash.
+    Present {
+        /// Hash of the ordered, typed value tuple.
+        hash: u64,
+        /// Full collision-checking value tuple.
+        values: Box<[u8]>,
+    },
+}
+
+impl Hash for ContextPartitionKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Missing => state.write_u64(0),
+            Self::Present { hash, .. } => state.write_u64(*hash),
+        }
+    }
+}
+
+/// Borrowed batch selection; produces an owned key and projected context only
+/// when a new partition is admitted.
+pub struct ContextPartitionSelection<'a> {
+    bytes: Option<SmallVec<[u8; 128]>>,
+    hash: u64,
+    context: &'a Context,
+    binding: &'a BoundContextEntry,
+}
+
+impl ContextPartitionSelection<'_> {
+    /// Hash the precomputed projection for this table's randomized hash seed.
+    #[must_use]
+    pub fn table_hash<S: std::hash::BuildHasher>(&self, state: &S) -> u64 {
+        let mut hasher = state.build_hasher();
+        hasher.write_u64(self.hash);
+        hasher.finish()
+    }
+
+    /// Compare the complete value tuple; hash equality alone is insufficient.
+    #[must_use]
+    pub fn matches(&self, key: &ContextPartitionKey) -> bool {
+        match (self.bytes.as_deref(), key) {
+            (None, ContextPartitionKey::Missing) => true,
+            (
+                Some(values),
+                ContextPartitionKey::Present {
+                    hash,
+                    values: owned,
+                },
+            ) => self.hash == *hash && values == owned.as_ref(),
+            _ => false,
+        }
+    }
+
+    /// Materialize one active partition's key.
+    #[must_use]
+    pub fn into_key(self) -> ContextPartitionKey {
+        match self.bytes {
+            Some(values) => ContextPartitionKey::Present {
+                hash: self.hash,
+                values: values.into_vec().into_boxed_slice(),
+            },
+            None => ContextPartitionKey::Missing,
+        }
+    }
+
+    /// Detach only fields represented by a complete selected entry.
+    #[must_use]
+    pub fn output_context(&self) -> Context {
+        if self.bytes.is_none() {
+            return Context::default();
+        }
+        let mut output = Context::default();
+        let mut headers = TransportHeaders::new();
+        let mut identities = Vec::new();
+        for field in self.binding.binding().fields.iter() {
+            let primitive = &self.binding.layout().fields()[field.index()];
+            match primitive.source {
+                ContextSource::TransportHeader => {
+                    for header in self
+                        .context
+                        .transport_headers
+                        .find_by_name(primitive.name.as_str())
+                    {
+                        headers.push(TransportHeader::new(
+                            primitive.name.clone(),
+                            header.value.value_kind,
+                            header.value.bytes,
+                        ));
+                    }
+                }
+                ContextSource::AuthorizedIdentity => identities.push(primitive.name.as_str()),
+            }
+        }
+        output.transport_headers = headers;
+        output.authorized_identity = self.context.authorized_identity.select(&identities);
+        output
     }
 }
 
@@ -1606,6 +1832,10 @@ mod test {
     };
     use otel_arrow_dfe_channel::mpsc::Channel as LocalChannel;
     use otel_arrow_dfe_config::ContextEntryName;
+    use otel_arrow_dfe_config::context_layout::{ContextLayout, ContextPrimitive, ContextSource};
+    use otel_arrow_dfe_config::context_policy::{
+        ContextEntryDeclaration, ContextEntryDefinition, ContextEntryPart, ContextScope,
+    };
     use otel_arrow_dfe_config::transport_headers::{TransportHeader, ValueKind};
     use otel_arrow_dfe_config::transport_headers_policy::{
         CaptureDefaults, CaptureRule, HeaderCapturePolicy,
@@ -1694,6 +1924,241 @@ mod test {
             baseline + header_bytes + claim_bytes
         );
         assert_eq!(size_of::<OtapPdata>(), 160);
+    }
+
+    /// Scenario: a composite selects one captured header and one verified claim.
+    /// Guarantees: missing members share one key, while a complete entry
+    /// projects only its selected fields without leaking unrelated metadata.
+    #[test]
+    fn composite_batch_selection_is_atomic_and_projects_only_key_fields() {
+        let layout = Arc::new(
+            ContextLayout::compile(
+                [
+                    ContextPrimitive {
+                        name: "workspace_id".try_into().expect("valid name"),
+                        source: ContextSource::TransportHeader,
+                    },
+                    ContextPrimitive {
+                        name: "unrelated".try_into().expect("valid name"),
+                        source: ContextSource::TransportHeader,
+                    },
+                    ContextPrimitive {
+                        name: "customer_id".try_into().expect("valid name"),
+                        source: ContextSource::AuthorizedIdentity,
+                    },
+                    ContextPrimitive {
+                        name: "access_role".try_into().expect("valid name"),
+                        source: ContextSource::AuthorizedIdentity,
+                    },
+                ],
+                &[ContextEntryDeclaration {
+                    scope: ContextScope::Engine,
+                    name: "product_user".try_into().expect("valid group name"),
+                    definition: ContextEntryDefinition(vec![
+                        ContextEntryPart::AuthorizedIdentity {
+                            name: "customer_id".try_into().expect("valid reference"),
+                            store_as: None,
+                        },
+                        ContextEntryPart::TransportHeader {
+                            name: "workspace_id".try_into().expect("valid reference"),
+                            store_as: None,
+                        },
+                    ]),
+                }],
+            )
+            .expect("valid composite layout"),
+        );
+        let binding =
+            BoundContextEntry::new(layout, &"product_user".try_into().expect("valid reference"))
+                .expect("compiled group");
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
+            {"claim": "sub", "store_as": "customer_id"},
+            {"claim": "role", "store_as": "access_role"},
+        ]))
+        .expect("valid claim policy");
+        let mut headers = TransportHeaders::new();
+        headers.push(TransportHeader::captured(
+            "workspace_id".try_into().expect("valid name"),
+            "X-Workspace",
+            true,
+            ValueKind::Text,
+            b"workspace-a".as_slice(),
+        ));
+        headers.push(TransportHeader::text(
+            "unrelated".try_into().expect("valid name"),
+            "must-not-pass",
+        ));
+        let identity = AuthorizedIdentity::new()
+            .with_subject("customer-a")
+            .with_claim_str("role", "must-not-pass");
+        let mut pdata = create_test_pdata().with_transport_headers(headers);
+        pdata.capture_authorized_identity(&policy, &identity);
+        let (ctx, _) = pdata.into_parts();
+        let selected = ctx.partition_selection(&binding);
+        let output = selected.output_context();
+        let key = selected.into_key();
+        assert!(matches!(key, ContextPartitionKey::Present { .. }));
+        assert_eq!(
+            output
+                .transport_headers()
+                .and_then(|headers| headers.find_by_name("workspace_id").next())
+                .and_then(|header| header.value_as_str()),
+            Some("workspace-a")
+        );
+        assert_eq!(
+            output
+                .transport_headers()
+                .and_then(|headers| headers.find_by_name("workspace_id").next())
+                .map(|header| header.wire_name()),
+            Some("workspace_id"),
+            "original wire names are not part of the partition key"
+        );
+        assert!(
+            output
+                .transport_headers()
+                .is_some_and(|headers| headers.find_by_name("unrelated").next().is_none())
+        );
+        let projected = output
+            .authorized_identity_entries()
+            .expect("selected claim");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(
+            projected
+                .get("customer_id")
+                .and_then(|entry| entry.value().as_str()),
+            Some("customer-a")
+        );
+        assert!(projected.get("access_role").is_none());
+
+        let mut incomplete = create_test_pdata().with_transport_headers(TransportHeaders::new());
+        incomplete.capture_authorized_identity(&policy, &identity);
+        let (ctx, _) = incomplete.into_parts();
+        let missing = ctx.partition_selection(&binding);
+        assert!(missing.matches(&ContextPartitionKey::Missing));
+        assert!(missing.output_context().transport_headers().is_none());
+        assert!(
+            missing
+                .output_context()
+                .authorized_identity_entries()
+                .is_none()
+        );
+    }
+
+    /// Scenario: a hash collision points to a partition with different data.
+    /// Guarantees: full typed value bytes, not the hash alone, select a batch.
+    #[test]
+    fn context_partition_hash_collision_checks_full_key() {
+        let layout = Arc::new(
+            ContextLayout::compile(
+                [ContextPrimitive {
+                    name: "tenant".try_into().expect("valid name"),
+                    source: ContextSource::TransportHeader,
+                }],
+                &[],
+            )
+            .expect("layout"),
+        );
+        let binding =
+            BoundContextEntry::new(layout, &"tenant".try_into().expect("valid reference"))
+                .expect("primitive binding");
+        let mut headers = TransportHeaders::new();
+        headers.push(TransportHeader::text(
+            "tenant".try_into().expect("valid name"),
+            "acme",
+        ));
+        let mut ctx = Context::default();
+        ctx.set_transport_headers(headers);
+        let selected = ctx.partition_selection(&binding);
+        let ContextPartitionKey::Present { hash, values } = selected.into_key() else {
+            panic!("value is present");
+        };
+        assert!(
+            ctx.partition_selection(&binding)
+                .matches(&ContextPartitionKey::Present {
+                    hash,
+                    values: values.clone(),
+                })
+        );
+        assert!(
+            !ctx.partition_selection(&binding)
+                .matches(&ContextPartitionKey::Present {
+                    hash,
+                    values: Box::from(&b"other"[..]),
+                })
+        );
+    }
+
+    /// Scenario: a composite contains equal bytes with different transport
+    /// kinds or different verified-claim cardinality.
+    /// Guarantees: partition identity preserves source value type and order;
+    /// projection retains multi-valued claim cardinality.
+    #[test]
+    fn composite_partition_preserves_value_kind_and_claim_cardinality() {
+        let layout = Arc::new(
+            ContextLayout::compile(
+                [
+                    ContextPrimitive {
+                        name: "workspace".try_into().expect("valid name"),
+                        source: ContextSource::TransportHeader,
+                    },
+                    ContextPrimitive {
+                        name: "groups".try_into().expect("valid name"),
+                        source: ContextSource::AuthorizedIdentity,
+                    },
+                ],
+                &[ContextEntryDeclaration {
+                    scope: ContextScope::Engine,
+                    name: "tenant".try_into().expect("valid name"),
+                    definition: ContextEntryDefinition(vec![
+                        ContextEntryPart::TransportHeader {
+                            name: "workspace".try_into().expect("valid reference"),
+                            store_as: None,
+                        },
+                        ContextEntryPart::AuthorizedIdentity {
+                            name: "groups".try_into().expect("valid reference"),
+                            store_as: None,
+                        },
+                    ]),
+                }],
+            )
+            .expect("valid layout"),
+        );
+        let binding =
+            BoundContextEntry::new(layout, &"tenant".try_into().expect("valid reference"))
+                .expect("entry");
+        let policy: AuthorizedIdentityPolicy =
+            serde_json::from_value(serde_json::json!([{"claim": "groups", "store_as": "groups"}]))
+                .expect("valid policy");
+        let make_context = |kind, many| {
+            let mut headers = TransportHeaders::new();
+            headers.push(TransportHeader::new(
+                "workspace".try_into().expect("valid name"),
+                kind,
+                b"same".as_slice(),
+            ));
+            let identity = if many {
+                AuthorizedIdentity::new().with_claim_values("groups", ["same"])
+            } else {
+                AuthorizedIdentity::new().with_claim_str("groups", "same")
+            };
+            let mut pdata = create_test_pdata().with_transport_headers(headers);
+            pdata.capture_authorized_identity(&policy, &identity);
+            pdata.into_parts().0
+        };
+        let text_one = make_context(ValueKind::Text, false);
+        let binary_one = make_context(ValueKind::Binary, false);
+        let text_many = make_context(ValueKind::Text, true);
+        let key = text_one.partition_selection(&binding).into_key();
+        assert_ne!(key, binary_one.partition_selection(&binding).into_key());
+        assert_ne!(key, text_many.partition_selection(&binding).into_key());
+        let projection = text_many.partition_selection(&binding).output_context();
+        let groups = projection
+            .authorized_identity_entries()
+            .and_then(|entries| entries.get("groups"))
+            .expect("selected groups")
+            .value();
+        assert!(groups.is_many());
+        assert_eq!(groups.values().collect::<Vec<_>>(), ["same"]);
     }
 
     fn create_test() -> (TestCallData, OtapPdata) {

@@ -5,6 +5,8 @@
 
 use crate::pdata::OtapPdata;
 use bytes::Bytes;
+use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
+use otel_arrow_dfe_engine::capability::auth::AuthorizedIdentity;
 use otel_arrow_dfe_engine::control::{AckMsg, NackMsg, UnwindData, nanos_since_birth};
 use otel_arrow_dfe_engine::testing::exporter::{TestRuntime, create_exporter_from_factory};
 use otel_arrow_dfe_engine::{
@@ -16,6 +18,16 @@ use prost::Message;
 use serde_json::Value;
 use std::ops::Add;
 use std::time::Instant;
+
+/// Attach verified claim projections in tests without making the production
+/// authorization capture method public to arbitrary pipeline components.
+pub fn capture_test_authorized_identity(
+    pdata: &mut OtapPdata,
+    policy: &AuthorizedIdentityPolicy,
+    identity: &AuthorizedIdentity,
+) {
+    pdata.capture_authorized_identity(policy, identity);
+}
 
 /// Consume frames to locate the most recent subscriber with ACKS
 /// interest in test scenarios, simulating the runtime control manager.

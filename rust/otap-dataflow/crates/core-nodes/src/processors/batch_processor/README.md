@@ -60,9 +60,44 @@ config:
   inbound_request_limit: 1024
   outbound_request_limit: 512
 
+  # Optional complete primitive or composite context entry.
+  partition_by: [product_user]
+  # Maximum concurrent keys for each signal and payload format.
+  max_active_partitions: 1024
+
   # Output format: "otap", "otlp", or "preserve" (default: preserve).
   format: preserve
 ```
+
+`partition_by` accepts at most one whole context entry, such as
+`[workspace_id]` or `[product_user]`; qualified members such as
+`product_user:customer_id` are not accepted. A composite must be declared
+under `policies.context.entries` and its transport-header and authorized-identity
+source entries must be captured or produced in the pipeline. For example:
+
+```yaml
+policies:
+  context:
+    entries:
+      product_user:
+        - type: authorized_identity
+          name: customer_id
+        - type: transport_header
+          name: workspace_id
+```
+
+Every distinct ordered value tuple accumulates separately. A missing primitive
+or incomplete composite uses one shared missing-entry partition. Present
+partitions emit only the context fields in their key; the missing partition
+emits an empty context. Unrelated request headers and verified claims are not
+copied to batched outputs. `max_active_partitions` includes the missing key;
+when full, a new key is Nacked rather than merged with another partition.
+Original transport wire names and peer addresses are also omitted from
+partitioned outputs because they are not part of the selected key.
+The default is `1`, preserving unpartitioned behavior when `partition_by`
+is absent. Configure a larger bound for partitioned workloads. Size flushes
+affect only the selected key; a timer or shutdown flushes all keys for its
+signal and format.
 
 Each format object contains:
 
@@ -149,6 +184,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 | `otap.processor.batch.batching_errors` | `{error}` | Number of batches for which errors encountered. |
 | `otap.processor.batch.nacked_inbound_slots` | `{msg}` | Number of requests nacked due to inbound slot exhaustion. |
 | `otap.processor.batch.nacked_outbound_slots` | `{msg}` | Number of requests nacked due to outbound slot exhaustion. |
+| `otap.processor.batch.nacked_partition_limit` | `{msg}` | Number of inputs nacked because a new active partition would exceed `max_active_partitions`. |
 | `otap.processor.batch.split_budget_fallbacks` | `{entry}` | Number of oversize resource entries emitted whole because splitting would have exceeded `max_split_fragments`, `max_split_overhead_bytes`, or the per-flush `max_split_fragments_per_flush` threshold. |
 
 ### Events
@@ -163,6 +199,8 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 - `bytes` sizing depends on payload formats that can report encoded size.
 - `max_batch_duration: 0s` disables time-based accumulation and flushes
   immediately.
+- `partition_by` accepts zero or one complete context entry.
+- `max_active_partitions` must be non-zero and bounds keys per signal and format.
 
 ## Related Docs
 

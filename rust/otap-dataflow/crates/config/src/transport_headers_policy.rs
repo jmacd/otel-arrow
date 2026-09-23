@@ -147,6 +147,20 @@ fn hash_header_name<H: Hasher>(name: &str, state: &mut H) {
 }
 
 impl HeaderCapturePolicy {
+    /// Returns the stored entry name for each configured capture source.
+    ///
+    /// A wire name without `store_as` is stored in lowercase. Duplicate
+    /// destinations are left for the context compiler to deduplicate.
+    pub fn stored_entry_names(&self) -> impl Iterator<Item = ContextEntryName> + '_ {
+        self.headers.iter().flat_map(|rule| {
+            rule.match_names.iter().map(|wire_name| {
+                rule.store_as
+                    .clone()
+                    .unwrap_or_else(|| wire_name.to_ascii_lowercase())
+            })
+        })
+    }
+
     /// Create a new capture policy from the given defaults and rules.
     #[must_use]
     pub fn new(defaults: CaptureDefaults, headers: Vec<CaptureRule>) -> Self {
