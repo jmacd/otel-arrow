@@ -537,6 +537,7 @@ mod tests {
     use otel_arrow_dfe_config::context_policy::{
         ContextEntryDefinition, ContextEntryPart, ContextScope,
     };
+    use otel_arrow_dfe_engine::retained_work::{LocalRetainedBuckets, LocalRetainedSnapshot};
     use std::mem::size_of;
 
     fn name(value: &str) -> ContextEntryName {
@@ -764,6 +765,92 @@ mod tests {
             .expect("compatible")
             .expect("present");
         assert!(!other.eq_owned(&key));
+    }
+
+    /// Scenario: two independently packed requests share a retained-work bucket.
+    /// Guarantees: borrowed projection reuses its owned key and charges a
+    /// different composite to a different bucket.
+    #[test]
+    fn borrowed_context_key_charges_the_matching_bucket() {
+        let layout = layout();
+        let binding = layout.bind(&name("product_user")).expect("entry");
+        let claim = ClaimValue::One("customer".into());
+        let first = PackedContext::pack(
+            &layout,
+            &[header(b"workspace-a", ValueKind::Text)],
+            &[CapturedClaim {
+                name: "customer_id",
+                value: &claim,
+            }],
+        )
+        .expect("first context");
+        let same = PackedContext::pack(
+            &layout,
+            &[header(b"workspace-a", ValueKind::Text)],
+            &[CapturedClaim {
+                name: "customer_id",
+                value: &claim,
+            }],
+        )
+        .expect("same context");
+        let different = PackedContext::pack(
+            &layout,
+            &[header(b"workspace-b", ValueKind::Text)],
+            &[CapturedClaim {
+                name: "customer_id",
+                value: &claim,
+            }],
+        )
+        .expect("other context");
+        let mut buckets = LocalRetainedBuckets::new(2);
+        let key = binding
+            .project(&first)
+            .expect("compatible")
+            .expect("present");
+        let first_ticket = buckets
+            .charge(
+                key.hash(),
+                |stored| key.eq_owned(stored),
+                || key.to_owned(),
+                Some(10),
+            )
+            .expect("first bucket");
+        let key = binding
+            .project(&same)
+            .expect("compatible")
+            .expect("present");
+        let second_ticket = buckets
+            .charge(
+                key.hash(),
+                |stored| key.eq_owned(stored),
+                || panic!("equal context must reuse the existing bucket"),
+                Some(15),
+            )
+            .expect("same bucket");
+        assert_eq!(buckets.bucket_count(), 1);
+        assert_eq!(
+            buckets.snapshot(key.hash(), |stored| key.eq_owned(stored)),
+            Some(LocalRetainedSnapshot {
+                retained_bytes: 25,
+                ..LocalRetainedSnapshot::default()
+            })
+        );
+        let key = binding
+            .project(&different)
+            .expect("compatible")
+            .expect("present");
+        let other_ticket = buckets
+            .charge(
+                key.hash(),
+                |stored| key.eq_owned(stored),
+                || key.to_owned(),
+                Some(7),
+            )
+            .expect("second bucket");
+        assert_eq!(buckets.bucket_count(), 2);
+        first_ticket.complete().expect("first settled");
+        second_ticket.complete().expect("same settled");
+        other_ticket.complete().expect("other settled");
     }
 
     /// Scenario: a header has text and binary occurrences separated by another field.

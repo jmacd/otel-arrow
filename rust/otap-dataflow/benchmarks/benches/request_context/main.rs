@@ -22,6 +22,7 @@ use otel_arrow_dfe_config::transport_headers_policy::{
     PropagationSelectorType,
 };
 use otel_arrow_dfe_engine::capability::auth::ClaimValue;
+use otel_arrow_dfe_engine::retained_work::{LocalRetainedAccount, LocalRetainedBuckets};
 use otel_arrow_dfe_otap::packed_context_experiment::{
     CapturedClaim, CapturedHeader, CompiledLayout, PackedContext,
 };
@@ -174,6 +175,37 @@ fn bench_mixed_context(c: &mut Criterion) {
                 .expect("compatible")
                 .expect("present");
             black_box((projected.hash(), projected.eq_owned(black_box(&owned))))
+        });
+    });
+    let account = LocalRetainedAccount::new();
+    let _ = group.bench_function("direct_charge_and_settle", |b| {
+        b.iter(|| {
+            let ticket = black_box(&account)
+                .charge(Some(64))
+                .expect("direct accounting charge");
+            ticket.complete().expect("direct accounting settlement");
+        });
+    });
+    let mut buckets = LocalRetainedBuckets::new(1024);
+    let first = buckets
+        .charge(owned.hash(), |_| false, || owned.clone(), Some(64))
+        .expect("seed the bucket");
+    first.complete().expect("seed settles");
+    let _ = group.bench_function("borrowed_bucket_charge_and_settle", |b| {
+        b.iter(|| {
+            let key = black_box(&binding)
+                .project(black_box(&packed))
+                .expect("compatible")
+                .expect("present");
+            let ticket = buckets
+                .charge(
+                    key.hash(),
+                    |stored| key.eq_owned(stored),
+                    || panic!("existing bucket must never materialize a key"),
+                    Some(64),
+                )
+                .expect("bounded bucket charge");
+            ticket.complete().expect("bounded bucket settlement");
         });
     });
     group.finish();

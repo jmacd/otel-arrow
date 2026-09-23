@@ -7,6 +7,7 @@
 //! telemetry export, and production charge sites are layered on separately.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -250,6 +251,144 @@ impl Drop for LocalRetainedTicket {
     }
 }
 
+/// Failure to charge a per-context retained-work bucket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalRetainedBucketError {
+    /// A new, distinct context would exceed the registry's bucket limit.
+    CapacityExhausted,
+    /// The underlying retained-work account rejected the charge.
+    Accounting(LocalAccountingError),
+}
+
+impl fmt::Display for LocalRetainedBucketError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityExhausted => {
+                write!(formatter, "retained-work bucket capacity exhausted")
+            }
+            Self::Accounting(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for LocalRetainedBucketError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CapacityExhausted => None,
+            Self::Accounting(error) => Some(error),
+        }
+    }
+}
+
+impl From<LocalAccountingError> for LocalRetainedBucketError {
+    fn from(error: LocalAccountingError) -> Self {
+        Self::Accounting(error)
+    }
+}
+
+struct LocalRetainedBucket<K> {
+    key: K,
+    account: Rc<LocalRetainedAccount>,
+}
+
+/// Bounded, runtime-local retained-work accounts indexed by context.
+///
+/// The caller supplies a precomputed projection hash and an equality closure
+/// over borrowed context data. Equal contexts must have the same projection
+/// hash; distinct contexts may have the same hash and are kept in separate
+/// buckets. An owned key is created only when a new bucket is admitted.
+///
+/// Buckets stay registered until the registry is dropped, even after their
+/// outstanding charges settle. Capacity therefore bounds the number of
+/// distinct contexts admitted over the registry's lifetime. Tickets retain
+/// their account independently and can settle after the registry is dropped.
+/// The registry, like its accounts, is neither `Send` nor `Sync`.
+pub struct LocalRetainedBuckets<K> {
+    by_hash: HashMap<u64, Vec<LocalRetainedBucket<K>>>,
+    bucket_count: usize,
+    max_buckets: usize,
+}
+
+impl<K> LocalRetainedBuckets<K> {
+    /// Creates an empty registry with a limit on distinct context buckets.
+    #[must_use]
+    pub fn new(max_buckets: usize) -> Self {
+        Self {
+            by_hash: HashMap::new(),
+            bucket_count: 0,
+            max_buckets,
+        }
+    }
+
+    /// Returns the number of registered distinct contexts.
+    #[must_use]
+    pub const fn bucket_count(&self) -> usize {
+        self.bucket_count
+    }
+
+    /// Returns the maximum number of distinct contexts this registry admits.
+    #[must_use]
+    pub const fn max_buckets(&self) -> usize {
+        self.max_buckets
+    }
+
+    /// Returns the current counters for a context, if it is registered.
+    ///
+    /// `equals` compares an owned key with borrowed context data captured by
+    /// the closure. Lookup does not allocate, including when hashes collide.
+    #[must_use]
+    pub fn snapshot<E>(&self, projection_hash: u64, mut equals: E) -> Option<LocalRetainedSnapshot>
+    where
+        E: FnMut(&K) -> bool,
+    {
+        self.by_hash
+            .get(&projection_hash)?
+            .iter()
+            .find(|bucket| equals(&bucket.key))
+            .map(|bucket| bucket.account.snapshot())
+    }
+
+    /// Charges the existing context or registers and charges a new one.
+    ///
+    /// `equals` compares each candidate's owned key with borrowed context
+    /// data captured by the closure. `create_key` runs only for a new context
+    /// with available capacity; neither an existing lookup nor a rejected new
+    /// context needs an owned key. The returned ticket must be completed or
+    /// dropped, even if this registry has since been dropped.
+    pub fn charge<E, C>(
+        &mut self,
+        projection_hash: u64,
+        mut equals: E,
+        create_key: C,
+        bytes: Option<u64>,
+    ) -> Result<LocalRetainedTicket, LocalRetainedBucketError>
+    where
+        E: FnMut(&K) -> bool,
+        C: FnOnce() -> K,
+    {
+        if let Some(bucket) = self
+            .by_hash
+            .get(&projection_hash)
+            .and_then(|candidates| candidates.iter().find(|bucket| equals(&bucket.key)))
+        {
+            return Ok(bucket.account.charge(bytes)?);
+        }
+        if self.bucket_count == self.max_buckets {
+            return Err(LocalRetainedBucketError::CapacityExhausted);
+        }
+
+        let key = create_key();
+        let account = LocalRetainedAccount::new();
+        let ticket = account.charge(bytes)?;
+        self.by_hash
+            .entry(projection_hash)
+            .or_default()
+            .push(LocalRetainedBucket { key, account });
+        self.bucket_count += 1;
+        Ok(ticket)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +506,215 @@ mod tests {
         assert_eq!(account.snapshot().retained_bytes, 0);
         assert_eq!(account.snapshot().corruption_count, 1);
         assert_eq!(account.snapshot().abandoned_items, 0);
+    }
+
+    /// Scenario: distinct contexts have the same projection hash.
+    /// Guarantees: full equality keeps their known and unknown charges separate.
+    #[test]
+    fn colliding_contexts_keep_separate_accounts() {
+        let mut buckets = LocalRetainedBuckets::new(2);
+        let first = buckets
+            .charge(
+                7,
+                |key: &String| key == "first",
+                || "first".into(),
+                Some(12),
+            )
+            .expect("first context should fit");
+        let second = buckets
+            .charge(7, |key| key == "second", || "second".into(), None)
+            .expect("colliding context should fit");
+
+        assert_eq!(buckets.bucket_count(), 2);
+        assert_eq!(
+            buckets.snapshot(7, |key| key == "first"),
+            Some(LocalRetainedSnapshot {
+                retained_bytes: 12,
+                ..LocalRetainedSnapshot::default()
+            })
+        );
+        assert_eq!(
+            buckets.snapshot(7, |key| key == "second"),
+            Some(LocalRetainedSnapshot {
+                unknown_items: 1,
+                ..LocalRetainedSnapshot::default()
+            })
+        );
+        assert_eq!(buckets.snapshot(8, |key| key == "first"), None);
+
+        first.complete().expect("first context should settle");
+        second.complete().expect("second context should settle");
+    }
+
+    /// Scenario: an existing context is charged when its hash also has collisions.
+    /// Guarantees: lookup reuses the matching account without calling create_key.
+    #[test]
+    fn existing_context_does_not_create_a_key() {
+        let mut buckets = LocalRetainedBuckets::new(2);
+        let first = buckets
+            .charge(3, |key: &String| key == "first", || "first".into(), Some(4))
+            .expect("first context should fit");
+        let second = buckets
+            .charge(3, |key| key == "second", || "second".into(), Some(6))
+            .expect("second context should fit");
+        let again = buckets
+            .charge(
+                3,
+                |key| key == "first",
+                || panic!("existing context must not create an owned key"),
+                Some(5),
+            )
+            .expect("existing context must work even at capacity");
+
+        assert_eq!(buckets.bucket_count(), 2);
+        assert_eq!(
+            buckets
+                .snapshot(3, |key| key == "first")
+                .map(|s| s.retained_bytes),
+            Some(9)
+        );
+        assert_eq!(
+            buckets
+                .snapshot(3, |key| key == "second")
+                .map(|s| s.retained_bytes),
+            Some(6)
+        );
+        first.complete().expect("first charge should settle");
+        second.complete().expect("second charge should settle");
+        again.complete().expect("reused charge should settle");
+    }
+
+    /// Scenario: a distinct context arrives after all bucket slots are occupied.
+    /// Guarantees: capacity rejects it without constructing a key or merging charges.
+    #[test]
+    fn bucket_capacity_rejects_distinct_contexts() {
+        let mut buckets = LocalRetainedBuckets::new(1);
+        let ticket = buckets
+            .charge(9, |key: &String| key == "first", || "first".into(), Some(8))
+            .expect("first context should fit");
+
+        let error = buckets
+            .charge(
+                9,
+                |key| key == "other",
+                || panic!("rejected context must not create an owned key"),
+                Some(5),
+            )
+            .expect_err("distinct context with the same hash must be rejected");
+
+        assert_eq!(error, LocalRetainedBucketError::CapacityExhausted);
+        assert_eq!(buckets.max_buckets(), 1);
+        assert_eq!(buckets.bucket_count(), 1);
+        assert_eq!(
+            buckets
+                .snapshot(9, |key| key == "first")
+                .map(|s| s.retained_bytes),
+            Some(8)
+        );
+        assert_eq!(buckets.snapshot(9, |key| key == "other"), None);
+        ticket.complete().expect("original charge should settle");
+
+        let error = buckets
+            .charge(
+                10,
+                |key| key == "third",
+                || panic!("idle buckets still count toward capacity"),
+                None,
+            )
+            .expect_err("idle buckets stay registered");
+        assert_eq!(error, LocalRetainedBucketError::CapacityExhausted);
+    }
+
+    /// Scenario: all tickets outlive the registry that created their context.
+    /// Guarantees: normal completion and abandoned drop still settle their shared account.
+    #[test]
+    fn tickets_settle_after_registry_drop() {
+        let mut buckets = LocalRetainedBuckets::new(1);
+        let completed = buckets
+            .charge(
+                1,
+                |key: &String| key == "context",
+                || "context".into(),
+                Some(7),
+            )
+            .expect("context should fit");
+        let abandoned = buckets
+            .charge(
+                1,
+                |key| key == "context",
+                || panic!("existing context must not create a key"),
+                None,
+            )
+            .expect("context should be reused");
+        let account = Rc::clone(&completed.account);
+
+        drop(buckets);
+        completed.complete().expect("ticket should settle");
+        assert_eq!(account.snapshot().unknown_items, 1);
+        drop(abandoned);
+        assert_eq!(
+            account.snapshot(),
+            LocalRetainedSnapshot {
+                abandoned_items: 1,
+                ..LocalRetainedSnapshot::default()
+            }
+        );
+    }
+
+    /// Scenario: the registry has no capacity for even its first context.
+    /// Guarantees: zero capacity rejects without constructing a key or accounting charge.
+    #[test]
+    fn zero_bucket_capacity_rejects_first_context() {
+        let mut buckets = LocalRetainedBuckets::<String>::new(0);
+        let error = buckets
+            .charge(
+                1,
+                |_| false,
+                || panic!("no key should be created at zero capacity"),
+                Some(1),
+            )
+            .expect_err("zero-capacity registry must reject the first context");
+        assert_eq!(error, LocalRetainedBucketError::CapacityExhausted);
+        assert_eq!(buckets.bucket_count(), 0);
+    }
+
+    /// Scenario: another charge to an existing context overflows its account.
+    /// Guarantees: the registry reports accounting failure without adding a bucket.
+    #[test]
+    fn existing_bucket_propagates_accounting_failure() {
+        let mut buckets = LocalRetainedBuckets::new(1);
+        let ticket = buckets
+            .charge(
+                1,
+                |key: &String| key == "context",
+                || "context".into(),
+                Some(u64::MAX),
+            )
+            .expect("initial charge should fit");
+        let error = buckets
+            .charge(
+                1,
+                |key| key == "context",
+                || panic!("existing context must not create a key"),
+                Some(1),
+            )
+            .expect_err("overflow must be reported");
+
+        assert_eq!(
+            error,
+            LocalRetainedBucketError::Accounting(LocalAccountingError::Overflow(
+                LocalAccountingCounter::RetainedBytes
+            ))
+        );
+        assert_eq!(buckets.bucket_count(), 1);
+        assert_eq!(
+            buckets.snapshot(1, |key| key == "context"),
+            Some(LocalRetainedSnapshot {
+                retained_bytes: u64::MAX,
+                corruption_count: 1,
+                ..LocalRetainedSnapshot::default()
+            })
+        );
+        ticket.complete().expect("initial charge should settle");
     }
 }
