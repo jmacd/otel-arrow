@@ -14,6 +14,7 @@
 //! This functionality is exposed through various traits implemented by effect handlers.
 
 use std::fmt;
+use std::mem::size_of;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -160,6 +161,16 @@ impl fmt::Debug for AuthorizedIdentityEntries {
 }
 
 impl AuthorizedIdentityEntries {
+    /// Estimates the heap storage kept alive by the selected claims.
+    ///
+    /// Clones share the allocation; per-request estimates are not additive.
+    #[must_use]
+    pub fn retained_memory_bytes(&self) -> usize {
+        self.packed.as_deref().map_or(0, |packed| {
+            size_of::<PackedAuthorizedIdentity>() + 2 * size_of::<usize>() + packed.bytes.len()
+        })
+    }
+
     fn capture(policy: &AuthorizedIdentityPolicy, identity: &AuthorizedIdentity) -> Option<Self> {
         PackedAuthorizedIdentity::capture(policy, identity).map(|packed| Self {
             packed: Some(Arc::new(packed)),
@@ -413,6 +424,18 @@ pub struct Context {
 }
 
 impl Context {
+    /// Estimates request-context heap storage, excluding the inline `Context`.
+    ///
+    /// Includes routing frame capacity and captured metadata. It does not
+    /// inspect dynamically owned contents of routing calldata; shared Arc
+    /// storage is counted in full for each request that retains it.
+    #[must_use]
+    pub fn retained_memory_bytes(&self) -> usize {
+        self.stack.capacity() * size_of::<Frame>()
+            + self.transport_headers.retained_memory_bytes()
+            + self.authorized_identity.retained_memory_bytes()
+    }
+
     /// Create a context with reserved frame capacity to avoid reallocating
     /// when the first subscriber is pushed.
     #[must_use]
@@ -961,6 +984,18 @@ impl FlowMetricAccumulation for OtapPdata {
 }
 
 impl OtapPdata {
+    /// Estimates the bytes retained by this request after receiver capture.
+    ///
+    /// The inline pdata object, context heap storage, and the payload's
+    /// retained-memory estimate are counted separately. `Bytes` may keep a
+    /// larger inaccessible backing allocation alive; see the payload API.
+    #[must_use]
+    pub fn retained_memory_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.context.retained_memory_bytes()
+            + self.payload.retained_memory_bytes()
+    }
+
     /// Returns `true` if a flow_metric accumulator is currently active.
     #[must_use]
     fn has_active_flow_metric(&self) -> bool {
@@ -1572,6 +1607,9 @@ mod test {
     use otel_arrow_dfe_channel::mpsc::Channel as LocalChannel;
     use otel_arrow_dfe_config::ContextEntryName;
     use otel_arrow_dfe_config::transport_headers::{TransportHeader, ValueKind};
+    use otel_arrow_dfe_config::transport_headers_policy::{
+        CaptureDefaults, CaptureRule, HeaderCapturePolicy,
+    };
     use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
     use otel_arrow_dfe_engine::control::{
         PipelineCompletionMsg, pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
@@ -1600,6 +1638,61 @@ mod test {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn otap_pdata_layout_is_stable() {
+        assert_eq!(size_of::<OtapPdata>(), 160);
+    }
+
+    /// Scenario: a receiver attaches both packed headers and one verified claim.
+    /// Guarantees: the request-memory estimate includes the inline pdata,
+    /// payload, and both metadata allocations without changing its layout.
+    #[test]
+    fn receiver_context_retained_memory_estimate_includes_both_sources() {
+        let mut pdata = create_test_pdata();
+        let baseline = pdata.retained_memory_bytes();
+        assert_eq!(
+            baseline,
+            size_of::<OtapPdata>() + pdata.payload_ref().retained_memory_bytes()
+        );
+
+        let mut headers = TransportHeaders::new();
+        let capture = HeaderCapturePolicy::new(
+            CaptureDefaults::default(),
+            vec![CaptureRule {
+                match_names: vec![
+                    ContextEntryName::try_from("x-workspace-id").expect("valid wire name"),
+                ],
+                store_as: Some(ContextEntryName::try_from("workspace_id").expect("valid name")),
+                sensitive: false,
+                value_kind: None,
+            }],
+        )
+        .compile(|_| false);
+        assert!(
+            capture
+                .capture_from_pairs(
+                    [("X-Workspace-Id", b"workspace-a".as_slice())].into_iter(),
+                    &mut headers,
+                )
+                .is_none()
+        );
+        let header_bytes = headers.retained_memory_bytes();
+        pdata.set_transport_headers(headers);
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(
+            serde_json::json!([{"claim": "sub", "store_as": "customer_id"}]),
+        )
+        .expect("valid claim policy");
+        pdata.capture_authorized_identity(
+            &policy,
+            &AuthorizedIdentity::new().with_subject("customer-a"),
+        );
+        let claim_bytes = pdata
+            .authorized_identity_entries()
+            .expect("captured claim")
+            .retained_memory_bytes();
+        assert!(header_bytes > 0 && claim_bytes > 0);
+        assert_eq!(
+            pdata.retained_memory_bytes(),
+            baseline + header_bytes + claim_bytes
+        );
         assert_eq!(size_of::<OtapPdata>(), 160);
     }
 

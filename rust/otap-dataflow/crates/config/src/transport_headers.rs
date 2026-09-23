@@ -15,6 +15,7 @@ use crate::context::ContextEntryName;
 use std::borrow::Cow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::mem::size_of;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -254,6 +255,36 @@ enum TransportHeadersStorage {
 }
 
 impl TransportHeadersStorage {
+    fn retained_memory_bytes(&self) -> usize {
+        let contents = match self {
+            Self::Packed(packed) => packed.bytes.len(),
+            Self::Owned(headers) => {
+                headers.capacity() * size_of::<TransportHeader>()
+                    + headers
+                        .iter()
+                        .map(|header| {
+                            header.name.as_str().len()
+                                + header.value.bytes.len()
+                                + header.value.original_name.as_deref().map_or(0, str::len)
+                        })
+                        .sum::<usize>()
+            }
+            Self::Overlay { base, appended } => {
+                base.retained_memory_bytes()
+                    + appended.capacity() * size_of::<TransportHeader>()
+                    + appended
+                        .iter()
+                        .map(|header| {
+                            header.name.as_str().len()
+                                + header.value.bytes.len()
+                                + header.value.original_name.as_deref().map_or(0, str::len)
+                        })
+                        .sum::<usize>()
+            }
+        };
+        size_of::<Self>() + 2 * size_of::<usize>() + contents
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::Owned(headers) => headers.len(),
@@ -332,6 +363,17 @@ impl PartialEq for TransportHeaders {
 impl Eq for TransportHeaders {}
 
 impl TransportHeaders {
+    /// Estimates the heap storage kept alive by this collection.
+    ///
+    /// Clones share the same allocation, so summing this value across cloned
+    /// requests counts shared storage more than once.
+    #[must_use]
+    pub fn retained_memory_bytes(&self) -> usize {
+        self.storage
+            .as_deref()
+            .map_or(0, TransportHeadersStorage::retained_memory_bytes)
+    }
+
     /// Create an empty header collection.
     #[must_use]
     pub fn new() -> Self {
@@ -817,6 +859,32 @@ mod tests {
     #[test]
     fn transport_headers_remains_pointer_width() {
         assert_eq!(size_of::<TransportHeaders>(), size_of::<usize>());
+    }
+
+    /// Scenario: a captured header is packed, cloned, and later appended.
+    /// Guarantees: retained-size estimates include the shared packed block
+    /// and the copy-on-write overlay without materializing the packed base.
+    #[test]
+    fn retained_memory_estimate_tracks_packed_and_overlay_storage() {
+        let mut headers = TransportHeaders::new();
+        assert_eq!(headers.retained_memory_bytes(), 0);
+        headers.replace(vec![header("tenant", "X-Tenant", b"acme")]);
+        let packed = headers.retained_memory_bytes();
+        assert_eq!(
+            packed,
+            size_of::<TransportHeadersStorage>()
+                + 2 * size_of::<usize>()
+                + PACKED_HEADER_LEN
+                + "tenant".len()
+                + "X-Tenant".len()
+                + b"acme".len()
+        );
+        let mut changed = headers.clone();
+        assert_eq!(changed.retained_memory_bytes(), packed);
+        changed.push(header("partition", "X-Partition", b"first"));
+        assert_eq!(headers.retained_memory_bytes(), packed);
+        assert!(changed.retained_memory_bytes() > packed);
+        assert_eq!(changed.find_by_name("partition").count(), 1);
     }
 
     /// Scenario: matching and nonmatching packed headers are interleaved.
