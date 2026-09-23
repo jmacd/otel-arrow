@@ -11,11 +11,19 @@ use std::sync::Arc;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use otel_arrow_dfe_config::ContextEntryName;
+use otel_arrow_dfe_config::context_layout::{ContextPrimitive, ContextSource};
+use otel_arrow_dfe_config::context_policy::{
+    ContextEntryDeclaration, ContextEntryDefinition, ContextEntryPart, ContextScope,
+};
 use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
 use otel_arrow_dfe_config::transport_headers_policy::{
     CaptureDefaults, CaptureRule, CompiledHeaderCapturePolicy, HeaderCapturePolicy,
     HeaderPropagationPolicy, NameStrategy, PropagationDefault, PropagationSelector,
     PropagationSelectorType,
+};
+use otel_arrow_dfe_engine::capability::auth::ClaimValue;
+use otel_arrow_dfe_otap::packed_context_experiment::{
+    CapturedClaim, CapturedHeader, CompiledLayout, PackedContext,
 };
 use rdkafka::message::{Header, Headers, OwnedHeaders};
 use tonic::metadata::{KeyAndValueRef, MetadataKey, MetadataMap, MetadataValue};
@@ -94,12 +102,81 @@ fn context_name(raw: impl AsRef<str>) -> ContextEntryName {
 }
 
 fn main_benchmarks(c: &mut Criterion) {
+    bench_mixed_context(c);
     bench_receive(c);
     bench_receive_http(c);
     bench_end_to_end(c);
     bench_lookup_clone_and_append(c);
     bench_receive_kafka_original(c);
     bench_end_to_end_kafka_original(c);
+}
+
+fn bench_mixed_context(c: &mut Criterion) {
+    let name = context_name("product_user");
+    let layout = CompiledLayout::compile(
+        vec![
+            ContextPrimitive {
+                source: ContextSource::AuthorizedIdentity,
+                name: context_name("customer_id"),
+            },
+            ContextPrimitive {
+                source: ContextSource::TransportHeader,
+                name: context_name("workspace_id"),
+            },
+        ],
+        &[ContextEntryDeclaration {
+            scope: ContextScope::Engine,
+            name: name.clone(),
+            definition: ContextEntryDefinition(vec![
+                ContextEntryPart::AuthorizedIdentity {
+                    name: context_name("customer_id").into(),
+                    store_as: None,
+                },
+                ContextEntryPart::TransportHeader {
+                    name: context_name("workspace_id").into(),
+                    store_as: None,
+                },
+            ]),
+        }],
+    )
+    .expect("valid compiled layout");
+    let binding = layout.bind(&name).expect("composite entry");
+    let claim = ClaimValue::One("customer-123".into());
+    let claims = [CapturedClaim {
+        name: "customer_id",
+        value: &claim,
+    }];
+    let headers = [CapturedHeader {
+        name: "workspace_id",
+        original_name: None,
+        kind: ValueKind::Text,
+        value: b"workspace-abc",
+    }];
+    let packed = PackedContext::pack(&layout, &headers, &claims).expect("packed context");
+    let owned = binding
+        .project(&packed)
+        .expect("compatible")
+        .expect("present")
+        .to_owned();
+    let mut group = c.benchmark_group("request_context/mixed_accounting");
+    let _ = group.bench_function("pack_one_header_one_claim", |b| {
+        b.iter(|| {
+            black_box(
+                PackedContext::pack(black_box(&layout), black_box(&headers), black_box(&claims))
+                    .expect("packed context"),
+            )
+        });
+    });
+    let _ = group.bench_function("cached_hash_and_full_compare", |b| {
+        b.iter(|| {
+            let projected = black_box(&binding)
+                .project(black_box(&packed))
+                .expect("compatible")
+                .expect("present");
+            black_box((projected.hash(), projected.eq_owned(black_box(&owned))))
+        });
+    });
+    group.finish();
 }
 
 fn bench_receive_http(c: &mut Criterion) {
