@@ -326,7 +326,7 @@ Topic declaration precedence (for a pipeline in a given group):
 ## Context Entries
 
 Context entries are stored with original source-type information to
-encoding the origin of transport headers, authorized data fields, and
+encode the origin of transport headers, authorized data fields, and
 more. Simple context entries are created using a single name entered
 in configuration of the appropriate type, for example a transport
 headers `header_capture` rule with a `store_as` clause creates a named
@@ -351,9 +351,11 @@ policies:
 ```
 
 > [!NOTE]
-> Context entry declarations are retained in resolved configuration but do not
-> currently construct, capture, propagate, or consume grouping entries at
-> runtime. Conditional elements and runtime support will be added separately.
+> Context entry declarations are retained in resolved configuration. Consumers
+> bind declarations at startup; `processor:batch` can currently consume one
+> complete primitive or composite entry through its `partition_by` setting.
+> Conditional elements and additional runtime consumers will be added
+> separately.
 
 ## Engine Observability Pipeline
 

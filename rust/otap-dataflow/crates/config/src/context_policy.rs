@@ -110,7 +110,7 @@ impl ContextEntryDefinition {
     }
 }
 
-/// One value-bearing grouping member.
+/// Single member of a composite entry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContextEntryPart {
@@ -139,7 +139,7 @@ enum ContextEntryPartKind {
 }
 
 impl ContextEntryPart {
-    /// Returns the exact source reference of a grouping member.
+    /// Returns the exact source reference of a composite member.
     #[must_use]
     pub fn source(&self) -> &ContextEntryRef {
         match self {
@@ -234,10 +234,10 @@ pub struct ContextEntryDeclaration {
 mod tests {
     use super::*;
 
-    /// Scenario: one grouping entry mixes authorized-identity and transport-header members.
+    /// Scenario: one composite entry mixes authorized-identity and transport-header members.
     /// Guarantees: both supported variants, aliases, scoped names, and order are preserved.
     #[test]
-    fn parses_grouping_entry_in_order() {
+    fn parses_composite_entry_in_order() {
         let policy: ContextPolicy = serde_yaml::from_str(
             r#"
 entries:
@@ -286,7 +286,7 @@ entries:
         assert!(error.to_string().contains("duplicate context entry name"));
     }
 
-    /// Scenario: a grouping entry has no members.
+    /// Scenario: a composite entry has no members.
     /// Guarantees: semantic validation rejects the empty declaration.
     #[test]
     fn rejects_empty_definitions() {
@@ -300,7 +300,7 @@ entries:
     }
 
     /// Scenario: two value members derive or specify the same output name.
-    /// Guarantees: grouping entries cannot expose ambiguous qualified member names.
+    /// Guarantees: composite entries cannot expose ambiguous qualified member names.
     #[test]
     fn rejects_duplicate_output_member_names() {
         for yaml in [
@@ -313,7 +313,7 @@ entries:
     }
 
     /// Scenario: a value source reference is repeated with a different member name.
-    /// Guarantees: one source value cannot create redundant grouping dimensions.
+    /// Guarantees: one source value cannot create redundant composite dimensions.
     #[test]
     fn rejects_duplicate_value_references() {
         let yaml = "entries: {tenant: [{type: transport_header, name: id, store_as: first}, {type: transport_header, name: id, store_as: second}]}";
