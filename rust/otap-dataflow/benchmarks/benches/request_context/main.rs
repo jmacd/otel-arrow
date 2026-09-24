@@ -23,7 +23,6 @@ use otel_arrow_dfe_config::transport_headers_policy::{
 };
 use otel_arrow_dfe_engine::capability::auth::ClaimValue;
 use otel_arrow_dfe_engine::context_declaration::BoundContextEntry;
-use otel_arrow_dfe_engine::retained_work::{LocalRetainedAccount, LocalRetainedBuckets};
 use otel_arrow_dfe_otap::packed_context_experiment::{
     CapturedClaim, CapturedHeader, CompiledLayout, PackedContext,
 };
@@ -219,7 +218,7 @@ fn bench_mixed_context(c: &mut Criterion) {
         .expect("compatible")
         .expect("present")
         .to_owned();
-    let mut group = c.benchmark_group("request_context/mixed_accounting");
+    let mut group = c.benchmark_group("request_context/mixed_context");
     let _ = group.bench_function("pack_one_header_one_claim", |b| {
         b.iter(|| {
             black_box(
@@ -235,39 +234,6 @@ fn bench_mixed_context(c: &mut Criterion) {
                 .expect("compatible")
                 .expect("present");
             black_box((projected.hash(), projected.eq_owned(black_box(&owned))))
-        });
-    });
-    let account = LocalRetainedAccount::new();
-    let _ = group.bench_function("direct_charge_settle_snapshot", |b| {
-        b.iter(|| {
-            let ticket = black_box(&account)
-                .charge(Some(64))
-                .expect("direct accounting charge");
-            ticket.complete().expect("direct accounting settlement");
-            black_box(account.snapshot())
-        });
-    });
-    let mut buckets = LocalRetainedBuckets::new(1024);
-    let first = buckets
-        .charge(owned.hash(), |_| false, || owned.clone(), Some(64))
-        .expect("seed the bucket");
-    first.complete().expect("seed settles");
-    let _ = group.bench_function("borrowed_bucket_charge_settle_snapshot", |b| {
-        b.iter(|| {
-            let key = black_box(&binding)
-                .project(black_box(&packed))
-                .expect("compatible")
-                .expect("present");
-            let ticket = buckets
-                .charge(
-                    key.hash(),
-                    |stored| key.eq_owned(stored),
-                    || panic!("existing bucket must never materialize a key"),
-                    Some(64),
-                )
-                .expect("bounded bucket charge");
-            ticket.complete().expect("bounded bucket settlement");
-            black_box(buckets.snapshot(key.hash(), |stored| key.eq_owned(stored)))
         });
     });
     group.finish();
