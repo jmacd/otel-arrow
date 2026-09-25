@@ -808,7 +808,7 @@ impl<PData> ProcessorWrapper<PData> {
         };
         let result = tokio::select! {
             biased;
-            _ = shutdown_deadline.expired() => Ok(()),
+            _ = shutdown_deadline.processors_cancelled() => Ok(()),
             result = run => result,
         };
         // Return the original processing error if present; otherwise surface
@@ -1706,9 +1706,16 @@ mod tests {
         );
         let shutdown = async {
             started_rx.await.expect("handler started before shutdown");
-            deadline.record_shutdown((start + Duration::from_secs(deadline_secs)).into_std());
+            let shutdown_deadline = start + Duration::from_secs(deadline_secs);
+            deadline.record(shutdown_deadline.into_std());
+            tokio::time::sleep_until(shutdown_deadline).await;
+            deadline.cancel_processors();
         };
-        let (result, ()) = tokio::join!(run, shutdown);
+        tokio::pin!(run);
+        let result = tokio::select! {
+            result = &mut run => result,
+            () = shutdown => run.await,
+        };
         if fail_before_final_metrics {
             let Error::ProcessorError { error, .. } = result.expect_err("original error survives")
             else {

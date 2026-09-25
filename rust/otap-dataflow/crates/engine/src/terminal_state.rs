@@ -11,23 +11,25 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
-/// Pipeline-wide deadline shared by every terminal metrics handoff.
+/// Pipeline-wide terminal metrics deadline and forced processor cancellation state.
 ///
 /// The runtime control manager records the real shutdown deadline as soon as
-/// it accepts shutdown. Error paths that terminate without a shutdown message
-/// lazily establish one finite fallback. Every final reporter then uses the
-/// same absolute deadline instead of receiving a fresh timeout.
+/// it accepts shutdown, then broadcasts processor cancellation when that
+/// deadline expires. Error paths that terminate without a shutdown message
+/// lazily establish one finite fallback for terminal metrics. Every final
+/// reporter then uses the same absolute deadline instead of receiving a fresh
+/// timeout.
 #[derive(Clone, Debug)]
 pub(crate) struct TerminalMetricsDeadline {
     deadline: Arc<Mutex<Option<Instant>>>,
-    shutdown_deadline: watch::Sender<Option<Instant>>,
+    processor_cancellation: watch::Sender<bool>,
 }
 
 impl Default for TerminalMetricsDeadline {
     fn default() -> Self {
         Self {
             deadline: Arc::default(),
-            shutdown_deadline: watch::channel(None).0,
+            processor_cancellation: watch::channel(false).0,
         }
     }
 }
@@ -44,14 +46,6 @@ impl TerminalMetricsDeadline {
         *current = Some(current.map_or(deadline, |current| current.min(deadline)));
     }
 
-    /// Records a pipeline shutdown deadline for both cancellation and terminal metrics.
-    pub(crate) fn record_shutdown(&self, deadline: Instant) {
-        self.record(deadline);
-        self.shutdown_deadline.send_modify(|current| {
-            *current = Some(current.map_or(deadline, |current| current.min(deadline)));
-        });
-    }
-
     /// Returns the shared deadline, installing a finite fallback if necessary.
     pub(crate) fn get(&self) -> Instant {
         let mut deadline = self
@@ -61,21 +55,18 @@ impl TerminalMetricsDeadline {
         *deadline.get_or_insert_with(|| Instant::now() + Self::FALLBACK)
     }
 
-    /// Waits for an explicit shutdown deadline, ignoring terminal metrics fallback deadlines.
-    pub(crate) async fn expired(&self) {
-        let mut updates = self.shutdown_deadline.subscribe();
-        loop {
-            let deadline = *updates.borrow_and_update();
-            if let Some(deadline) = deadline {
-                tokio::select! {
-                    biased;
-                    _ = crate::clock::sleep_until(deadline) => return,
-                    _ = updates.changed() => {}
-                }
-            } else {
-                let _ = updates.changed().await;
-            }
-        }
+    /// Cancels processor work when the runtime control manager reaches the shutdown deadline.
+    pub(crate) fn cancel_processors(&self) {
+        let _previous = self.processor_cancellation.send_replace(true);
+    }
+
+    /// Waits for the runtime control manager to cancel processor work.
+    pub(crate) async fn processors_cancelled(&self) {
+        let mut cancellation = self.processor_cancellation.subscribe();
+        let _cancelled = cancellation
+            .wait_for(|cancelled| *cancelled)
+            .await
+            .expect("the cancellation sender is retained by this waiter");
     }
 }
 
@@ -136,44 +127,38 @@ impl Default for TerminalState {
 mod tests {
     use super::*;
 
-    /// Scenario: Metric fallback and node terminal deadlines precede a pipeline shutdown request.
-    /// Guarantees: Only the explicit pipeline shutdown deadline wakes cancellation waiters.
+    /// Scenario: Metric deadlines are recorded before the manager cancels processor work.
+    /// Guarantees: Only explicit manager cancellation wakes all processor waiters.
     #[tokio::test(start_paused = true)]
-    async fn deadline_waiters_observe_shutdown() {
+    async fn processor_waiters_observe_manager_cancellation() {
         let deadline = TerminalMetricsDeadline::default();
         let _ = deadline.get();
         deadline.record(tokio::time::Instant::now().into_std() + Duration::from_secs(1));
         let first = deadline.clone();
         let second = deadline.clone();
-        let first = tokio::spawn(async move { first.expired().await });
-        let second = tokio::spawn(async move { second.expired().await });
+        let first = tokio::spawn(async move { first.processors_cancelled().await });
+        let second = tokio::spawn(async move { second.processors_cancelled().await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(60)).await;
         assert!(!first.is_finished());
         assert!(!second.is_finished());
-        deadline.record_shutdown(tokio::time::Instant::now().into_std() + Duration::from_secs(2));
+        deadline.record(tokio::time::Instant::now().into_std() + Duration::from_secs(2));
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        deadline.cancel_processors();
         first.await.expect("first waiter completes");
         second.await.expect("second waiter completes");
     }
 
-    /// Scenario: An existing shutdown deadline is shortened while a waiter is sleeping.
-    /// Guarantees: The waiter observes the earlier deadline instead of the original timeout.
-    #[tokio::test(start_paused = true)]
-    async fn deadline_waiter_observes_shortened_deadline() {
+    /// Scenario: A processor begins waiting after manager cancellation was broadcast.
+    /// Guarantees: The retained cancellation state wakes late waiters immediately.
+    #[tokio::test]
+    async fn late_processor_waiter_observes_cancellation() {
         let deadline = TerminalMetricsDeadline::default();
-        let now = tokio::time::Instant::now();
-        deadline.record_shutdown((now + Duration::from_secs(60)).into_std());
-        let waiter = deadline.clone();
-        let waiter = tokio::spawn(async move { waiter.expired().await });
-        tokio::task::yield_now().await;
-        deadline.record_shutdown((now + Duration::from_secs(2)).into_std());
-        tokio::time::timeout(Duration::from_secs(3), waiter)
-            .await
-            .expect("shortened deadline is honored")
-            .expect("waiter completes");
-        assert!(tokio::time::Instant::now() < now + Duration::from_secs(3));
+        deadline.cancel_processors();
+        deadline.processors_cancelled().await;
     }
 
     #[test]

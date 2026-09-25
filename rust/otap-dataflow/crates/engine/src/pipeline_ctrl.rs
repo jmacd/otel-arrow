@@ -463,6 +463,7 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
             if let Some(deadline) = shutdown_deadline
                 && now >= deadline
             {
+                self.terminal_metrics_deadline.cancel_processors();
                 shutdown_deadline_forced = true;
                 self.runtime_control_metrics
                     .record_shutdown_deadline_forced(now);
@@ -527,7 +528,7 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
                             if is_draining_ingress {
                                 continue;
                             }
-                            self.terminal_metrics_deadline.record_shutdown(deadline);
+                            self.terminal_metrics_deadline.record(deadline);
                             self.event_reporter.report(EngineEvent::shutdown_requested(
                                 self.pipeline_key.clone(),
                                 Some(reason.clone()),
@@ -2457,7 +2458,7 @@ mod tests {
                 let (manager, pipeline_tx, _control_receivers, _nodes, _pipeline_entity_guard) =
                     setup_test_manager::<()>();
                 let deadline = manager.terminal_metrics_deadline.clone();
-                let original = tokio::time::Instant::now() + Duration::from_secs(10);
+                let original = tokio::time::Instant::now() + Duration::from_millis(100);
                 pipeline_tx
                     .send(RuntimeControlMsg::Shutdown {
                         deadline: original.into_std(),
@@ -2467,22 +2468,24 @@ mod tests {
                     .unwrap();
                 pipeline_tx
                     .send(RuntimeControlMsg::Shutdown {
-                        deadline: (original - Duration::from_secs(8)).into_std(),
+                        deadline: (original - Duration::from_millis(80)).into_std(),
                         reason: "duplicate shutdown".to_owned(),
                     })
                     .await
                     .unwrap();
-                drop(pipeline_tx);
-                manager.run().await.unwrap();
+                let manager_handle = tokio::task::spawn_local(manager.run());
+                tokio::task::yield_now().await;
                 assert_eq!(deadline.get(), original.into_std());
                 assert!(
-                    timeout(Duration::from_secs(3), deadline.expired())
+                    timeout(Duration::from_millis(30), deadline.processors_cancelled(),)
                         .await
                         .is_err(),
                     "duplicate request must not cancel processors early"
                 );
-                deadline.expired().await;
+                deadline.processors_cancelled().await;
                 assert_eq!(tokio::time::Instant::now(), original);
+                drop(pipeline_tx);
+                manager_handle.await.unwrap().unwrap();
             })
             .await;
     }
