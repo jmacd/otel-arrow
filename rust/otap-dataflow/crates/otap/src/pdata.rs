@@ -18,6 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
@@ -42,7 +43,9 @@ use otel_arrow_dfe_engine::{
 use otel_arrow_dfe_pdata::OtapPayload;
 use smallvec::SmallVec;
 
-use crate::packed_context::{CapturedClaim, CapturedHeader, PackedContext, PackedEntryKey};
+use crate::packed_context::{
+    CapturedClaim, CapturedHeader, DecodedClaim, PackedContext, PackedEntryKey,
+};
 
 const AUTHORIZED_ENTRY_LEN: usize = 20;
 const AUTHORIZED_VALUE_LEN: usize = 8;
@@ -167,6 +170,54 @@ impl fmt::Debug for AuthorizedIdentityEntries {
 }
 
 impl AuthorizedIdentityEntries {
+    fn from_decoded(claims: Vec<DecodedClaim>) -> Self {
+        if claims.is_empty() {
+            return Self::default();
+        }
+        let entry_count = claims.len();
+        let value_count = claims.iter().map(|claim| claim.values.len()).sum::<usize>();
+        let entry_bytes = entry_count * AUTHORIZED_ENTRY_LEN;
+        let descriptor_len = entry_bytes + value_count * AUTHORIZED_VALUE_LEN;
+        let blob_len = claims
+            .iter()
+            .map(|claim| {
+                claim.name.as_str().len() + claim.values.iter().map(String::len).sum::<usize>()
+            })
+            .sum::<usize>();
+        let mut bytes = vec![0; descriptor_len + blob_len];
+        let mut blob_at = descriptor_len;
+        let mut value_index = 0;
+        for (entry_index, claim) in claims.into_iter().enumerate() {
+            let at = entry_index * AUTHORIZED_ENTRY_LEN;
+            let name = write_context_blob(&mut bytes, &mut blob_at, claim.name.as_str().as_bytes())
+                .expect("decoded identity name fits packed storage");
+            write_context_range(&mut bytes, at, name).expect("decoded identity name range fits");
+            write_context_u32(&mut bytes, at + 8, value_index)
+                .expect("decoded identity value offset fits");
+            write_context_u32(&mut bytes, at + 12, claim.values.len())
+                .expect("decoded identity value count fits");
+            bytes[at + 16] = u8::from(claim.many);
+            for value in claim.values {
+                let range = write_context_blob(&mut bytes, &mut blob_at, value.as_bytes())
+                    .expect("decoded identity value fits");
+                write_context_range(
+                    &mut bytes,
+                    entry_bytes + value_index * AUTHORIZED_VALUE_LEN,
+                    range,
+                )
+                .expect("decoded identity value range fits");
+                value_index += 1;
+            }
+        }
+        Self {
+            packed: Some(Arc::new(PackedAuthorizedIdentity {
+                bytes: bytes.into_boxed_slice(),
+                entry_count,
+                value_count,
+            })),
+        }
+    }
+
     fn select(&self, names: &[&str]) -> Self {
         if self.iter().all(|entry| names.contains(&entry.name())) {
             return self.clone();
@@ -465,12 +516,35 @@ pub struct Context {
     signal: Option<SignalType>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct RequestContext {
     layout: Arc<CompiledContextLayout>,
     packed: PackedContext,
-    transport_headers: TransportHeaders,
-    authorized_identity: AuthorizedIdentityEntries,
+    transport_headers: OnceLock<TransportHeaders>,
+    authorized_identity: OnceLock<AuthorizedIdentityEntries>,
+}
+
+impl PartialEq for RequestContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.layout == other.layout && self.packed == other.packed
+    }
+}
+
+impl Eq for RequestContext {}
+
+impl fmt::Debug for RequestContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestContext")
+            .field(
+                "transport_header_count",
+                &self.packed.transport_header_count(),
+            )
+            .field(
+                "authorized_identity",
+                &self.packed.authorized_identity_debug(&self.layout),
+            )
+            .finish()
+    }
 }
 
 impl RequestContext {
@@ -479,21 +553,28 @@ impl RequestContext {
         transport_headers: TransportHeaders,
         authorized_identity: AuthorizedIdentityEntries,
     ) -> Self {
+        assert!(
+            layout_covers(&layout, &transport_headers, &authorized_identity),
+            "compiled context layout must cover every materialized field"
+        );
         let packed = pack_request_context(&layout, &transport_headers, &authorized_identity);
         Self {
             layout,
             packed,
-            transport_headers,
-            authorized_identity,
+            transport_headers: OnceLock::new(),
+            authorized_identity: OnceLock::new(),
         }
     }
 
-    fn repack(&mut self) {
-        self.packed = pack_request_context(
-            &self.layout,
-            &self.transport_headers,
-            &self.authorized_identity,
-        );
+    fn transport_headers(&self) -> &TransportHeaders {
+        self.transport_headers
+            .get_or_init(|| self.packed.transport_headers(&self.layout))
+    }
+
+    fn authorized_identity(&self) -> &AuthorizedIdentityEntries {
+        self.authorized_identity.get_or_init(|| {
+            AuthorizedIdentityEntries::from_decoded(self.packed.authorized_claims(&self.layout))
+        })
     }
 }
 
@@ -502,15 +583,8 @@ fn pack_request_context(
     transport_headers: &TransportHeaders,
     authorized_identity: &AuthorizedIdentityEntries,
 ) -> PackedContext {
-    let fields = layout.layout().fields();
     let headers = transport_headers
         .iter()
-        .filter(|header| {
-            fields.iter().any(|field| {
-                field.source == ContextSource::TransportHeader
-                    && field.name.as_str() == header.name.as_str()
-            })
-        })
         .map(|header| CapturedHeader {
             name: header.name.as_str(),
             original_name: header.value.original_name,
@@ -520,12 +594,6 @@ fn pack_request_context(
         .collect::<Vec<_>>();
     let claims = authorized_identity
         .iter()
-        .filter(|entry| {
-            fields.iter().any(|field| {
-                field.source == ContextSource::AuthorizedIdentity
-                    && field.name.as_str() == entry.name()
-            })
-        })
         .map(|entry| {
             let value = if entry.value().is_many() {
                 ClaimValue::many(entry.value().values())
@@ -574,6 +642,24 @@ fn standalone_context_layout(
         .collect();
     CompiledContextLayout::compile(fields, &[])
         .expect("standalone materialized context layout remains valid")
+}
+
+fn layout_covers(
+    layout: &CompiledContextLayout,
+    transport_headers: &TransportHeaders,
+    authorized_identity: &AuthorizedIdentityEntries,
+) -> bool {
+    let fields = layout.layout().fields();
+    transport_headers.iter().all(|header| {
+        fields.iter().any(|field| {
+            field.source == ContextSource::TransportHeader
+                && field.name.as_str() == header.name.as_str()
+        })
+    }) && authorized_identity.iter().all(|entry| {
+        fields.iter().any(|field| {
+            field.source == ContextSource::AuthorizedIdentity && field.name.as_str() == entry.name()
+        })
+    })
 }
 
 impl Context {
@@ -1001,20 +1087,28 @@ impl Context {
     pub fn transport_headers(&self) -> Option<&TransportHeaders> {
         self.request_context
             .as_deref()
-            .map(|context| &context.transport_headers)
+            .map(RequestContext::transport_headers)
             .filter(|headers| !headers.is_empty())
     }
 
     /// Takes and returns the captured transport headers, if any.
     #[must_use]
     pub fn take_transport_headers(&mut self) -> Option<TransportHeaders> {
-        let _headers = self.transport_headers()?;
-        let context = self.request_context.as_mut()?;
-        let context = Arc::make_mut(context);
-        let headers = Some(std::mem::take(&mut context.transport_headers));
-        context.repack();
-        self.drop_empty_request_context();
-        headers
+        let context = self.request_context.as_deref()?;
+        let headers = context.transport_headers().clone();
+        if headers.is_empty() {
+            return None;
+        }
+        let authorized_identity = context.authorized_identity().clone();
+        let layout = Arc::clone(&context.layout);
+        self.request_context = (!authorized_identity.is_empty()).then(|| {
+            Arc::new(RequestContext::new(
+                layout,
+                TransportHeaders::default(),
+                authorized_identity,
+            ))
+        });
+        Some(headers)
     }
 
     /// Set the transport headers for this context.
@@ -1023,23 +1117,22 @@ impl Context {
             self.request_context = None;
             return;
         }
-        if self.request_context.is_none() {
-            let authorized_identity = AuthorizedIdentityEntries::default();
-            let layout = standalone_context_layout(&headers, &authorized_identity);
-            self.request_context = Some(Arc::new(RequestContext::new(
-                layout,
-                headers,
-                authorized_identity,
-            )));
-            return;
-        }
-        let context = self.request_context_mut();
-        context.transport_headers = headers;
-        context.repack();
-        self.drop_empty_request_context();
+        let authorized_identity = self
+            .authorized_identity_entries()
+            .cloned()
+            .unwrap_or_default();
+        let layout = self
+            .request_context
+            .as_deref()
+            .map(|context| Arc::clone(&context.layout))
+            .filter(|layout| layout_covers(layout, &headers, &authorized_identity))
+            .unwrap_or_else(|| standalone_context_layout(&headers, &authorized_identity));
+        self.request_context = (!headers.is_empty() || !authorized_identity.is_empty())
+            .then(|| Arc::new(RequestContext::new(layout, headers, authorized_identity)));
     }
 
-    fn set_transport_headers_with_layout(
+    /// Set receiver-captured headers using a generation-bearing pipeline layout.
+    pub fn set_transport_headers_with_layout(
         &mut self,
         layout: Arc<CompiledContextLayout>,
         headers: TransportHeaders,
@@ -1057,7 +1150,7 @@ impl Context {
     pub fn authorized_identity_entries(&self) -> Option<&AuthorizedIdentityEntries> {
         self.request_context
             .as_deref()
-            .map(|context| &context.authorized_identity)
+            .map(RequestContext::authorized_identity)
             .filter(|entries| !entries.is_empty())
     }
 
@@ -1072,20 +1165,15 @@ impl Context {
             self.request_context = None;
             return;
         }
-        if self.request_context.is_none() {
-            let transport_headers = TransportHeaders::default();
-            let layout = standalone_context_layout(&transport_headers, &entries);
-            self.request_context = Some(Arc::new(RequestContext::new(
-                layout,
-                transport_headers,
-                entries,
-            )));
-            return;
-        }
-        let context = self.request_context_mut();
-        context.authorized_identity = entries;
-        context.repack();
-        self.drop_empty_request_context();
+        let transport_headers = self.transport_headers().cloned().unwrap_or_default();
+        let layout = self
+            .request_context
+            .as_deref()
+            .map(|context| Arc::clone(&context.layout))
+            .filter(|layout| layout_covers(layout, &transport_headers, &entries))
+            .unwrap_or_else(|| standalone_context_layout(&transport_headers, &entries));
+        self.request_context = (!transport_headers.is_empty() || !entries.is_empty())
+            .then(|| Arc::new(RequestContext::new(layout, transport_headers, entries)));
     }
 
     fn capture_request_context(
@@ -1107,26 +1195,6 @@ impl Context {
                     authorized_identity,
                 ))
             });
-    }
-
-    fn request_context_mut(&mut self) -> &mut RequestContext {
-        Arc::make_mut(self.request_context.get_or_insert_with(|| {
-            let transport_headers = TransportHeaders::default();
-            let authorized_identity = AuthorizedIdentityEntries::default();
-            Arc::new(RequestContext::new(
-                standalone_context_layout(&transport_headers, &authorized_identity),
-                transport_headers,
-                authorized_identity,
-            ))
-        }))
-    }
-
-    fn drop_empty_request_context(&mut self) {
-        if self.request_context.as_deref().is_some_and(|context| {
-            context.transport_headers.is_empty() && context.authorized_identity.is_empty()
-        }) {
-            self.request_context = None;
-        }
     }
 
     /// Returns the peer address observed by the receiving socket, if any.
@@ -3712,11 +3780,15 @@ mod test {
 
         let detached = context.clone_detached();
 
+        let source_request = context
+            .request_context
+            .as_ref()
+            .expect("source request context");
+        assert!(source_request.packed.has_storage());
+        assert!(source_request.transport_headers.get().is_none());
+        assert!(source_request.authorized_identity.get().is_none());
         assert!(Arc::ptr_eq(
-            context
-                .request_context
-                .as_ref()
-                .expect("source request context"),
+            source_request,
             detached
                 .request_context
                 .as_ref()
@@ -3812,6 +3884,48 @@ mod test {
             context.request_context.as_ref().expect("mutated context"),
             detached.request_context.as_ref().expect("detached context")
         ));
+    }
+
+    /// Scenario: only one of two equivalent contexts initializes its decoded
+    /// transport and identity compatibility views.
+    /// Guarantees: cache initialization does not change request-context value equality.
+    #[test]
+    fn decoded_view_cache_does_not_affect_context_equality() {
+        let mut headers = TransportHeaders::new();
+        headers.push(TransportHeader::text(
+            ContextEntryName::try_from("tenant").expect("valid context entry name"),
+            b"acme".to_vec(),
+        ));
+        let context = Context::default();
+        let mut populated = context.clone();
+        populated.set_transport_headers(headers);
+        let uncached = populated.clone();
+
+        assert!(populated.transport_headers().is_some());
+        assert_eq!(populated, uncached);
+    }
+
+    /// Scenario: receiver capture produces a field omitted from its pipeline layout.
+    /// Guarantees: request construction fails loudly instead of dropping the field.
+    #[test]
+    #[should_panic(expected = "compiled context layout must cover every materialized field")]
+    fn pipeline_layout_must_cover_captured_fields() {
+        let layout = CompiledContextLayout::compile(
+            vec![ContextPrimitive {
+                source: ContextSource::TransportHeader,
+                name: ContextEntryName::try_from("compiled").expect("valid context entry name"),
+            }],
+            &[],
+        )
+        .expect("valid context layout");
+        let mut headers = TransportHeaders::new();
+        headers.push(TransportHeader::text(
+            ContextEntryName::try_from("uncompiled").expect("valid context entry name"),
+            b"value".to_vec(),
+        ));
+
+        let mut context = Context::default();
+        context.set_transport_headers_with_layout(layout, headers);
     }
 
     /// Scenario: an identity contains one selected multi-valued claim while

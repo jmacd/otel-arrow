@@ -22,7 +22,7 @@ use otel_arrow_dfe_config::transport_headers_policy::{
     PropagationSelectorType,
 };
 use otel_arrow_dfe_engine::capability::auth::ClaimValue;
-use otel_arrow_dfe_engine::context_declaration::BoundContextEntry;
+use otel_arrow_dfe_engine::context_declaration::{BoundContextEntry, CompiledContextLayout};
 use otel_arrow_dfe_otap::packed_context::{
     CapturedClaim, CapturedHeader, CompiledLayout, PackedContext,
 };
@@ -105,6 +105,7 @@ fn context_name(raw: impl AsRef<str>) -> ContextEntryName {
 
 fn main_benchmarks(c: &mut Criterion) {
     bench_mixed_context(c);
+    bench_active_context(c);
     bench_batch_partition_lookup(c);
     bench_receive(c);
     bench_receive_http(c);
@@ -119,20 +120,11 @@ fn bench_batch_partition_lookup(c: &mut Criterion) {
     for header_count in [1, 4, 16] {
         let (headers, _, name) = comparison_headers(header_count);
         let name = context_name(name);
-        let layout = Arc::new(
-            ContextLayout::compile(
-                [ContextPrimitive {
-                    name: name.clone(),
-                    source: ContextSource::TransportHeader,
-                }],
-                &[],
-            )
-            .expect("valid layout"),
-        );
-        let binding =
-            BoundContextEntry::new(layout, &name.clone().into()).expect("primitive entry");
+        let layout = transport_layout(&headers);
+        let binding = BoundContextEntry::new_compiled(Arc::clone(&layout), &name.clone().into())
+            .expect("primitive entry");
         let mut context = Context::default();
-        context.set_transport_headers(headers);
+        context.set_transport_headers_with_layout(layout, headers);
         let selection = context.partition_selection(&binding);
         let key = selection.into_key();
         let state = std::collections::hash_map::RandomState::new();
@@ -169,6 +161,54 @@ fn bench_batch_partition_lookup(c: &mut Criterion) {
         );
     }
     group.finish();
+}
+
+fn bench_active_context(c: &mut Criterion) {
+    let mut group = c.benchmark_group("request_context/active_context");
+    for header_count in [1, 4, 16] {
+        let (headers, _, _) = comparison_headers(header_count);
+        let layout = transport_layout(&headers);
+        let _ = group.bench_with_input(
+            BenchmarkId::new("pack_and_first_compatibility_view", header_count),
+            &header_count,
+            |b, _| {
+                b.iter(|| {
+                    let mut context = Context::default();
+                    context.set_transport_headers_with_layout(
+                        Arc::clone(black_box(&layout)),
+                        black_box(headers.clone()),
+                    );
+                    black_box(context.transport_headers().is_some())
+                });
+            },
+        );
+
+        let mut context = Context::default();
+        context.set_transport_headers_with_layout(Arc::clone(&layout), headers.clone());
+        _ = context.transport_headers();
+        let _ = group.bench_with_input(
+            BenchmarkId::new("cached_compatibility_view", header_count),
+            &header_count,
+            |b, _| {
+                b.iter(|| black_box(black_box(&context).transport_headers()));
+            },
+        );
+    }
+    group.finish();
+}
+
+fn transport_layout(headers: &TransportHeaders) -> Arc<CompiledContextLayout> {
+    CompiledContextLayout::from_layout(
+        ContextLayout::compile(
+            headers.iter().map(|header| ContextPrimitive {
+                name: context_name(header.name.as_str()),
+                source: ContextSource::TransportHeader,
+            }),
+            &[],
+        )
+        .expect("valid layout"),
+    )
+    .expect("live layout")
 }
 
 fn bench_mixed_context(c: &mut Criterion) {

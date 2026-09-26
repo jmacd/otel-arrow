@@ -9,14 +9,13 @@ use std::sync::Arc;
 use otel_arrow_dfe_config::ContextEntryName;
 use otel_arrow_dfe_config::context_layout::ContextSource;
 use otel_arrow_dfe_config::error::Error;
-use otel_arrow_dfe_config::transport_headers::ValueKind;
+use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
 use otel_arrow_dfe_engine::capability::auth::ClaimValue;
 pub use otel_arrow_dfe_engine::context_declaration::CompiledContextLayout as CompiledLayout;
-use smallvec::SmallVec;
 
 const HEADER_SIZE: usize = 16;
 const FIELD_SIZE: usize = 16;
-const VALUE_SIZE: usize = 24;
+const VALUE_SIZE: usize = 28;
 const NONE: u32 = u32::MAX;
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -58,7 +57,7 @@ pub struct CapturedClaim<'a> {
 /// All source values and compiled metadata in one shared allocation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackedContext {
-    bytes: Option<Arc<[u8]>>,
+    bytes: Option<Box<[u8]>>,
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
@@ -162,9 +161,8 @@ impl PackedContext {
             return Err(invalid("context exceeds 32-bit packed range"));
         }
 
-        // Small requests use stack scratch space; only larger requests spill.
-        let mut scratch = SmallVec::<[u8; 512]>::from_elem(0, total);
-        let data = scratch.as_mut_slice();
+        let mut bytes = vec![0; total].into_boxed_slice();
+        let data = bytes.as_mut();
         write_u64(data, 0, layout.generation());
         write_u32(data, 8, headers.len());
         write_u32(data, 12, claims.len());
@@ -185,9 +183,15 @@ impl PackedContext {
                 header.value,
             );
         }
-        for claim in claims {
+        for (claim_index, claim) in claims.iter().enumerate() {
             let field = field(layout, ContextSource::AuthorizedIdentity, claim.name)?;
             let field_at = fields_at + field * FIELD_SIZE;
+            if data[field_at + 8] != 0 {
+                return Err(invalid(format!(
+                    "duplicate authorized identity field `{}`",
+                    claim.name
+                )));
+            }
             data[field_at + 8] = 1;
             data[field_at + 9] = u8::from(matches!(claim.value, ClaimValue::Many(_)));
             for value in claim.value.as_slice() {
@@ -203,6 +207,9 @@ impl PackedContext {
                     value.as_bytes(),
                 );
             }
+            // Claims are unique, so the completed value chain no longer needs
+            // its last-value cursor. Reuse it for compatibility decode order.
+            write_u32(data, field_at + 12, claim_index);
         }
         debug_assert_eq!(value_index, count);
         debug_assert_eq!(blob_index, total);
@@ -234,9 +241,7 @@ impl PackedContext {
                 hasher.finish(),
             );
         }
-        Ok(Self {
-            bytes: Some(Arc::from(scratch.as_slice())),
-        })
+        Ok(Self { bytes: Some(bytes) })
     }
 
     fn write_value(
@@ -281,6 +286,7 @@ impl PackedContext {
         }
         write_u32(bytes, at + 16, NONE as usize);
         bytes[at + 20] = kind;
+        write_u32(bytes, at + 24, field);
         *value_index += 1;
     }
 
@@ -326,10 +332,10 @@ impl PackedContext {
         })
     }
 
-    /// Count the allocations retained per request for the packed domain.
+    /// Returns whether this context retains a packed byte allocation.
     #[must_use]
-    pub fn storage_strong_count(&self) -> usize {
-        self.bytes.as_ref().map_or(0, Arc::strong_count)
+    pub fn has_storage(&self) -> bool {
+        self.bytes.is_some()
     }
 
     /// Returns the cached atomic-presence hash for a compatible bound entry.
@@ -366,6 +372,145 @@ impl PackedContext {
         let entry = binding.binding().presence.index();
         Ok(entry_present(bytes, entry).then_some(PackedEntryKey { binding, bytes }))
     }
+
+    /// Decodes transport headers for compatibility consumers.
+    #[must_use]
+    pub(crate) fn transport_headers(&self, layout: &CompiledLayout) -> TransportHeaders {
+        let Some(bytes) = self.bytes.as_deref() else {
+            return TransportHeaders::default();
+        };
+        assert_eq!(
+            read_u64(bytes, 0),
+            layout.generation(),
+            "packed context layout generation mismatch"
+        );
+        let fields_at = fields_at(layout.layout().entries().len());
+        let values_at = fields_at + layout.layout().fields().len() * FIELD_SIZE;
+        let mut headers = TransportHeaders::with_capacity(read_u32(bytes, 8) as usize);
+        for index in 0..read_u32(bytes, 8) as usize {
+            let at = values_at + index * VALUE_SIZE;
+            let field = read_u32(bytes, at + 24) as usize;
+            let primitive = &layout.layout().fields()[field];
+            let value_at = read_u32(bytes, at) as usize;
+            let value_len = read_u32(bytes, at + 4) as usize;
+            let original_at = read_u32(bytes, at + 8) as usize;
+            let original_len = read_u32(bytes, at + 12) as usize;
+            let kind = match bytes[at + 20] {
+                0 => ValueKind::Text,
+                1 => ValueKind::Binary,
+                value => panic!("invalid packed transport value kind {value}"),
+            };
+            let value = &bytes[value_at..value_at + value_len];
+            let header = if original_len == 0 {
+                TransportHeader::new(primitive.name.clone(), kind, value)
+            } else {
+                let original = std::str::from_utf8(&bytes[original_at..original_at + original_len])
+                    .expect("packed original header name remains UTF-8");
+                TransportHeader::captured(primitive.name.clone(), original, true, kind, value)
+            };
+            headers.push(header);
+        }
+        headers
+    }
+
+    /// Decodes verified identity fields for compatibility consumers.
+    #[must_use]
+    pub(crate) fn authorized_claims(&self, layout: &CompiledLayout) -> Vec<DecodedClaim> {
+        let Some(bytes) = self.bytes.as_deref() else {
+            return Vec::new();
+        };
+        assert_eq!(
+            read_u64(bytes, 0),
+            layout.generation(),
+            "packed context layout generation mismatch"
+        );
+        let fields_at = fields_at(layout.layout().entries().len());
+        let values_at = fields_at + layout.layout().fields().len() * FIELD_SIZE;
+        let mut claims = layout
+            .layout()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.source == ContextSource::AuthorizedIdentity)
+            .filter_map(|(field, primitive)| {
+                let at = fields_at + field * FIELD_SIZE;
+                (bytes[at + 8] != 0).then(|| {
+                    (
+                        read_u32(bytes, at + 12),
+                        DecodedClaim {
+                            name: primitive.name.clone(),
+                            many: bytes[at + 9] != 0,
+                            values: Self::field_values(bytes, fields_at, values_at, field)
+                                .map(|(_, value)| {
+                                    std::str::from_utf8(value)
+                                        .expect("packed authorized identity remains UTF-8")
+                                        .to_owned()
+                                })
+                                .collect(),
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        claims.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        claims.into_iter().map(|(_, claim)| claim).collect()
+    }
+
+    /// Returns the number of captured transport headers without decoding.
+    #[must_use]
+    pub fn transport_header_count(&self) -> usize {
+        self.bytes
+            .as_deref()
+            .map_or(0, |bytes| read_u32(bytes, 8) as usize)
+    }
+
+    /// Formats authorized identity metadata without exposing values or allocating views.
+    pub(crate) fn authorized_identity_debug<'a>(
+        &'a self,
+        layout: &'a CompiledLayout,
+    ) -> impl std::fmt::Debug + 'a {
+        struct DebugIdentity<'a> {
+            packed: &'a PackedContext,
+            layout: &'a CompiledLayout,
+        }
+        impl std::fmt::Debug for DebugIdentity<'_> {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let Some(bytes) = self.packed.bytes.as_deref() else {
+                    return formatter.debug_list().finish();
+                };
+                let fields_at = fields_at(self.layout.layout().entries().len());
+                let mut list = formatter.debug_list();
+                for (field, primitive) in self.layout.layout().fields().iter().enumerate() {
+                    if primitive.source != ContextSource::AuthorizedIdentity {
+                        continue;
+                    }
+                    let at = fields_at + field * FIELD_SIZE;
+                    if bytes[at + 8] != 0 {
+                        _ = list.entry(&format_args!(
+                            "{{ name: {:?}, value_count: {} }}",
+                            primitive.name.as_str(),
+                            read_u32(bytes, at + 4)
+                        ));
+                    }
+                }
+                list.finish()
+            }
+        }
+        DebugIdentity {
+            packed: self,
+            layout,
+        }
+    }
+}
+
+/// One decoded authorized-identity field for compatibility access.
+pub struct DecodedClaim {
+    /// Stored context entry name.
+    pub name: ContextEntryName,
+    /// Whether the source claim was multi-valued.
+    pub many: bool,
+    /// Values in source order.
+    pub values: Vec<String>,
 }
 
 /// Borrowed precomputed entry key used by the batch lookup fast path.
@@ -801,7 +946,7 @@ mod tests {
             ContextKeyBinding::bind(Arc::clone(&layout), &name("product_user")).expect("entry");
         let packed = PackedContext::pack(&layout, &[], &[]).expect("empty context");
         assert_eq!(size_of::<PackedContext>(), 2 * size_of::<usize>());
-        assert_eq!(packed.storage_strong_count(), 0);
+        assert!(!packed.has_storage());
         assert!(
             binding
                 .project(&packed)
@@ -811,7 +956,7 @@ mod tests {
     }
 
     /// Scenario: two contexts have the same mixed-source composite.
-    /// Guarantees: packed hash, full equality, and cloning preserve its identity.
+    /// Guarantees: packed hash, full equality, and value cloning preserve its identity.
     #[test]
     fn mixed_source_keys_share_cached_hash_and_compare_fully() {
         let layout = layout();
@@ -825,7 +970,8 @@ mod tests {
         )
         .expect("packed");
         let cloned = packed.clone();
-        assert_eq!(packed.storage_strong_count(), 2);
+        assert!(packed.has_storage());
+        assert_eq!(packed, cloned);
         let key = binding
             .project(&packed)
             .expect("compatible")
@@ -1025,5 +1171,81 @@ mod tests {
                 .project(&packed)
                 .is_err()
         );
+    }
+
+    /// Scenario: policy capture order differs from the layout's sorted field order.
+    /// Guarantees: compatibility decoding preserves policy order, including empty many claims.
+    #[test]
+    fn authorized_claims_preserve_capture_order() {
+        let layout = CompiledLayout::compile(
+            vec![
+                ContextPrimitive {
+                    source: ContextSource::AuthorizedIdentity,
+                    name: name("alpha"),
+                },
+                ContextPrimitive {
+                    source: ContextSource::AuthorizedIdentity,
+                    name: name("zeta"),
+                },
+            ],
+            &[],
+        )
+        .expect("valid layout");
+        let zeta = ClaimValue::Many(vec![]);
+        let alpha = ClaimValue::One("value".into());
+        let packed = PackedContext::pack(
+            &layout,
+            &[],
+            &[
+                CapturedClaim {
+                    name: "zeta",
+                    value: &zeta,
+                },
+                CapturedClaim {
+                    name: "alpha",
+                    value: &alpha,
+                },
+            ],
+        )
+        .expect("packed");
+        let decoded = packed.authorized_claims(&layout);
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|claim| claim.name.as_str())
+                .collect::<Vec<_>>(),
+            ["zeta", "alpha"]
+        );
+        assert!(decoded[0].many);
+        assert!(decoded[0].values.is_empty());
+    }
+
+    /// Scenario: two verified claims target the same packed identity field.
+    /// Guarantees: packing rejects ambiguity instead of corrupting its value chain cursor.
+    #[test]
+    fn duplicate_authorized_claims_are_rejected() {
+        let layout = layout();
+        let first = ClaimValue::One("first".into());
+        let second = ClaimValue::One("second".into());
+        let error = PackedContext::pack(&layout, &[], &[claim(&first), claim(&second)])
+            .expect_err("duplicate claims must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate authorized identity field")
+        );
+    }
+
+    /// Scenario: compatibility decoding is attempted with another pipeline generation.
+    /// Guarantees: incompatible descriptor offsets fail loudly instead of being interpreted.
+    #[test]
+    #[should_panic(expected = "packed context layout generation mismatch")]
+    fn compatibility_decode_rejects_generation_mismatch() {
+        let old = layout();
+        let packed = PackedContext::pack(&old, &[header(b"workspace-a", ValueKind::Text)], &[])
+            .expect("packed");
+        let new =
+            CompiledLayout::compile(old.layout().fields().to_vec(), &[]).expect("valid new layout");
+        _ = packed.transport_headers(&new);
     }
 }
