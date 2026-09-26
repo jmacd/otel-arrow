@@ -10,9 +10,11 @@
 
 use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_config::transport_headers_policy::CompiledHeaderCapturePolicy;
+use otel_arrow_dfe_engine::context_declaration::CompiledContextLayout;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use rdkafka::Message as _;
 use rdkafka::message::{BorrowedMessage, Headers};
+use std::sync::Arc;
 
 /// Apply the capture policy (if configured) to extract Kafka message headers
 /// into [`TransportHeaders`] on the [`OtapPdata`] context.
@@ -22,6 +24,7 @@ use rdkafka::message::{BorrowedMessage, Headers};
 pub(super) fn capture_transport_headers(
     kafka_message: &BorrowedMessage<'_>,
     capture_policy: Option<&CompiledHeaderCapturePolicy>,
+    context_layout: &Arc<CompiledContextLayout>,
     pdata: &mut OtapPdata,
 ) {
     if let Some(policy) = capture_policy
@@ -37,7 +40,7 @@ pub(super) fn capture_transport_headers(
             );
         }
         if !transport_headers.is_empty() {
-            pdata.set_transport_headers(transport_headers);
+            pdata.set_transport_headers_with_layout(Arc::clone(context_layout), transport_headers);
         }
     }
 }

@@ -436,7 +436,14 @@ impl TrafficGeneratorReceiver {
 
         let mut pdata = OtapPdata::new_todo_context(payload);
         if let Some(headers) = transport_headers {
-            pdata.set_transport_headers(headers.clone());
+            pdata.set_transport_headers_with_layout(
+                Arc::clone(
+                    handler
+                        .context_layout()
+                        .expect("receiver context layout is installed"),
+                ),
+                headers.clone(),
+            );
         }
         if self.config.enable_ack_nack() {
             handler.subscribe_to(

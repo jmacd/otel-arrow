@@ -1974,6 +1974,10 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             .compiled_context_bindings()
             .authorized_identity_policy(&pipeline_ctx.pipeline_key(), &pipeline_ctx.node_id())
             .cloned();
+        let context_layout = pipeline_ctx
+            .compiled_context_bindings()
+            .pipeline_layout(&pipeline_ctx.pipeline_key())
+            .cloned();
 
         let receiver = create(
             (*pipeline_ctx).clone(),
@@ -1983,6 +1987,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             capabilities,
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?
+        .with_context_layout(context_layout)
         .with_capture_policy(capture_policy)
         .with_authorized_identity_policy(authorized_identity_policy);
         pipeline_ctx

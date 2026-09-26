@@ -21,13 +21,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
-use otel_arrow_dfe_config::context_layout::ContextSource;
+use otel_arrow_dfe_config::context_layout::{ContextPrimitive, ContextSource};
 use otel_arrow_dfe_config::transport_headers::TransportHeader;
 use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_config::{PortName, SignalFormat, SignalType};
 use otel_arrow_dfe_engine::_private::AckNackRouting;
 use otel_arrow_dfe_engine::capability::auth::{AuthorizedIdentity, ClaimValue};
-use otel_arrow_dfe_engine::context_declaration::BoundContextEntry;
+use otel_arrow_dfe_engine::context_declaration::{BoundContextEntry, CompiledContextLayout};
 use otel_arrow_dfe_engine::control::{
     AckMsg, CallData, Frame, NackMsg, RouteData, nanos_since_birth,
 };
@@ -41,6 +41,8 @@ use otel_arrow_dfe_engine::{
 };
 use otel_arrow_dfe_pdata::OtapPayload;
 use smallvec::SmallVec;
+
+use crate::packed_context::{CapturedClaim, CapturedHeader, PackedContext, PackedEntryKey};
 
 const AUTHORIZED_ENTRY_LEN: usize = 20;
 const AUTHORIZED_VALUE_LEN: usize = 8;
@@ -425,11 +427,9 @@ fn read_context_str(bytes: &[u8], range: (usize, usize)) -> Option<&str> {
 /// Carries four independent concerns:
 /// - **Routing stack**: Ack/Nack routing frames used by the pipeline engine
 ///   for result notification. Reset at transport boundaries (topic hops).
-/// - **Transport headers**: Protocol-neutral request-scoped metadata captured
-///   from inbound transport headers. Preserved across transport boundaries.
-/// - **Authorized identity**: Verified claims selected by policy and kept
-///   separate from untrusted transport headers. Preserved across transport
-///   boundaries.
+/// - **Request context**: Protocol-neutral transport headers and verified
+///   identity claims share one copy-on-write allocation while retaining
+///   distinct provenance. Preserved across transport boundaries.
 /// - **Peer address**: Optional socket address observed by the receiving
 ///   socket at request acceptance time. Populated by receivers that have a
 ///   real socket (OTLP gRPC/HTTP, OTAP gRPC, syslog/CEF) and left `None` by
@@ -438,13 +438,11 @@ fn read_context_str(bytes: &[u8], range: (usize, usize)) -> Option<&str> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Context {
     stack: Vec<Frame>,
-    /// Transport headers captured from inbound protocol metadata.
+    /// Request metadata shared as one unit across pdata clones.
     ///
-    /// Empty when no headers have been captured (the common case, zero
-    /// additional allocation).
-    transport_headers: TransportHeaders,
-    /// Verified authorization claims selected by policy.
-    authorized_identity: AuthorizedIdentityEntries,
+    /// Empty when neither transport headers nor authorized identity entries
+    /// were captured (the common case, zero additional allocation).
+    request_context: Option<Arc<RequestContext>>,
     /// Peer address observed by the receiving socket at request acceptance
     /// time. `None` for receivers without a real socket.
     peer_addr: Option<SocketAddr>,
@@ -467,6 +465,117 @@ pub struct Context {
     signal: Option<SignalType>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestContext {
+    layout: Arc<CompiledContextLayout>,
+    packed: PackedContext,
+    transport_headers: TransportHeaders,
+    authorized_identity: AuthorizedIdentityEntries,
+}
+
+impl RequestContext {
+    fn new(
+        layout: Arc<CompiledContextLayout>,
+        transport_headers: TransportHeaders,
+        authorized_identity: AuthorizedIdentityEntries,
+    ) -> Self {
+        let packed = pack_request_context(&layout, &transport_headers, &authorized_identity);
+        Self {
+            layout,
+            packed,
+            transport_headers,
+            authorized_identity,
+        }
+    }
+
+    fn repack(&mut self) {
+        self.packed = pack_request_context(
+            &self.layout,
+            &self.transport_headers,
+            &self.authorized_identity,
+        );
+    }
+}
+
+fn pack_request_context(
+    layout: &CompiledContextLayout,
+    transport_headers: &TransportHeaders,
+    authorized_identity: &AuthorizedIdentityEntries,
+) -> PackedContext {
+    let fields = layout.layout().fields();
+    let headers = transport_headers
+        .iter()
+        .filter(|header| {
+            fields.iter().any(|field| {
+                field.source == ContextSource::TransportHeader
+                    && field.name.as_str() == header.name.as_str()
+            })
+        })
+        .map(|header| CapturedHeader {
+            name: header.name.as_str(),
+            original_name: header.value.original_name,
+            kind: header.value.value_kind,
+            value: header.value.bytes,
+        })
+        .collect::<Vec<_>>();
+    let claims = authorized_identity
+        .iter()
+        .filter(|entry| {
+            fields.iter().any(|field| {
+                field.source == ContextSource::AuthorizedIdentity
+                    && field.name.as_str() == entry.name()
+            })
+        })
+        .map(|entry| {
+            let value = if entry.value().is_many() {
+                ClaimValue::many(entry.value().values())
+            } else {
+                ClaimValue::one(
+                    entry
+                        .value()
+                        .as_str()
+                        .expect("single authorized identity entry has one value"),
+                )
+            };
+            (entry.name().to_owned(), value)
+        })
+        .collect::<Vec<_>>();
+    let claims = claims
+        .iter()
+        .map(|(name, value)| CapturedClaim { name, value })
+        .collect::<Vec<_>>();
+    PackedContext::pack(layout, &headers, &claims)
+        .expect("materialized context values match their compiled layout")
+}
+
+fn standalone_context_layout(
+    transport_headers: &TransportHeaders,
+    authorized_identity: &AuthorizedIdentityEntries,
+) -> Arc<CompiledContextLayout> {
+    let fields = transport_headers
+        .iter()
+        .map(|header| ContextPrimitive {
+            source: ContextSource::TransportHeader,
+            name: header
+                .name
+                .as_str()
+                .try_into()
+                .expect("stored transport header name remains valid"),
+        })
+        .chain(authorized_identity.iter().map(|entry| {
+            ContextPrimitive {
+                source: ContextSource::AuthorizedIdentity,
+                name: entry
+                    .name()
+                    .try_into()
+                    .expect("stored authorized identity name remains valid"),
+            }
+        }))
+        .collect();
+    CompiledContextLayout::compile(fields, &[])
+        .expect("standalone materialized context layout remains valid")
+}
+
 impl Context {
     /// Projects one configured whole entry into a collision-safe batch key.
     ///
@@ -477,6 +586,27 @@ impl Context {
         &'a self,
         binding: &'a BoundContextEntry,
     ) -> ContextPartitionSelection<'a> {
+        match self
+            .request_context
+            .as_deref()
+            .map(|context| context.packed.bound_entry(binding))
+        {
+            Some(Ok(Some(key))) => {
+                return ContextPartitionSelection {
+                    key: ContextPartitionSelectionKey::Packed(key),
+                    context: self,
+                    binding,
+                };
+            }
+            Some(Ok(None)) | None => {
+                return ContextPartitionSelection {
+                    key: ContextPartitionSelectionKey::Missing,
+                    context: self,
+                    binding,
+                };
+            }
+            Some(Err(_)) => {}
+        }
         let mut bytes = SmallVec::<[u8; 128]>::new();
         for field in binding.binding().fields.iter() {
             let primitive = &binding.layout().fields()[field.index()];
@@ -485,7 +615,11 @@ impl Context {
             let mut count = 0_u64;
             match primitive.source {
                 ContextSource::TransportHeader => {
-                    for header in self.transport_headers.find_by_name(primitive.name.as_str()) {
+                    for header in self
+                        .transport_headers()
+                        .into_iter()
+                        .flat_map(|headers| headers.find_by_name(primitive.name.as_str()))
+                    {
                         count += 1;
                         bytes.push(match header.value.value_kind {
                             otel_arrow_dfe_config::transport_headers::ValueKind::Text => 0,
@@ -495,10 +629,12 @@ impl Context {
                     }
                 }
                 ContextSource::AuthorizedIdentity => {
-                    let Some(entry) = self.authorized_identity.get(primitive.name.as_str()) else {
+                    let Some(entry) = self
+                        .authorized_identity_entries()
+                        .and_then(|entries| entries.get(primitive.name.as_str()))
+                    else {
                         return ContextPartitionSelection {
-                            bytes: None,
-                            hash: 0,
+                            key: ContextPartitionSelectionKey::Missing,
                             context: self,
                             binding,
                         };
@@ -513,8 +649,7 @@ impl Context {
             }
             if count == 0 {
                 return ContextPartitionSelection {
-                    bytes: None,
-                    hash: 0,
+                    key: ContextPartitionSelectionKey::Missing,
                     context: self,
                     binding,
                 };
@@ -524,8 +659,10 @@ impl Context {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         bytes.hash(&mut hasher);
         ContextPartitionSelection {
-            bytes: Some(bytes),
-            hash: hasher.finish(),
+            key: ContextPartitionSelectionKey::Legacy {
+                hash: hasher.finish(),
+                bytes: Box::new(bytes),
+            },
             context: self,
             binding,
         }
@@ -537,8 +674,7 @@ impl Context {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             stack: Vec::with_capacity(capacity),
-            transport_headers: TransportHeaders::default(),
-            authorized_identity: AuthorizedIdentityEntries::default(),
+            request_context: None,
             peer_addr: None,
             flow_compute_ns: None,
             signal: None,
@@ -863,33 +999,134 @@ impl Context {
     /// Returns a reference to the captured transport headers, if any.
     #[must_use]
     pub fn transport_headers(&self) -> Option<&TransportHeaders> {
-        (!self.transport_headers.is_empty()).then_some(&self.transport_headers)
+        self.request_context
+            .as_deref()
+            .map(|context| &context.transport_headers)
+            .filter(|headers| !headers.is_empty())
     }
 
     /// Takes and returns the captured transport headers, if any.
     #[must_use]
     pub fn take_transport_headers(&mut self) -> Option<TransportHeaders> {
-        (!self.transport_headers.is_empty()).then(|| std::mem::take(&mut self.transport_headers))
+        let _headers = self.transport_headers()?;
+        let context = self.request_context.as_mut()?;
+        let context = Arc::make_mut(context);
+        let headers = Some(std::mem::take(&mut context.transport_headers));
+        context.repack();
+        self.drop_empty_request_context();
+        headers
     }
 
     /// Set the transport headers for this context.
     pub fn set_transport_headers(&mut self, headers: TransportHeaders) {
-        self.transport_headers = headers;
+        if headers.is_empty() && self.authorized_identity_entries().is_none() {
+            self.request_context = None;
+            return;
+        }
+        if self.request_context.is_none() {
+            let authorized_identity = AuthorizedIdentityEntries::default();
+            let layout = standalone_context_layout(&headers, &authorized_identity);
+            self.request_context = Some(Arc::new(RequestContext::new(
+                layout,
+                headers,
+                authorized_identity,
+            )));
+            return;
+        }
+        let context = self.request_context_mut();
+        context.transport_headers = headers;
+        context.repack();
+        self.drop_empty_request_context();
+    }
+
+    fn set_transport_headers_with_layout(
+        &mut self,
+        layout: Arc<CompiledContextLayout>,
+        headers: TransportHeaders,
+    ) {
+        let authorized_identity = self
+            .authorized_identity_entries()
+            .cloned()
+            .unwrap_or_default();
+        self.request_context = (!headers.is_empty() || !authorized_identity.is_empty())
+            .then(|| Arc::new(RequestContext::new(layout, headers, authorized_identity)));
     }
 
     /// Returns the authorization-derived context entries, if any.
     #[must_use]
     pub fn authorized_identity_entries(&self) -> Option<&AuthorizedIdentityEntries> {
-        (!self.authorized_identity.is_empty()).then_some(&self.authorized_identity)
+        self.request_context
+            .as_deref()
+            .map(|context| &context.authorized_identity)
+            .filter(|entries| !entries.is_empty())
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn capture_authorized_identity(
         &mut self,
         policy: &AuthorizedIdentityPolicy,
         identity: &AuthorizedIdentity,
     ) {
-        self.authorized_identity =
-            AuthorizedIdentityEntries::capture(policy, identity).unwrap_or_default();
+        let entries = AuthorizedIdentityEntries::capture(policy, identity).unwrap_or_default();
+        if entries.is_empty() && self.transport_headers().is_none() {
+            self.request_context = None;
+            return;
+        }
+        if self.request_context.is_none() {
+            let transport_headers = TransportHeaders::default();
+            let layout = standalone_context_layout(&transport_headers, &entries);
+            self.request_context = Some(Arc::new(RequestContext::new(
+                layout,
+                transport_headers,
+                entries,
+            )));
+            return;
+        }
+        let context = self.request_context_mut();
+        context.authorized_identity = entries;
+        context.repack();
+        self.drop_empty_request_context();
+    }
+
+    fn capture_request_context(
+        &mut self,
+        layout: Option<Arc<CompiledContextLayout>>,
+        transport_headers: TransportHeaders,
+        authorized_identity: Option<(&AuthorizedIdentityPolicy, &AuthorizedIdentity)>,
+    ) {
+        let authorized_identity = authorized_identity
+            .and_then(|(policy, identity)| AuthorizedIdentityEntries::capture(policy, identity))
+            .unwrap_or_default();
+        let layout = layout
+            .unwrap_or_else(|| standalone_context_layout(&transport_headers, &authorized_identity));
+        self.request_context = (!transport_headers.is_empty() || !authorized_identity.is_empty())
+            .then(|| {
+                Arc::new(RequestContext::new(
+                    layout,
+                    transport_headers,
+                    authorized_identity,
+                ))
+            });
+    }
+
+    fn request_context_mut(&mut self) -> &mut RequestContext {
+        Arc::make_mut(self.request_context.get_or_insert_with(|| {
+            let transport_headers = TransportHeaders::default();
+            let authorized_identity = AuthorizedIdentityEntries::default();
+            Arc::new(RequestContext::new(
+                standalone_context_layout(&transport_headers, &authorized_identity),
+                transport_headers,
+                authorized_identity,
+            ))
+        }))
+    }
+
+    fn drop_empty_request_context(&mut self) {
+        if self.request_context.as_deref().is_some_and(|context| {
+            context.transport_headers.is_empty() && context.authorized_identity.is_empty()
+        }) {
+            self.request_context = None;
+        }
     }
 
     /// Returns the peer address observed by the receiving socket, if any.
@@ -955,8 +1192,7 @@ impl Context {
     pub fn clone_detached(&self) -> Self {
         Self {
             stack: Vec::new(),
-            transport_headers: self.transport_headers.clone(),
-            authorized_identity: self.authorized_identity.clone(),
+            request_context: self.request_context.clone(),
             peer_addr: self.peer_addr,
             flow_compute_ns: None,
             signal: None,
@@ -995,10 +1231,18 @@ impl Hash for ContextPartitionKey {
 /// Borrowed batch selection; produces an owned key and projected context only
 /// when a new partition is admitted.
 pub struct ContextPartitionSelection<'a> {
-    bytes: Option<SmallVec<[u8; 128]>>,
-    hash: u64,
+    key: ContextPartitionSelectionKey<'a>,
     context: &'a Context,
     binding: &'a BoundContextEntry,
+}
+
+enum ContextPartitionSelectionKey<'a> {
+    Missing,
+    Packed(PackedEntryKey<'a>),
+    Legacy {
+        hash: u64,
+        bytes: Box<SmallVec<[u8; 128]>>,
+    },
 }
 
 impl ContextPartitionSelection<'_> {
@@ -1006,22 +1250,30 @@ impl ContextPartitionSelection<'_> {
     #[must_use]
     pub fn table_hash<S: std::hash::BuildHasher>(&self, state: &S) -> u64 {
         let mut hasher = state.build_hasher();
-        hasher.write_u64(self.hash);
+        hasher.write_u64(match &self.key {
+            ContextPartitionSelectionKey::Missing => 0,
+            ContextPartitionSelectionKey::Packed(key) => key.hash(),
+            ContextPartitionSelectionKey::Legacy { hash, .. } => *hash,
+        });
         hasher.finish()
     }
 
     /// Compare the complete value tuple; hash equality alone is insufficient.
     #[must_use]
     pub fn matches(&self, key: &ContextPartitionKey) -> bool {
-        match (self.bytes.as_deref(), key) {
-            (None, ContextPartitionKey::Missing) => true,
+        match (&self.key, key) {
+            (ContextPartitionSelectionKey::Missing, ContextPartitionKey::Missing) => true,
             (
-                Some(values),
+                ContextPartitionSelectionKey::Packed(selected),
+                ContextPartitionKey::Present { hash, values },
+            ) => selected.hash() == *hash && selected.eq_bytes(values),
+            (
+                ContextPartitionSelectionKey::Legacy { hash, bytes },
                 ContextPartitionKey::Present {
-                    hash,
+                    hash: owned_hash,
                     values: owned,
                 },
-            ) => self.hash == *hash && values == owned.as_ref(),
+            ) => *hash == *owned_hash && bytes.as_slice() == owned.as_ref(),
             _ => false,
         }
     }
@@ -1029,19 +1281,23 @@ impl ContextPartitionSelection<'_> {
     /// Materialize one active partition's key.
     #[must_use]
     pub fn into_key(self) -> ContextPartitionKey {
-        match self.bytes {
-            Some(values) => ContextPartitionKey::Present {
-                hash: self.hash,
-                values: values.into_vec().into_boxed_slice(),
+        match self.key {
+            ContextPartitionSelectionKey::Missing => ContextPartitionKey::Missing,
+            ContextPartitionSelectionKey::Packed(key) => {
+                let (hash, values) = key.to_parts();
+                ContextPartitionKey::Present { hash, values }
+            }
+            ContextPartitionSelectionKey::Legacy { hash, bytes } => ContextPartitionKey::Present {
+                hash,
+                values: bytes.into_vec().into_boxed_slice(),
             },
-            None => ContextPartitionKey::Missing,
         }
     }
 
     /// Detach only fields represented by a complete selected entry.
     #[must_use]
     pub fn output_context(&self) -> Context {
-        if self.bytes.is_none() {
+        if matches!(self.key, ContextPartitionSelectionKey::Missing) {
             return Context::default();
         }
         let mut output = Context::default();
@@ -1053,8 +1309,9 @@ impl ContextPartitionSelection<'_> {
                 ContextSource::TransportHeader => {
                     for header in self
                         .context
-                        .transport_headers
-                        .find_by_name(primitive.name.as_str())
+                        .transport_headers()
+                        .into_iter()
+                        .flat_map(|headers| headers.find_by_name(primitive.name.as_str()))
                     {
                         headers.push(TransportHeader::new(
                             primitive.name.clone(),
@@ -1066,8 +1323,19 @@ impl ContextPartitionSelection<'_> {
                 ContextSource::AuthorizedIdentity => identities.push(primitive.name.as_str()),
             }
         }
-        output.transport_headers = headers;
-        output.authorized_identity = self.context.authorized_identity.select(&identities);
+        let authorized_identity = self
+            .context
+            .authorized_identity_entries()
+            .map(|entries| entries.select(&identities))
+            .unwrap_or_default();
+        output.request_context =
+            (!headers.is_empty() || !authorized_identity.is_empty()).then(|| {
+                Arc::new(RequestContext::new(
+                    Arc::clone(self.binding.compiled_layout()),
+                    headers,
+                    authorized_identity,
+                ))
+            });
         output
     }
 }
@@ -1432,6 +1700,7 @@ impl OtapPdata {
         self.context.authorized_identity_entries()
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn capture_authorized_identity(
         &mut self,
         policy: &AuthorizedIdentityPolicy,
@@ -1440,9 +1709,30 @@ impl OtapPdata {
         self.context.capture_authorized_identity(policy, identity);
     }
 
+    /// Capture transport headers and verified identity into one shared request context.
+    pub(crate) fn capture_request_context(
+        &mut self,
+        layout: Option<Arc<CompiledContextLayout>>,
+        transport_headers: TransportHeaders,
+        authorized_identity: Option<(&AuthorizedIdentityPolicy, &AuthorizedIdentity)>,
+    ) {
+        self.context
+            .capture_request_context(layout, transport_headers, authorized_identity);
+    }
+
     /// Set transport headers on this pdata's context.
     pub fn set_transport_headers(&mut self, headers: TransportHeaders) {
         self.context.set_transport_headers(headers);
+    }
+
+    /// Set receiver-captured transport headers using the pipeline's compiled layout.
+    pub fn set_transport_headers_with_layout(
+        &mut self,
+        layout: Arc<CompiledContextLayout>,
+        headers: TransportHeaders,
+    ) {
+        self.context
+            .set_transport_headers_with_layout(layout, headers);
     }
 
     /// Builder-style method to attach transport headers.
@@ -1824,13 +2114,13 @@ mod test {
     use std::mem::size_of;
     use tokio::sync::mpsc;
 
-    /// Scenario: queued OTAP pdata includes optional authorization-derived context.
-    /// Guarantees: the 64-bit queued-message layout reflects only one additional
-    /// pointer for the optional trusted context collection.
+    /// Scenario: queued OTAP pdata includes optional transport and identity context.
+    /// Guarantees: both metadata domains occupy one shared pointer in the
+    /// 64-bit queued-message layout.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn otap_pdata_layout_is_stable() {
-        assert_eq!(size_of::<OtapPdata>(), 160);
+        assert_eq!(size_of::<OtapPdata>(), 152);
     }
 
     /// Scenario: a composite selects one captured header and one verified claim.
@@ -1875,9 +2165,13 @@ mod test {
             )
             .expect("valid composite layout"),
         );
-        let binding =
-            BoundContextEntry::new(layout, &"product_user".try_into().expect("valid reference"))
-                .expect("compiled group");
+        let layout =
+            CompiledContextLayout::from_layout((*layout).clone()).expect("live context layout");
+        let binding = BoundContextEntry::new_compiled(
+            Arc::clone(&layout),
+            &"product_user".try_into().expect("valid reference"),
+        )
+        .expect("compiled group");
         let policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
             {"claim": "sub", "store_as": "customer_id"},
             {"claim": "role", "store_as": "access_role"},
@@ -1898,8 +2192,8 @@ mod test {
         let identity = AuthorizedIdentity::new()
             .with_subject("customer-a")
             .with_claim_str("role", "must-not-pass");
-        let mut pdata = create_test_pdata().with_transport_headers(headers);
-        pdata.capture_authorized_identity(&policy, &identity);
+        let mut pdata = create_test_pdata();
+        pdata.capture_request_context(Some(layout), headers, Some((&policy, &identity)));
         let (ctx, _) = pdata.into_parts();
         let selected = ctx.partition_selection(&binding);
         let output = selected.output_context();
@@ -3418,6 +3712,16 @@ mod test {
 
         let detached = context.clone_detached();
 
+        assert!(Arc::ptr_eq(
+            context
+                .request_context
+                .as_ref()
+                .expect("source request context"),
+            detached
+                .request_context
+                .as_ref()
+                .expect("detached request context")
+        ));
         assert_eq!(detached.transport_headers(), Some(&headers));
         let authorized = detached
             .authorized_identity_entries()
@@ -3444,6 +3748,70 @@ mod test {
         // processor's slot map and Acks upstream once its outbounds settle.
         assert!(context.has_ack_or_nack_subscribers());
         assert_eq!(context.signal(), Some(SignalType::Logs));
+    }
+
+    /// Scenario: transport headers are replaced after a detached context clone
+    /// shares request metadata containing a verified identity.
+    /// Guarantees: mutation uses copy-on-write, preserves identity in both
+    /// contexts, and does not alter the clone's original headers.
+    #[test]
+    fn transport_header_mutation_preserves_shared_authorized_identity() {
+        let identity_policy: AuthorizedIdentityPolicy = serde_json::from_value(
+            serde_json::json!([{"claim": "sub", "store_as": "customer_id"}]),
+        )
+        .expect("valid authorized identity policy");
+        let identity = AuthorizedIdentity::new().with_subject("customer-42");
+        let mut original_headers = TransportHeaders::new();
+        original_headers.push(TransportHeader::text(
+            ContextEntryName::try_from("tenant").expect("valid context entry name"),
+            b"before".to_vec(),
+        ));
+
+        let mut context = Context::default();
+        let layout = CompiledContextLayout::compile(
+            vec![
+                ContextPrimitive {
+                    source: ContextSource::TransportHeader,
+                    name: ContextEntryName::try_from("tenant").expect("valid context entry name"),
+                },
+                ContextPrimitive {
+                    source: ContextSource::AuthorizedIdentity,
+                    name: ContextEntryName::try_from("customer_id")
+                        .expect("valid context entry name"),
+                },
+            ],
+            &[],
+        )
+        .expect("valid context layout");
+        context.capture_request_context(
+            Some(layout),
+            original_headers.clone(),
+            Some((&identity_policy, &identity)),
+        );
+        let detached = context.clone_detached();
+
+        let mut replacement_headers = TransportHeaders::new();
+        replacement_headers.push(TransportHeader::text(
+            ContextEntryName::try_from("tenant").expect("valid context entry name"),
+            b"after".to_vec(),
+        ));
+        context.set_transport_headers(replacement_headers.clone());
+
+        assert_eq!(context.transport_headers(), Some(&replacement_headers));
+        assert_eq!(detached.transport_headers(), Some(&original_headers));
+        for candidate in [&context, &detached] {
+            assert_eq!(
+                candidate
+                    .authorized_identity_entries()
+                    .and_then(|entries| entries.get("customer_id"))
+                    .and_then(|entry| entry.value().as_str()),
+                Some("customer-42")
+            );
+        }
+        assert!(!Arc::ptr_eq(
+            context.request_context.as_ref().expect("mutated context"),
+            detached.request_context.as_ref().expect("detached context")
+        ));
     }
 
     /// Scenario: an identity contains one selected multi-valued claim while

@@ -12,6 +12,7 @@ use crate::channel_metrics::ChannelMetricsRegistry;
 use crate::channel_mode::{LocalMode, SharedMode, wrap_node_control_channel_metrics};
 use crate::config::ReceiverConfig;
 use crate::context::PipelineContext;
+use crate::context_declaration::CompiledContextLayout;
 use crate::control::{
     Controllable, NodeControlMsg, PipelineCompletionMsgSender, RuntimeCtrlMsgSender,
 };
@@ -69,6 +70,8 @@ pub enum ReceiverWrapper<PData> {
         capture_policy: Option<CompiledHeaderCapturePolicy>,
         /// Pre-resolved authorized identity claim projection policy.
         authorized_identity_policy: Option<AuthorizedIdentityPolicy>,
+        /// Compiled context layout for this pipeline generation.
+        context_layout: Option<Arc<CompiledContextLayout>>,
     },
     /// A receiver with a `Send` implementation.
     Shared {
@@ -97,6 +100,8 @@ pub enum ReceiverWrapper<PData> {
         capture_policy: Option<CompiledHeaderCapturePolicy>,
         /// Pre-resolved authorized identity claim projection policy.
         authorized_identity_policy: Option<AuthorizedIdentityPolicy>,
+        /// Compiled context layout for this pipeline generation.
+        context_layout: Option<Arc<CompiledContextLayout>>,
     },
 }
 
@@ -140,6 +145,7 @@ impl<PData> ReceiverWrapper<PData> {
             source_tag: SourceTagging::Disabled,
             capture_policy: None,
             authorized_identity_policy: None,
+            context_layout: None,
         }
     }
 
@@ -169,6 +175,7 @@ impl<PData> ReceiverWrapper<PData> {
             source_tag: SourceTagging::Disabled,
             capture_policy: None,
             authorized_identity_policy: None,
+            context_layout: None,
         }
     }
 
@@ -186,6 +193,7 @@ impl<PData> ReceiverWrapper<PData> {
                 source_tag,
                 capture_policy,
                 authorized_identity_policy,
+                context_layout,
                 ..
             } => ReceiverWrapper::Local {
                 node_id,
@@ -200,6 +208,7 @@ impl<PData> ReceiverWrapper<PData> {
                 source_tag,
                 capture_policy,
                 authorized_identity_policy,
+                context_layout,
             },
             ReceiverWrapper::Shared {
                 node_id,
@@ -213,6 +222,7 @@ impl<PData> ReceiverWrapper<PData> {
                 source_tag,
                 capture_policy,
                 authorized_identity_policy,
+                context_layout,
                 ..
             } => ReceiverWrapper::Shared {
                 node_id,
@@ -227,6 +237,7 @@ impl<PData> ReceiverWrapper<PData> {
                 source_tag,
                 capture_policy,
                 authorized_identity_policy,
+                context_layout,
             },
         }
     }
@@ -258,6 +269,7 @@ impl<PData> ReceiverWrapper<PData> {
                 source_tag,
                 capture_policy,
                 authorized_identity_policy,
+                context_layout,
                 ..
             } => {
                 let (control_sender, control_receiver) =
@@ -284,6 +296,7 @@ impl<PData> ReceiverWrapper<PData> {
                     source_tag,
                     capture_policy,
                     authorized_identity_policy,
+                    context_layout,
                 }
             }
             ReceiverWrapper::Shared {
@@ -299,6 +312,7 @@ impl<PData> ReceiverWrapper<PData> {
                 source_tag,
                 capture_policy,
                 authorized_identity_policy,
+                context_layout,
                 ..
             } => {
                 let (control_sender, control_receiver) =
@@ -325,6 +339,7 @@ impl<PData> ReceiverWrapper<PData> {
                     source_tag,
                     capture_policy,
                     authorized_identity_policy,
+                    context_layout,
                 }
             }
         }
@@ -351,6 +366,7 @@ impl<PData> ReceiverWrapper<PData> {
                     source_tag,
                     capture_policy,
                     authorized_identity_policy,
+                    context_layout,
                     ..
                 },
                 metrics_reporter,
@@ -378,6 +394,7 @@ impl<PData> ReceiverWrapper<PData> {
                 effect_handler.set_source_tagging(source_tag);
                 effect_handler.set_capture_policy(capture_policy);
                 effect_handler.set_authorized_identity_policy(authorized_identity_policy);
+                effect_handler.set_context_layout(context_layout);
                 effect_handler
                     .core
                     .set_pipeline_completion_msg_sender(pipeline_completion_msg_tx);
@@ -394,6 +411,7 @@ impl<PData> ReceiverWrapper<PData> {
                     source_tag,
                     capture_policy,
                     authorized_identity_policy,
+                    context_layout,
                     ..
                 },
                 metrics_reporter,
@@ -421,6 +439,7 @@ impl<PData> ReceiverWrapper<PData> {
                 effect_handler.set_source_tagging(source_tag);
                 effect_handler.set_capture_policy(capture_policy);
                 effect_handler.set_authorized_identity_policy(authorized_identity_policy);
+                effect_handler.set_context_layout(context_layout);
                 effect_handler
                     .core
                     .set_pipeline_completion_msg_sender(pipeline_completion_msg_tx);
@@ -518,6 +537,18 @@ impl<PData> NodeWithPDataSender<PData> for ReceiverWrapper<PData> {
 }
 
 impl<PData> ReceiverWrapper<PData> {
+    /// Returns the wrapper with the compiled context layout for its pipeline.
+    pub(crate) fn with_context_layout(
+        mut self,
+        layout: Option<Arc<CompiledContextLayout>>,
+    ) -> Self {
+        match &mut self {
+            ReceiverWrapper::Local { context_layout, .. }
+            | ReceiverWrapper::Shared { context_layout, .. } => *context_layout = layout,
+        }
+        self
+    }
+
     /// Returns the wrapper with the given pre-resolved capture engine for
     /// transport header extraction.
     pub(crate) fn with_capture_policy(self, policy: Option<CompiledHeaderCapturePolicy>) -> Self {
@@ -534,6 +565,7 @@ impl<PData> ReceiverWrapper<PData> {
                 telemetry,
                 source_tag,
                 authorized_identity_policy,
+                context_layout,
                 ..
             } => ReceiverWrapper::Local {
                 node_id,
@@ -548,6 +580,7 @@ impl<PData> ReceiverWrapper<PData> {
                 source_tag,
                 capture_policy: policy,
                 authorized_identity_policy,
+                context_layout,
             },
             ReceiverWrapper::Shared {
                 node_id,
@@ -561,6 +594,7 @@ impl<PData> ReceiverWrapper<PData> {
                 telemetry,
                 source_tag,
                 authorized_identity_policy,
+                context_layout,
                 ..
             } => ReceiverWrapper::Shared {
                 node_id,
@@ -575,6 +609,7 @@ impl<PData> ReceiverWrapper<PData> {
                 source_tag,
                 capture_policy: policy,
                 authorized_identity_policy,
+                context_layout,
             },
         }
     }
@@ -597,6 +632,7 @@ impl<PData> ReceiverWrapper<PData> {
                 telemetry,
                 source_tag,
                 capture_policy,
+                context_layout,
                 ..
             } => ReceiverWrapper::Local {
                 node_id,
@@ -611,6 +647,7 @@ impl<PData> ReceiverWrapper<PData> {
                 source_tag,
                 capture_policy,
                 authorized_identity_policy: policy,
+                context_layout,
             },
             ReceiverWrapper::Shared {
                 node_id,
@@ -624,6 +661,7 @@ impl<PData> ReceiverWrapper<PData> {
                 telemetry,
                 source_tag,
                 capture_policy,
+                context_layout,
                 ..
             } => ReceiverWrapper::Shared {
                 node_id,
@@ -638,6 +676,7 @@ impl<PData> ReceiverWrapper<PData> {
                 source_tag,
                 capture_policy,
                 authorized_identity_policy: policy,
+                context_layout,
             },
         }
     }

@@ -26,6 +26,7 @@ use otel_arrow_dfe_config::transport_headers_policy::HeaderCapturePolicy;
 use otel_arrow_dfe_config::validation::validate_typed_config;
 use otel_arrow_dfe_engine::config::ReceiverConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
+use otel_arrow_dfe_engine::context_declaration::CompiledContextLayout;
 use otel_arrow_dfe_engine::control::NodeControlMsg;
 use otel_arrow_dfe_engine::error::{Error as EngineError, ReceiverErrorKind, format_error_sources};
 use otel_arrow_dfe_engine::local::receiver as local;
@@ -270,6 +271,7 @@ impl KafkaReceiver {
         &mut self,
         kafka_message: BorrowedMessage<'_>,
         capture_policy: Option<&CompiledHeaderCapturePolicy>,
+        context_layout: &Arc<CompiledContextLayout>,
     ) -> Result<OtapPdata, KafkaReceiverError> {
         let topic = kafka_message.topic();
 
@@ -310,7 +312,7 @@ impl KafkaReceiver {
             )),
         }?;
 
-        capture_transport_headers(&kafka_message, capture_policy, &mut pdata);
+        capture_transport_headers(&kafka_message, capture_policy, context_layout, &mut pdata);
 
         Ok(pdata)
     }
@@ -456,6 +458,11 @@ impl KafkaReceiver {
         // Retrieve the capture policy (if configured) for extracting Kafka
         // headers into the OtapPdata context as TransportHeaders.
         let capture_policy = effect_handler.capture_policy();
+        let context_layout = Arc::clone(
+            effect_handler
+                .context_layout()
+                .expect("receiver context layout is installed"),
+        );
 
         // Safety-net timer: periodically commit offsets even if no acks
         // arrive for a while. Only started when manual commit is active
@@ -794,7 +801,7 @@ impl KafkaReceiver {
                                 continue;
                             }
 
-                            match self.process_kafka(data, capture_policy) {
+                            match self.process_kafka(data, capture_policy, &context_layout) {
                                 Ok(mut otap_data) => {
                                     let signal = otap_data.signal_type();
                                     self.metrics

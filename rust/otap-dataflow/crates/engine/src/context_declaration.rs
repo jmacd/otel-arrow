@@ -39,6 +39,9 @@ use otel_arrow_dfe_config::transport_headers_policy::{
 use otel_arrow_dfe_config::{ContextEntryName, NodeId as ConfigNodeId, PipelineKey};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_CONTEXT_LAYOUT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// A context entry and its requested representation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -270,18 +273,83 @@ pub struct CompiledContextBindings {
     /// Compiled node bindings indexed first by pipeline, then by node.
     by_pipeline: HashMap<PipelineKey, HashMap<ConfigNodeId, CompiledNodeBindings>>,
     entry_bindings: HashMap<PipelineKey, HashMap<ConfigNodeId, BoundContextEntry>>,
+    pipeline_layouts: HashMap<PipelineKey, Arc<CompiledContextLayout>>,
+}
+
+/// One pipeline generation's immutable context layout.
+#[derive(Debug)]
+pub struct CompiledContextLayout {
+    generation: u64,
+    layout: ContextLayout,
+}
+
+impl PartialEq for CompiledContextLayout {
+    fn eq(&self, other: &Self) -> bool {
+        self.layout == other.layout
+    }
+}
+
+impl Eq for CompiledContextLayout {}
+
+impl CompiledContextLayout {
+    /// Compile one generation-bearing layout.
+    pub fn compile(
+        fields: Vec<ContextPrimitive>,
+        declarations: &[otel_arrow_dfe_config::context_policy::ContextEntryDeclaration],
+    ) -> Result<Arc<Self>, Error> {
+        Self::new(ContextLayout::compile(fields, declarations)?)
+    }
+
+    /// Attach a live generation identity to an already compiled layout.
+    pub fn from_layout(layout: ContextLayout) -> Result<Arc<Self>, Error> {
+        Self::new(layout)
+    }
+
+    fn new(layout: ContextLayout) -> Result<Arc<Self>, Error> {
+        let generation = NEXT_CONTEXT_LAYOUT_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| Error::InvalidUserConfig {
+                error: "context layout generation overflow".to_owned(),
+            })?;
+        Ok(Arc::new(Self { generation, layout }))
+    }
+
+    /// Returns the identity of this live pipeline layout generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the deterministic compiled layout.
+    #[must_use]
+    pub const fn layout(&self) -> &ContextLayout {
+        &self.layout
+    }
 }
 
 /// One node's exact entry binding and its immutable pipeline layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundContextEntry {
-    layout: Arc<ContextLayout>,
+    layout: Arc<CompiledContextLayout>,
     binding: ContextBinding,
 }
 
 impl BoundContextEntry {
     /// Bind one complete entry to a compiled pipeline layout.
     pub fn new(layout: Arc<ContextLayout>, reference: &ContextEntryRef) -> Result<Self, Error> {
+        Self::new_compiled(
+            CompiledContextLayout::from_layout((*layout).clone())?,
+            reference,
+        )
+    }
+
+    /// Bind one complete entry to a live pipeline layout generation.
+    pub fn new_compiled(
+        layout: Arc<CompiledContextLayout>,
+        reference: &ContextEntryRef,
+    ) -> Result<Self, Error> {
         if reference.scope().is_some() {
             return Err(Error::InvalidUserConfig {
                 error: format!(
@@ -289,7 +357,7 @@ impl BoundContextEntry {
                 ),
             });
         }
-        let binding = layout.bind(reference)?;
+        let binding = layout.layout.bind(reference)?;
         Ok(Self { layout, binding })
     }
 
@@ -302,6 +370,12 @@ impl BoundContextEntry {
     /// Returns the source fields resolved for this pipeline generation.
     #[must_use]
     pub fn layout(&self) -> &ContextLayout {
+        self.layout.layout()
+    }
+
+    /// Returns the generation-bearing pipeline layout.
+    #[must_use]
+    pub fn compiled_layout(&self) -> &Arc<CompiledContextLayout> {
         &self.layout
     }
 }
@@ -497,6 +571,7 @@ impl CompiledContextBindings {
         Self {
             by_pipeline: HashMap::new(),
             entry_bindings: HashMap::new(),
+            pipeline_layouts: HashMap::new(),
         }
     }
 
@@ -523,6 +598,7 @@ impl CompiledContextBindings {
         Self {
             by_pipeline,
             entry_bindings: HashMap::new(),
+            pipeline_layouts: HashMap::new(),
         }
     }
 
@@ -546,9 +622,8 @@ impl CompiledContextBindings {
                 pipeline.pipeline_group_id.clone(),
                 pipeline.pipeline_id.clone(),
             );
-            let Some(nodes) = declarations.get(&key) else {
-                continue;
-            };
+            let empty_nodes = HashMap::new();
+            let nodes = declarations.get(&key).unwrap_or(&empty_nodes);
             let selected: Vec<_> = nodes
                 .iter()
                 .flat_map(|(node, declarations)| {
@@ -562,9 +637,6 @@ impl CompiledContextBindings {
                         })
                 })
                 .collect();
-            if selected.is_empty() {
-                continue;
-            }
             let mut sources = Vec::new();
             for declarations in nodes.values() {
                 for declaration in declarations.iter() {
@@ -604,7 +676,11 @@ impl CompiledContextBindings {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let layout = Arc::new(ContextLayout::compile(sources, &definitions)?);
+            let layout =
+                CompiledContextLayout::new(ContextLayout::compile(sources, &definitions)?)?;
+            _ = self
+                .pipeline_layouts
+                .insert(key.clone(), Arc::clone(&layout));
             let mut bindings = HashMap::new();
             for (node, reference) in selected {
                 if bindings.contains_key(node) {
@@ -614,12 +690,20 @@ impl CompiledContextBindings {
                 }
                 _ = bindings.insert(
                     node.clone(),
-                    BoundContextEntry::new(Arc::clone(&layout), reference)?,
+                    BoundContextEntry::new_compiled(Arc::clone(&layout), reference)?,
                 );
             }
             _ = self.entry_bindings.insert(key, bindings);
         }
         Ok(())
+    }
+
+    /// Returns the compiled layout for one live pipeline generation.
+    pub(crate) fn pipeline_layout(
+        &self,
+        pipeline: &PipelineKey,
+    ) -> Option<&Arc<CompiledContextLayout>> {
+        self.pipeline_layouts.get(pipeline)
     }
 
     /// Returns the node's compiled header capture policy.

@@ -448,9 +448,8 @@ impl UnaryService<OtapPdata> for OtapBatchService {
 
         // Capture transport headers synchronously before moving the effect handler
         // into the async block, avoiding a clone of the capture policy.
+        let mut transport_headers = TransportHeaders::new();
         if let Some(policy) = effect_handler.capture_policy() {
-            let mut transport_headers = TransportHeaders::new();
-
             // Decode binary metadata before capture to prevent double encoding on propagation.
             let pairs = metadata.iter().filter_map(|kv| match kv {
                 tonic::metadata::KeyAndValueRef::Ascii(key, value) => {
@@ -463,15 +462,19 @@ impl UnaryService<OtapPdata> for OtapBatchService {
             });
 
             let _stats = policy.capture_from_pairs(pairs, &mut transport_headers);
-            if !transport_headers.is_empty() {
-                otap_batch.set_transport_headers(transport_headers);
-            }
         }
-        if let Some(policy) = effect_handler.authorized_identity_policy()
-            && let Some(identity) = extensions.get::<AuthorizedIdentity>()
-        {
-            otap_batch.capture_authorized_identity(policy, identity);
-        }
+        let authorized_identity = match (
+            effect_handler.authorized_identity_policy(),
+            extensions.get::<AuthorizedIdentity>(),
+        ) {
+            (Some(policy), Some(identity)) => Some((policy, identity)),
+            _ => None,
+        };
+        otap_batch.capture_request_context(
+            effect_handler.context_layout().cloned(),
+            transport_headers,
+            authorized_identity,
+        );
 
         let state = self.state.clone();
         let metrics = self.metrics.clone();

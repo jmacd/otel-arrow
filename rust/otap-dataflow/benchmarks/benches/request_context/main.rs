@@ -23,7 +23,7 @@ use otel_arrow_dfe_config::transport_headers_policy::{
 };
 use otel_arrow_dfe_engine::capability::auth::ClaimValue;
 use otel_arrow_dfe_engine::context_declaration::BoundContextEntry;
-use otel_arrow_dfe_otap::packed_context_experiment::{
+use otel_arrow_dfe_otap::packed_context::{
     CapturedClaim, CapturedHeader, CompiledLayout, PackedContext,
 };
 use otel_arrow_dfe_otap::pdata::Context;
@@ -200,7 +200,9 @@ fn bench_mixed_context(c: &mut Criterion) {
         }],
     )
     .expect("valid compiled layout");
-    let binding = layout.bind(&name).expect("composite entry");
+    let binding =
+        otel_arrow_dfe_otap::packed_context::ContextKeyBinding::bind(Arc::clone(&layout), &name)
+            .expect("composite entry");
     let claim = ClaimValue::One("customer-123".into());
     let claims = [CapturedClaim {
         name: "customer_id",

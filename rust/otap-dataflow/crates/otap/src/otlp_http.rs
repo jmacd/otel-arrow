@@ -851,20 +851,22 @@ impl HttpHandler {
                 let mut pdata = OtapPdata::new(context, payload.into());
                 pdata.set_peer_addr(self.peer_addr);
 
-                // Capture transport headers from HTTP headers when a capture policy is configured.
+                let mut transport_headers = TransportHeaders::new();
                 if let Some(policy) = self.effect_handler.capture_policy() {
-                    let mut transport_headers = TransportHeaders::new();
                     _ = policy.capture_from_http_headers(&headers, &mut transport_headers);
-                    if !transport_headers.is_empty() {
-                        pdata.set_transport_headers(transport_headers);
-                    }
                 }
-                if let (Some(policy), Some(identity)) = (
+                let authorized_identity = match (
                     self.effect_handler.authorized_identity_policy(),
                     authorized_identity.as_ref(),
                 ) {
-                    pdata.capture_authorized_identity(policy, identity);
-                }
+                    (Some(policy), Some(identity)) => Some((policy, identity)),
+                    _ => None,
+                };
+                pdata.capture_request_context(
+                    self.effect_handler.context_layout().cloned(),
+                    transport_headers,
+                    authorized_identity,
+                );
 
                 let cancel_rx = if self.settings.wait_for_result {
                     let state = match signal {

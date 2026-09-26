@@ -16,7 +16,7 @@ pub mod accessory;
 pub mod pdata;
 
 /// Experimental compiled mixed-source context projection.
-pub mod packed_context_experiment;
+pub mod packed_context;
 
 mod pdata_conversions;
 

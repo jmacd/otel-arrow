@@ -33,6 +33,7 @@
 //! parallel on different cores, each with its own receiver instance.
 
 use crate::Interests;
+use crate::context_declaration::CompiledContextLayout;
 use crate::control::{NodeControlMsg, RuntimeCtrlMsgSender};
 use crate::effect_handler::{
     EffectHandlerCore, SourceTagging, TelemetryTimerCancelHandle, TimerCancelHandle,
@@ -112,6 +113,8 @@ pub struct EffectHandler<PData> {
     capture_policy: Option<Arc<CompiledHeaderCapturePolicy>>,
     /// Immutable authorized identity policy shared by request handlers.
     authorized_identity_policy: Option<Arc<AuthorizedIdentityPolicy>>,
+    /// Compiled context layout for this pipeline generation.
+    context_layout: Option<Arc<CompiledContextLayout>>,
 }
 
 /// Implementation for the `Send` effect handler.
@@ -134,6 +137,7 @@ impl<PData> EffectHandler<PData> {
             router,
             capture_policy: None,
             authorized_identity_policy: None,
+            context_layout: None,
         }
     }
 
@@ -189,6 +193,17 @@ impl<PData> EffectHandler<PData> {
     /// Sets the authorized identity claim projection policy.
     pub fn set_authorized_identity_policy(&mut self, policy: Option<AuthorizedIdentityPolicy>) {
         self.authorized_identity_policy = policy.map(Arc::new);
+    }
+
+    /// Returns the compiled context layout for this pipeline generation.
+    #[must_use]
+    pub fn context_layout(&self) -> Option<&Arc<CompiledContextLayout>> {
+        self.context_layout.as_ref()
+    }
+
+    /// Sets the compiled context layout for this pipeline generation.
+    pub fn set_context_layout(&mut self, layout: Option<Arc<CompiledContextLayout>>) {
+        self.context_layout = layout;
     }
 
     /// Sends a message to the next node(s) in the pipeline.
