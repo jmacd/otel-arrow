@@ -146,7 +146,7 @@ mod tests {
             }],
         );
 
-        let propagated: Vec<_> = propagation_policy.propagate(headers_after).collect();
+        let propagated: Vec<_> = propagation_policy.propagate(&headers_after).collect();
 
         assert_eq!(
             propagated.len(),
@@ -205,7 +205,7 @@ mod tests {
             },
             vec![],
         );
-        let propagated: Vec<_> = propagation_policy.propagate(headers).collect();
+        let propagated: Vec<_> = propagation_policy.propagate(&headers).collect();
         assert_eq!(propagated.len(), 3, "duplicates must survive propagation");
 
         let values: Vec<&[u8]> = propagated.iter().map(|h| h.value).collect();
@@ -248,7 +248,7 @@ mod tests {
             },
             vec![],
         );
-        let propagated: Vec<_> = propagation_policy.propagate(headers).collect();
+        let propagated: Vec<_> = propagation_policy.propagate(&headers).collect();
 
         assert_eq!(propagated[0].value_kind, ValueKind::Binary);
         assert_eq!(propagated[0].value, binary_value.as_slice());

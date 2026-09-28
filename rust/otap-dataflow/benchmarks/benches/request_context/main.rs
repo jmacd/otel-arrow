@@ -172,7 +172,7 @@ fn bench_active_context(c: &mut Criterion) {
         let (headers, _, _) = comparison_headers(header_count);
         let layout = transport_layout(&headers);
         let _ = group.bench_with_input(
-            BenchmarkId::new("pack_and_first_compatibility_view", header_count),
+            BenchmarkId::new("pack_and_visit_headers", header_count),
             &header_count,
             |b, _| {
                 b.iter(|| {
@@ -181,19 +181,34 @@ fn bench_active_context(c: &mut Criterion) {
                         Arc::clone(black_box(&layout)),
                         black_box(headers.clone()),
                     );
-                    black_box(context.transport_headers().is_some())
+                    black_box(
+                        context
+                            .transport_headers()
+                            .into_iter()
+                            .flat_map(|headers| headers.iter())
+                            .map(|header| header.value.bytes.len())
+                            .sum::<usize>(),
+                    )
                 });
             },
         );
 
         let mut context = Context::default();
         context.set_transport_headers_with_layout(Arc::clone(&layout), headers.clone());
-        _ = context.transport_headers();
         let _ = group.bench_with_input(
-            BenchmarkId::new("cached_compatibility_view", header_count),
+            BenchmarkId::new("borrow_and_visit_headers", header_count),
             &header_count,
             |b, _| {
-                b.iter(|| black_box(black_box(&context).transport_headers()));
+                b.iter(|| {
+                    black_box(
+                        black_box(&context)
+                            .transport_headers()
+                            .into_iter()
+                            .flat_map(|headers| headers.iter())
+                            .map(|header| header.value.bytes.len())
+                            .sum::<usize>(),
+                    )
+                });
             },
         );
     }

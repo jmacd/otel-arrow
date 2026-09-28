@@ -8,6 +8,7 @@
 
 use crate::Interests;
 use crate::config::ReceiverConfig;
+use crate::context_declaration::CompiledContextLayout;
 use crate::control::{
     Controllable, NodeControlMsg, RuntimeCtrlMsgReceiver, pipeline_completion_msg_channel,
     runtime_ctrl_msg_channel,
@@ -27,6 +28,7 @@ use serde_json::Value;
 use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::LocalSet;
 use tokio::time::sleep;
@@ -236,6 +238,13 @@ impl<PData: Clone + Debug + 'static> Default for TestRuntime<PData> {
 }
 
 impl<PData: Debug + 'static> TestPhase<PData> {
+    /// Sets the pipeline's compiled context layout on the receiver wrapper.
+    #[must_use]
+    pub fn with_context_layout(mut self, layout: Option<Arc<CompiledContextLayout>>) -> Self {
+        self.receiver = self.receiver.with_context_layout(layout);
+        self
+    }
+
     /// Sets a capture policy on the receiver wrapper for transport header testing.
     #[must_use]
     pub fn with_capture_policy(mut self, policy: Option<HeaderCapturePolicy>) -> Self {

@@ -13,7 +13,9 @@
 
 use crate::context::{ContextEntryName, ContextEntryRef};
 use crate::context_policy::{ContextEntryDeclaration, ContextEntryPart};
-use crate::transport_headers::{CapturedTransportHeader, TransportHeaders, ValueKind};
+use crate::transport_headers::{
+    CapturedTransportHeader, TransportHeaderSource, TransportHeaders, ValueKind,
+};
 use hashbrown::{Equivalent, HashMap};
 use http::{HeaderMap, HeaderName};
 use schemars::JsonSchema;
@@ -631,10 +633,10 @@ impl HeaderPropagationPolicy {
     /// Qualified `composite:member` selectors are active only after
     /// [`Self::compile_context`] has resolved the policy. Unqualified selectors
     /// do not require compilation.
-    pub fn propagate<'a>(
-        &'a self,
-        headers: &'a TransportHeaders,
-    ) -> impl Iterator<Item = PropagatedHeader<'a>> {
+    pub fn propagate<'a, H>(&'a self, headers: &'a H) -> impl Iterator<Item = PropagatedHeader<'a>>
+    where
+        H: TransportHeaderSource + ?Sized,
+    {
         let mut condition_matches = ConditionMatchCache::new();
         headers.iter().filter_map(move |header| {
             let (action, name_strategy, selected_name) = self.resolve_action_for_header(
@@ -688,12 +690,15 @@ impl HeaderPropagationPolicy {
         }
     }
 
-    fn resolve_action_for_header<'a>(
+    fn resolve_action_for_header<'a, H>(
         &'a self,
-        headers: &'a TransportHeaders,
+        headers: &'a H,
         name: &str,
         condition_matches: &mut ConditionMatchCache<'a>,
-    ) -> (PropagationAction, NameStrategy, Option<&'a str>) {
+    ) -> (PropagationAction, NameStrategy, Option<&'a str>)
+    where
+        H: TransportHeaderSource + ?Sized,
+    {
         for ov in &self.overrides {
             if ov
                 .match_rule
@@ -744,11 +749,14 @@ fn register_named_source(
 }
 
 impl CompiledNamedPropagation {
-    fn matches_cached<'a>(
+    fn matches_cached<'a, H>(
         &'a self,
-        headers: &TransportHeaders,
+        headers: &H,
         condition_matches: &mut ConditionMatchCache<'a>,
-    ) -> bool {
+    ) -> bool
+    where
+        H: TransportHeaderSource + ?Sized,
+    {
         condition_matches
             .iter()
             .find_map(|(conditions, matches)| {
@@ -761,7 +769,10 @@ impl CompiledNamedPropagation {
             })
     }
 
-    fn matches(&self, headers: &TransportHeaders) -> bool {
+    fn matches<H>(&self, headers: &H) -> bool
+    where
+        H: TransportHeaderSource + ?Sized,
+    {
         self.conditions.iter().all(|condition| {
             headers.iter().any(|header| {
                 header

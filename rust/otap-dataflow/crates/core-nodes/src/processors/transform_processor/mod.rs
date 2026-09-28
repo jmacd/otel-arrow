@@ -2672,8 +2672,10 @@ mod test {
                     ("info_port", &info_ctx),
                 ] {
                     assert_eq!(
-                        context.transport_headers(),
-                        Some(&headers),
+                        context
+                            .transport_headers()
+                            .expect("inbound transport headers"),
+                        &headers,
                         "{port} lost the inbound transport headers"
                     );
                     assert_eq!(

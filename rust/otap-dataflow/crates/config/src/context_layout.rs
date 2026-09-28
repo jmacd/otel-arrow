@@ -128,16 +128,16 @@ impl ContextLayout {
             .collect();
         let mut entries = Vec::with_capacity(fields.len() + declarations.len());
         let mut by_name = BTreeMap::new();
-        let mut primitive_names = BTreeSet::new();
+        let mut primitive_sources = BTreeMap::new();
         for (index, field) in fields.iter().enumerate() {
             let name = field.name.clone();
-            if primitive_names.insert(name.clone()) {
-                _ = by_name.insert(name.clone(), ContextEntryId(index));
-            } else {
-                // Both domains remain addressable to grouping declarations;
-                // a bare consumer reference cannot select between them.
-                _ = by_name.remove(&name);
+            if let Some(existing) = primitive_sources.insert(name.clone(), field.source) {
+                return Err(invalid(format!(
+                    "context source `{name}` is produced as both {existing:?} and {:?}",
+                    field.source
+                )));
             }
+            _ = by_name.insert(name.clone(), ContextEntryId(index));
             entries.push(ContextEntryLayout {
                 name: name.clone(),
                 scope: None,
@@ -156,7 +156,7 @@ impl ContextLayout {
                 .then_with(|| left.name.cmp(&right.name))
         });
         for declaration in ordered {
-            if primitive_names.contains(&declaration.name)
+            if primitive_sources.contains_key(&declaration.name)
                 || by_name.contains_key(&declaration.name)
             {
                 return Err(invalid(format!(
@@ -445,10 +445,10 @@ mod tests {
         assert!(layout.bind(&reference("workspace:customer")).is_err());
     }
 
-    /// Scenario: both source domains export one name and a grouping aliases the members.
-    /// Guarantees: typed grouping resolves both, while a bare source reference is ambiguous.
+    /// Scenario: transport-header and authorized-identity capture produce the same stored name.
+    /// Guarantees: layout compilation rejects the collision instead of requiring consumer aliases.
     #[test]
-    fn source_domain_collision_requires_grouping_aliases() {
+    fn source_domain_collision_is_rejected() {
         let fields = [
             ContextPrimitive {
                 name: name("customer"),
@@ -459,30 +459,11 @@ mod tests {
                 source: ContextSource::TransportHeader,
             },
         ];
-        let declaration = ContextEntryDeclaration {
-            scope: ContextScope::Engine,
-            name: name("composite"),
-            definition: ContextEntryDefinition(vec![
-                ContextEntryPart::AuthorizedIdentity {
-                    name: reference("customer"),
-                    store_as: Some(name("verified")),
-                },
-                ContextEntryPart::TransportHeader {
-                    name: reference("customer"),
-                    store_as: Some(name("untrusted")),
-                },
-            ]),
-        };
-        let layout = ContextLayout::compile(fields, &[declaration]).expect("typed sources");
-        assert_eq!(
-            layout
-                .bind(&reference("composite"))
-                .expect("group")
-                .fields
-                .len(),
-            2
-        );
-        assert!(layout.bind(&reference("customer")).is_err());
+        let error = ContextLayout::compile(fields, &[]).expect_err("collision must fail");
+        let message = error.to_string();
+        assert!(message.contains("context source `customer`"));
+        assert!(message.contains("TransportHeader"));
+        assert!(message.contains("AuthorizedIdentity"));
     }
 
     /// Scenario: equivalent conditional composites declare their conditions in different orders.

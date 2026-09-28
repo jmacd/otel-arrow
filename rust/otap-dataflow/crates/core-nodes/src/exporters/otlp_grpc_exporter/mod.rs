@@ -1117,7 +1117,7 @@ fn build_grpc_metadata(
     };
 
     if let Some((policy, transport_headers)) = propagation {
-        for header in policy.propagate(transport_headers) {
+        for header in policy.propagate(&transport_headers) {
             match header.value_kind {
                 ValueKind::Text => {
                     // ASCII metadata: parse the header name and value.

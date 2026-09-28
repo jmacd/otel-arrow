@@ -793,10 +793,11 @@ mod tests {
     use super::*;
 
     use crate::receivers::traffic_generator::config::{Config, TrafficConfig};
+    use otel_arrow_dfe_config::context_layout::{ContextLayout, ContextPrimitive, ContextSource};
     use otel_arrow_dfe_config::node::NodeUserConfig;
     use otel_arrow_dfe_config::transport_headers::ValueKind;
     use otel_arrow_dfe_engine::context::ControllerContext;
-    use otel_arrow_dfe_engine::context_declaration::ContextDeclaration;
+    use otel_arrow_dfe_engine::context_declaration::{CompiledContextLayout, ContextDeclaration};
     use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
     use otel_arrow_dfe_engine::testing::{
         receiver::{NotSendValidateContext, TestContext, TestRuntime},
@@ -835,6 +836,24 @@ mod tests {
     fn traffic_receiver(pipeline_ctx: PipelineContext, config: Config) -> TrafficGeneratorReceiver {
         TrafficGeneratorReceiver::new(pipeline_ctx, config)
             .expect("valid traffic generator configuration")
+    }
+
+    fn transport_context_layout(config: &Config) -> Arc<CompiledContextLayout> {
+        CompiledContextLayout::from_layout(
+            ContextLayout::compile(
+                config
+                    .transport_headers()
+                    .keys()
+                    .cloned()
+                    .map(|name| ContextPrimitive {
+                        name,
+                        source: ContextSource::TransportHeader,
+                    }),
+                &[],
+            )
+            .expect("valid traffic-generator context layout"),
+        )
+        .expect("live traffic-generator context layout")
     }
 
     /// Scenario: Ack/Nack tracking is enabled, one generated batch remains
@@ -1629,6 +1648,7 @@ mod tests {
         let controller_ctx = ControllerContext::new(telemetry_registry_handle);
         let pipeline_ctx =
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let context_layout = transport_context_layout(&config);
 
         let receiver = ReceiverWrapper::local(
             traffic_receiver(pipeline_ctx, config),
@@ -1669,6 +1689,7 @@ mod tests {
 
         test_runtime
             .set_receiver(receiver)
+            .with_context_layout(Some(context_layout))
             .run_test(scenario)
             .run_validation(validation);
     }
@@ -1705,6 +1726,7 @@ mod tests {
         let controller_ctx = ControllerContext::new(telemetry_registry_handle);
         let pipeline_ctx =
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let context_layout = transport_context_layout(&config);
 
         let receiver = ReceiverWrapper::local(
             traffic_receiver(pipeline_ctx, config),
@@ -1754,6 +1776,7 @@ mod tests {
 
         test_runtime
             .set_receiver(receiver)
+            .with_context_layout(Some(context_layout))
             .run_test(scenario)
             .run_validation(validation);
     }
@@ -1791,6 +1814,7 @@ mod tests {
         let controller_ctx = ControllerContext::new(telemetry_registry_handle);
         let pipeline_ctx =
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let context_layout = transport_context_layout(&config);
 
         let receiver = ReceiverWrapper::local(
             traffic_receiver(pipeline_ctx, config),
@@ -1836,6 +1860,7 @@ mod tests {
 
         test_runtime
             .set_receiver(receiver)
+            .with_context_layout(Some(context_layout))
             .run_test(scenario)
             .run_validation(validation);
     }

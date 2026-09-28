@@ -59,7 +59,9 @@ use otel_arrow_dfe_engine::{
 };
 use otel_arrow_dfe_otap::OTAP_PROCESSOR_FACTORIES;
 use otel_arrow_dfe_otap::accessory::slots::{Key as SlotKey, State as SlotState};
-use otel_arrow_dfe_otap::pdata::{Context, ContextPartitionKey, OtapPdata, PeerAddrMerger};
+use otel_arrow_dfe_otap::pdata::{
+    Context, ContextPartitionKey, ContextPartitionSelection, OtapPdata, PeerAddrMerger,
+};
 use otel_arrow_dfe_pdata::{
     OtapArrowRecords, OtapPayload, OtapPayloadHelpers, OtlpProtoBytes, PayloadData, Sizer,
     TryIntoWithOptions,
@@ -72,7 +74,6 @@ use otel_arrow_dfe_telemetry::metrics::MetricSet;
 use otel_arrow_dfe_telemetry_macros::metric_set;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
@@ -512,7 +513,7 @@ struct SignalBatches<T: OtapPayloadHelpers> {
 /// Per-input wait context, including the arriving request's context.
 struct BatchContext {
     /// Original request context.
-    ctx: Context,
+    ctx: Option<Context>,
     /// Number of outbounds
     outbound: usize,
 }
@@ -539,7 +540,7 @@ struct Inputs<T: OtapPayloadHelpers> {
 
     /// Total weight across all pending portions, in the active sizer's unit.
     weight: usize,
-    /// Detached context containing only the selected partition entry.
+    /// Detached selected partition context, or empty for unpartitioned batching.
     output_context: Context,
 }
 
@@ -548,12 +549,27 @@ struct MultiContext {
     pos: usize,
 }
 
+/// Pending payloads in the processor's configured batching mode.
+enum PendingInputs<T: OtapPayloadHelpers> {
+    /// One shared buffer when no partition binding is configured.
+    Unpartitioned(Inputs<T>),
+    /// Bounded keyed buffers when a partition binding is configured.
+    Partitioned(HashMap<ContextPartitionKey, Inputs<T>>),
+}
+
+enum PendingTarget<'a> {
+    Unpartitioned,
+    Partitioned {
+        selection: ContextPartitionSelection<'a>,
+        hash: u64,
+        exists: bool,
+    },
+}
+
 /// Per-signal buffer state
 struct SignalBuffer<T: OtapPayloadHelpers> {
-    /// Original single-buffer path when partitioning is disabled.
-    inputs: Inputs<T>,
-    /// Bounded keyed buffers used only with an explicit partition binding.
-    partitions: HashMap<ContextPartitionKey, Inputs<T>>,
+    /// Exactly one buffering strategy selected at construction.
+    pending: PendingInputs<T>,
 
     /// Map of inbound requests.  This contains a limited number of pending request
     /// contexts with details for the impl to notify after an outcome is available.
@@ -1005,68 +1021,49 @@ where
             effect.notify_ack(AckMsg::new(pdata)).await?;
             return Ok(());
         }
-        if self.partition_binding.is_none() {
-            return self
-                .accept_unpartitioned(effect, ctx, payload, weight)
-                .await;
-        }
-
-        let selection = self
-            .partition_binding
-            .map(|binding| ctx.partition_selection(binding));
-        let hash = match &selection {
-            Some(selection) => selection.table_hash(self.buffer.partitions.hasher()),
-            None => {
-                let mut state = self.buffer.partitions.hasher().build_hasher();
-                state.write_u64(0);
-                state.finish()
+        let target = match (&mut self.buffer.pending, self.partition_binding) {
+            (PendingInputs::Unpartitioned(_), None) => PendingTarget::Unpartitioned,
+            (PendingInputs::Partitioned(partitions), Some(binding)) => {
+                let selection = ctx.partition_selection(binding);
+                let hash = selection.table_hash(partitions.hasher());
+                let exists = partitions
+                    .raw_entry()
+                    .from_hash(hash, |key| selection.matches(key))
+                    .is_some();
+                if !exists && partitions.len() >= self.config.max_active_partitions.get() {
+                    self.metrics.nacked_partition_limit.inc();
+                    drop(selection);
+                    effect
+                        .notify_nack(NackMsg::new(
+                            "batch active context partition limit exhausted",
+                            OtapPdata::new(ctx, payload.into()),
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+                PendingTarget::Partitioned {
+                    selection,
+                    hash,
+                    exists,
+                }
+            }
+            (PendingInputs::Unpartitioned(_), Some(_)) => {
+                unreachable!("partition binding requires partitioned pending inputs")
+            }
+            (PendingInputs::Partitioned(_), None) => {
+                unreachable!("missing partition binding requires unpartitioned pending inputs")
             }
         };
-        let exists = self
-            .buffer
-            .partitions
-            .raw_entry()
-            .from_hash(hash, |key| {
-                selection
-                    .as_ref()
-                    .map_or(matches!(key, ContextPartitionKey::Missing), |s| {
-                        s.matches(key)
-                    })
-            })
-            .is_some();
-        if !exists && self.buffer.partitions.len() >= self.config.max_active_partitions.get() {
-            self.metrics.nacked_partition_limit.inc();
-            effect
-                .notify_nack(NackMsg::new(
-                    "batch active context partition limit exhausted",
-                    OtapPdata::new(ctx, payload.into()),
-                ))
-                .await?;
-            return Ok(());
-        }
-        let output_context = if exists {
-            Context::default()
-        } else {
-            selection
-                .as_ref()
-                .map_or_else(Context::default, |selection| selection.output_context())
-        };
 
-        // Capture the receiver-observed peer address before `ctx` may be
-        // moved into BatchContext below. The portion retains it so the
-        // flush path can merge peer_addr across contributing inputs even
-        // when none of them subscribed to ack/nack.
         let peer_addr = ctx.peer_addr();
-
-        // Reserve tracking without moving the context yet: partition lookup
-        // still borrows its packed header and identity values.
         let inkey = if ctx.needs_completion_tracking() {
             match self.buffer.inbound.allocate_with_data(BatchContext {
-                ctx: Context::default(),
+                ctx: None,
                 outbound: 0,
             }) {
                 Err(_) => {
                     self.metrics.nacked_inbound_slots.inc();
+                    drop(target);
                     effect
                         .notify_nack(NackMsg::new(
                             "inbound routes exhausted",
@@ -1081,122 +1078,80 @@ where
             None
         };
 
-        // Record the arrival time when the current input is empty. Defer
-        // scheduling the wakeup until after measuring the accepted payload, so
-        // one-request size flushes do not pay set/cancel timer overhead.
         let timeout = self.config.max_batch_duration;
-        let arrival = if timeout != Duration::ZERO && self.buffer.partitions.is_empty() {
-            Some(Instant::now())
-        } else {
-            None
-        };
-
-        let flush_key = match self
-            .buffer
-            .partitions
-            .raw_entry_mut()
-            .from_hash(hash, |key| {
-                selection
-                    .as_ref()
-                    .map_or(matches!(key, ContextPartitionKey::Missing), |s| {
-                        s.matches(key)
-                    })
-            }) {
-            RawEntryMut::Occupied(mut entry) => {
-                entry.get_mut().accept(
-                    payload,
-                    BatchPortion::new(inkey, peer_addr, weight),
-                    Context::default(),
-                );
-                let size = entry.get().size_by(self.fmtcfg.sizer)?;
-                (timeout == Duration::ZERO || size >= self.fmtcfg.lower_limit())
-                    .then(|| entry.key().clone())
+        let (was_empty, pending_size, partition) = match (target, &mut self.buffer.pending) {
+            (PendingTarget::Unpartitioned, PendingInputs::Unpartitioned(inputs)) => {
+                let was_empty = inputs.pending.is_empty();
+                inputs.accept(payload, BatchPortion::new(inkey, peer_addr, weight));
+                (was_empty, inputs.size_by(self.fmtcfg.sizer)?, None)
             }
-            RawEntryMut::Vacant(entry) => {
-                let key = selection.map_or(ContextPartitionKey::Missing, |s| s.into_key());
-                let (stored, inputs) = entry.insert_hashed_nocheck(hash, key, Inputs::default());
-                inputs.accept(
-                    payload,
-                    BatchPortion::new(inkey, peer_addr, weight),
-                    output_context,
-                );
-                let size = inputs.size_by(self.fmtcfg.sizer)?;
-                (timeout == Duration::ZERO || size >= self.fmtcfg.lower_limit())
-                    .then(|| stored.clone())
+            (
+                PendingTarget::Partitioned {
+                    selection,
+                    hash,
+                    exists,
+                },
+                PendingInputs::Partitioned(partitions),
+            ) => {
+                let was_empty = partitions.is_empty();
+                let (size, key) = match partitions
+                    .raw_entry_mut()
+                    .from_hash(hash, |key| selection.matches(key))
+                {
+                    RawEntryMut::Occupied(mut entry) => {
+                        debug_assert!(exists);
+                        entry
+                            .get_mut()
+                            .accept(payload, BatchPortion::new(inkey, peer_addr, weight));
+                        (entry.get().size_by(self.fmtcfg.sizer)?, entry.key().clone())
+                    }
+                    RawEntryMut::Vacant(entry) => {
+                        debug_assert!(!exists);
+                        let output_context = selection.output_context();
+                        let key = selection.into_key();
+                        let (stored, inputs) =
+                            entry.insert_hashed_nocheck(hash, key, Inputs::default());
+                        inputs.accept_first(
+                            payload,
+                            BatchPortion::new(inkey, peer_addr, weight),
+                            output_context,
+                        );
+                        (inputs.size_by(self.fmtcfg.sizer)?, stored.clone())
+                    }
+                };
+                (was_empty, size, Some(key))
             }
+            _ => unreachable!("pending target must match the configured buffer mode"),
         };
         if let Some(slot) = inkey {
             self.buffer
                 .inbound
                 .get_mut(slot)
                 .expect("reserved inbound context still exists")
-                .ctx = ctx;
+                .ctx = Some(ctx);
         }
 
-        // Flush based on size when the batch reaches the lower limit.
-        if flush_key.is_none() {
-            if let Some(now) = arrival {
-                self.buffer
-                    .set_arrival(self.signal, now, timeout, effect)
-                    .await?;
-            }
-            Ok(())
-        } else {
-            self.flush_signal_impl(
-                effect,
-                arrival.unwrap_or_else(Instant::now),
-                FlushReason::Size,
-                flush_key,
-            )
-            .await
-        }
+        let arrival = (timeout != Duration::ZERO && was_empty).then(Instant::now);
+        self.finish_accept(
+            effect,
+            arrival,
+            timeout == Duration::ZERO || pending_size >= self.fmtcfg.lower_limit(),
+            partition,
+        )
+        .await
     }
 
-    async fn accept_unpartitioned(
+    async fn finish_accept(
         &mut self,
         effect: &mut local::EffectHandler<OtapPdata>,
-        ctx: Context,
-        payload: T,
-        weight: usize,
+        arrival: Option<Instant>,
+        should_flush: bool,
+        partition: Option<ContextPartitionKey>,
     ) -> Result<(), EngineError> {
-        let peer_addr = ctx.peer_addr();
-        let inkey = if ctx.needs_completion_tracking() {
-            match self
-                .buffer
-                .inbound
-                .allocate_with_data(BatchContext { ctx, outbound: 0 })
-            {
-                Err(bctx) => {
-                    self.metrics.nacked_inbound_slots.inc();
-                    effect
-                        .notify_nack(NackMsg::new(
-                            "inbound routes exhausted",
-                            OtapPdata::new(bctx.ctx, payload.into()),
-                        ))
-                        .await?;
-                    return Ok(());
-                }
-                Ok(slot) => Some(slot),
-            }
-        } else {
-            None
-        };
-        let timeout = self.config.max_batch_duration;
-        let arrival = if timeout != Duration::ZERO && self.buffer.inputs.pending.is_empty() {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        self.buffer.inputs.accept(
-            payload,
-            BatchPortion::new(inkey, peer_addr, weight),
-            Context::default(),
-        );
-        let pending_size = self.buffer.inputs.size_by(self.fmtcfg.sizer)?;
-        if timeout != Duration::ZERO && pending_size < self.fmtcfg.lower_limit() {
+        if !should_flush {
             if let Some(now) = arrival {
                 self.buffer
-                    .set_arrival(self.signal, now, timeout, effect)
+                    .set_arrival(self.signal, now, self.config.max_batch_duration, effect)
                     .await?;
             }
             Ok(())
@@ -1205,7 +1160,7 @@ where
                 effect,
                 arrival.unwrap_or_else(Instant::now),
                 FlushReason::Size,
-                None,
+                partition,
             )
             .await
         }
@@ -1231,18 +1186,22 @@ where
             self.buffer.wakeup_armed = false;
         }
 
-        // If the input is empty.
-        if self.partition_binding.is_some() && self.buffer.partitions.is_empty()
-            || self.partition_binding.is_none() && self.buffer.inputs.pending.is_empty()
-        {
+        let partitioned = matches!(self.buffer.pending, PendingInputs::Partitioned(_));
+        let pending_is_empty = match &self.buffer.pending {
+            PendingInputs::Unpartitioned(inputs) => inputs.pending.is_empty(),
+            PendingInputs::Partitioned(partitions) => partitions.is_empty(),
+        };
+        if pending_is_empty {
             return Ok(());
         }
 
+        let active_buffer_count = match &self.buffer.pending {
+            PendingInputs::Unpartitioned(_) => 1,
+            PendingInputs::Partitioned(partitions) => partitions.len(),
+        };
         if reason != FlushReason::Timer
             && self.buffer.wakeup_armed
-            && (reason == FlushReason::Shutdown
-                || partition.is_none()
-                || self.buffer.partitions.len() == 1)
+            && (reason == FlushReason::Shutdown || partition.is_none() || active_buffer_count == 1)
         {
             let _ = effect.cancel_wakeup(SignalBuffer::<T>::wakeup_slot(self.signal));
             self.buffer.wakeup_armed = false;
@@ -1261,23 +1220,20 @@ where
             return Ok(());
         }
 
-        let keys = if self.partition_binding.is_none() {
-            vec![ContextPartitionKey::Missing]
-        } else {
-            match partition {
-                Some(key) if self.buffer.partitions.contains_key(&key) => vec![key],
+        let keys = match &self.buffer.pending {
+            PendingInputs::Unpartitioned(_) => vec![ContextPartitionKey::Missing],
+            PendingInputs::Partitioned(partitions) => match partition {
+                Some(key) if partitions.contains_key(&key) => vec![key],
                 Some(_) => Vec::new(),
-                None => self.buffer.partitions.keys().cloned().collect(),
-            }
+                None => partitions.keys().cloned().collect(),
+            },
         };
         for key in keys {
-            let mut inputs = if self.partition_binding.is_some() {
-                self.buffer
-                    .partitions
+            let mut inputs = match &mut self.buffer.pending {
+                PendingInputs::Unpartitioned(inputs) => inputs.drain(),
+                PendingInputs::Partitioned(partitions) => partitions
                     .remove(&key)
-                    .expect("selected partition remains buffered")
-            } else {
-                self.buffer.inputs.drain()
+                    .expect("selected partition remains buffered"),
             };
             let flush_started = Instant::now();
             self.metrics
@@ -1373,7 +1329,6 @@ where
                 {
                     self.buffer.take_remaining(
                         &key,
-                        self.partition_binding.is_some(),
                         self.fmtcfg.sizer,
                         &mut inputs,
                         &mut output_batches,
@@ -1410,9 +1365,7 @@ where
                 // Unpartitioned batches retain a shared peer address. A
                 // partitioned batch projects only its selected context key,
                 // even if all inputs happen to share an unrelated peer.
-                if self.partition_binding.is_none()
-                    && let Some(addr) = merged_peer
-                {
+                if !partitioned && let Some(addr) = merged_peer {
                     pdata.set_peer_addr(addr);
                 }
                 if let Some(ctxs) = routed_ctxs {
@@ -1428,7 +1381,7 @@ where
                                         .notify_nack(NackMsg::new(
                                             "outbound routes exhausted",
                                             OtapPdata::new(
-                                                batch.ctx,
+                                                batch.ctx.expect("accepted input has its context"),
                                                 SignalBuffer::empty(self.signal).into(),
                                             ),
                                         ))
@@ -1452,9 +1405,11 @@ where
                 effect.send_message_with_source_node(pdata).await?;
             }
         }
-        if self.partition_binding.is_some() && self.buffer.partitions.is_empty()
-            || self.partition_binding.is_none() && self.buffer.inputs.pending.is_empty()
-        {
+        let pending_is_empty = match &self.buffer.pending {
+            PendingInputs::Unpartitioned(inputs) => inputs.pending.is_empty(),
+            PendingInputs::Partitioned(partitions) => partitions.is_empty(),
+        };
+        if pending_is_empty {
             self.buffer.arrival = None;
             self.buffer.wakeup_armed = false;
         }
@@ -1720,13 +1675,16 @@ impl<T: OtapPayloadHelpers> Inputs<T> {
         }
     }
 
-    fn accept(&mut self, batch: T, part: BatchPortion, output_context: Context) {
-        if self.pending.is_empty() {
-            self.output_context = output_context;
-        }
+    fn accept(&mut self, batch: T, part: BatchPortion) {
         self.weight += part.weight;
         self.pending.push(batch);
         self.context.push(part);
+    }
+
+    fn accept_first(&mut self, batch: T, part: BatchPortion, output_context: Context) {
+        debug_assert!(self.pending.is_empty());
+        self.output_context = output_context;
+        self.accept(batch, part);
     }
 
     fn take_pending(&mut self) -> Vec<T> {
@@ -1763,8 +1721,11 @@ where
 {
     fn new(cfg: &Config) -> Self {
         Self {
-            inputs: Inputs::default(),
-            partitions: HashMap::new(),
+            pending: if cfg.partition_by.is_empty() {
+                PendingInputs::Unpartitioned(Inputs::default())
+            } else {
+                PendingInputs::Partitioned(HashMap::new())
+            },
             inbound: SlotState::new(cfg.inbound_request_limit.get()),
             outbound: SlotState::new(cfg.outbound_request_limit.get()),
             arrival: None,
@@ -1778,7 +1739,6 @@ where
     fn take_remaining(
         &mut self,
         key: &ContextPartitionKey,
-        partitioned: bool,
         sizer: Sizer,
         from_inputs: &mut Inputs<T>,
         output_batches: &mut Vec<(T, usize)>,
@@ -1811,14 +1771,14 @@ where
         from_inputs.weight -= last_weight;
 
         let output_context = from_inputs.output_context().clone_detached();
-        if partitioned {
-            self.partitions.entry(key.clone()).or_default().accept(
-                remaining,
-                new_part,
-                output_context,
-            );
-        } else {
-            self.inputs.accept(remaining, new_part, output_context);
+        match &mut self.pending {
+            PendingInputs::Partitioned(partitions) => partitions
+                .entry(key.clone())
+                .or_default()
+                .accept_first(remaining, new_part, output_context),
+            PendingInputs::Unpartitioned(inputs) => {
+                inputs.accept_first(remaining, new_part, output_context);
+            }
         }
     }
 
@@ -1891,9 +1851,11 @@ where
                         false
                     }
                 });
-                if let Some(mut batch) = removed {
-                    let rdata =
-                        OtapPdata::new(std::mem::take(&mut batch.ctx), OtapPayload::empty(signal));
+                if let Some(batch) = removed {
+                    let rdata = OtapPdata::new(
+                        batch.ctx.expect("accepted input has its context"),
+                        OtapPayload::empty(signal),
+                    );
 
                     if let Err(err) = res {
                         effect.notify_nack(NackMsg::new(err, rdata)).await?;
@@ -2139,6 +2101,22 @@ mod tests {
             BatchProcessor::build_from_json(&json!({"partition_by": ["product_user"]}), metrics)
                 .is_err()
         );
+    }
+
+    /// Scenario: signal buffers are constructed with and without a partition selection.
+    /// Guarantees: each signal owns exactly one pending-input representation for its fixed mode.
+    #[test]
+    fn signal_buffer_mode_is_structurally_exclusive() {
+        let unpartitioned = SignalBuffer::<OtapArrowRecords>::new(&Config::default());
+        assert!(matches!(
+            unpartitioned.pending,
+            PendingInputs::Unpartitioned(_)
+        ));
+
+        let partitioned: Config = serde_json::from_value(json!({"partition_by": ["workspace_id"]}))
+            .expect("valid config");
+        let partitioned = SignalBuffer::<OtapArrowRecords>::new(&partitioned);
+        assert!(matches!(partitioned.pending, PendingInputs::Partitioned(_)));
     }
 
     /// Scenario: an engine config declares a composite and a batch node

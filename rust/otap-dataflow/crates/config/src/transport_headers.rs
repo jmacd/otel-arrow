@@ -145,6 +145,12 @@ impl TransportHeader {
 pub struct ContextEntryNameRef<'a>(&'a str);
 
 impl<'a> ContextEntryNameRef<'a> {
+    /// Creates a borrowed configured context entry name.
+    #[must_use]
+    pub const fn new(name: &'a str) -> Self {
+        Self(name)
+    }
+
     /// Returns the configured name.
     #[must_use]
     pub const fn as_str(&self) -> &'a str {
@@ -314,6 +320,56 @@ pub struct TransportHeaders {
     storage: Option<Arc<TransportHeadersStorage>>,
 }
 
+/// Read-only access to an ordered sequence of transport headers.
+///
+/// Implementations may decode borrowed header views from packed storage.
+pub trait TransportHeaderSource {
+    /// Returns the number of headers.
+    fn len(&self) -> usize;
+
+    /// Returns the header at `index`.
+    fn get(&self, index: usize) -> Option<TransportHeaderRef<'_>>;
+
+    /// Returns whether there are no headers.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterates over all headers in capture order.
+    fn iter(&self) -> TransportHeaderSourceIter<'_, Self> {
+        TransportHeaderSourceIter {
+            source: self,
+            index: 0,
+        }
+    }
+}
+
+/// Iterator over any borrowed transport-header source.
+pub struct TransportHeaderSourceIter<'a, S: ?Sized> {
+    source: &'a S,
+    index: usize,
+}
+
+impl<'a, S: TransportHeaderSource + ?Sized> Iterator for TransportHeaderSourceIter<'a, S> {
+    type Item = TransportHeaderRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.source.len() {
+            return None;
+        }
+        let index = self.index;
+        self.index += 1;
+        self.source.get(index)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.source.len().saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl<S: TransportHeaderSource + ?Sized> ExactSizeIterator for TransportHeaderSourceIter<'_, S> {}
+
 impl fmt::Debug for TransportHeaders {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_list().entries(self.iter()).finish()
@@ -452,6 +508,16 @@ impl TransportHeaders {
             name,
             index: 0,
         }
+    }
+}
+
+impl TransportHeaderSource for TransportHeaders {
+    fn len(&self) -> usize {
+        Self::len(self)
+    }
+
+    fn get(&self, index: usize) -> Option<TransportHeaderRef<'_>> {
+        Self::get(self, index)
     }
 }
 

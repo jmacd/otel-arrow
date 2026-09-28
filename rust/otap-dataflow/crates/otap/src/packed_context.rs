@@ -9,9 +9,14 @@ use std::sync::Arc;
 use otel_arrow_dfe_config::ContextEntryName;
 use otel_arrow_dfe_config::context_layout::ContextSource;
 use otel_arrow_dfe_config::error::Error;
-use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
+use otel_arrow_dfe_config::transport_headers::{
+    ContextEntryNameRef, TransportHeader, TransportHeaderRef, TransportHeaderSource,
+    TransportHeaderValueRef, TransportHeaders, ValueKind,
+};
 use otel_arrow_dfe_engine::capability::auth::ClaimValue;
 pub use otel_arrow_dfe_engine::context_declaration::CompiledContextLayout as CompiledLayout;
+
+use crate::pdata::AuthorizedIdentityEntries;
 
 const HEADER_SIZE: usize = 16;
 const FIELD_SIZE: usize = 16;
@@ -208,7 +213,7 @@ impl PackedContext {
                 );
             }
             // Claims are unique, so the completed value chain no longer needs
-            // its last-value cursor. Reuse it for compatibility decode order.
+            // its last-value cursor. Reuse it to retain capture-policy order.
             write_u32(data, field_at + 12, claim_index);
         }
         debug_assert_eq!(value_index, count);
@@ -377,87 +382,42 @@ impl PackedContext {
         Ok(entry_present(bytes, entry).then_some(PackedEntryKey { binding, bytes }))
     }
 
-    /// Decodes transport headers for compatibility consumers.
+    /// Borrows all captured transport headers directly from packed storage.
     #[must_use]
-    pub(crate) fn transport_headers(&self, layout: &CompiledLayout) -> TransportHeaders {
-        let Some(bytes) = self.bytes.as_deref() else {
-            return TransportHeaders::default();
-        };
-        assert_eq!(
-            read_u64(bytes, 0),
-            layout.generation(),
-            "packed context layout generation mismatch"
-        );
-        let fields_at = fields_at(layout.layout().entries().len());
-        let values_at = fields_at + layout.layout().fields().len() * FIELD_SIZE;
-        let mut headers = TransportHeaders::with_capacity(read_u32(bytes, 8) as usize);
-        for index in 0..read_u32(bytes, 8) as usize {
-            let at = values_at + index * VALUE_SIZE;
-            let field = read_u32(bytes, at + 24) as usize;
-            let primitive = &layout.layout().fields()[field];
-            let value_at = read_u32(bytes, at) as usize;
-            let value_len = read_u32(bytes, at + 4) as usize;
-            let original_at = read_u32(bytes, at + 8) as usize;
-            let original_len = read_u32(bytes, at + 12) as usize;
-            let kind = match bytes[at + 20] {
-                0 => ValueKind::Text,
-                1 => ValueKind::Binary,
-                value => panic!("invalid packed transport value kind {value}"),
-            };
-            let value = &bytes[value_at..value_at + value_len];
-            let header = if original_len == 0 {
-                TransportHeader::new(primitive.name.clone(), kind, value)
-            } else {
-                let original = std::str::from_utf8(&bytes[original_at..original_at + original_len])
-                    .expect("packed original header name remains UTF-8");
-                TransportHeader::captured(primitive.name.clone(), original, true, kind, value)
-            };
-            headers.push(header);
+    pub(crate) fn transport_headers<'a>(
+        &'a self,
+        layout: &'a CompiledLayout,
+    ) -> PackedTransportHeaders<'a> {
+        if let Some(bytes) = self.bytes.as_deref() {
+            assert_eq!(
+                read_u64(bytes, 0),
+                layout.generation(),
+                "packed context layout generation mismatch"
+            );
         }
-        headers
+        PackedTransportHeaders {
+            layout,
+            bytes: self.bytes.as_deref(),
+        }
     }
 
-    /// Decodes verified identity fields for compatibility consumers.
+    /// Borrows all verified identity entries directly from packed storage.
     #[must_use]
-    pub(crate) fn authorized_claims(&self, layout: &CompiledLayout) -> Vec<DecodedClaim> {
-        let Some(bytes) = self.bytes.as_deref() else {
-            return Vec::new();
-        };
-        assert_eq!(
-            read_u64(bytes, 0),
-            layout.generation(),
-            "packed context layout generation mismatch"
-        );
-        let fields_at = fields_at(layout.layout().entries().len());
-        let values_at = fields_at + layout.layout().fields().len() * FIELD_SIZE;
-        let mut claims = layout
-            .layout()
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| field.source == ContextSource::AuthorizedIdentity)
-            .filter_map(|(field, primitive)| {
-                let at = fields_at + field * FIELD_SIZE;
-                (bytes[at + 8] != 0).then(|| {
-                    (
-                        read_u32(bytes, at + 12),
-                        DecodedClaim {
-                            name: primitive.name.clone(),
-                            many: bytes[at + 9] != 0,
-                            values: Self::field_values(bytes, fields_at, values_at, field)
-                                .map(|(_, value)| {
-                                    std::str::from_utf8(value)
-                                        .expect("packed authorized identity remains UTF-8")
-                                        .to_owned()
-                                })
-                                .collect(),
-                        },
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        claims.sort_unstable_by_key(|(ordinal, _)| *ordinal);
-        claims.into_iter().map(|(_, claim)| claim).collect()
+    pub(crate) fn authorized_identity<'a>(
+        &'a self,
+        layout: &'a CompiledLayout,
+    ) -> PackedAuthorizedIdentityEntries<'a> {
+        if let Some(bytes) = self.bytes.as_deref() {
+            assert_eq!(
+                read_u64(bytes, 0),
+                layout.generation(),
+                "packed context layout generation mismatch"
+            );
+        }
+        PackedAuthorizedIdentityEntries {
+            layout,
+            bytes: self.bytes.as_deref(),
+        }
     }
 
     /// Returns the number of captured transport headers without decoding.
@@ -507,7 +467,345 @@ impl PackedContext {
     }
 }
 
-/// One decoded authorized-identity field for compatibility access.
+/// Borrowed read-only view of transport headers in canonical packed storage.
+#[derive(Clone, Copy)]
+pub struct PackedTransportHeaders<'a> {
+    layout: &'a CompiledLayout,
+    bytes: Option<&'a [u8]>,
+}
+
+impl std::fmt::Debug for PackedTransportHeaders<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq<TransportHeaders> for PackedTransportHeaders<'_> {
+    fn eq(&self, other: &TransportHeaders) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl PartialEq<&TransportHeaders> for PackedTransportHeaders<'_> {
+    fn eq(&self, other: &&TransportHeaders) -> bool {
+        self == *other
+    }
+}
+
+impl<'a> PackedTransportHeaders<'a> {
+    /// Returns the number of captured headers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        TransportHeaderSource::len(self)
+    }
+
+    /// Returns whether there are no captured headers.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        TransportHeaderSource::is_empty(self)
+    }
+
+    /// Returns one captured header by capture-order index.
+    #[must_use]
+    pub fn get(self, index: usize) -> Option<TransportHeaderRef<'a>> {
+        let bytes = self.bytes?;
+        if index >= self.len() {
+            return None;
+        }
+        let fields_at = fields_at(self.layout.layout().entries().len());
+        let values_at = fields_at + self.layout.layout().fields().len() * FIELD_SIZE;
+        let at = values_at + index * VALUE_SIZE;
+        let field = read_u32(bytes, at + 24) as usize;
+        let primitive = self.layout.layout().fields().get(field)?;
+        let value_at = read_u32(bytes, at) as usize;
+        let value_len = read_u32(bytes, at + 4) as usize;
+        let original_at = read_u32(bytes, at + 8) as usize;
+        let original_len = read_u32(bytes, at + 12) as usize;
+        let value_kind = match bytes[at + 20] {
+            0 => ValueKind::Text,
+            1 => ValueKind::Binary,
+            value => panic!("invalid packed transport value kind {value}"),
+        };
+        let original_name = (original_len != 0).then(|| {
+            std::str::from_utf8(&bytes[original_at..original_at + original_len])
+                .expect("packed original header name remains UTF-8")
+        });
+        Some(TransportHeaderRef {
+            name: ContextEntryNameRef::new(primitive.name.as_str()),
+            value: TransportHeaderValueRef {
+                original_name,
+                value_kind,
+                bytes: &bytes[value_at..value_at + value_len],
+            },
+        })
+    }
+
+    /// Iterates over captured headers in capture order.
+    #[must_use]
+    pub fn iter(self) -> PackedTransportHeadersIter<'a> {
+        PackedTransportHeadersIter {
+            headers: self,
+            index: 0,
+        }
+    }
+
+    /// Iterates over headers with an exact stored-name match.
+    pub fn find_by_name<'b>(
+        self,
+        name: &'b str,
+    ) -> impl Iterator<Item = TransportHeaderRef<'b>> + 'b
+    where
+        'a: 'b,
+    {
+        self.iter()
+            .filter(move |header| header.name.as_str() == name)
+    }
+
+    /// Materializes an owned collection for mutation or ownership transfer.
+    #[must_use]
+    pub fn to_owned(self) -> TransportHeaders {
+        let mut headers = TransportHeaders::with_capacity(self.len());
+        for header in self.iter() {
+            headers.push(TransportHeader::from(header));
+        }
+        headers
+    }
+}
+
+/// Iterator over canonical packed transport headers.
+pub struct PackedTransportHeadersIter<'a> {
+    headers: PackedTransportHeaders<'a>,
+    index: usize,
+}
+
+impl<'a> Iterator for PackedTransportHeadersIter<'a> {
+    type Item = TransportHeaderRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let header = self.headers.get(self.index)?;
+        self.index += 1;
+        Some(header)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.headers.len().saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for PackedTransportHeadersIter<'_> {}
+
+impl TransportHeaderSource for PackedTransportHeaders<'_> {
+    fn len(&self) -> usize {
+        self.bytes.map_or(0, |bytes| read_u32(bytes, 8) as usize)
+    }
+
+    fn get(&self, index: usize) -> Option<TransportHeaderRef<'_>> {
+        (*self).get(index)
+    }
+}
+
+/// Borrowed read-only view of verified identity in canonical packed storage.
+#[derive(Clone, Copy)]
+pub struct PackedAuthorizedIdentityEntries<'a> {
+    layout: &'a CompiledLayout,
+    bytes: Option<&'a [u8]>,
+}
+
+impl<'a> PackedAuthorizedIdentityEntries<'a> {
+    /// Returns the number of captured identity entries.
+    #[must_use]
+    pub fn len(self) -> usize {
+        self.bytes.map_or(0, |bytes| read_u32(bytes, 12) as usize)
+    }
+
+    /// Returns whether no identity entries were captured.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterates over identity entries in capture-policy order.
+    #[must_use]
+    pub fn iter(self) -> PackedAuthorizedIdentityIter<'a> {
+        PackedAuthorizedIdentityIter {
+            entries: self,
+            ordinal: 0,
+        }
+    }
+
+    /// Finds an identity entry by exact configured name.
+    #[must_use]
+    pub fn get(self, name: &str) -> Option<PackedAuthorizedIdentityEntry<'a>> {
+        let field = self.layout.layout().fields().iter().position(|field| {
+            field.source == ContextSource::AuthorizedIdentity && field.name.as_str() == name
+        })?;
+        self.decode_field(field)
+    }
+
+    /// Materializes all entries for mutation or ownership transfer.
+    #[must_use]
+    pub fn to_owned(self) -> AuthorizedIdentityEntries {
+        AuthorizedIdentityEntries::from_decoded(self.iter().map(DecodedClaim::from).collect())
+    }
+
+    /// Materializes only entries selected by exact configured name.
+    #[must_use]
+    pub fn select(self, names: &[&str]) -> AuthorizedIdentityEntries {
+        AuthorizedIdentityEntries::from_decoded(
+            self.iter()
+                .filter(|entry| names.contains(&entry.name()))
+                .map(DecodedClaim::from)
+                .collect(),
+        )
+    }
+
+    fn decode_ordinal(self, ordinal: usize) -> Option<PackedAuthorizedIdentityEntry<'a>> {
+        let bytes = self.bytes?;
+        let fields_at = fields_at(self.layout.layout().entries().len());
+        self.layout
+            .layout()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.source == ContextSource::AuthorizedIdentity)
+            .find_map(|(field, _)| {
+                let at = fields_at + field * FIELD_SIZE;
+                (bytes[at + 8] != 0 && read_u32(bytes, at + 12) as usize == ordinal)
+                    .then(|| self.decode_field(field))
+                    .flatten()
+            })
+    }
+
+    fn decode_field(self, field: usize) -> Option<PackedAuthorizedIdentityEntry<'a>> {
+        let bytes = self.bytes?;
+        let fields_at = fields_at(self.layout.layout().entries().len());
+        let values_at = fields_at + self.layout.layout().fields().len() * FIELD_SIZE;
+        let at = fields_at + field * FIELD_SIZE;
+        if bytes[at + 8] == 0 {
+            return None;
+        }
+        Some(PackedAuthorizedIdentityEntry {
+            name: self.layout.layout().fields()[field].name.as_str(),
+            value: PackedAuthorizedClaimValue {
+                bytes,
+                values_at,
+                first_value: read_u32(bytes, at) as usize,
+                value_count: read_u32(bytes, at + 4) as usize,
+                many: bytes[at + 9] != 0,
+            },
+        })
+    }
+}
+
+/// Iterator over verified identity entries in capture-policy order.
+pub struct PackedAuthorizedIdentityIter<'a> {
+    entries: PackedAuthorizedIdentityEntries<'a>,
+    ordinal: usize,
+}
+
+impl<'a> Iterator for PackedAuthorizedIdentityIter<'a> {
+    type Item = PackedAuthorizedIdentityEntry<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ordinal >= self.entries.len() {
+            return None;
+        }
+        let entry = self.entries.decode_ordinal(self.ordinal);
+        self.ordinal += 1;
+        entry
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.entries.len().saturating_sub(self.ordinal);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for PackedAuthorizedIdentityIter<'_> {}
+
+/// One verified identity entry borrowed from canonical packed storage.
+#[derive(Clone, Copy)]
+pub struct PackedAuthorizedIdentityEntry<'a> {
+    name: &'a str,
+    value: PackedAuthorizedClaimValue<'a>,
+}
+
+impl<'a> PackedAuthorizedIdentityEntry<'a> {
+    /// Returns the configured context entry name.
+    #[must_use]
+    pub const fn name(self) -> &'a str {
+        self.name
+    }
+
+    /// Returns the verified claim without flattening its cardinality.
+    #[must_use]
+    pub const fn value(self) -> PackedAuthorizedClaimValue<'a> {
+        self.value
+    }
+}
+
+/// Borrowed single- or multi-valued verified claim in canonical packed storage.
+#[derive(Clone, Copy)]
+pub struct PackedAuthorizedClaimValue<'a> {
+    bytes: &'a [u8],
+    values_at: usize,
+    first_value: usize,
+    value_count: usize,
+    many: bool,
+}
+
+impl<'a> PackedAuthorizedClaimValue<'a> {
+    /// Returns the single value, or `None` for a multi-valued claim.
+    #[must_use]
+    pub fn as_str(self) -> Option<&'a str> {
+        (!self.many && self.value_count == 1).then(|| self.decode_value(self.first_value))
+    }
+
+    /// Iterates values in source order.
+    pub fn values(self) -> impl Iterator<Item = &'a str> {
+        (0..self.value_count).map(move |offset| self.decode_value(self.first_value + offset))
+    }
+
+    /// Returns the number of values.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.value_count
+    }
+
+    /// Returns whether the claim contains no values.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.value_count == 0
+    }
+
+    /// Returns whether the source claim used multi-valued cardinality.
+    #[must_use]
+    pub const fn is_many(self) -> bool {
+        self.many
+    }
+
+    fn decode_value(self, index: usize) -> &'a str {
+        let at = self.values_at + index * VALUE_SIZE;
+        let start = read_u32(self.bytes, at) as usize;
+        let len = read_u32(self.bytes, at + 4) as usize;
+        std::str::from_utf8(&self.bytes[start..start + len])
+            .expect("packed authorized identity remains UTF-8")
+    }
+}
+
+impl From<PackedAuthorizedIdentityEntry<'_>> for DecodedClaim {
+    fn from(entry: PackedAuthorizedIdentityEntry<'_>) -> Self {
+        Self {
+            name: ContextEntryName::try_from(entry.name())
+                .expect("packed authorized identity name remains valid"),
+            many: entry.value().is_many(),
+            values: entry.value().values().map(str::to_owned).collect(),
+        }
+    }
+}
+
+/// One owned authorized-identity field used at materialization boundaries.
 pub struct DecodedClaim {
     /// Stored context entry name.
     pub name: ContextEntryName,
@@ -1098,60 +1396,40 @@ mod tests {
         assert!(binding.project(&packed).expect("compatible").is_some());
     }
 
-    /// Scenario: two physical sources store values under the same configured name.
-    /// Guarantees: typed fields remain distinct when a composite aliases its members.
+    /// Scenario: two physical sources use the same configured stored name.
+    /// Guarantees: layout compilation rejects the ambiguous primitive before packing.
     #[test]
-    fn same_name_across_source_domains_remains_distinct() {
+    fn same_name_across_source_domains_is_rejected() {
         let field = name("tenant");
-        let layout = CompiledLayout::compile(
-            vec![
-                ContextPrimitive {
-                    source: ContextSource::AuthorizedIdentity,
-                    name: field.clone(),
-                },
-                ContextPrimitive {
-                    source: ContextSource::TransportHeader,
-                    name: field.clone(),
-                },
-            ],
-            &[ContextEntryDeclaration {
-                scope: ContextScope::Engine,
-                name: name("identity"),
-                definition: ContextEntryDefinition(vec![
-                    ContextEntryPart::AuthorizedIdentity {
-                        name: field.clone().into(),
-                        store_as: Some(name("verified")),
+        assert!(
+            CompiledLayout::compile(
+                vec![
+                    ContextPrimitive {
+                        source: ContextSource::AuthorizedIdentity,
+                        name: field.clone(),
                     },
-                    ContextEntryPart::TransportHeader {
-                        name: field.into(),
-                        store_as: Some(name("untrusted")),
+                    ContextPrimitive {
+                        source: ContextSource::TransportHeader,
+                        name: field.clone(),
                     },
-                ]),
-            }],
-        )
-        .expect("typed layout");
-        let binding = ContextKeyBinding::bind(Arc::clone(&layout), &name("identity"))
-            .expect("composite entry");
-        let claim = ClaimValue::One("trusted".into());
-        let packed = PackedContext::pack(
-            &layout,
-            &[CapturedHeader {
-                name: "tenant",
-                original_name: None,
-                kind: ValueKind::Text,
-                value: b"untrusted",
-            }],
-            &[CapturedClaim {
-                name: "tenant",
-                value: &claim,
-            }],
-        )
-        .expect("packed");
-        let key = binding
-            .project(&packed)
-            .expect("compatible")
-            .expect("present");
-        assert!(key.eq_owned(&key.to_owned()));
+                ],
+                &[ContextEntryDeclaration {
+                    scope: ContextScope::Engine,
+                    name: name("identity"),
+                    definition: ContextEntryDefinition(vec![
+                        ContextEntryPart::AuthorizedIdentity {
+                            name: field.clone().into(),
+                            store_as: Some(name("verified")),
+                        },
+                        ContextEntryPart::TransportHeader {
+                            name: field.into(),
+                            store_as: Some(name("untrusted")),
+                        },
+                    ]),
+                }],
+            )
+            .is_err()
+        );
     }
 
     /// Scenario: a claim switches from one value to a one-element many claim.
@@ -1257,9 +1535,9 @@ mod tests {
     }
 
     /// Scenario: policy capture order differs from the layout's sorted field order.
-    /// Guarantees: compatibility decoding preserves policy order, including empty many claims.
+    /// Guarantees: the packed view preserves policy order, including empty many claims.
     #[test]
-    fn authorized_claims_preserve_capture_order() {
+    fn authorized_identity_view_preserves_capture_order() {
         let layout = CompiledLayout::compile(
             vec![
                 ContextPrimitive {
@@ -1291,16 +1569,16 @@ mod tests {
             ],
         )
         .expect("packed");
-        let decoded = packed.authorized_claims(&layout);
+        let entries = packed
+            .authorized_identity(&layout)
+            .iter()
+            .collect::<Vec<_>>();
         assert_eq!(
-            decoded
-                .iter()
-                .map(|claim| claim.name.as_str())
-                .collect::<Vec<_>>(),
+            entries.iter().map(|entry| entry.name()).collect::<Vec<_>>(),
             ["zeta", "alpha"]
         );
-        assert!(decoded[0].many);
-        assert!(decoded[0].values.is_empty());
+        assert!(entries[0].value().is_many());
+        assert!(entries[0].value().is_empty());
     }
 
     /// Scenario: two verified claims target the same packed identity field.
@@ -1319,16 +1597,68 @@ mod tests {
         );
     }
 
-    /// Scenario: compatibility decoding is attempted with another pipeline generation.
+    /// Scenario: a packed header view is requested with another pipeline generation.
     /// Guarantees: incompatible descriptor offsets fail loudly instead of being interpreted.
     #[test]
     #[should_panic(expected = "packed context layout generation mismatch")]
-    fn compatibility_decode_rejects_generation_mismatch() {
+    fn transport_header_view_rejects_generation_mismatch() {
         let old = layout();
         let packed = PackedContext::pack(&old, &[header(b"workspace-a", ValueKind::Text)], &[])
             .expect("packed");
         let new =
             CompiledLayout::compile(old.layout().fields().to_vec(), &[]).expect("valid new layout");
         _ = packed.transport_headers(&new);
+    }
+
+    /// Scenario: callers inspect a captured header through the request-context view.
+    /// Guarantees: names and values are borrowed from canonical storage without materialization.
+    #[test]
+    fn transport_header_view_borrows_packed_storage() {
+        let layout = layout();
+        let packed = PackedContext::pack(
+            &layout,
+            &[CapturedHeader {
+                name: "workspace_id",
+                original_name: Some("X-Workspace"),
+                kind: ValueKind::Binary,
+                value: b"workspace-a",
+            }],
+            &[],
+        )
+        .expect("packed");
+        let bytes = packed.bytes.as_deref().expect("packed storage");
+        let header = packed
+            .transport_headers(&layout)
+            .iter()
+            .next()
+            .expect("captured header");
+
+        assert_eq!(header.name.as_str(), "workspace_id");
+        assert_eq!(header.wire_name(), "X-Workspace");
+        assert_eq!(header.value.value_kind, ValueKind::Binary);
+        assert_eq!(header.value.bytes, b"workspace-a");
+        let storage = bytes.as_ptr_range();
+        assert!(storage.contains(&header.value.bytes.as_ptr()));
+    }
+
+    /// Scenario: callers inspect a verified claim through the request-context view.
+    /// Guarantees: claim values are borrowed from canonical storage without materialization.
+    #[test]
+    fn authorized_identity_view_borrows_packed_storage() {
+        let layout = layout();
+        let value = ClaimValue::One("customer-a".into());
+        let packed = PackedContext::pack(&layout, &[], &[claim(&value)]).expect("packed");
+        let bytes = packed.bytes.as_deref().expect("packed storage");
+        let value = packed
+            .authorized_identity(&layout)
+            .get("customer_id")
+            .expect("captured identity")
+            .value()
+            .as_str()
+            .expect("single identity value");
+
+        assert_eq!(value, "customer-a");
+        let storage = bytes.as_ptr_range();
+        assert!(storage.contains(&value.as_ptr()));
     }
 }
