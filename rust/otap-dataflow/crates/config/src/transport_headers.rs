@@ -1312,15 +1312,15 @@ mod tests {
     /// Guarantees: only the overridden header is propagated.
     #[test]
     fn propagate_selector_none_drops_all_unless_override() {
-        let policy = HeaderPropagationPolicy {
-            default: PropagationDefault {
+        let policy = HeaderPropagationPolicy::new(
+            PropagationDefault {
                 selector: PropagationSelector {
                     selector_type: PropagationSelectorType::None,
                     named: None,
                 },
                 ..PropagationDefault::default()
             },
-            overrides: vec![PropagationOverride {
+            vec![PropagationOverride {
                 match_rule: PropagationMatch {
                     stored_names: vec![context_name("tenant_id")],
                 },
@@ -1328,7 +1328,7 @@ mod tests {
                 name: None,
                 on_error: None,
             }],
-        };
+        );
 
         let mut headers = TransportHeaders::new();
         headers.push(header("tenant_id", "X-Tenant-Id", b"t-1"));
@@ -1367,16 +1367,16 @@ mod tests {
     /// Guarantees: only that entry is propagated.
     #[test]
     fn propagate_named_selector() {
-        let policy = HeaderPropagationPolicy {
-            default: PropagationDefault {
+        let policy = HeaderPropagationPolicy::new(
+            PropagationDefault {
                 selector: PropagationSelector {
                     selector_type: PropagationSelectorType::Named,
-                    named: Some(vec![context_name("tenant_id")]),
+                    named: Some(vec![context_name("tenant_id").into()]),
                 },
                 ..PropagationDefault::default()
             },
-            overrides: vec![],
-        };
+            vec![],
+        );
 
         let mut headers = TransportHeaders::new();
         headers.push(header("tenant_id", "X-Tenant-Id", b"t-1"));

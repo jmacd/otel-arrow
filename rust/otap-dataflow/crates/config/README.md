@@ -348,14 +348,28 @@ policies:
         - type: transport_header         # Transport header
           name: workspace_id             # Stored name of header
           store_as: othername_id         # (option) Entry name
+        - type: transport_header_match   # Exact value condition
+          name: environment
+          value: production
 ```
 
 > [!NOTE]
-> Context entry declarations are retained in resolved configuration. Consumers
-> bind declarations at startup; `processor:batch` can currently consume one
-> complete primitive or composite entry through its `partition_by` setting.
-> Conditional elements and additional runtime consumers will be added
-> separately.
+> Context entry declarations are retained in resolved configuration and bound
+> at startup. `processor:batch` can consume one complete primitive or composite
+> entry through `partition_by`; conditional composites are present only when
+> every value-bearing member exists and every `transport_header_match`
+> condition succeeds.
+>
+> Named transport-header propagation can refer to a composite member with
+> `product_user:othername_id`. The selected member must exist, and every
+> `transport_header_match` condition must have an exact byte-value match.
+> Header names match case-insensitively, duplicate values use any-match
+> semantics, and unrelated value-bearing members are not evaluated.
+> A qualified selector cannot share its primitive source with another
+> qualified or unqualified entry. Repeated unqualified selectors, including
+> ASCII case variants, are accepted as equivalent.
+> Propagation overrides retain precedence over composite conditions.
+> Other composite consumers are not yet wired at runtime.
 
 ## Engine Observability Pipeline
 

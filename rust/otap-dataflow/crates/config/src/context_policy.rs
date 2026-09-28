@@ -84,6 +84,8 @@ impl ContextEntryDefinition {
         let mut errors = Vec::new();
         let mut output_names = BTreeSet::new();
         let mut value_references = BTreeSet::new();
+        let mut conditions = BTreeSet::new();
+        let mut value_member_count = 0usize;
 
         if self.0.is_empty() {
             errors.push(format!("{path_prefix} must contain at least one member"));
@@ -91,8 +93,28 @@ impl ContextEntryDefinition {
         }
 
         for (index, part) in self.0.iter().enumerate() {
-            let (kind, entry, name) = part.kind_ref_and_name();
+            let (kind, entry, name) = match part {
+                ContextEntryPart::TransportHeader { name, store_as } => (
+                    ContextEntryPartKind::TransportHeader,
+                    name,
+                    store_as.as_ref().unwrap_or_else(|| name.name()),
+                ),
+                ContextEntryPart::AuthorizedIdentity { name, store_as } => (
+                    ContextEntryPartKind::AuthorizedIdentity,
+                    name,
+                    store_as.as_ref().unwrap_or_else(|| name.name()),
+                ),
+                ContextEntryPart::TransportHeaderMatch { name, value } => {
+                    if !conditions.insert((name, value)) {
+                        errors.push(format!(
+                            "{path_prefix}[{index}] repeats transport-header condition for `{name}`"
+                        ));
+                    }
+                    continue;
+                }
+            };
 
+            value_member_count += 1;
             if !output_names.insert(name) {
                 errors.push(format!(
                     "{path_prefix}[{index}] produces duplicate member name `{name}`"
@@ -104,6 +126,11 @@ impl ContextEntryDefinition {
                     entry
                 ));
             }
+        }
+        if value_member_count == 0 {
+            errors.push(format!(
+                "{path_prefix} must contain at least one value-bearing member"
+            ));
         }
 
         errors
@@ -130,6 +157,17 @@ pub enum ContextEntryPart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         store_as: Option<ContextEntryName>,
     },
+    /// Requires a transport-header entry to contain an exact configured value.
+    ///
+    /// Header names match using ASCII case-insensitive transport semantics.
+    /// Values compare as exact UTF-8 bytes, and any matching duplicate value
+    /// satisfies this condition.
+    TransportHeaderMatch {
+        /// Exact source context entry reference.
+        name: ContextEntryRef,
+        /// Required text value.
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -139,50 +177,35 @@ enum ContextEntryPartKind {
 }
 
 impl ContextEntryPart {
-    /// Returns the exact source reference of a composite member.
+    /// Returns the exact source reference of a member or condition.
     #[must_use]
     pub fn source(&self) -> &ContextEntryRef {
         match self {
-            Self::TransportHeader { name, .. } | Self::AuthorizedIdentity { name, .. } => name,
+            Self::TransportHeader { name, .. }
+            | Self::AuthorizedIdentity { name, .. }
+            | Self::TransportHeaderMatch { name, .. } => name,
         }
     }
 
-    /// Returns the resulting member name after applying `store_as`.
+    /// Returns the resulting value-member name after applying `store_as`.
     #[must_use]
-    pub fn member_name(&self) -> &ContextEntryName {
-        let (_, _, name) = self.kind_ref_and_name();
-        name
-    }
-
-    fn kind_ref_and_name(
-        &self,
-    ) -> (
-        ContextEntryPartKind,
-        &'_ ContextEntryRef,
-        &'_ ContextEntryName,
-    ) {
-        let (kind, name, store_as) = match self {
-            Self::TransportHeader { name, store_as } => (
-                ContextEntryPartKind::TransportHeader,
-                name,
-                store_as.as_ref(),
-            ),
-            Self::AuthorizedIdentity { name, store_as } => (
-                ContextEntryPartKind::AuthorizedIdentity,
-                name,
-                store_as.as_ref(),
-            ),
-        };
-        let output_name = store_as.unwrap_or_else(|| name.name());
-        (kind, name, output_name)
+    pub fn member_name(&self) -> Option<&ContextEntryName> {
+        match self {
+            Self::TransportHeader { name, store_as }
+            | Self::AuthorizedIdentity { name, store_as } => {
+                Some(store_as.as_ref().unwrap_or_else(|| name.name()))
+            }
+            Self::TransportHeaderMatch { .. } => None,
+        }
     }
 }
-
 // Most config types derive JsonSchema. This enum is manual only because the
 // config crate's test-only kube CRD generation requires a structural schema:
 // kube rejects the derived internally tagged enum when each variant gives the
-// shared `type` property a different singleton value. Keep this schema aligned
-// with serde and the CRD compatibility tests in engine.rs.
+// shared `type` property a different singleton value. Properties stay at the
+// root for structural compatibility, while Kubernetes CEL rules enforce the
+// variant-specific field contract. Keep this schema aligned with serde and the
+// CRD compatibility tests in engine.rs.
 impl JsonSchema for ContextEntryPart {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         "ContextEntryPart".into()
@@ -196,14 +219,28 @@ impl JsonSchema for ContextEntryPart {
                     "type": "string",
                     "enum": [
                         "transport_header",
-                        "authorized_identity"
+                        "authorized_identity",
+                        "transport_header_match"
                     ]
                 },
                 "name": generator.subschema_for::<ContextEntryRef>(),
-                "store_as": generator.subschema_for::<ContextEntryName>()
+                "store_as": generator.subschema_for::<ContextEntryName>(),
+                "value": {
+                    "type": "string"
+                }
             },
             "required": ["type", "name"],
-            "additionalProperties": false
+            "additionalProperties": false,
+            "x-kubernetes-validations": [
+                {
+                    "rule": "self.type == 'transport_header_match' ? has(self.value) : !has(self.value)",
+                    "message": "`value` is required for transport_header_match and forbidden for value-bearing members"
+                },
+                {
+                    "rule": "self.type != 'transport_header_match' || !has(self.store_as)",
+                    "message": "`store_as` is forbidden for transport_header_match"
+                }
+            ]
         })
     }
 }
@@ -268,6 +305,33 @@ entries:
         ));
     }
 
+    /// Scenario: a composite entry includes an exact transport-header condition.
+    /// Guarantees: the condition name and value are retained without becoming a value member.
+    #[test]
+    fn parses_transport_header_match_condition() {
+        let policy: ContextPolicy = serde_yaml::from_str(
+            r#"
+entries:
+  product_user:
+    - type: transport_header
+      name: workspace
+    - type: transport_header_match
+      name: environment
+      value: production
+"#,
+        )
+        .expect("valid context policy");
+
+        let name = ContextEntryName::try_from("product_user").expect("valid name");
+        let parts = &policy.entries.get(&name).expect("entry is present").0;
+        assert!(matches!(
+            &parts[1],
+            ContextEntryPart::TransportHeaderMatch { name, value }
+                if name.name().as_str() == "environment" && value == "production"
+        ));
+        assert!(policy.validation_errors("context").is_empty());
+    }
+
     /// Scenario: a context entry map repeats the exact same YAML key.
     /// Guarantees: deserialization rejects the duplicate instead of retaining the last definition.
     #[test]
@@ -322,6 +386,33 @@ entries:
         assert!(!policy.validation_errors("context").is_empty());
     }
 
+    /// Scenario: a composite repeats an identical transport-header condition.
+    /// Guarantees: redundant conditions are rejected while distinct values remain expressible.
+    #[test]
+    fn rejects_duplicate_transport_header_conditions() {
+        let yaml = "entries: {tenant: [{type: transport_header, name: id}, {type: transport_header_match, name: environment, value: prod}, {type: transport_header_match, name: environment, value: prod}]}";
+        let policy = serde_yaml::from_str::<ContextPolicy>(yaml).expect("valid syntax");
+
+        assert_eq!(
+            policy.validation_errors("context"),
+            ["context.entries.tenant[2] repeats transport-header condition for `environment`"]
+        );
+    }
+
+    /// Scenario: a composite contains conditions but exposes no value-bearing member.
+    /// Guarantees: conditions cannot define a composite without a selectable field.
+    #[test]
+    fn rejects_condition_only_definitions() {
+        let yaml =
+            "entries: {tenant: [{type: transport_header_match, name: environment, value: prod}]}";
+        let policy = serde_yaml::from_str::<ContextPolicy>(yaml).expect("valid syntax");
+
+        assert_eq!(
+            policy.validation_errors("context"),
+            ["context.entries.tenant must contain at least one value-bearing member"]
+        );
+    }
+
     /// Scenario: different source types use the same entry name and one member is aliased.
     /// Guarantees: source type distinguishes references while stored member names stay unique.
     #[test]
@@ -338,7 +429,10 @@ entries:
     fn rejects_unsupported_variants_and_fields() {
         for yaml in [
             "entries: {tenant: [{type: transport_header, name: id, value: prod}]}",
+            "entries: {tenant: [{type: authorized_identity, name: id, value: prod}]}",
             "entries: {tenant: [{type: transport_header, name: id, alias: other}]}",
+            "entries: {tenant: [{type: transport_header_match, name: id}]}",
+            "entries: {tenant: [{type: transport_header_match, name: id, store_as: other, value: prod}]}",
             "entries: {tenant: [{type: unsupported, name: id}]}",
             "entries: {tenant: [{type: transport_header, ctx_ref: id}]}",
         ] {
@@ -362,20 +456,38 @@ entries:
     }
 
     /// Scenario: schema is generated for context entry parts.
-    /// Guarantees: both variants and the strict common field set appear deterministically.
+    /// Guarantees: common fields stay structural and variant-specific fields match serde.
     #[test]
     fn schema_exposes_supported_parts() {
         let schema = serde_json::to_value(schemars::schema_for!(ContextEntryPart))
             .expect("schema serializes");
         let rendered = schema.to_string();
 
-        for variant in ["transport_header", "authorized_identity"] {
+        for variant in [
+            "transport_header",
+            "authorized_identity",
+            "transport_header_match",
+        ] {
             assert!(rendered.contains(variant));
         }
         assert_eq!(schema["required"], serde_json::json!(["type", "name"]));
         assert!(schema["properties"].get("name").is_some());
         assert!(schema["properties"].get("ctx_ref").is_none());
         assert!(schema["properties"].get("store_as").is_some());
+        assert!(schema["properties"].get("value").is_some());
         assert!(rendered.contains("additionalProperties"));
+
+        let validations = schema["x-kubernetes-validations"]
+            .as_array()
+            .expect("variant validation");
+        assert_eq!(validations.len(), 2);
+        assert_eq!(
+            validations[0]["rule"],
+            "self.type == 'transport_header_match' ? has(self.value) : !has(self.value)"
+        );
+        assert_eq!(
+            validations[1]["rule"],
+            "self.type != 'transport_header_match' || !has(self.store_as)"
+        );
     }
 }

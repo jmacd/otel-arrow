@@ -219,6 +219,10 @@ impl PackedContext {
                 .members
                 .iter()
                 .any(|member| data[fields_at + member.field.index() * FIELD_SIZE + 8] == 0)
+                || entry.conditions.iter().any(|condition| {
+                    !Self::field_values(data, fields_at, values_at, condition.field.index())
+                        .any(|(_, value)| value == condition.value.as_ref())
+                })
             {
                 continue;
             }
@@ -895,6 +899,44 @@ mod tests {
         .expect("valid layout")
     }
 
+    fn conditional_layout() -> Arc<CompiledLayout> {
+        CompiledLayout::compile(
+            vec![
+                ContextPrimitive {
+                    source: ContextSource::AuthorizedIdentity,
+                    name: name("customer_id"),
+                },
+                ContextPrimitive {
+                    source: ContextSource::TransportHeader,
+                    name: name("environment"),
+                },
+                ContextPrimitive {
+                    source: ContextSource::TransportHeader,
+                    name: name("workspace_id"),
+                },
+            ],
+            &[ContextEntryDeclaration {
+                scope: ContextScope::Engine,
+                name: name("product_user"),
+                definition: ContextEntryDefinition(vec![
+                    ContextEntryPart::AuthorizedIdentity {
+                        name: name("customer_id").into(),
+                        store_as: None,
+                    },
+                    ContextEntryPart::TransportHeader {
+                        name: name("workspace_id").into(),
+                        store_as: None,
+                    },
+                    ContextEntryPart::TransportHeaderMatch {
+                        name: name("environment").into(),
+                        value: "production".to_owned(),
+                    },
+                ]),
+            }],
+        )
+        .expect("valid conditional layout")
+    }
+
     fn claim<'a>(value: &'a ClaimValue) -> CapturedClaim<'a> {
         CapturedClaim {
             name: "customer_id",
@@ -907,6 +949,15 @@ mod tests {
             name: "workspace_id",
             original_name: None,
             kind,
+            value,
+        }
+    }
+
+    fn environment(value: &[u8]) -> CapturedHeader<'_> {
+        CapturedHeader {
+            name: "environment",
+            original_name: None,
+            kind: ValueKind::Text,
             value,
         }
     }
@@ -934,6 +985,38 @@ mod tests {
                 .expect("compatible")
                 .is_none()
         );
+    }
+
+    /// Scenario: a mixed-source composite also requires an exact transport-header value.
+    /// Guarantees: its precomputed presence bit is set only when all members and the condition match.
+    #[test]
+    fn conditional_composite_presence_is_precomputed() {
+        let layout = conditional_layout();
+        let binding =
+            ContextKeyBinding::bind(Arc::clone(&layout), &name("product_user")).expect("entry");
+        let customer = ClaimValue::One("customer-a".into());
+        let workspace = header(b"workspace-a", ValueKind::Text);
+
+        let matching = PackedContext::pack(
+            &layout,
+            &[
+                workspace,
+                environment(b"development"),
+                environment(b"production"),
+            ],
+            &[claim(&customer)],
+        )
+        .expect("packed");
+        assert!(binding.project(&matching).expect("compatible").is_some());
+
+        for headers in [
+            vec![workspace],
+            vec![workspace, environment(b"development")],
+        ] {
+            let packed =
+                PackedContext::pack(&layout, &headers, &[claim(&customer)]).expect("packed");
+            assert!(binding.project(&packed).expect("compatible").is_none());
+        }
     }
 
     /// Scenario: a request has neither captured headers nor verified claims.

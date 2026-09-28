@@ -70,7 +70,16 @@ pub struct ContextMember {
     pub field: ContextFieldId,
 }
 
-/// One atomic logical entry, including its ordered primitive members.
+/// One exact condition controlling atomic entry presence.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ContextCondition {
+    /// Referenced transport-header field.
+    pub field: ContextFieldId,
+    /// Required exact byte value.
+    pub value: Box<[u8]>,
+}
+
+/// One atomic logical entry, including members and presence conditions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextEntryLayout {
     /// Logical entry name.
@@ -79,6 +88,8 @@ pub struct ContextEntryLayout {
     pub scope: Option<ContextScope>,
     /// Members in definition order; all must be present for this entry to exist.
     pub members: Box<[ContextMember]>,
+    /// Canonically ordered conditions; all must match for this entry to exist.
+    pub conditions: Box<[ContextCondition]>,
 }
 
 /// Immutable, deterministic source and grouping layout for one pipeline.
@@ -134,6 +145,7 @@ impl ContextLayout {
                     name,
                     field: ContextFieldId(index),
                 }]),
+                conditions: Box::new([]),
             });
         }
 
@@ -160,11 +172,17 @@ impl ContextLayout {
             }
             let mut names = BTreeSet::new();
             let mut members = Vec::with_capacity(declaration.definition.0.len());
+            let mut conditions = Vec::new();
             for part in &declaration.definition.0 {
-                let source = match part {
-                    ContextEntryPart::TransportHeader { .. } => ContextSource::TransportHeader,
+                let (source, condition_value) = match part {
+                    ContextEntryPart::TransportHeader { .. } => {
+                        (ContextSource::TransportHeader, None)
+                    }
                     ContextEntryPart::AuthorizedIdentity { .. } => {
-                        ContextSource::AuthorizedIdentity
+                        (ContextSource::AuthorizedIdentity, None)
+                    }
+                    ContextEntryPart::TransportHeaderMatch { value, .. } => {
+                        (ContextSource::TransportHeader, Some(value))
                     }
                 };
                 let reference = part.source();
@@ -186,7 +204,24 @@ impl ContextLayout {
                             declaration.name, source
                         ))
                     })?;
-                let name = part.member_name().clone();
+                if let Some(value) = condition_value {
+                    let condition = ContextCondition {
+                        field,
+                        value: value.as_bytes().into(),
+                    };
+                    if conditions.contains(&condition) {
+                        return Err(invalid(format!(
+                            "context entry `{}` repeats condition for `{reference}`",
+                            declaration.name
+                        )));
+                    }
+                    conditions.push(condition);
+                    continue;
+                }
+                let name = part
+                    .member_name()
+                    .expect("value-bearing context part has a member name")
+                    .clone();
                 if !names.insert(name.clone()) {
                     return Err(invalid(format!(
                         "context entry `{}` repeats member `{name}`",
@@ -204,12 +239,20 @@ impl ContextLayout {
                 }
                 members.push(ContextMember { name, field });
             }
+            if members.is_empty() {
+                return Err(invalid(format!(
+                    "context entry `{}` must contain at least one value-bearing member",
+                    declaration.name
+                )));
+            }
+            conditions.sort_unstable();
             let id = ContextEntryId(entries.len());
             _ = by_name.insert(declaration.name.clone(), id);
             entries.push(ContextEntryLayout {
                 name: declaration.name.clone(),
                 scope: Some(declaration.scope.clone()),
                 members: members.into_boxed_slice(),
+                conditions: conditions.into_boxed_slice(),
             });
         }
         Ok(Self {
@@ -440,5 +483,46 @@ mod tests {
             2
         );
         assert!(layout.bind(&reference("customer")).is_err());
+    }
+
+    /// Scenario: equivalent conditional composites declare their conditions in different orders.
+    /// Guarantees: conditions compile canonically and do not become projected value members.
+    #[test]
+    fn conditional_entries_compile_canonical_presence_requirements() {
+        let mut fields = sources();
+        fields.extend([
+            ContextPrimitive {
+                name: name("environment"),
+                source: ContextSource::TransportHeader,
+            },
+            ContextPrimitive {
+                name: name("region"),
+                source: ContextSource::TransportHeader,
+            },
+        ]);
+        let mut conditional = entry();
+        conditional.definition.0.extend([
+            ContextEntryPart::TransportHeaderMatch {
+                name: reference("region"),
+                value: "west".to_owned(),
+            },
+            ContextEntryPart::TransportHeaderMatch {
+                name: reference("environment"),
+                value: "production".to_owned(),
+            },
+        ]);
+        let mut reordered = conditional.clone();
+        reordered.definition.0.swap(2, 3);
+
+        let first = ContextLayout::compile(fields.clone(), &[conditional]).expect("layout");
+        let second = ContextLayout::compile(fields, &[reordered]).expect("layout");
+        assert_eq!(first, second);
+        let entry = &first.entries()[first
+            .bind(&reference("product_user"))
+            .unwrap()
+            .presence
+            .index()];
+        assert_eq!(entry.members.len(), 2);
+        assert_eq!(entry.conditions.len(), 2);
     }
 }
