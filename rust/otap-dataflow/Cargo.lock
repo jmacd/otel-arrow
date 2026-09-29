@@ -1240,6 +1240,7 @@ dependencies = [
  "bytes",
  "core_affinity",
  "criterion",
+ "dhat",
  "fluke-hpack",
  "flume",
  "futures",

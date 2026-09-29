@@ -42,9 +42,7 @@ use otel_arrow_dfe_engine::{
 use otel_arrow_dfe_pdata::OtapPayload;
 use smallvec::SmallVec;
 
-use crate::packed_context::{
-    CapturedClaim, CapturedHeader, DecodedClaim, PackedContext, PackedEntryKey,
-};
+use crate::packed_context::{DecodedClaim, PackedContext, PackedEntryKey};
 
 const AUTHORIZED_ENTRY_LEN: usize = 20;
 const AUTHORIZED_VALUE_LEN: usize = 8;
@@ -115,7 +113,8 @@ impl<'a> AuthorizedClaimValue<'a> {
     }
 
     /// Iterates values in source order.
-    pub fn values(&self) -> impl Iterator<Item = &'a str> + '_ {
+    #[must_use]
+    pub fn values(self) -> impl ExactSizeIterator<Item = &'a str> {
         (0..self.value_count)
             .map(move |offset| self.storage.decode_value(self.first_value + offset))
     }
@@ -169,6 +168,16 @@ impl fmt::Debug for AuthorizedIdentityEntries {
 }
 
 impl AuthorizedIdentityEntries {
+    /// Captures benchmark fixture identity using the production representation.
+    #[cfg(feature = "bench")]
+    #[must_use]
+    pub fn capture_for_benchmark(
+        policy: &AuthorizedIdentityPolicy,
+        identity: &AuthorizedIdentity,
+    ) -> Self {
+        Self::capture(policy, identity).expect("benchmark identity must match its capture policy")
+    }
+
     pub(crate) fn from_decoded(claims: Vec<DecodedClaim>) -> Self {
         if claims.is_empty() {
             return Self::default();
@@ -522,36 +531,7 @@ fn pack_request_context(
     transport_headers: &TransportHeaders,
     authorized_identity: &AuthorizedIdentityEntries,
 ) -> PackedContext {
-    let headers = transport_headers
-        .iter()
-        .map(|header| CapturedHeader {
-            name: header.name.as_str(),
-            original_name: header.value.original_name,
-            kind: header.value.value_kind,
-            value: header.value.bytes,
-        })
-        .collect::<Vec<_>>();
-    let claims = authorized_identity
-        .iter()
-        .map(|entry| {
-            let value = if entry.value().is_many() {
-                ClaimValue::many(entry.value().values())
-            } else {
-                ClaimValue::one(
-                    entry
-                        .value()
-                        .as_str()
-                        .expect("single authorized identity entry has one value"),
-                )
-            };
-            (entry.name().to_owned(), value)
-        })
-        .collect::<Vec<_>>();
-    let claims = claims
-        .iter()
-        .map(|(name, value)| CapturedClaim { name, value })
-        .collect::<Vec<_>>();
-    PackedContext::pack(layout, &headers, &claims)
+    PackedContext::pack_materialized(layout, transport_headers, authorized_identity)
         .expect("materialized context values match their compiled layout")
 }
 
@@ -602,6 +582,24 @@ fn layout_covers(
 }
 
 impl Context {
+    /// Constructs a complete request context for allocation benchmarks.
+    #[cfg(feature = "bench")]
+    #[must_use]
+    pub fn from_request_context_for_benchmark(
+        layout: Arc<CompiledContextLayout>,
+        transport_headers: TransportHeaders,
+        authorized_identity: AuthorizedIdentityEntries,
+    ) -> Self {
+        Self {
+            request_context: Some(Arc::new(RequestContext::new(
+                layout,
+                transport_headers,
+                authorized_identity,
+            ))),
+            ..Self::default()
+        }
+    }
+
     /// Projects one configured whole entry into a collision-safe batch key.
     ///
     /// The small common key stays on the stack. An absent member maps to one

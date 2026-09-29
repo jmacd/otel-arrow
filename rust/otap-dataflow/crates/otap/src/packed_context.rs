@@ -126,6 +126,14 @@ impl PackedContext {
         Self::pack_impl(layout, headers, claims, true)
     }
 
+    pub(crate) fn pack_materialized(
+        layout: &CompiledLayout,
+        headers: &TransportHeaders,
+        claims: &AuthorizedIdentityEntries,
+    ) -> Result<Self, Error> {
+        Self::pack_materialized_impl(layout, headers, claims)
+    }
+
     /// Packs source values without evaluating or hashing compiled entries.
     #[cfg(feature = "bench")]
     pub fn pack_deferred(
@@ -165,6 +173,144 @@ impl PackedContext {
                     .ok_or_else(|| invalid("context blob size overflow"))?;
             }
         }
+        Self::pack_sized(
+            layout,
+            headers.len(),
+            claims.len(),
+            count,
+            blob_len,
+            cache_entries,
+            |data, fields_at, values_at, value_index, blob_index| {
+                for header in headers {
+                    let field = field(layout, ContextSource::TransportHeader, header.name)?;
+                    Self::write_value(
+                        data,
+                        fields_at,
+                        values_at,
+                        value_index,
+                        blob_index,
+                        field,
+                        header.kind as u8,
+                        header.original_name,
+                        header.value,
+                    );
+                }
+                for (claim_index, claim) in claims.iter().enumerate() {
+                    let field = field(layout, ContextSource::AuthorizedIdentity, claim.name)?;
+                    let field_at = fields_at + field * FIELD_SIZE;
+                    if data[field_at + 8] != 0 {
+                        return Err(invalid(format!(
+                            "duplicate authorized identity field `{}`",
+                            claim.name
+                        )));
+                    }
+                    data[field_at + 8] = 1;
+                    data[field_at + 9] = u8::from(matches!(claim.value, ClaimValue::Many(_)));
+                    for value in claim.value.as_slice() {
+                        Self::write_value(
+                            data,
+                            fields_at,
+                            values_at,
+                            value_index,
+                            blob_index,
+                            field,
+                            2,
+                            None,
+                            value.as_bytes(),
+                        );
+                    }
+                    // Claims are unique, so the completed value chain no longer needs
+                    // its last-value cursor. Reuse it to retain capture-policy order.
+                    write_u32(data, field_at + 12, claim_index);
+                }
+                Ok(())
+            },
+        )
+    }
+
+    fn pack_materialized_impl(
+        layout: &CompiledLayout,
+        headers: &TransportHeaders,
+        claims: &AuthorizedIdentityEntries,
+    ) -> Result<Self, Error> {
+        if headers.is_empty() && claims.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut count = headers.len();
+        let mut blob_len = 0usize;
+        for header in headers.iter() {
+            _ = field(layout, ContextSource::TransportHeader, header.name.as_str())?;
+            blob_len = blob_len
+                .checked_add(header.value.bytes.len())
+                .and_then(|len| len.checked_add(header.value.original_name.map_or(0, str::len)))
+                .ok_or_else(|| invalid("context blob size overflow"))?;
+        }
+        for claim in claims.iter() {
+            _ = field(layout, ContextSource::AuthorizedIdentity, claim.name())?;
+            count = count
+                .checked_add(claim.value().len())
+                .ok_or_else(|| invalid("context value count overflow"))?;
+            for value in claim.value().values() {
+                blob_len = blob_len
+                    .checked_add(value.len())
+                    .ok_or_else(|| invalid("context blob size overflow"))?;
+            }
+        }
+        Self::pack_sized(
+            layout,
+            headers.len(),
+            claims.len(),
+            count,
+            blob_len,
+            true,
+            |data, fields_at, values_at, value_index, blob_index| {
+                for header in headers.iter() {
+                    let field =
+                        field(layout, ContextSource::TransportHeader, header.name.as_str())?;
+                    Self::write_value(
+                        data,
+                        fields_at,
+                        values_at,
+                        value_index,
+                        blob_index,
+                        field,
+                        header.value.value_kind as u8,
+                        header.value.original_name,
+                        header.value.bytes,
+                    );
+                }
+                for (claim_index, claim) in claims.iter().enumerate() {
+                    let value = claim.value();
+                    let field = field(layout, ContextSource::AuthorizedIdentity, claim.name())?;
+                    Self::write_claim(
+                        data,
+                        fields_at,
+                        values_at,
+                        value_index,
+                        blob_index,
+                        field,
+                        claim.name(),
+                        value.is_many(),
+                        claim_index,
+                        value.values(),
+                    )?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn pack_sized(
+        layout: &CompiledLayout,
+        header_count: usize,
+        claim_count: usize,
+        count: usize,
+        blob_len: usize,
+        cache_entries: bool,
+        write: impl FnOnce(&mut [u8], usize, usize, &mut usize, &mut usize) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
         let entry_count = layout.layout().entries().len();
         let fields_at = fields_at(entry_count);
         let values_at = layout
@@ -188,53 +334,18 @@ impl PackedContext {
         let mut bytes = vec![0; total].into_boxed_slice();
         let data = bytes.as_mut();
         write_u64(data, 0, layout.generation());
-        write_u32(data, 8, headers.len());
-        write_u32(data, 12, claims.len());
+        write_u32(data, 8, header_count);
+        write_u32(data, 12, claim_count);
 
         let mut value_index = 0usize;
         let mut blob_index = blob_at;
-        for header in headers {
-            let field = field(layout, ContextSource::TransportHeader, header.name)?;
-            Self::write_value(
-                data,
-                fields_at,
-                values_at,
-                &mut value_index,
-                &mut blob_index,
-                field,
-                header.kind as u8,
-                header.original_name,
-                header.value,
-            );
-        }
-        for (claim_index, claim) in claims.iter().enumerate() {
-            let field = field(layout, ContextSource::AuthorizedIdentity, claim.name)?;
-            let field_at = fields_at + field * FIELD_SIZE;
-            if data[field_at + 8] != 0 {
-                return Err(invalid(format!(
-                    "duplicate authorized identity field `{}`",
-                    claim.name
-                )));
-            }
-            data[field_at + 8] = 1;
-            data[field_at + 9] = u8::from(matches!(claim.value, ClaimValue::Many(_)));
-            for value in claim.value.as_slice() {
-                Self::write_value(
-                    data,
-                    fields_at,
-                    values_at,
-                    &mut value_index,
-                    &mut blob_index,
-                    field,
-                    2,
-                    None,
-                    value.as_bytes(),
-                );
-            }
-            // Claims are unique, so the completed value chain no longer needs
-            // its last-value cursor. Reuse it to retain capture-policy order.
-            write_u32(data, field_at + 12, claim_index);
-        }
+        write(
+            data,
+            fields_at,
+            values_at,
+            &mut value_index,
+            &mut blob_index,
+        )?;
         debug_assert_eq!(value_index, count);
         debug_assert_eq!(blob_index, total);
 
@@ -273,6 +384,46 @@ impl PackedContext {
             }
         }
         Ok(Self { bytes: Some(bytes) })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_claim<'a>(
+        bytes: &mut [u8],
+        fields_at: usize,
+        values_at: usize,
+        value_index: &mut usize,
+        blob_index: &mut usize,
+        field: usize,
+        name: &str,
+        many: bool,
+        claim_index: usize,
+        values: impl Iterator<Item = &'a str>,
+    ) -> Result<(), Error> {
+        let field_at = fields_at + field * FIELD_SIZE;
+        if bytes[field_at + 8] != 0 {
+            return Err(invalid(format!(
+                "duplicate authorized identity field `{name}`"
+            )));
+        }
+        bytes[field_at + 8] = 1;
+        bytes[field_at + 9] = u8::from(many);
+        for value in values {
+            Self::write_value(
+                bytes,
+                fields_at,
+                values_at,
+                value_index,
+                blob_index,
+                field,
+                2,
+                None,
+                value.as_bytes(),
+            );
+        }
+        // Claims are unique, so the completed value chain no longer needs
+        // its last-value cursor. Reuse it to retain capture-policy order.
+        write_u32(bytes, field_at + 12, claim_index);
+        Ok(())
     }
 
     fn write_value(
@@ -902,7 +1053,16 @@ impl PackedEntryKey<'_> {
         values_at: usize,
         fields: &[otel_arrow_dfe_config::context_layout::ContextFieldId],
     ) -> OwnedContextKey {
-        let mut bytes = Vec::new();
+        let length = fields
+            .iter()
+            .map(|field| field.index())
+            .map(|field| {
+                5 + PackedContext::field_values(context, fields_at, values_at, field)
+                    .map(|(_, value)| 5 + value.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        let mut bytes = Vec::with_capacity(length);
         for field in fields.iter().map(|field| field.index()) {
             let at = fields_at + field * FIELD_SIZE;
             bytes.push(context[at + 9]);
@@ -917,6 +1077,7 @@ impl PackedEntryKey<'_> {
                 bytes.extend_from_slice(value);
             }
         }
+        debug_assert_eq!(bytes.len(), length);
         OwnedContextKey {
             generation,
             entry,
