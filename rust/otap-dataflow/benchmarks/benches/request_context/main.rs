@@ -6,6 +6,7 @@
 mod header_propagation;
 
 use std::borrow::Cow;
+use std::hash::{BuildHasher, Hasher};
 use std::hint::black_box;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -126,6 +127,12 @@ fn bench_batch_partition_lookup(c: &mut Criterion) {
         let layout = transport_layout(&headers);
         let binding = BoundContextEntry::new_compiled(Arc::clone(&layout), &name.clone().into())
             .expect("primitive entry");
+        // An equivalent generation mismatch exercises the fallback that scans,
+        // serializes, and hashes selected values for every lookup.
+        let recomputed_layout = transport_layout(&headers);
+        let recomputed_binding =
+            BoundContextEntry::new_compiled(recomputed_layout, &name.clone().into())
+                .expect("primitive entry");
         let mut context = Context::default();
         context.set_transport_headers_with_layout(layout, headers);
         let selection = context.partition_selection(&binding);
@@ -133,6 +140,9 @@ fn bench_batch_partition_lookup(c: &mut Criterion) {
         let state = std::collections::hash_map::RandomState::new();
         let mut partitions = hashbrown::HashMap::new();
         _ = partitions.insert(key.clone(), 1usize);
+        let recomputed_key = context.partition_selection(&recomputed_binding).into_key();
+        let mut recomputed_partitions = hashbrown::HashMap::new();
+        _ = recomputed_partitions.insert(recomputed_key, 1usize);
         let _ = group.bench_with_input(
             BenchmarkId::new("existing_key", header_count),
             &header_count,
@@ -155,6 +165,23 @@ fn bench_batch_partition_lookup(c: &mut Criterion) {
                     let hash = selected.table_hash(partitions.hasher());
                     black_box(
                         partitions
+                            .raw_entry()
+                            .from_hash(hash, |candidate| selected.matches(candidate))
+                            .map(|(_, pending)| *pending),
+                    )
+                });
+            },
+        );
+        let _ = group.bench_with_input(
+            BenchmarkId::new("recomputed_partition_hit", header_count),
+            &header_count,
+            |b, _| {
+                b.iter(|| {
+                    let selected =
+                        black_box(&context).partition_selection(black_box(&recomputed_binding));
+                    let hash = selected.table_hash(recomputed_partitions.hasher());
+                    black_box(
+                        recomputed_partitions
                             .raw_entry()
                             .from_hash(hash, |candidate| selected.matches(candidate))
                             .map(|(_, pending)| *pending),
@@ -231,7 +258,7 @@ fn transport_layout(headers: &TransportHeaders) -> Arc<CompiledContextLayout> {
 
 fn bench_mixed_context(c: &mut Criterion) {
     let name = context_name("product_user");
-    let layout = CompiledLayout::compile(
+    let layout = CompiledLayout::compile_with_bindings(
         vec![
             ContextPrimitive {
                 source: ContextSource::AuthorizedIdentity,
@@ -254,8 +281,13 @@ fn bench_mixed_context(c: &mut Criterion) {
                     name: context_name("workspace_id").into(),
                     store_as: None,
                 },
+                ContextEntryPart::TransportHeaderMatch {
+                    name: context_name("workspace_id").into(),
+                    value: "workspace-abc".to_owned(),
+                },
             ]),
         }],
+        &[name.clone().into()],
     )
     .expect("valid compiled layout");
     let binding =
@@ -278,6 +310,17 @@ fn bench_mixed_context(c: &mut Criterion) {
         .expect("compatible")
         .expect("present")
         .to_owned();
+    let deferred =
+        PackedContext::pack_deferred(&layout, &headers, &claims).expect("deferred packed context");
+    let deferred_owned = binding
+        .project_recomputed(&deferred)
+        .expect("compatible")
+        .expect("present")
+        .to_owned();
+    let mut cached_partitions = hashbrown::HashMap::new();
+    _ = cached_partitions.insert(owned.clone(), 1usize);
+    let mut deferred_partitions = hashbrown::HashMap::new();
+    _ = deferred_partitions.insert(deferred_owned, 1usize);
     let mut group = c.benchmark_group("request_context/mixed_context");
     let _ = group.bench_function("pack_one_header_one_claim", |b| {
         b.iter(|| {
@@ -294,6 +337,49 @@ fn bench_mixed_context(c: &mut Criterion) {
                 .expect("compatible")
                 .expect("present");
             black_box((projected.hash(), projected.eq_owned(black_box(&owned))))
+        });
+    });
+    let _ = group.bench_function("precomputed_construct_and_single_hit", |b| {
+        b.iter(|| {
+            let packed =
+                PackedContext::pack(black_box(&layout), black_box(&headers), black_box(&claims))
+                    .expect("packed context");
+            let projected = black_box(&binding)
+                .project(&packed)
+                .expect("compatible")
+                .expect("present");
+            let mut hasher = cached_partitions.hasher().build_hasher();
+            hasher.write_u64(projected.hash());
+            let hash = hasher.finish();
+            black_box(
+                cached_partitions
+                    .raw_entry()
+                    .from_hash(hash, |candidate| projected.eq_owned(candidate))
+                    .map(|(_, pending)| *pending),
+            )
+        });
+    });
+    let _ = group.bench_function("deferred_construct_and_single_hit", |b| {
+        b.iter(|| {
+            let packed = PackedContext::pack_deferred(
+                black_box(&layout),
+                black_box(&headers),
+                black_box(&claims),
+            )
+            .expect("deferred packed context");
+            let projected = black_box(&binding)
+                .project_recomputed(&packed)
+                .expect("compatible")
+                .expect("present");
+            let mut hasher = deferred_partitions.hasher().build_hasher();
+            hasher.write_u64(projected.hash());
+            let hash = hasher.finish();
+            black_box(
+                deferred_partitions
+                    .raw_entry()
+                    .from_hash(hash, |candidate| projected.eq_owned(candidate))
+                    .map(|(_, pending)| *pending),
+            )
         });
     });
     group.finish();

@@ -27,7 +27,7 @@ use crate::error::Error as EngineError;
 use otel_arrow_dfe_config::ContextEntryRef;
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
 use otel_arrow_dfe_config::context_layout::{
-    ContextBinding, ContextLayout, ContextPrimitive, ContextSource,
+    ContextBinding, ContextEntryId, ContextLayout, ContextPrimitive, ContextSource,
 };
 use otel_arrow_dfe_config::context_policy::ContextEntryDeclaration as ConfigContextEntryDeclaration;
 use otel_arrow_dfe_config::engine::ResolvedOtelDataflowSpec;
@@ -38,7 +38,7 @@ use otel_arrow_dfe_config::transport_headers_policy::{
     TransportHeadersPolicy,
 };
 use otel_arrow_dfe_config::{ContextEntryName, NodeId as ConfigNodeId, PipelineKey};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -282,11 +282,12 @@ pub struct CompiledContextBindings {
 pub struct CompiledContextLayout {
     generation: u64,
     layout: ContextLayout,
+    cached_entries: Box<[ContextEntryId]>,
 }
 
 impl PartialEq for CompiledContextLayout {
     fn eq(&self, other: &Self) -> bool {
-        self.layout == other.layout
+        self.layout == other.layout && self.cached_entries == other.cached_entries
     }
 }
 
@@ -298,15 +299,62 @@ impl CompiledContextLayout {
         fields: Vec<ContextPrimitive>,
         declarations: &[otel_arrow_dfe_config::context_policy::ContextEntryDeclaration],
     ) -> Result<Arc<Self>, Error> {
-        Self::new(ContextLayout::compile(fields, declarations)?)
+        let layout = ContextLayout::compile(fields, declarations)?;
+        let cached_entries = layout
+            .entries()
+            .iter()
+            .map(|entry| layout.bind(&entry.name.clone().into()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|binding| binding.presence)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Self::new(layout, cached_entries)
+    }
+
+    /// Compile a layout that caches only entries with live processor bindings.
+    pub fn compile_with_bindings(
+        fields: Vec<ContextPrimitive>,
+        declarations: &[otel_arrow_dfe_config::context_policy::ContextEntryDeclaration],
+        references: &[ContextEntryRef],
+    ) -> Result<Arc<Self>, Error> {
+        let layout = ContextLayout::compile(fields, declarations)?;
+        Self::from_layout_with_bindings(layout, references)
     }
 
     /// Attach a live generation identity to an already compiled layout.
     pub fn from_layout(layout: ContextLayout) -> Result<Arc<Self>, Error> {
-        Self::new(layout)
+        let cached_entries = layout
+            .entries()
+            .iter()
+            .map(|entry| layout.bind(&entry.name.clone().into()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|binding| binding.presence)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Self::new(layout, cached_entries)
     }
 
-    fn new(layout: ContextLayout) -> Result<Arc<Self>, Error> {
+    fn from_layout_with_bindings(
+        layout: ContextLayout,
+        references: &[ContextEntryRef],
+    ) -> Result<Arc<Self>, Error> {
+        let cached_entries = references
+            .iter()
+            .map(|reference| layout.bind(reference).map(|binding| binding.presence))
+            .collect::<Result<BTreeSet<_>, _>>()?
+            .into_iter()
+            .collect();
+        Self::new(layout, cached_entries)
+    }
+
+    fn new(
+        layout: ContextLayout,
+        cached_entries: Box<[ContextEntryId]>,
+    ) -> Result<Arc<Self>, Error> {
         let generation = NEXT_CONTEXT_LAYOUT_GENERATION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
@@ -314,7 +362,11 @@ impl CompiledContextLayout {
             .map_err(|_| Error::InvalidUserConfig {
                 error: "context layout generation overflow".to_owned(),
             })?;
-        Ok(Arc::new(Self { generation, layout }))
+        Ok(Arc::new(Self {
+            generation,
+            layout,
+            cached_entries,
+        }))
     }
 
     /// Returns the identity of this live pipeline layout generation.
@@ -327,6 +379,12 @@ impl CompiledContextLayout {
     #[must_use]
     pub const fn layout(&self) -> &ContextLayout {
         &self.layout
+    }
+
+    /// Returns entries whose presence and hash are cached during request construction.
+    #[must_use]
+    pub const fn cached_entries(&self) -> &[ContextEntryId] {
+        &self.cached_entries
     }
 }
 
@@ -359,6 +417,13 @@ impl BoundContextEntry {
             });
         }
         let binding = layout.layout.bind(reference)?;
+        if !layout.cached_entries.contains(&binding.presence) {
+            return Err(Error::InvalidUserConfig {
+                error: format!(
+                    "context entry `{reference}` has no live processor binding in this pipeline"
+                ),
+            });
+        }
         Ok(Self { layout, binding })
     }
 
@@ -677,8 +742,14 @@ impl CompiledContextBindings {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let layout =
-                CompiledContextLayout::new(ContextLayout::compile(sources, &definitions)?)?;
+            let layout = CompiledContextLayout::compile_with_bindings(
+                sources,
+                &definitions,
+                &selected
+                    .iter()
+                    .map(|(_, reference)| (*reference).clone())
+                    .collect::<Vec<_>>(),
+            )?;
             _ = self
                 .pipeline_layouts
                 .insert(key.clone(), Arc::clone(&layout));
@@ -1271,6 +1342,20 @@ groups:
                 .conditions
                 .len(),
             1
+        );
+        assert_eq!(
+            binding.compiled_layout().cached_entries(),
+            &[binding.binding().presence]
+        );
+        assert!(
+            BoundContextEntry::new_compiled(
+                Arc::clone(binding.compiled_layout()),
+                &"workspace_id"
+                    .try_into()
+                    .expect("valid primitive reference"),
+            )
+            .is_err(),
+            "unbound primitive entries must not acquire speculative hash caches"
         );
 
         let mut unavailable = declarations.clone();

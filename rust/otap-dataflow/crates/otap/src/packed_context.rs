@@ -123,6 +123,25 @@ impl PackedContext {
         headers: &[CapturedHeader<'_>],
         claims: &[CapturedClaim<'_>],
     ) -> Result<Self, Error> {
+        Self::pack_impl(layout, headers, claims, true)
+    }
+
+    /// Packs source values without evaluating or hashing compiled entries.
+    #[cfg(feature = "bench")]
+    pub fn pack_deferred(
+        layout: &CompiledLayout,
+        headers: &[CapturedHeader<'_>],
+        claims: &[CapturedClaim<'_>],
+    ) -> Result<Self, Error> {
+        Self::pack_impl(layout, headers, claims, false)
+    }
+
+    fn pack_impl(
+        layout: &CompiledLayout,
+        headers: &[CapturedHeader<'_>],
+        claims: &[CapturedClaim<'_>],
+        cache_entries: bool,
+    ) -> Result<Self, Error> {
         if headers.is_empty() && claims.is_empty() {
             return Ok(Self::default());
         }
@@ -219,36 +238,39 @@ impl PackedContext {
         debug_assert_eq!(value_index, count);
         debug_assert_eq!(blob_index, total);
 
-        for (entry_id, entry) in layout.layout().entries().iter().enumerate() {
-            if entry
-                .members
-                .iter()
-                .any(|member| data[fields_at + member.field.index() * FIELD_SIZE + 8] == 0)
-                || entry.conditions.iter().any(|condition| {
-                    !Self::field_values(data, fields_at, values_at, condition.field.index())
-                        .any(|(_, value)| value == condition.value.as_ref())
-                })
-            {
-                continue;
-            }
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            layout.generation().hash(&mut hasher);
-            entry_id.hash(&mut hasher);
-            for member in entry.members.iter() {
-                Self::hash_field(
+        if cache_entries {
+            for entry_id in layout.cached_entries().iter().map(|entry| entry.index()) {
+                let entry = &layout.layout().entries()[entry_id];
+                if entry
+                    .members
+                    .iter()
+                    .any(|member| data[fields_at + member.field.index() * FIELD_SIZE + 8] == 0)
+                    || entry.conditions.iter().any(|condition| {
+                        !Self::field_values(data, fields_at, values_at, condition.field.index())
+                            .any(|(_, value)| value == condition.value.as_ref())
+                    })
+                {
+                    continue;
+                }
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                layout.generation().hash(&mut hasher);
+                entry_id.hash(&mut hasher);
+                for member in entry.members.iter() {
+                    Self::hash_field(
+                        data,
+                        fields_at,
+                        values_at,
+                        member.field.index(),
+                        &mut hasher,
+                    );
+                }
+                set_entry_present(data, entry_id);
+                write_u64(
                     data,
-                    fields_at,
-                    values_at,
-                    member.field.index(),
-                    &mut hasher,
+                    entry_hashes_at(entry_count) + entry_id * 8,
+                    hasher.finish(),
                 );
             }
-            set_entry_present(data, entry_id);
-            write_u64(
-                data,
-                entry_hashes_at(entry_count) + entry_id * 8,
-                hasher.finish(),
-            );
         }
         Ok(Self { bytes: Some(bytes) })
     }
@@ -1005,6 +1027,87 @@ impl ContextKeyBinding {
             binding: self,
             bytes,
         }))
+    }
+
+    /// Evaluates and hashes one bound entry from packed source fields.
+    #[cfg(feature = "bench")]
+    pub fn project_recomputed<'a>(
+        &'a self,
+        context: &'a PackedContext,
+    ) -> Result<Option<RecomputedContextKey<'a>>, Error> {
+        let Some(bytes) = context.bytes.as_deref() else {
+            return Ok(None);
+        };
+        if read_u64(bytes, 0) != self.layout.generation() {
+            return Err(invalid("incompatible packed context layout generation"));
+        }
+        let fields_at = fields_at(self.layout.layout().entries().len());
+        let values_at = fields_at + self.layout.layout().fields().len() * FIELD_SIZE;
+        let entry = &self.layout.layout().entries()[self.entry];
+        if entry
+            .members
+            .iter()
+            .any(|member| bytes[fields_at + member.field.index() * FIELD_SIZE + 8] == 0)
+            || entry.conditions.iter().any(|condition| {
+                !PackedContext::field_values(bytes, fields_at, values_at, condition.field.index())
+                    .any(|(_, value)| value == condition.value.as_ref())
+            })
+        {
+            return Ok(None);
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.layout.generation().hash(&mut hasher);
+        self.entry.hash(&mut hasher);
+        for field in &self.fields {
+            PackedContext::hash_field(bytes, fields_at, values_at, field.index(), &mut hasher);
+        }
+        Ok(Some(RecomputedContextKey {
+            binding: self,
+            bytes,
+            hash: hasher.finish(),
+        }))
+    }
+}
+
+/// One bound entry evaluated and hashed on demand.
+#[cfg(feature = "bench")]
+pub struct RecomputedContextKey<'a> {
+    binding: &'a ContextKeyBinding,
+    bytes: &'a [u8],
+    hash: u64,
+}
+
+#[cfg(feature = "bench")]
+impl RecomputedContextKey<'_> {
+    /// Returns the hash computed during this projection.
+    #[must_use]
+    pub const fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    /// Performs the same full collision comparison as a cached projection.
+    #[must_use]
+    pub fn eq_owned(&self, key: &OwnedContextKey) -> bool {
+        ContextKey {
+            binding: self.binding,
+            bytes: self.bytes,
+        }
+        .eq_owned(key)
+    }
+
+    /// Materializes an owned key for benchmark table setup.
+    #[must_use]
+    pub fn to_owned(&self) -> OwnedContextKey {
+        PackedEntryKey::owned_key(
+            self.binding.layout.generation(),
+            self.binding.entry,
+            self.hash,
+            self.bytes,
+            fields_at(self.binding.layout.layout().entries().len()),
+            fields_at(self.binding.layout.layout().entries().len())
+                + self.binding.layout.layout().fields().len() * FIELD_SIZE,
+            &self.binding.fields,
+        )
     }
 }
 
