@@ -131,15 +131,6 @@ impl ContextEntryDefinition {
     }
 }
 
-/// Context domains are separate areas of configuration and authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum ContextDomain {
-    /// Untrusted transport metadata.
-    TransportHeader,
-    /// Verified authorization claim.
-    AuthorizedIdentity,
-}
-
 /// Single member of a composite entry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -171,6 +162,15 @@ pub enum ContextEntryPart {
         /// Required text value.
         value: String,
     },
+}
+
+/// Context domains are separate areas of configuration and authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ContextDomain {
+    /// Untrusted transport metadata.
+    TransportHeader,
+    /// Verified authorization claim.
+    AuthorizedIdentity,
 }
 
 impl ContextEntryPart {
