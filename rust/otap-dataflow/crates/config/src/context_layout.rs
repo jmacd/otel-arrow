@@ -3,6 +3,9 @@
 
 //! Context layout support.
 
+mod bindings;
+pub use bindings::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::context::{ContextEntryName, ContextEntryRef};
