@@ -1,7 +1,16 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Context layout support.
+//! Shared context declarations, binding compilation, and resolved projections.
+//!
+//! A projection selects values without weakening its composite's presence gate:
+//! every member must exist in its declared domain and every condition must match.
+//! Header propagation is the first consumer of this shared contract.
+//!
+//! Layout-local IDs and whole-composite projections provide a foundation for
+//! subsequent consumers. They are not offsets into message storage. Presence
+//! is evaluated against existing header and identity storage at read time;
+//! ingestion-time materialization and precomputed hashes are separate work.
 
 mod bindings;
 pub use bindings::*;
@@ -11,9 +20,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::context::{ContextEntryName, ContextEntryRef};
 use crate::context_policy::{ContextEntryDeclaration, ContextEntryPart, ContextScope};
 use crate::error::Error;
+use crate::transport_headers::TransportHeaders;
 
-/// A deterministic layout of primitive fields and composite entries.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A deterministic logical layout of primitive fields and composite entries.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ContextLayout {
     /// Primitive elements from each domain.
     fields: Box<[ContextFieldLayout]>,
@@ -24,7 +34,7 @@ pub struct ContextLayout {
 }
 
 /// Context domains are separate areas of configuration and authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ContextDomain {
     /// Untrusted transport metadata.
     TransportHeader,
@@ -32,12 +42,12 @@ pub enum ContextDomain {
     AuthorizedIdentity,
 }
 
-/// A primitive field is a single named element.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+/// A primitive field is a named element in one authority domain.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ContextFieldLayout {
     /// Stored name.
     pub name: ContextEntryName,
-    /// Storage domain.
+    /// Authority domain.
     pub domain: ContextDomain,
 }
 
@@ -66,7 +76,7 @@ impl ContextEntryId {
 }
 
 /// Identity of one top-level name in the layout.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ContextNameId {
     /// A primitive field.
     Primitive(ContextFieldId),
@@ -75,7 +85,7 @@ pub enum ContextNameId {
 }
 
 /// Member of a composite entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ContextMember {
     /// Name is this member's store_as, falls back to the field's
     /// primitive name.
@@ -85,7 +95,7 @@ pub struct ContextMember {
 }
 
 /// One conditional element
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ContextCondition {
     /// Condition field
     pub field: ContextFieldId,
@@ -94,7 +104,7 @@ pub struct ContextCondition {
 }
 
 /// One composite entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ContextEntryLayout {
     /// Composite entry name.
     pub name: ContextEntryName,
@@ -107,7 +117,7 @@ pub struct ContextEntryLayout {
 }
 
 /// Selected context values and their atomic presence gate.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ContextProjection {
     /// One independent primitive field.
     Primitive(ContextFieldId),
@@ -146,7 +156,71 @@ fn invalid(message: impl Into<String>) -> Error {
     }
 }
 
+/// Read-only presence information from a message's separate authority domains.
+pub trait ContextValues {
+    /// Captured or produced transport headers.
+    fn transport_headers(&self) -> Option<&TransportHeaders>;
+
+    /// Whether an exact stored authorized-identity name is present.
+    fn has_authorized_identity(&self, name: &ContextEntryName) -> bool;
+}
+
+impl ContextValues for TransportHeaders {
+    fn transport_headers(&self) -> Option<&TransportHeaders> {
+        Some(self)
+    }
+
+    fn has_authorized_identity(&self, _name: &ContextEntryName) -> bool {
+        false
+    }
+}
+
 impl ContextLayout {
+    /// Compiles composites selected by qualified references, leaving unused definitions inert.
+    ///
+    /// Only the selected definitions contribute fields. Capture and producer
+    /// policies keep their existing semantics; context can also arrive from
+    /// another pipeline. Missing message values mean absence, not a startup error.
+    pub(crate) fn for_references<'a>(
+        declarations: &[ContextEntryDeclaration],
+        references: impl IntoIterator<Item = &'a ContextEntryRef>,
+    ) -> Result<Self, Error> {
+        let mut fields = BTreeSet::<ContextFieldLayout>::new();
+        let requested = references
+            .into_iter()
+            .filter_map(ContextEntryRef::scope)
+            .collect::<BTreeSet<_>>();
+        for name in &requested {
+            if !declarations
+                .iter()
+                .any(|declaration| &declaration.name == *name)
+            {
+                return Err(invalid(format!("unknown composite context entry `{name}`")));
+            }
+        }
+        let selected = declarations
+            .iter()
+            .filter(|declaration| requested.contains(&declaration.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let required = selected
+            .iter()
+            .flat_map(|declaration| &declaration.definition.0)
+            .map(|part| ContextFieldLayout {
+                name: part.reference().name().clone(),
+                domain: part.domain(),
+            })
+            .collect::<BTreeSet<_>>();
+        for field in required {
+            if !fields.iter().any(|existing| {
+                existing.domain == field.domain && existing.matches_name(&field.name)
+            }) {
+                _ = fields.insert(field);
+            }
+        }
+        Self::compile(fields, &selected)
+    }
+
     /// Compile one pipeline's fields and entry declarations.
     pub fn compile(
         fields: impl IntoIterator<Item = ContextFieldLayout>,
@@ -195,27 +269,16 @@ impl ContextLayout {
                     )));
                 }
             };
-            if declaration.definition.0.is_empty() {
-                return Err(invalid(format!(
-                    "context entry `{}` must contain at least one member",
-                    declaration.name
-                )));
+            let errors = declaration
+                .definition
+                .validation_errors(&format!("context entry `{}`", declaration.name));
+            if !errors.is_empty() {
+                return Err(invalid(errors.join("; ")));
             }
-            let mut member_names = BTreeSet::new();
             let mut members = Vec::with_capacity(declaration.definition.0.len());
             let mut conditions = Vec::new();
             for part in &declaration.definition.0 {
-                let (domain, condition_value) = match part {
-                    ContextEntryPart::TransportHeader { .. } => {
-                        (ContextDomain::TransportHeader, None)
-                    }
-                    ContextEntryPart::AuthorizedIdentity { .. } => {
-                        (ContextDomain::AuthorizedIdentity, None)
-                    }
-                    ContextEntryPart::TransportHeaderMatch { value, .. } => {
-                        (ContextDomain::TransportHeader, Some(value))
-                    }
-                };
+                let domain = part.domain();
                 let reference = part.reference();
                 if reference.scope().is_some() {
                     return Err(invalid(format!(
@@ -223,29 +286,29 @@ impl ContextLayout {
                         declaration.name
                     )));
                 }
-                let field = fields
-                    .binary_search(&ContextFieldLayout {
-                        name: reference.name().clone(),
-                        domain,
-                    })
-                    .map(ContextFieldId)
-                    .map_err(|_| {
+                let mut matching = fields.iter().enumerate().filter(|(_, field)| {
+                    field.domain == domain && field.matches_name(reference.name())
+                });
+                let field = matching
+                    .next()
+                    .map(|(index, _)| ContextFieldId(index))
+                    .ok_or_else(|| {
                         invalid(format!(
                             "context entry `{}` requires unavailable {:?} domain `{reference}`",
                             declaration.name, domain
                         ))
                     })?;
-                if let Some(value) = condition_value {
+                if matching.next().is_some() {
+                    return Err(invalid(format!(
+                        "context entry `{}` has ambiguous {:?} reference `{reference}`",
+                        declaration.name, domain
+                    )));
+                }
+                if let ContextEntryPart::TransportHeaderMatch { value, .. } = part {
                     let condition = ContextCondition {
                         field,
                         value: value.as_bytes().into(),
                     };
-                    if conditions.contains(&condition) {
-                        return Err(invalid(format!(
-                            "context entry `{}` repeats condition for `{reference}`",
-                            declaration.name
-                        )));
-                    }
                     conditions.push(condition);
                     continue;
                 }
@@ -253,12 +316,6 @@ impl ContextLayout {
                     .member_name()
                     .expect("value-bearing context part has a member name")
                     .clone();
-                if !member_names.insert(name.clone()) {
-                    return Err(invalid(format!(
-                        "context entry `{}` repeats member `{name}`",
-                        declaration.name
-                    )));
-                }
                 if members
                     .iter()
                     .any(|member: &ContextMember| member.field == field)
@@ -270,14 +327,9 @@ impl ContextLayout {
                 }
                 members.push(ContextMember { name, field });
             }
-            if members.is_empty() {
-                return Err(invalid(format!(
-                    "context entry `{}` must contain at least one value-bearing member",
-                    declaration.name
-                )));
-            }
             members.sort_unstable_by(|left, right| left.name.cmp(&right.name));
             conditions.sort_unstable();
+            conditions.dedup();
             let id = ContextEntryId(entries.len());
             _ = vacant_name.insert(ContextNameId::Composite(id));
             entries.push(ContextEntryLayout {
@@ -304,6 +356,38 @@ impl ContextLayout {
     #[must_use]
     pub fn entries(&self) -> &[ContextEntryLayout] {
         &self.entries
+    }
+
+    /// Evaluates a composite atomically, including members not selected for output.
+    #[must_use]
+    pub fn is_present(&self, entry: ContextEntryId, context: &impl ContextValues) -> bool {
+        let entry = &self.entries[entry.index()];
+        let headers = context.transport_headers();
+        entry.members.iter().all(|member| {
+            let field = &self.fields[member.field.index()];
+            match field.domain {
+                ContextDomain::TransportHeader => headers.is_some_and(|headers| {
+                    headers.iter().any(|header| {
+                        header
+                            .name
+                            .as_str()
+                            .eq_ignore_ascii_case(field.name.as_str())
+                    })
+                }),
+                ContextDomain::AuthorizedIdentity => context.has_authorized_identity(&field.name),
+            }
+        }) && entry.conditions.iter().all(|condition| {
+            let field = &self.fields[condition.field.index()];
+            headers.is_some_and(|headers| {
+                headers.iter().any(|header| {
+                    header
+                        .name
+                        .as_str()
+                        .eq_ignore_ascii_case(field.name.as_str())
+                        && header.value.bytes == condition.value.as_ref()
+                })
+            })
+        })
     }
 
     /// Resolve a primitive, whole composite, or qualified composite member.
@@ -347,6 +431,17 @@ impl ContextLayout {
                     fields: Box::new([field]),
                 })
             }
+        }
+    }
+}
+
+impl ContextFieldLayout {
+    fn matches_name(&self, name: &ContextEntryName) -> bool {
+        match self.domain {
+            ContextDomain::TransportHeader => {
+                self.name.as_str().eq_ignore_ascii_case(name.as_str())
+            }
+            ContextDomain::AuthorizedIdentity => self.name == *name,
         }
     }
 }
@@ -748,9 +843,15 @@ mod tests {
                 condition_only,
                 "must contain at least one value-bearing member",
             ),
-            (duplicate_member, "repeats member `customer_id`"),
-            (duplicate_source, "repeats `customer`"),
-            (duplicate_condition, "repeats condition for `workspace`"),
+            (
+                duplicate_member,
+                "produces duplicate member name `customer_id`",
+            ),
+            (duplicate_source, "repeats reference `customer`"),
+            (
+                duplicate_condition,
+                "repeats transport-header condition for `workspace`",
+            ),
         ] {
             assert_compile_error(fields(), &[declaration], expected);
         }
@@ -834,5 +935,80 @@ mod tests {
         };
         assert_eq!(layout.entries()[entry_id.index()].conditions.len(), 2);
         assert_eq!(projection_names(&layout, &member), ["workspace"]);
+    }
+
+    /// Scenario: a header reference varies in case while an identity reference does not.
+    /// Guarantees: transport matching preserves stored spelling without folding identity names.
+    #[test]
+    fn reference_matching_respects_source_domains() {
+        let mut declaration = entry();
+        declaration.definition.0[1] = ContextEntryPart::TransportHeader {
+            name: reference("WORKSPACE"),
+            store_as: None,
+        };
+        let layout = compile(fields(), &[declaration.clone()]);
+        let projection = layout
+            .resolve(&reference("product_user:WORKSPACE"))
+            .expect("member");
+        assert_eq!(projection_names(&layout, &projection), ["workspace"]);
+        declaration.definition.0[0] = ContextEntryPart::AuthorizedIdentity {
+            name: reference("CUSTOMER"),
+            store_as: None,
+        };
+        assert_compile_error(fields(), &[declaration], "unavailable AuthorizedIdentity");
+    }
+
+    /// Scenario: distinct stored header names differ only by ASCII case.
+    /// Guarantees: a case-insensitive composite reference reports ambiguity rather than picking one.
+    #[test]
+    fn ambiguous_transport_reference_is_rejected() {
+        let mut sources = fields();
+        sources.push(ContextFieldLayout {
+            name: name("WORKSPACE"),
+            domain: ContextDomain::TransportHeader,
+        });
+        assert_compile_error(sources, &[entry()], "ambiguous TransportHeader reference");
+    }
+
+    /// Scenario: a pipeline consumes one composite while another has unsupported nested references.
+    /// Guarantees: only live references activate definitions, and external source slots may be absent.
+    #[test]
+    fn consumer_selection_leaves_unused_definitions_inert() {
+        let mut unused = entry();
+        unused.name = name("unused");
+        unused.definition.0[0] = ContextEntryPart::AuthorizedIdentity {
+            name: reference("other:identity"),
+            store_as: None,
+        };
+        let selected = reference("product_user:workspace");
+        let layout = ContextLayout::for_references(&[entry(), unused], [&selected])
+            .expect("only selected entry compiles");
+        assert_eq!(layout.entries().len(), 1);
+        assert_eq!(layout.fields().len(), 2);
+        let ContextNameId::Composite(entry) = layout.resolve(&selected).expect("member").presence()
+        else {
+            panic!("expected composite");
+        };
+        assert!(!layout.is_present(entry, &TransportHeaders::new()));
+    }
+
+    /// Scenario: member and condition spellings differ in case and their declaration order changes.
+    /// Guarantees: reserved field names, condition gates, and resulting layouts are deterministic.
+    #[test]
+    fn inferred_transport_fields_are_canonical() {
+        let mut declaration = entry();
+        declaration
+            .definition
+            .0
+            .push(ContextEntryPart::TransportHeaderMatch {
+                name: reference("WORKSPACE"),
+                value: "production".to_owned(),
+            });
+        let selected = reference("product_user:workspace");
+        let first =
+            ContextLayout::for_references(&[declaration.clone()], [&selected]).expect("original");
+        declaration.definition.0.reverse();
+        let second = ContextLayout::for_references(&[declaration], [&selected]).expect("reordered");
+        assert_eq!(first, second);
     }
 }

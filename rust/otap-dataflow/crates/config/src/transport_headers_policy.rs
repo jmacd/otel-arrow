@@ -12,7 +12,10 @@
 //! TODO: Implement the sensitive capability for headers
 
 use crate::context::{ContextEntryName, ContextEntryRef};
-use crate::context_policy::{ContextEntryDeclaration, ContextEntryPart};
+use crate::context_layout::{
+    ContextDomain, ContextEntryId, ContextLayout, ContextNameId, ContextValues,
+};
+use crate::context_policy::ContextEntryDeclaration;
 use crate::transport_headers::{CapturedTransportHeader, TransportHeaders, ValueKind};
 use hashbrown::{Equivalent, HashMap};
 use http::{HeaderMap, HeaderName};
@@ -22,6 +25,7 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 // -- Stats types --------------------------------------------------------------
 
@@ -445,9 +449,8 @@ pub enum ValueKindConfig {
 ///
 /// Deserialization and [`Self::new`] produce an unresolved policy. Unqualified
 /// named selectors work immediately, but qualified `composite:member`
-/// selectors remain inactive until [`Self::compile_context`] resolves them
-/// against the visible context declarations. The engine performs this
-/// compilation before installing exporter bindings.
+/// selectors require [`Self::compile_context`] or the shared pipeline compiler
+/// to resolve them against visible context declarations before use.
 #[derive(
     Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash, PartialOrd, Ord,
 )]
@@ -463,22 +466,20 @@ pub struct HeaderPropagationPolicy {
     #[serde(skip)]
     #[schemars(skip)]
     compiled_named: Vec<CompiledNamedPropagation>,
+    /// Immutable layout shared by bindings; no cross-core mutable state.
+    #[serde(skip)]
+    #[schemars(skip)]
+    layout: Option<Arc<ContextLayout>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct CompiledNamedPropagation {
     source_name: ContextEntryName,
     output_name: ContextEntryName,
-    conditions: Vec<CompiledTransportHeaderMatch>,
+    entry: ContextEntryId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct CompiledTransportHeaderMatch {
-    name: ContextEntryName,
-    value: Box<[u8]>,
-}
-
-type ConditionMatchCache<'a> = SmallVec<[(&'a [CompiledTransportHeaderMatch], bool); 4]>;
+type ConditionMatchCache = SmallVec<[(ContextEntryId, bool); 4]>;
 
 impl HeaderPropagationPolicy {
     /// Creates an unresolved propagation policy from the default and overrides.
@@ -491,6 +492,7 @@ impl HeaderPropagationPolicy {
             default,
             overrides,
             compiled_named: Vec::new(),
+            layout: None,
         }
     }
 
@@ -499,69 +501,53 @@ impl HeaderPropagationPolicy {
     /// This step validates every qualified `composite:member` reference and
     /// installs the primitive transport-header bindings used by propagation.
     /// It is safe to call for policies containing only unqualified selectors.
-    pub fn compile_context(
-        mut self,
-        declarations: &[ContextEntryDeclaration],
-    ) -> Result<Self, String> {
+    pub fn compile_context(self, declarations: &[ContextEntryDeclaration]) -> Result<Self, String> {
+        let layout = ContextLayout::for_references(declarations, self.context_references())
+            .map_err(|error| error.to_string())?;
+        self.compile_layout(Arc::new(layout))
+    }
+
+    /// References requested by this propagation policy.
+    pub(crate) fn context_references(&self) -> impl Iterator<Item = &ContextEntryRef> {
+        self.default.selector.named.iter().flatten()
+    }
+
+    /// Resolves propagation-specific names and domains against the shared layout.
+    pub(crate) fn compile_layout(mut self, layout: Arc<ContextLayout>) -> Result<Self, String> {
         self.compiled_named.clear();
+        self.layout = None;
         let Some(references) = self.default.selector.named.as_ref() else {
             return Ok(self);
         };
         let mut selected_sources = HashMap::<Box<str>, ContextEntryRef>::new();
 
         for reference in references {
-            let Some(composite_name) = reference.scope() else {
+            let Some(_) = reference.scope() else {
                 register_named_source(&mut selected_sources, reference.name(), reference)?;
                 continue;
             };
-            let declaration = declarations
-                .iter()
-                .find(|declaration| declaration.name.as_str() == composite_name.as_str())
-                .ok_or_else(|| format!("unknown composite context entry `{composite_name}`"))?;
-
-            let mut source_name = None;
-            let mut conditions = Vec::new();
-            for part in &declaration.definition.0 {
-                match part {
-                    ContextEntryPart::TransportHeader { name, store_as } => {
-                        if store_as.as_ref().unwrap_or_else(|| name.name()) == reference.name() {
-                            source_name = Some(unqualified_context_name(
-                                name,
-                                "transport-header composite member",
-                            )?);
-                        }
-                    }
-                    ContextEntryPart::AuthorizedIdentity { name, store_as } => {
-                        if store_as.as_ref().unwrap_or_else(|| name.name()) == reference.name() {
-                            return Err(format!(
-                                "context entry reference `{reference}` selects authorized-identity member `{name}`, which cannot be propagated as a transport header"
-                            ));
-                        }
-                    }
-                    ContextEntryPart::TransportHeaderMatch { name, value } => {
-                        conditions.push(CompiledTransportHeaderMatch {
-                            name: unqualified_context_name(
-                                name,
-                                "transport-header match condition",
-                            )?,
-                            value: value.as_bytes().into(),
-                        });
-                    }
-                }
+            let projection = layout
+                .resolve(reference)
+                .map_err(|error| error.to_string())?;
+            let ContextNameId::Composite(entry) = projection.presence() else {
+                unreachable!("qualified references resolve to composites");
+            };
+            let field = &layout.fields()[projection.fields()[0].index()];
+            let source_name = field.name.clone();
+            if field.domain != ContextDomain::TransportHeader {
+                return Err(format!(
+                    "context entry reference `{reference}` selects authorized-identity member `{source_name}`, which cannot be propagated as a transport header"
+                ));
             }
-            conditions.sort_unstable();
-
-            let source_name = source_name.ok_or_else(|| {
-                format!(
-                    "context entry reference `{reference}` does not select a transport-header member"
-                )
-            })?;
             register_named_source(&mut selected_sources, &source_name, reference)?;
             self.compiled_named.push(CompiledNamedPropagation {
                 source_name,
                 output_name: reference.name().clone(),
-                conditions,
+                entry,
             });
+        }
+        if !self.compiled_named.is_empty() {
+            self.layout = Some(layout);
         }
         Ok(self)
     }
@@ -617,30 +603,45 @@ impl HeaderPropagationPolicy {
     /// Qualified `composite:member` selectors are active only after
     /// [`Self::compile_context`] has resolved the policy. Unqualified selectors
     /// do not require compilation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if qualified selectors were not compiled before use.
     pub fn propagate<'a>(
         &'a self,
-        headers: &'a TransportHeaders,
+        context: &'a impl ContextValues,
     ) -> impl Iterator<Item = PropagatedHeader<'a>> {
+        assert!(
+            self.layout.is_some()
+                || !self
+                    .context_references()
+                    .any(|reference| reference.scope().is_some()),
+            "qualified context propagation requires compiled bindings"
+        );
         let mut condition_matches = ConditionMatchCache::new();
-        headers.iter().filter_map(move |header| {
-            let (action, name_strategy, selected_name) = self.resolve_action_for_header(
-                headers,
-                header.name.as_str(),
-                &mut condition_matches,
-            );
-            if action == PropagationAction::Drop {
-                return None;
-            }
-            let header_name = match name_strategy {
-                NameStrategy::StoredName => selected_name.unwrap_or(header.name.as_str()),
-                NameStrategy::Preserve => header.wire_name(),
-            };
-            Some(PropagatedHeader {
-                header_name,
-                value_kind: header.value.value_kind,
-                value: header.value.bytes,
+        context
+            .transport_headers()
+            .into_iter()
+            .flat_map(TransportHeaders::iter)
+            .filter_map(move |header| {
+                let (action, name_strategy, selected_name) = self.resolve_action_for_header(
+                    context,
+                    header.name.as_str(),
+                    &mut condition_matches,
+                );
+                if action == PropagationAction::Drop {
+                    return None;
+                }
+                let header_name = match name_strategy {
+                    NameStrategy::StoredName => selected_name.unwrap_or(header.name.as_str()),
+                    NameStrategy::Preserve => header.wire_name(),
+                };
+                Some(PropagatedHeader {
+                    header_name,
+                    value_kind: header.value.value_kind,
+                    value: header.value.bytes,
+                })
             })
-        })
     }
 
     fn resolve_static_action_for_name(
@@ -676,9 +677,9 @@ impl HeaderPropagationPolicy {
 
     fn resolve_action_for_header<'a>(
         &'a self,
-        headers: &'a TransportHeaders,
+        context: &'a impl ContextValues,
         name: &str,
-        condition_matches: &mut ConditionMatchCache<'a>,
+        condition_matches: &mut ConditionMatchCache,
     ) -> (PropagationAction, NameStrategy, Option<&'a str>) {
         for ov in &self.overrides {
             if ov
@@ -699,7 +700,22 @@ impl HeaderPropagationPolicy {
             if !name.eq_ignore_ascii_case(binding.source_name.as_str()) {
                 continue;
             }
-            if binding.matches_cached(headers, condition_matches) {
+            let present = match condition_matches
+                .iter()
+                .find(|(entry, _)| *entry == binding.entry)
+            {
+                Some((_, present)) => *present,
+                None => {
+                    let present = self
+                        .layout
+                        .as_ref()
+                        .expect("compiled named bindings have a layout")
+                        .is_present(binding.entry, context);
+                    condition_matches.push((binding.entry, present));
+                    present
+                }
+            };
+            if present {
                 return (
                     self.default.action,
                     self.default.name,
@@ -727,49 +743,6 @@ fn register_named_source(
     }
     let _ = selected_sources.insert(key, reference.clone());
     Ok(())
-}
-
-impl CompiledNamedPropagation {
-    fn matches_cached<'a>(
-        &'a self,
-        headers: &TransportHeaders,
-        condition_matches: &mut ConditionMatchCache<'a>,
-    ) -> bool {
-        condition_matches
-            .iter()
-            .find_map(|(conditions, matches)| {
-                (*conditions == self.conditions.as_slice()).then_some(*matches)
-            })
-            .unwrap_or_else(|| {
-                let matches = self.matches(headers);
-                condition_matches.push((self.conditions.as_slice(), matches));
-                matches
-            })
-    }
-
-    fn matches(&self, headers: &TransportHeaders) -> bool {
-        self.conditions.iter().all(|condition| {
-            headers.iter().any(|header| {
-                header
-                    .name
-                    .as_str()
-                    .eq_ignore_ascii_case(condition.name.as_str())
-                    && header.value.bytes == condition.value.as_ref()
-            })
-        })
-    }
-}
-
-fn unqualified_context_name(
-    reference: &ContextEntryRef,
-    purpose: &str,
-) -> Result<ContextEntryName, String> {
-    if reference.scope().is_some() {
-        return Err(format!(
-            "{purpose} `{reference}` must reference a primitive context entry"
-        ));
-    }
-    Ok(reference.name().clone())
 }
 
 /// Default propagation behavior.
@@ -1373,7 +1346,7 @@ named:
 
     /// Scenario: a named selector references a composite transport-header member with a condition.
     /// Guarantees: names ignore ASCII case, values match exactly, all conditions pass, duplicate
-    /// values use any-match semantics, and unrelated value members are not evaluated.
+    /// values use any-match semantics, and unselected identity members must also be present.
     #[test]
     fn composite_transport_header_propagation_requires_matching_conditions() {
         let policy: HeaderPropagationPolicy = serde_yaml::from_str(
@@ -1422,7 +1395,12 @@ default:
             context_name("region"),
             b"us-east",
         ));
-        let propagated = policy.propagate(&headers).collect::<Vec<_>>();
+        assert_eq!(policy.propagate(&headers).count(), 0);
+        let context = IdentityContext {
+            headers: &headers,
+            identity: &["customer_id"],
+        };
+        let propagated = policy.propagate(&context).collect::<Vec<_>>();
         assert_eq!(propagated.len(), 1);
         assert_eq!(propagated[0].header_name, "workspace_id");
         assert_eq!(propagated[0].value, b"acme");
@@ -1454,7 +1432,11 @@ default:
             b"us-east",
         ));
 
-        assert_eq!(policy.propagate(&headers).count(), 0);
+        let context = IdentityContext {
+            headers: &headers,
+            identity: &["customer_id"],
+        };
+        assert_eq!(policy.propagate(&context).count(), 0);
     }
 
     /// Scenario: duplicate selected-source values are propagated across repeated calls.
@@ -1495,7 +1477,11 @@ default:
             context_name("region"),
             b"us-east",
         ));
-        let propagated = policy.propagate(&headers).collect::<Vec<_>>();
+        let context = IdentityContext {
+            headers: &headers,
+            identity: &["customer_id"],
+        };
+        let propagated = policy.propagate(&context).collect::<Vec<_>>();
         assert_eq!(propagated.len(), 2);
         assert!(
             propagated
@@ -1506,8 +1492,8 @@ default:
         assert_eq!(propagated[1].value, b"beta");
     }
 
-    /// Scenario: two selected composite members share the same condition set.
-    /// Guarantees: propagation evaluates and caches that condition set only once per call.
+    /// Scenario: two selected members share one composite presence gate.
+    /// Guarantees: propagation evaluates and caches the whole gate only once per call.
     #[test]
     fn composite_transport_header_propagation_shares_conditions_across_bindings() {
         let policy: HeaderPropagationPolicy = serde_yaml::from_str(
@@ -1548,13 +1534,93 @@ entries:
             context_name("environment"),
             b"production",
         ));
+        for name in ["workspace", "account"] {
+            headers.push(crate::transport_headers::TransportHeader::text(
+                context_name(name),
+                b"present",
+            ));
+        }
         let mut condition_matches = ConditionMatchCache::new();
 
         assert_eq!(policy.compiled_named.len(), 2);
-        assert!(policy.compiled_named[0].matches_cached(&headers, &mut condition_matches));
+        assert_eq!(
+            policy
+                .resolve_action_for_header(&headers, "workspace", &mut condition_matches)
+                .0,
+            PropagationAction::Propagate
+        );
         assert_eq!(condition_matches.len(), 1);
-        assert!(policy.compiled_named[1].matches_cached(&headers, &mut condition_matches));
+        assert_eq!(
+            policy
+                .resolve_action_for_header(&headers, "account", &mut condition_matches)
+                .0,
+            PropagationAction::Propagate
+        );
         assert_eq!(condition_matches.len(), 1);
+    }
+
+    /// Scenario: two composites have identical conditions but require different identities.
+    /// Guarantees: cached presence never allows one composite's identity to satisfy another.
+    #[test]
+    fn composite_presence_cache_distinguishes_members() {
+        let context: crate::context_policy::ContextPolicy = serde_yaml::from_str(
+            r#"
+entries:
+  first:
+    - {type: transport_header, name: workspace}
+    - {type: authorized_identity, name: customer}
+    - {type: transport_header_match, name: environment, value: prod}
+  second:
+    - {type: transport_header, name: account}
+    - {type: authorized_identity, name: missing_identity}
+    - {type: transport_header_match, name: environment, value: prod}
+"#,
+        )
+        .expect("context policy");
+        let declarations = context
+            .entries
+            .into_iter()
+            .map(|(name, definition)| ContextEntryDeclaration {
+                scope: crate::context_policy::ContextScope::Engine,
+                name,
+                definition,
+            })
+            .collect::<Vec<_>>();
+        let policy: HeaderPropagationPolicy = serde_yaml::from_str(
+            "default:\n  selector: {type: named, named: ['first:workspace', 'second:account']}",
+        )
+        .expect("propagation policy");
+        let policy = policy.compile_context(&declarations).expect("compiled");
+        let mut headers = TransportHeaders::new();
+        for (name, value) in [
+            ("workspace", "acme"),
+            ("account", "beta"),
+            ("environment", "prod"),
+        ] {
+            headers.push(crate::transport_headers::TransportHeader::text(
+                context_name(name),
+                value.as_bytes(),
+            ));
+        }
+        let context = IdentityContext {
+            headers: &headers,
+            identity: &["customer"],
+        };
+        let propagated = policy.propagate(&context).collect::<Vec<_>>();
+        assert_eq!(propagated.len(), 1);
+        assert_eq!(propagated[0].header_name, "workspace");
+    }
+
+    /// Scenario: a caller tries to use a qualified selector without compiling its declaration.
+    /// Guarantees: misuse fails loudly rather than silently discarding selected headers.
+    #[test]
+    #[should_panic(expected = "qualified context propagation requires compiled bindings")]
+    fn uncompiled_composite_propagation_fails_fast() {
+        let policy: HeaderPropagationPolicy = serde_yaml::from_str(
+            "default:\n  selector: {type: named, named: ['tenant:workspace']}",
+        )
+        .expect("propagation policy");
+        let _ = policy.propagate(&TransportHeaders::new()).count();
     }
 
     /// Scenario: an override selects a primitive source whose composite conditions are absent.
@@ -1615,6 +1681,21 @@ entries:
             scope: crate::context_policy::ContextScope::Engine,
             name,
             definition,
+        }
+    }
+
+    struct IdentityContext<'a> {
+        headers: &'a TransportHeaders,
+        identity: &'a [&'a str],
+    }
+
+    impl ContextValues for IdentityContext<'_> {
+        fn transport_headers(&self) -> Option<&TransportHeaders> {
+            Some(self.headers)
+        }
+
+        fn has_authorized_identity(&self, name: &ContextEntryName) -> bool {
+            self.identity.contains(&name.as_str())
         }
     }
 
@@ -1701,7 +1782,10 @@ default:
             .compile_context(&declarations)
             .expect_err("duplicate source must fail");
         assert!(error.contains("`tenant_a:workspace_id` and `tenant_b:workspace_id`"));
-        assert!(error.contains("same transport-header entry `WORKSPACE`"));
+        assert!(
+            error.contains("same transport-header entry `WORKSPACE`")
+                || error.contains("same transport-header entry `workspace`")
+        );
     }
 
     fn composite_declarations_for_duplicate_source() -> Vec<ContextEntryDeclaration> {

@@ -3,7 +3,10 @@
 
 //! Configuration-only node declarations and compiled context bindings.
 
+use super::ContextLayout;
 use crate::authorized_identity_policy::AuthorizedIdentityPolicy;
+use crate::context_policy::ContextEntryDeclaration;
+use crate::engine::ResolvedOtelDataflowSpec;
 use crate::error::Error;
 use crate::transport_headers_policy::{
     CompiledHeaderCapturePolicy, HeaderCapturePolicy, HeaderPropagationPolicy,
@@ -221,6 +224,70 @@ pub struct PreparedContext {
     pub runtime_requirements: ContextRuntimeRequirements,
     /// Node bindings compiled using the selected engine requirements.
     pub bindings: Arc<CompiledContextBindings>,
+}
+
+impl PreparedContext {
+    /// Resolves shared layouts before deriving retention requirements and node bindings.
+    ///
+    /// Candidate bindings use the installed retention profile so an update cannot
+    /// silently depend on original names that running receivers have discarded.
+    pub fn compile(
+        mut declarations: ContextDeclarationsByPipeline,
+        resolved: &ResolvedOtelDataflowSpec,
+        installed: Option<&ContextRuntimeRequirements>,
+    ) -> Result<Self, Error> {
+        for pipeline in &resolved.pipelines {
+            let key = PipelineKey::new(
+                pipeline.pipeline_group_id.clone(),
+                pipeline.pipeline_id.clone(),
+            );
+            let nodes = declarations
+                .get_mut(&key)
+                .ok_or_else(|| Error::InvalidUserConfig {
+                    error: format!("missing context declarations for pipeline {key:?}"),
+                })?;
+            compile_pipeline(nodes, &pipeline.policies.context)?;
+        }
+        let runtime_requirements = ContextRuntimeRequirements::compile(&declarations);
+        let bindings = CompiledContextBindings::compile(
+            declarations,
+            installed.unwrap_or(&runtime_requirements),
+        );
+        Ok(Self {
+            runtime_requirements,
+            // Immutable startup/live-update snapshots are shared with running pipelines.
+            bindings: Arc::new(bindings),
+        })
+    }
+}
+
+fn compile_pipeline(
+    nodes: &mut HashMap<ConfigNodeId, NodeContextDeclarations>,
+    entries: &[ContextEntryDeclaration],
+) -> Result<(), Error> {
+    let references = nodes
+        .values()
+        .flat_map(NodeContextDeclarations::iter)
+        .filter_map(|declaration| match declaration {
+            ContextDeclaration::HeaderPropagation { policy } => Some(policy),
+            _ => None,
+        })
+        .flat_map(HeaderPropagationPolicy::context_references);
+    // Bindings share an immutable layout, never shared mutable request state.
+    let layout = Arc::new(ContextLayout::for_references(entries, references)?);
+    for declarations in nodes.values_mut() {
+        *declarations = std::mem::take(declarations)
+            .into_iter()
+            .map(|declaration| match declaration {
+                ContextDeclaration::HeaderPropagation { policy } => policy
+                    .compile_layout(layout.clone())
+                    .map(|policy| ContextDeclaration::HeaderPropagation { policy })
+                    .map_err(|error| Error::InvalidUserConfig { error }),
+                declaration => Ok(declaration),
+            })
+            .collect::<Result<NodeContextDeclarations, Error>>()?;
+    }
+    Ok(())
 }
 
 impl ContextRuntimeRequirements {

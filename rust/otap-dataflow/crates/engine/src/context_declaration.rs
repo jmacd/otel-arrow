@@ -21,9 +21,6 @@ use otel_arrow_dfe_config::node::{NodeKind, NodeUserConfig};
 use otel_arrow_dfe_config::transport_headers_policy::TransportHeadersPolicy;
 use std::collections::HashMap;
 
-use otel_arrow_dfe_config::context_policy::ContextEntryDeclaration as ConfigContextEntryDeclaration;
-use std::sync::Arc;
-
 /// Derives context declarations from component configuration.
 #[derive(Clone, Copy)]
 pub struct ContextDeclarationProvider {
@@ -86,12 +83,8 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         resolved: &ResolvedOtelDataflowSpec,
     ) -> Result<PreparedContext, EngineError> {
         let declarations = self.context_declarations(resolved)?;
-        let runtime_requirements = ContextRuntimeRequirements::compile(&declarations);
-        let bindings = Self::compile_bindings(declarations, &runtime_requirements);
-        Ok(PreparedContext {
-            runtime_requirements,
-            bindings,
-        })
+        PreparedContext::compile(declarations, resolved, None)
+            .map_err(|error| EngineError::ConfigError(Box::new(error)))
     }
 
     /// Compiles candidate bindings using the immutable installed requirements.
@@ -101,19 +94,8 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         installed_requirements: &ContextRuntimeRequirements,
     ) -> Result<PreparedContext, EngineError> {
         let declarations = self.context_declarations(resolved)?;
-        let runtime_requirements = ContextRuntimeRequirements::compile(&declarations);
-        let bindings = Self::compile_bindings(declarations, installed_requirements);
-        Ok(PreparedContext {
-            runtime_requirements,
-            bindings,
-        })
-    }
-
-    fn compile_bindings(
-        declarations: ContextDeclarationsByPipeline,
-        requirements: &ContextRuntimeRequirements,
-    ) -> Arc<CompiledContextBindings> {
-        Arc::new(CompiledContextBindings::compile(declarations, requirements))
+        PreparedContext::compile(declarations, resolved, Some(installed_requirements))
+            .map_err(|error| EngineError::ConfigError(Box::new(error)))
     }
 
     fn context_declarations(
@@ -138,8 +120,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                     node_config,
                     &pipeline.policies.transport_headers,
                     &pipeline.policies.authorized_identity,
-                    &pipeline.policies.context,
-                )?;
+                );
                 let declarations = component_declarations
                     .into_iter()
                     .chain(wrapper_declarations)
@@ -156,9 +137,8 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         node: &NodeUserConfig,
         pipeline_policy: &Option<TransportHeadersPolicy>,
         authorized_identity: &Option<AuthorizedIdentityPolicy>,
-        context: &[ConfigContextEntryDeclaration],
-    ) -> Result<NodeContextDeclarations, EngineError> {
-        let declarations = match node.kind() {
+    ) -> NodeContextDeclarations {
+        match node.kind() {
             NodeKind::Receiver => node
                 .header_capture
                 .as_ref()
@@ -186,23 +166,12 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                 });
                 policy
                     .cloned()
-                    .map(|policy| {
-                        policy
-                            .compile_context(context)
-                            .map(|policy| ContextDeclaration::HeaderPropagation { policy })
-                            .map_err(|error| {
-                                EngineError::ConfigError(Box::new(Error::InvalidUserConfig {
-                                    error,
-                                }))
-                            })
-                    })
-                    .transpose()?
+                    .map(|policy| ContextDeclaration::HeaderPropagation { policy })
                     .into_iter()
                     .collect()
             }
             NodeKind::Processor => NodeContextDeclarations::default(),
-        };
-        Ok(declarations)
+        }
     }
 
     fn node_context_declarations(
@@ -270,11 +239,13 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otel_arrow_dfe_config::context_policy::ContextEntryDeclaration as ConfigContextEntryDeclaration;
     use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders};
     use otel_arrow_dfe_config::transport_headers_policy::{
         CaptureDefaults, CaptureRule, HeaderCapturePolicy, HeaderPropagationPolicy,
     };
     use otel_arrow_dfe_config::{ContextEntryName, NodeId as ConfigNodeId};
+    use std::sync::Arc;
 
     /// Typed component configuration used to exercise declaration validation.
     #[derive(serde::Deserialize)]
@@ -728,9 +699,7 @@ groups:
                 &receiver,
                 &Some(pipeline_policy.clone()),
                 &Some(identity_policy.clone()),
-                &[],
-            )
-            .expect("wrapper declarations"),
+            ),
             [
                 ContextDeclaration::HeaderCapture {
                     policy: node_capture,
@@ -749,9 +718,7 @@ groups:
                 &receiver,
                 &Some(pipeline_policy.clone()),
                 &Some(identity_policy.clone()),
-                &[],
-            )
-            .expect("wrapper declarations"),
+            ),
             [
                 ContextDeclaration::HeaderCapture {
                     policy: pipeline_policy.header_capture.clone(),
@@ -772,9 +739,7 @@ groups:
                 &exporter,
                 &Some(pipeline_policy.clone()),
                 &Some(identity_policy.clone()),
-                &[],
-            )
-            .expect("wrapper declarations"),
+            ),
             [ContextDeclaration::HeaderPropagation {
                 policy: node_propagation,
             }]
@@ -788,9 +753,7 @@ groups:
                 &exporter,
                 &Some(pipeline_policy.clone()),
                 &Some(identity_policy),
-                &[],
-            )
-            .expect("wrapper declarations"),
+            ),
             [ContextDeclaration::HeaderPropagation {
                 policy: pipeline_policy.header_propagation,
             }]
@@ -800,7 +763,7 @@ groups:
     }
 
     /// Scenario: an exporter selects a conditional composite transport-header member.
-    /// Guarantees: wrapper compilation resolves the visible declaration before installing policy.
+    /// Guarantees: collected wrapper declarations use the shared compiler before installing policy.
     #[test]
     fn wrapper_compiles_conditional_composite_header_propagation() {
         let context: otel_arrow_dfe_config::context_policy::ContextPolicy = serde_yaml::from_str(
@@ -836,18 +799,17 @@ default:
             .expect("valid propagation policy"),
         );
 
-        let declarations = PipelineFactory::<()>::wrapper_context_declarations(
-            &exporter,
-            &None,
-            &None,
-            &[declaration],
-        )
-        .expect("wrapper declarations");
+        let declarations =
+            PipelineFactory::<()>::wrapper_context_declarations(&exporter, &None, &None);
         let ContextDeclaration::HeaderPropagation { policy } =
             declarations.iter().next().expect("propagation declaration")
         else {
             panic!("expected header propagation declaration");
         };
+        let policy = policy
+            .clone()
+            .compile_context(&[declaration])
+            .expect("compiled policy");
         let mut headers = TransportHeaders::new();
         headers.push(TransportHeader::text(context_name("workspace"), b"acme"));
         assert_eq!(policy.propagate(&headers).count(), 0);
@@ -886,6 +848,8 @@ default:
             context_name("environment"),
             b"production",
         ));
+        assert_eq!(policy.propagate(&headers).count(), 0);
+        headers.push(TransportHeader::text(context_name("account"), b"customer"));
         let propagated = policy.propagate(&headers).collect::<Vec<_>>();
         assert_eq!(propagated.len(), 1);
         assert_eq!(propagated[0].header_name, "workspace_id");
@@ -913,6 +877,19 @@ default:
             !installed
                 .bindings
                 .pipeline_bindings_match(&member_candidate.bindings, &pipeline)
+        );
+
+        let changed_unselected = resolve_conditional_pipeline(
+            &current_composite.replace("name: account,", "name: other_account,"),
+            "tenant:workspace_id",
+        );
+        let unselected_candidate = factory
+            .compile_candidate_context(&changed_unselected, &installed.runtime_requirements)
+            .expect("changed presence gate compiles");
+        assert!(
+            !installed
+                .bindings
+                .pipeline_bindings_match(&unselected_candidate.bindings, &pipeline)
         );
     }
 
@@ -947,6 +924,132 @@ default:
         );
     }
 
+    /// Scenario: unused composite definitions change while an exporter keeps the same binding.
+    /// Guarantees: startup leaves unused definitions inert and candidate bindings remain compatible.
+    #[test]
+    fn full_yaml_compilation_ignores_unused_composites() {
+        let composite = "[{type: transport_header, name: workspace}]";
+        let original = conditional_pipeline_yaml(composite, "tenant:workspace");
+        let changed = original.replace(
+            "tenant: ",
+            "unused: [{type: transport_header, name: unsupported:nested}]\n      tenant: ",
+        );
+        let resolve = |yaml: &str| {
+            otel_arrow_dfe_config::engine::OtelDataflowSpec::from_yaml(yaml)
+                .expect("valid config")
+                .resolve()
+        };
+        let factory = test_pipeline_factory();
+        let installed = factory
+            .compile_initial_context(&resolve(&original))
+            .expect("initial");
+        let candidate = factory
+            .compile_candidate_context(&resolve(&changed), &installed.runtime_requirements)
+            .expect("unused nested definition stays inert");
+        assert!(
+            installed
+                .bindings
+                .pipeline_bindings_match(&candidate.bindings, &pipeline("default", "main"))
+        );
+    }
+
+    /// Scenario: node capture overrides mask a conflicting pipeline capture alias.
+    /// Guarantees: binding compilation preserves capture precedence and original wire names.
+    #[test]
+    fn full_yaml_compilation_uses_effective_capture_and_retention() {
+        let yaml = conditional_pipeline_yaml(
+            "[{type: transport_header, name: WORKSPACE, store_as: workspace_id}]",
+            "tenant:workspace_id",
+        )
+        .replace("name: stored_name", "name: preserve")
+        .replace(
+            "          receiver:\n",
+            "          receiver:\n            header_capture:\n              headers:\n                - match_names: [X-Workspace]\n                  store_as: Workspace\n",
+        )
+        .replace(
+            "policies:\n",
+            "policies:\n  transport_headers:\n    header_capture:\n      headers:\n        - match_names: [X-Workspace]\n          store_as: customer\n  authorized_identity:\n    - claim: sub\n      store_as: customer\n",
+        );
+        let resolved = otel_arrow_dfe_config::engine::OtelDataflowSpec::from_yaml(&yaml)
+            .expect("valid config")
+            .resolve();
+        let installed = test_pipeline_factory()
+            .compile_initial_context(&resolved)
+            .expect("effective aliases do not collide");
+        let key = pipeline("default", "main");
+        let capture = installed
+            .bindings
+            .header_capture_policy(&key, &"receiver".into())
+            .expect("capture");
+        let propagation = installed
+            .bindings
+            .header_propagation_policy(&key, &"exporter".into())
+            .expect("propagation");
+        let mut headers = TransportHeaders::new();
+        assert!(
+            capture
+                .capture_from_pairs(
+                    [("X-Workspace", b"acme".as_slice())].into_iter(),
+                    &mut headers
+                )
+                .is_none()
+        );
+        let output = propagation.propagate(&headers).collect::<Vec<_>>();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].header_name, "X-Workspace");
+        assert_eq!(headers.get(0).expect("captured").name.as_str(), "Workspace");
+    }
+
+    /// Scenario: capture aliases differ only by case and an unselected identity uses the same name.
+    /// Guarantees: composite compilation does not impose a new namespace on unrelated source policies.
+    #[test]
+    fn full_yaml_compilation_preserves_independent_source_names() {
+        let yaml = conditional_pipeline_yaml(
+            "[{type: transport_header, name: workspace, store_as: workspace_id}]",
+            "tenant:workspace_id",
+        ).replace(
+            "policies:\n",
+            "policies:\n  transport_headers:\n    header_capture:\n      headers:\n        - {match_names: [x-first], store_as: Workspace}\n        - {match_names: [x-second], store_as: workspace}\n  authorized_identity:\n    - {claim: sub, store_as: workspace}\n",
+        );
+        let resolved = otel_arrow_dfe_config::engine::OtelDataflowSpec::from_yaml(&yaml)
+            .expect("valid config")
+            .resolve();
+        let installed = test_pipeline_factory()
+            .compile_initial_context(&resolved)
+            .expect("independent source names remain valid");
+        let key = pipeline("default", "main");
+        let capture = installed
+            .bindings
+            .header_capture_policy(&key, &"receiver".into())
+            .expect("capture");
+        let policy = installed
+            .bindings
+            .header_propagation_policy(&key, &"exporter".into())
+            .expect("propagation");
+        let mut headers = TransportHeaders::new();
+        assert!(
+            capture
+                .capture_from_pairs(
+                    [
+                        ("x-first", b"first".as_slice()),
+                        ("x-second", b"second".as_slice())
+                    ]
+                    .into_iter(),
+                    &mut headers,
+                )
+                .is_none()
+        );
+        let output = policy.propagate(&headers).collect::<Vec<_>>();
+        assert_eq!(output.len(), 2);
+        assert!(
+            output
+                .iter()
+                .all(|header| header.header_name == "workspace_id")
+        );
+        assert_eq!(output[0].value, b"first");
+        assert_eq!(output[1].value, b"second");
+    }
+
     /// Scenario: complete YAML contains an invalid qualified propagation selector.
     /// Guarantees: startup reports the unknown composite, unknown member, or unsupported type.
     #[test]
@@ -960,7 +1063,7 @@ default:
             (
                 "[{type: transport_header, name: workspace, store_as: workspace_id}]",
                 "tenant:missing",
-                "context entry reference `tenant:missing` does not select a transport-header member",
+                "unknown context member `tenant:missing`",
             ),
             (
                 "[{type: authorized_identity, name: customer_id}]",
@@ -988,8 +1091,7 @@ default:
 
         for policy in [None, Some(AuthorizedIdentityPolicy::default())] {
             let declarations =
-                PipelineFactory::<()>::wrapper_context_declarations(&receiver, &None, &policy, &[])
-                    .expect("wrapper declarations");
+                PipelineFactory::<()>::wrapper_context_declarations(&receiver, &None, &policy);
             assert!(declarations.is_empty());
 
             let compiled = compiled_bindings(declarations);
