@@ -32,6 +32,7 @@
 //! To ensure scalability, the pipeline engine will start multiple instances of the same pipeline
 //! in parallel on different cores, each with its own exporter instance.
 
+use crate::context_declaration::CompiledHeaderPropagationPolicy;
 use crate::control::{AckMsg, NackMsg, NodeControlMsg};
 use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
 use crate::error::Error;
@@ -43,7 +44,6 @@ use crate::terminal_state::TerminalState;
 use crate::{Interests, ReceivedAtNode};
 use async_trait::async_trait;
 use otel_arrow_dfe_channel::error::RecvError;
-use otel_arrow_dfe_config::transport_headers_policy::HeaderPropagationPolicy;
 use otel_arrow_dfe_pdata_codec::CodecService;
 use otel_arrow_dfe_telemetry::error::Error as TelemetryError;
 use otel_arrow_dfe_telemetry::metrics::{MetricSet, MetricSetHandler};
@@ -103,7 +103,7 @@ pub struct EffectHandler<PData> {
     _pd: PhantomData<PData>,
     /// Immutable propagation policy shared by handler clones.
     /// `None` disables propagation.
-    propagation_policy: Option<Arc<HeaderPropagationPolicy>>,
+    propagation_policy: Option<Arc<CompiledHeaderPropagationPolicy>>,
 }
 
 impl<PData> EffectHandler<PData> {
@@ -137,12 +137,12 @@ impl<PData> EffectHandler<PData> {
     ///
     /// `None` disables propagation.
     #[must_use]
-    pub fn propagation_policy(&self) -> Option<&HeaderPropagationPolicy> {
+    pub fn propagation_policy(&self) -> Option<&CompiledHeaderPropagationPolicy> {
         self.propagation_policy.as_deref()
     }
 
     /// Sets the propagation policy for transport header filtering.
-    pub fn set_propagation_policy(&mut self, policy: Option<HeaderPropagationPolicy>) {
+    pub fn set_propagation_policy(&mut self, policy: Option<CompiledHeaderPropagationPolicy>) {
         self.propagation_policy = policy.map(Arc::new);
     }
 

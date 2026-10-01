@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared context declarations, binding compilation, and resolved projections.
+//! Resolved projections used by the engine's context declarations and bindings.
 //!
 //! A projection selects values without weakening its composite's presence gate:
 //! every member must exist in its declared domain and every condition must match.
@@ -12,18 +12,18 @@
 //! is evaluated against existing header and identity storage at read time;
 //! ingestion-time materialization and precomputed hashes are separate work.
 
-mod bindings;
-pub use bindings::*;
-
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::context::{ContextEntryName, ContextEntryRef};
-use crate::context_policy::{ContextEntryDeclaration, ContextEntryPart, ContextScope};
-use crate::error::Error;
-use crate::transport_headers::TransportHeaders;
+use otel_arrow_dfe_config::context::{ContextEntryName, ContextEntryRef};
+pub use otel_arrow_dfe_config::context_policy::ContextDomain;
+use otel_arrow_dfe_config::context_policy::{
+    ContextEntryDeclaration, ContextEntryPart, ContextScope,
+};
+use otel_arrow_dfe_config::error::Error;
+use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 
 /// A deterministic logical layout of primitive fields and composite entries.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ContextLayout {
     /// Primitive elements from each domain.
     fields: Box<[ContextFieldLayout]>,
@@ -31,15 +31,6 @@ pub struct ContextLayout {
     entries: Box<[ContextEntryLayout]>,
     /// Namespace containing both primitives and composites.
     names: BTreeMap<ContextEntryName, ContextNameId>,
-}
-
-/// Context domains are separate areas of configuration and authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum ContextDomain {
-    /// Untrusted transport metadata.
-    TransportHeader,
-    /// Verified authorization claim.
-    AuthorizedIdentity,
 }
 
 /// A primitive field is a named element in one authority domain.
@@ -449,7 +440,7 @@ impl ContextFieldLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context_policy::ContextEntryDefinition;
+    use otel_arrow_dfe_config::context_policy::ContextEntryDefinition;
 
     fn name(value: &str) -> ContextEntryName {
         value.try_into().expect("valid name")

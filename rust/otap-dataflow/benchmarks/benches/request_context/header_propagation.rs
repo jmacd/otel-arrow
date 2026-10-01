@@ -18,6 +18,7 @@ use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_config::transport_headers_policy::{
     CaptureDefaults, CaptureRule, HeaderCapturePolicy, HeaderPropagationPolicy,
 };
+use otel_arrow_dfe_engine::context_declaration::CompiledHeaderPropagationPolicy;
 use std::hint::black_box;
 
 const HEADER_COUNTS: [usize; 4] = [1, 4, 16, 32];
@@ -129,8 +130,8 @@ fn headers(header_count: usize) -> TransportHeaders {
     )
 }
 
-fn unqualified_policy(header_count: usize) -> HeaderPropagationPolicy {
-    serde_yaml::from_str(&format!(
+fn unqualified_policy(header_count: usize) -> CompiledHeaderPropagationPolicy {
+    let policy = serde_yaml::from_str(&format!(
         r#"
 default:
   selector:
@@ -139,14 +140,15 @@ default:
 "#,
         header_count - 1
     ))
-    .expect("valid unqualified propagation policy")
+    .expect("valid unqualified propagation policy");
+    CompiledHeaderPropagationPolicy::compile(policy, &[]).expect("compiled unqualified policy")
 }
 
 fn conditional_policy(
     header_count: usize,
     condition_count: usize,
     matches: bool,
-) -> HeaderPropagationPolicy {
+) -> CompiledHeaderPropagationPolicy {
     let policy: HeaderPropagationPolicy = serde_yaml::from_str(
         r#"
 default:
@@ -156,13 +158,15 @@ default:
 "#,
     )
     .expect("valid conditional propagation policy");
-    policy
-        .compile_context(&[conditional_declaration(
+    CompiledHeaderPropagationPolicy::compile(
+        policy,
+        &[conditional_declaration(
             header_count,
             condition_count,
             matches,
-        )])
-        .expect("conditional propagation policy compiles")
+        )],
+    )
+    .expect("conditional propagation policy compiles")
 }
 
 fn conditional_declaration(
@@ -221,7 +225,7 @@ fn duplicate_source_headers(source_count: usize) -> TransportHeaders {
     packed_headers(headers)
 }
 
-fn duplicate_source_policy(matches: bool) -> HeaderPropagationPolicy {
+fn duplicate_source_policy(matches: bool) -> CompiledHeaderPropagationPolicy {
     let policy: HeaderPropagationPolicy = serde_yaml::from_str(
         r#"
 default:
@@ -245,13 +249,15 @@ default:
             },
         });
     }
-    policy
-        .compile_context(&[ContextEntryDeclaration {
+    CompiledHeaderPropagationPolicy::compile(
+        policy,
+        &[ContextEntryDeclaration {
             scope: ContextScope::Engine,
             name: context_name("composite"),
             definition: ContextEntryDefinition(parts),
-        }])
-        .expect("duplicate-source propagation policy compiles")
+        }],
+    )
+    .expect("duplicate-source propagation policy compiles")
 }
 
 fn shared_condition_headers(binding_count: usize) -> TransportHeaders {
@@ -265,7 +271,7 @@ fn shared_condition_headers(binding_count: usize) -> TransportHeaders {
     packed_headers(headers)
 }
 
-fn shared_condition_policy(binding_count: usize, matches: bool) -> HeaderPropagationPolicy {
+fn shared_condition_policy(binding_count: usize, matches: bool) -> CompiledHeaderPropagationPolicy {
     let named = (0..binding_count)
         .map(|index| format!("composite:selected_{index}"))
         .collect::<Vec<_>>()
@@ -296,13 +302,15 @@ default:
             },
         });
     }
-    policy
-        .compile_context(&[ContextEntryDeclaration {
+    CompiledHeaderPropagationPolicy::compile(
+        policy,
+        &[ContextEntryDeclaration {
             scope: ContextScope::Engine,
             name: context_name("composite"),
             definition: ContextEntryDefinition(parts),
-        }])
-        .expect("shared-condition propagation policy compiles")
+        }],
+    )
+    .expect("shared-condition propagation policy compiles")
 }
 
 fn packed_headers(headers: Vec<(String, String)>) -> TransportHeaders {

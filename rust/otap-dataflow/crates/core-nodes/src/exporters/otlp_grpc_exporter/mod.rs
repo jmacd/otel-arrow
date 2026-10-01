@@ -1399,6 +1399,7 @@ mod tests {
         TransportHeader, TransportHeaders, ValueKind,
     };
     use otel_arrow_dfe_config::transport_headers_policy::PropagationSelectorType;
+    use otel_arrow_dfe_engine::context_declaration::CompiledHeaderPropagationPolicy;
     use otel_arrow_dfe_config::transport_headers_policy::{
         HeaderPropagationPolicy, PropagationAction, PropagationDefault, PropagationMatch,
         PropagationOverride, PropagationSelector,
@@ -3165,7 +3166,7 @@ mod tests {
 
     /// Helper: Creates an [`EffectHandler`] with an optional propagation policy set.
     fn make_effect_handler_with_policy(
-        policy: Option<HeaderPropagationPolicy>,
+        policy: Option<CompiledHeaderPropagationPolicy>,
     ) -> EffectHandler<OtapPdata> {
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let node_id = test_node("test-exporter");
@@ -3194,20 +3195,24 @@ mod tests {
     }
 
     /// Helper: Propagation policy that propagates all captured headers.
-    fn propagate_all_policy() -> HeaderPropagationPolicy {
-        HeaderPropagationPolicy::new(
-            PropagationDefault {
-                selector: PropagationSelector {
-                    selector_type: PropagationSelectorType::AllCaptured,
-                    named: None,
+    fn propagate_all_policy() -> CompiledHeaderPropagationPolicy {
+        CompiledHeaderPropagationPolicy::compile(
+            HeaderPropagationPolicy::new(
+                PropagationDefault {
+                    selector: PropagationSelector {
+                        selector_type: PropagationSelectorType::AllCaptured,
+                        named: None,
+                    },
+                    ..PropagationDefault::default()
                 },
-                ..PropagationDefault::default()
-            },
-            vec![],
+                vec![],
+            ),
+            &[],
         )
+        .expect("valid propagation policy")
     }
 
-    fn conditional_workspace_policy() -> HeaderPropagationPolicy {
+    fn conditional_workspace_policy() -> CompiledHeaderPropagationPolicy {
         let context: ContextPolicy = serde_json::from_value(serde_json::json!({
             "entries": {
                 "tenant": [
@@ -3236,13 +3241,15 @@ mod tests {
             }
         }))
         .expect("valid conditional propagation policy");
-        policy
-            .compile_context(&[ContextEntryDeclaration {
+        CompiledHeaderPropagationPolicy::compile(
+            policy,
+            &[ContextEntryDeclaration {
                 scope: ContextScope::Engine,
                 name,
                 definition,
-            }])
-            .expect("conditional propagation policy compiles")
+            }],
+        )
+        .expect("conditional propagation policy compiles")
     }
 
     /// Scenario: an outgoing gRPC header belongs to a composite requiring verified identity.
@@ -3267,8 +3274,7 @@ mod tests {
         )
         .expect("propagation policy");
         let handler = make_effect_handler_with_policy(Some(
-            policy
-                .compile_context(&declarations)
+            CompiledHeaderPropagationPolicy::compile(policy, &declarations)
                 .expect("compiled policy"),
         ));
         let mut headers = TransportHeaders::new();
@@ -3370,25 +3376,31 @@ mod tests {
         assert!(matching.get("workspace_id").is_none());
     }
 
+    /// Scenario: a compiled propagation policy excludes the authorization header.
+    /// Guarantees: the gRPC metadata contains the other selected headers but not authorization.
     #[test]
     fn test_build_grpc_metadata_drops_filtered_headers() {
-        let policy = HeaderPropagationPolicy::new(
-            PropagationDefault {
-                selector: PropagationSelector {
-                    selector_type: PropagationSelectorType::AllCaptured,
-                    named: None,
+        let policy = CompiledHeaderPropagationPolicy::compile(
+            HeaderPropagationPolicy::new(
+                PropagationDefault {
+                    selector: PropagationSelector {
+                        selector_type: PropagationSelectorType::AllCaptured,
+                        named: None,
+                    },
+                    ..PropagationDefault::default()
                 },
-                ..PropagationDefault::default()
-            },
-            vec![PropagationOverride {
-                match_rule: PropagationMatch {
-                    stored_names: vec![context_name("authorization")],
-                },
-                action: PropagationAction::Drop,
-                name: None,
-                on_error: None,
-            }],
-        );
+                vec![PropagationOverride {
+                    match_rule: PropagationMatch {
+                        stored_names: vec![context_name("authorization")],
+                    },
+                    action: PropagationAction::Drop,
+                    name: None,
+                    on_error: None,
+                }],
+            ),
+            &[],
+        )
+        .expect("valid propagation policy");
         let handler = make_effect_handler_with_policy(Some(policy));
 
         let mut headers = TransportHeaders::new();
@@ -3499,19 +3511,25 @@ mod tests {
         );
     }
 
+    /// Scenario: a compiled propagation policy selects no captured headers.
+    /// Guarantees: metadata construction returns no map when there are no other metadata sources.
     #[test]
     fn test_build_grpc_metadata_returns_none_when_all_dropped() {
         // Policy that drops everything (selector = None means no headers are selected).
-        let policy = HeaderPropagationPolicy::new(
-            PropagationDefault {
-                selector: PropagationSelector {
-                    selector_type: PropagationSelectorType::None,
-                    named: None,
+        let policy = CompiledHeaderPropagationPolicy::compile(
+            HeaderPropagationPolicy::new(
+                PropagationDefault {
+                    selector: PropagationSelector {
+                        selector_type: PropagationSelectorType::None,
+                        named: None,
+                    },
+                    ..PropagationDefault::default()
                 },
-                ..PropagationDefault::default()
-            },
-            vec![],
-        );
+                vec![],
+            ),
+            &[],
+        )
+        .expect("valid propagation policy");
         let handler = make_effect_handler_with_policy(Some(policy));
 
         let mut headers = TransportHeaders::new();

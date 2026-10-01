@@ -1600,6 +1600,7 @@ pub mod test_support {
             HeaderPropagationPolicy, PropagationDefault, PropagationSelector,
             PropagationSelectorType,
         };
+        use otel_arrow_dfe_engine::context_declaration::CompiledHeaderPropagationPolicy;
         use otel_arrow_dfe_otap::pdata::Context;
         use otel_arrow_dfe_pdata::OtlpProtoBytes;
         use prost::Message as _;
@@ -7007,16 +7008,20 @@ pub mod test_support {
             context.set_transport_headers(transport);
 
             // Propagate all captured headers, preserving wire names.
-            let policy = HeaderPropagationPolicy::new(
-                PropagationDefault {
-                    selector: PropagationSelector {
-                        selector_type: PropagationSelectorType::AllCaptured,
-                        named: None,
+            let policy = CompiledHeaderPropagationPolicy::compile(
+                HeaderPropagationPolicy::new(
+                    PropagationDefault {
+                        selector: PropagationSelector {
+                            selector_type: PropagationSelectorType::AllCaptured,
+                            named: None,
+                        },
+                        ..Default::default()
                     },
-                    ..Default::default()
-                },
-                vec![],
-            );
+                    vec![],
+                ),
+                &[],
+            )
+            .expect("valid propagation policy");
             let (_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
             let mut eh: EffectHandler<OtapPdata> = EffectHandler::new(
                 test_node("hdr-test"),
@@ -7096,7 +7101,7 @@ pub mod test_support {
                 otel_arrow_dfe_engine::testing::test_pipeline_runtime_services(),
             );
             handler.set_propagation_policy(Some(
-                policy.compile_context(&declarations).expect("compiled"),
+                CompiledHeaderPropagationPolicy::compile(policy, &declarations).expect("compiled"),
             ));
             let mut transport = TransportHeaders::new();
             transport.push(transport_header("workspace", "X-Workspace", b"acme"));

@@ -20,11 +20,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
-use otel_arrow_dfe_config::context_layout::ContextValues;
 use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_config::{PortName, SignalFormat, SignalType};
 use otel_arrow_dfe_engine::_private::AckNackRouting;
 use otel_arrow_dfe_engine::capability::auth::{AuthorizedIdentity, ClaimValue};
+use otel_arrow_dfe_engine::context_declaration::ContextValues;
 use otel_arrow_dfe_engine::control::{
     AckMsg, CallData, Frame, NackMsg, RouteData, nanos_since_birth,
 };
@@ -3001,6 +3001,7 @@ mod test {
             ContextEntryDeclaration, ContextPolicy, ContextScope,
         };
         use otel_arrow_dfe_config::transport_headers_policy::HeaderPropagationPolicy;
+        use otel_arrow_dfe_engine::context_declaration::CompiledHeaderPropagationPolicy;
 
         let context_policy: ContextPolicy = serde_json::from_value(serde_json::json!({
             "entries": {"tenant": [
@@ -3022,7 +3023,7 @@ mod test {
             "default": {"selector": {"type": "named", "named": ["tenant:workspace"]}}
         }))
         .expect("propagation policy");
-        let policy = policy.compile_context(&entries).expect("compiled");
+        let policy = CompiledHeaderPropagationPolicy::compile(policy, &entries).expect("compiled");
         let mut headers = TransportHeaders::new();
         for name in ["workspace", "customer"] {
             headers.push(TransportHeader::text(

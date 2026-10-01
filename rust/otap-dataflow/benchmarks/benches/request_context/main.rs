@@ -19,6 +19,7 @@ use otel_arrow_dfe_config::transport_headers_policy::{
     HeaderPropagationPolicy, NameStrategy, PropagationDefault, PropagationSelector,
     PropagationSelectorType,
 };
+use otel_arrow_dfe_engine::context_declaration::CompiledHeaderPropagationPolicy;
 use rdkafka::message::{Header, Headers, OwnedHeaders};
 use tonic::metadata::{KeyAndValueRef, MetadataKey, MetadataMap, MetadataValue};
 
@@ -63,23 +64,29 @@ impl ConsumerCase {
         }
     }
 
-    fn propagation_policy(self) -> Option<HeaderPropagationPolicy> {
+    fn propagation_policy(self) -> Option<CompiledHeaderPropagationPolicy> {
         let name = match self {
             Self::None => return None,
             Self::Stored => NameStrategy::StoredName,
             Self::Original => NameStrategy::Preserve,
         };
-        Some(HeaderPropagationPolicy::new(
-            PropagationDefault {
-                selector: PropagationSelector {
-                    selector_type: PropagationSelectorType::AllCaptured,
-                    named: None,
-                },
-                name,
-                ..PropagationDefault::default()
-            },
-            vec![],
-        ))
+        Some(
+            CompiledHeaderPropagationPolicy::compile(
+                HeaderPropagationPolicy::new(
+                    PropagationDefault {
+                        selector: PropagationSelector {
+                            selector_type: PropagationSelectorType::AllCaptured,
+                            named: None,
+                        },
+                        name,
+                        ..PropagationDefault::default()
+                    },
+                    vec![],
+                ),
+                &[],
+            )
+            .expect("valid propagation policy"),
+        )
     }
 
     const fn preserves_original_names(self) -> bool {
@@ -622,7 +629,10 @@ fn capture_kafka_headers<T>(
     Arc::new(captured)
 }
 
-fn propagate_metadata(context: &TransportHeaders, policy: &HeaderPropagationPolicy) -> MetadataMap {
+fn propagate_metadata(
+    context: &TransportHeaders,
+    policy: &CompiledHeaderPropagationPolicy,
+) -> MetadataMap {
     let mut metadata = MetadataMap::new();
     for header in policy.propagate(context) {
         append_text_metadata(&mut metadata, header.header_name, header.value);

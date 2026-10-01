@@ -13,6 +13,7 @@ use crate::channel_mode::{LocalMode, SharedMode, wrap_node_control_channel_metri
 use crate::completion_emission_metrics::CompletionEmissionMetricsHandle;
 use crate::config::ExporterConfig;
 use crate::context::PipelineContext;
+use crate::context_declaration::CompiledHeaderPropagationPolicy;
 use crate::control::{
     Controllable, NodeControlMsg, PipelineCompletionMsgSender, RuntimeCtrlMsgSender,
 };
@@ -29,7 +30,6 @@ use crate::terminal_state::TerminalState;
 use otel_arrow_dfe_channel::error::SendError;
 use otel_arrow_dfe_channel::mpsc;
 use otel_arrow_dfe_config::node::NodeUserConfig;
-use otel_arrow_dfe_config::transport_headers_policy::HeaderPropagationPolicy;
 use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
 use std::sync::Arc;
 
@@ -57,7 +57,7 @@ pub enum ExporterWrapper<PData> {
         /// Telemetry guard for node lifecycle cleanup.
         telemetry: Option<NodeTelemetryGuard>,
         /// Pre-resolved propagation policy for transport header forwarding.
-        propagation_policy: Option<HeaderPropagationPolicy>,
+        propagation_policy: Option<CompiledHeaderPropagationPolicy>,
     },
     /// An exporter with a `Send` implementation.
     Shared {
@@ -78,7 +78,7 @@ pub enum ExporterWrapper<PData> {
         /// Telemetry guard for node lifecycle cleanup.
         telemetry: Option<NodeTelemetryGuard>,
         /// Pre-resolved propagation policy for transport header forwarding.
-        propagation_policy: Option<HeaderPropagationPolicy>,
+        propagation_policy: Option<CompiledHeaderPropagationPolicy>,
     },
 }
 
@@ -398,7 +398,10 @@ impl<PData> ExporterWrapper<PData> {
 
     /// Returns the wrapper with the given pre-resolved propagation policy for
     /// transport header forwarding.
-    pub(crate) fn with_propagation_policy(self, policy: Option<HeaderPropagationPolicy>) -> Self {
+    pub(crate) fn with_propagation_policy(
+        self,
+        policy: Option<CompiledHeaderPropagationPolicy>,
+    ) -> Self {
         match self {
             ExporterWrapper::Local {
                 node_id,
@@ -1405,7 +1408,7 @@ mod tests {
 
     // -- with_propagation_policy tests ----------------------------------------
 
-    use otel_arrow_dfe_config::transport_headers_policy::HeaderPropagationPolicy;
+    use crate::context_declaration::CompiledHeaderPropagationPolicy;
 
     #[test]
     fn test_with_propagation_policy_none_by_default() {
@@ -1425,6 +1428,8 @@ mod tests {
         }
     }
 
+    /// Scenario: a local exporter wrapper receives a compiled propagation policy.
+    /// Guarantees: the wrapper retains the policy for installation in its local effect handler.
     #[test]
     fn test_with_propagation_policy_local() {
         let test_runtime = TestRuntime::<TestMsg>::new();
@@ -1434,7 +1439,7 @@ mod tests {
             Arc::new(NodeUserConfig::new_exporter_config("test")),
             test_runtime.config(),
         )
-        .with_propagation_policy(Some(HeaderPropagationPolicy::default()));
+        .with_propagation_policy(Some(CompiledHeaderPropagationPolicy::default()));
 
         match wrapper {
             ExporterWrapper::Local {
@@ -1447,6 +1452,8 @@ mod tests {
         }
     }
 
+    /// Scenario: a shared exporter wrapper receives a compiled propagation policy.
+    /// Guarantees: the wrapper retains the policy for installation in its shared effect handler.
     #[test]
     fn test_with_propagation_policy_shared() {
         let test_runtime = TestRuntime::<TestMsg>::new();
@@ -1456,7 +1463,7 @@ mod tests {
             Arc::new(NodeUserConfig::new_exporter_config("test")),
             test_runtime.config(),
         )
-        .with_propagation_policy(Some(HeaderPropagationPolicy::default()));
+        .with_propagation_policy(Some(CompiledHeaderPropagationPolicy::default()));
 
         match wrapper {
             ExporterWrapper::Shared {

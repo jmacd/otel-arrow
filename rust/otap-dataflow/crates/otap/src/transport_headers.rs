@@ -10,6 +10,7 @@ mod tests {
         HeaderPropagationPolicy, PropagationAction, PropagationDefault, PropagationMatch,
         PropagationOverride, PropagationSelector, PropagationSelectorType,
     };
+    use otel_arrow_dfe_engine::context_declaration::CompiledHeaderPropagationPolicy;
 
     // -- Helper functions for tests ------------------------------------------
 
@@ -39,12 +40,15 @@ mod tests {
     /// 2. **Pdata context attachment** -- Attach captured headers to `OtapPdata`.
     /// 3. **Processor transparency** -- Verify headers survive `clone_without_context()`
     ///    (what happens at pipeline boundaries / processor pass-through).
-    /// 4. **Exporter propagation** -- Apply `HeaderPropagationPolicy` to filter headers
+    /// 4. **Exporter propagation** -- Apply `CompiledHeaderPropagationPolicy` to filter headers
     ///    for egress, including dropping sensitive headers like `authorization`.
     ///    This test exercises the scenario from the design spec:
     /// - `otlp_ingest` captures `x-tenant-id`, `x-request-id`, `authorization`
     /// - `batch` processor preserves headers unchanged
     /// - `otap_export` propagates all except `authorization` (dropped by override)
+    ///
+    /// Scenario: captured headers pass through pdata into compiled exporter propagation.
+    /// Guarantees: original names and values survive while the authorization override drops its header.
     #[test]
     fn end_to_end_capture_preserve_propagate() {
         // ========== Step 1: Simulate receiver header capture ==========
@@ -128,23 +132,27 @@ mod tests {
 
         // ========== Step 4: Simulate exporter propagation ==========
 
-        let propagation_policy = HeaderPropagationPolicy::new(
-            PropagationDefault {
-                selector: PropagationSelector {
-                    selector_type: PropagationSelectorType::AllCaptured,
-                    named: None,
+        let propagation_policy = CompiledHeaderPropagationPolicy::compile(
+            HeaderPropagationPolicy::new(
+                PropagationDefault {
+                    selector: PropagationSelector {
+                        selector_type: PropagationSelectorType::AllCaptured,
+                        named: None,
+                    },
+                    ..PropagationDefault::default()
                 },
-                ..PropagationDefault::default()
-            },
-            vec![PropagationOverride {
-                match_rule: PropagationMatch {
-                    stored_names: vec![context_name("authorization")],
-                },
-                action: PropagationAction::Drop,
-                name: None,
-                on_error: None,
-            }],
-        );
+                vec![PropagationOverride {
+                    match_rule: PropagationMatch {
+                        stored_names: vec![context_name("authorization")],
+                    },
+                    action: PropagationAction::Drop,
+                    name: None,
+                    on_error: None,
+                }],
+            ),
+            &[],
+        )
+        .expect("valid propagation policy");
 
         let propagated: Vec<_> = propagation_policy.propagate(headers_after).collect();
 
@@ -166,6 +174,9 @@ mod tests {
 
     /// Test that demonstrates duplicate header names are preserved throughout
     /// the entire pipeline flow (a key semantic requirement).
+    ///
+    /// Scenario: three identically named headers pass through pdata and propagation.
+    /// Guarantees: all duplicate values are emitted in their original order.
     #[test]
     fn end_to_end_duplicate_headers_preserved() {
         let capture_policy = make_capture_policy(vec![rule(&["x-forwarded-for"], None)]);
@@ -195,16 +206,20 @@ mod tests {
             "duplicates must survive clone_without_context"
         );
 
-        let propagation_policy = HeaderPropagationPolicy::new(
-            PropagationDefault {
-                selector: PropagationSelector {
-                    selector_type: PropagationSelectorType::AllCaptured,
-                    named: None,
+        let propagation_policy = CompiledHeaderPropagationPolicy::compile(
+            HeaderPropagationPolicy::new(
+                PropagationDefault {
+                    selector: PropagationSelector {
+                        selector_type: PropagationSelectorType::AllCaptured,
+                        named: None,
+                    },
+                    ..PropagationDefault::default()
                 },
-                ..PropagationDefault::default()
-            },
-            vec![],
-        );
+                vec![],
+            ),
+            &[],
+        )
+        .expect("valid propagation policy");
         let propagated: Vec<_> = propagation_policy.propagate(headers).collect();
         assert_eq!(propagated.len(), 3, "duplicates must survive propagation");
 
@@ -214,6 +229,9 @@ mod tests {
     }
 
     /// Test binary header preservation through the entire flow.
+    ///
+    /// Scenario: a binary transport header passes through pdata and propagation.
+    /// Guarantees: propagation preserves the binary value kind and exact bytes.
     #[test]
     fn end_to_end_binary_headers_preserved() {
         let capture_policy = make_capture_policy(vec![rule(&["trace-context-bin"], None)]);
@@ -238,16 +256,20 @@ mod tests {
         let pdata_after = pdata.clone_without_context();
 
         let headers = pdata_after.transport_headers().unwrap();
-        let propagation_policy = HeaderPropagationPolicy::new(
-            PropagationDefault {
-                selector: PropagationSelector {
-                    selector_type: PropagationSelectorType::AllCaptured,
-                    named: None,
+        let propagation_policy = CompiledHeaderPropagationPolicy::compile(
+            HeaderPropagationPolicy::new(
+                PropagationDefault {
+                    selector: PropagationSelector {
+                        selector_type: PropagationSelectorType::AllCaptured,
+                        named: None,
+                    },
+                    ..PropagationDefault::default()
                 },
-                ..PropagationDefault::default()
-            },
-            vec![],
-        );
+                vec![],
+            ),
+            &[],
+        )
+        .expect("valid propagation policy");
         let propagated: Vec<_> = propagation_policy.propagate(headers).collect();
 
         assert_eq!(propagated[0].value_kind, ValueKind::Binary);

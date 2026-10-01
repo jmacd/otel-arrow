@@ -4,7 +4,6 @@
 //! Declarative context entry policies.
 
 use crate::context::{ContextEntryName, ContextEntryRef};
-use crate::context_layout::ContextDomain;
 use crate::{PipelineGroupId, PipelineId};
 use schemars::JsonSchema;
 use serde::de::{self, MapAccess, Visitor};
@@ -132,6 +131,15 @@ impl ContextEntryDefinition {
     }
 }
 
+/// Context domains are separate areas of configuration and authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ContextDomain {
+    /// Untrusted transport metadata.
+    TransportHeader,
+    /// Verified authorization claim.
+    AuthorizedIdentity,
+}
+
 /// Single member of a composite entry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -168,7 +176,7 @@ pub enum ContextEntryPart {
 impl ContextEntryPart {
     /// Returns the authority domain required by this member or condition.
     #[must_use]
-    pub(crate) fn domain(&self) -> ContextDomain {
+    pub fn domain(&self) -> ContextDomain {
         match self {
             Self::TransportHeader { .. } | Self::TransportHeaderMatch { .. } => {
                 ContextDomain::TransportHeader
@@ -179,7 +187,7 @@ impl ContextEntryPart {
 
     /// Returns the reference of a member or condition.
     #[must_use]
-    pub(crate) fn reference(&self) -> &ContextEntryRef {
+    pub fn reference(&self) -> &ContextEntryRef {
         match self {
             Self::TransportHeader { name, .. }
             | Self::AuthorizedIdentity { name, .. }
@@ -189,7 +197,7 @@ impl ContextEntryPart {
 
     /// Returns the resulting value-member name after applying `store_as`.
     #[must_use]
-    pub(crate) fn member_name(&self) -> Option<&ContextEntryName> {
+    pub fn member_name(&self) -> Option<&ContextEntryName> {
         match self {
             Self::TransportHeader { name, store_as }
             | Self::AuthorizedIdentity { name, store_as } => {

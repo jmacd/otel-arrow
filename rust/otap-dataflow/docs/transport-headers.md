@@ -263,11 +263,17 @@ presence requirement. In the example, the receiver must successfully authorize
 the request and capture the verified `sub` claim as `customer_id`; a transport
 header named `customer_id` cannot substitute for that identity.
 
-During startup and live-update preparation, the selected composite definitions
-compile into a shared logical layout. Unused definitions remain inactive.
+During startup and live-update preparation, the existing engine context
+compiler resolves each exporter's selected composite definitions into a
+logical layout. Unused definitions remain inactive for that exporter.
 Capture and producer policies keep their existing behavior, and selected
 source fields may arrive from another pipeline. Missing values make the
 composite absent rather than invalidating startup.
+
+Configuration remains separate from execution: serialized propagation policies
+contain only settings, while engine bindings hold the resolved layout and
+propagation implementation. Exporters accept only compiled bindings, so an
+unresolved qualified selector cannot reach propagation.
 
 Presence is evaluated at export time using the existing header and identity
 storage and cached for that propagation call. This does not introduce a new
@@ -302,16 +308,16 @@ or define a separate composite containing only the required members.
 
 #### Compiled Namespace
 
-Within the selected composite definitions, primitive fields and composites
-share one unqualified namespace. Use distinct names for a composite and its
-source fields, and distinct stored names for header and identity fields.
+Within one exporter's selected composite definitions, primitive fields and
+composites share one unqualified namespace. Use distinct names for a composite
+and its source fields, and distinct stored names for header and identity fields.
 This prevents an unqualified reference from identifying two different entries.
 Use capture or identity `store_as` to rename a source; a member alias only
 changes its qualified output name.
 
-This constraint applies to the dependencies of selected composites, not every
-captured or produced value in the pipeline. Unrelated source policies do not
-acquire new collision checks.
+This constraint applies to that exporter's selected dependencies, not every
+captured or produced value in the pipeline or another exporter's independent
+bindings. Unrelated source policies do not acquire new collision checks.
 
 ### Name Strategy
 
