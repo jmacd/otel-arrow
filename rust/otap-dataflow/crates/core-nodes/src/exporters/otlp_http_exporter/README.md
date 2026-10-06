@@ -375,20 +375,19 @@ latest failure. An older in-flight success cannot clear a newer failure.
 Preparation and notification failures have independent bounded summaries and
 cannot establish delivery recovery.
 
-Successful delivery before the first failure is silent. A successful completion
-can emit a due summary for suppressed failures or confirm recovery. There are no
-probes or timers, so idle periods produce no reports and do not establish
-recovery. Changing error categories does not restart an episode or bypass the
-summary interval.
+Successful delivery before the first failure is silent. Reports are evaluated
+on completions without probes or timers, so idle periods produce no reports and
+do not establish recovery. Changing error categories does not restart an
+episode or bypass the summary interval.
 
 Export, preparation, and notification diagnostics include `diagnostic_kind`
 (`first_failure`, `summary`, or `recovery`) and interval/episode counts.
-Existing export and notification error event names are preserved. Every
-selected failure is an ordinary warning with its string `message`, boolean
-`retryable` where relevant, and summary counters. A success-triggered summary
-replays the saved failure event with fresh counters. Recovery is a separate
-ordinary INFO event stating that delivery recovered. Notification errors
-include lowercase `operation` (`ack` or `nack`).
+Existing export and notification error event names are preserved. Export errors
+retain a string `message` and boolean `retryable` describing the representative
+failure, which may differ from other failures counted in the summary. Recovery
+events retain that error sample and its age but omit `retryable`. Notification
+errors retain a lowercase `operation` (`ack` or `nack`). Preparation and
+notification errors carry their representative error in the log body.
 
 Operation-specific fields are encoded before interval and episode counters so
 the bounded ITS record preserves actionable error details. Oversized details

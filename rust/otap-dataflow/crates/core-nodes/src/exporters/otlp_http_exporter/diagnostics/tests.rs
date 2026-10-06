@@ -205,8 +205,7 @@ fn delivery_event_contract_and_sampled_failures() {
             &mut diagnostics,
             SignalType::Logs,
             at(0),
-            "otlp.exporter.http.export_recovered",
-            message = "OTLP HTTP export recovered"
+            "otlp.exporter.http.export_recovered"
         );
         assert!(
             diagnostics
@@ -245,16 +244,14 @@ fn delivery_event_contract_and_sampled_failures() {
             &mut diagnostics,
             SignalType::Logs,
             at(0),
-            "otlp.exporter.http.export_recovered",
-            message = "OTLP HTTP export recovered"
+            "otlp.exporter.http.export_recovered"
         );
         otel_summary_recover!(
             at: at(181),
             &mut diagnostics,
             SignalType::Logs,
             at(122),
-            "otlp.exporter.http.export_recovered",
-            message = "OTLP HTTP export recovered"
+            "otlp.exporter.http.export_recovered"
         );
     });
     let events = capture.0.lock().unwrap();
@@ -295,10 +292,8 @@ fn delivery_event_contract_and_sampled_failures() {
         Level::INFO,
         "recovery",
     );
-    assert_eq!(
-        events[5].body.as_deref(),
-        Some("OTLP HTTP export recovered")
-    );
+    assert!(events[5].body.is_none());
+    assert_eq!(events[5].fields["error"], "partial acceptance");
     assert_eq!(events[5].fields["signal"], "logs");
     assert_eq!(events[5].fields["error_sample_age_seconds"], 61.0);
     assert_eq!(events[5].fields["episode_seconds"], 181.0);
@@ -314,8 +309,8 @@ fn delivery_event_contract_and_sampled_failures() {
 fn preparation_and_notification_event_contracts() {
     let (_, capture) = with_capture(|emitter| {
         let start = Instant::now();
-        let mut preparation = SignalDiagnostics::new(emitter.clone());
-        let mut notifications = SignalDiagnostics::new(emitter);
+        let mut preparation = SignalDiagnostics::warnings_only(emitter.clone());
+        let mut notifications = SignalDiagnostics::warnings_only(emitter);
         otel_summary_warn!(
             at: start,
             &mut preparation,

@@ -309,6 +309,7 @@ impl<T> SignalSet<T> {
 pub struct SignalDiagnostics<E> {
     signals: SignalSet<DiagnosticTracker<E>>,
     emitter: StructuredLogEmitter,
+    retain_sample: bool,
 }
 
 impl<E> Default for SignalDiagnostics<E> {
@@ -318,13 +319,31 @@ impl<E> Default for SignalDiagnostics<E> {
 }
 
 impl<E> SignalDiagnostics<E> {
-    /// Creates per-signal diagnostic state using the supplied emitter.
+    /// Creates per-signal state retaining samples for success summaries and recovery.
     #[must_use]
     pub fn new(emitter: StructuredLogEmitter) -> Self {
         Self {
             signals: SignalSet::default(),
             emitter,
+            retain_sample: true,
         }
+    }
+
+    /// Creates failure-only state without retaining records between warnings.
+    ///
+    /// Use with `otel_summary_warn!` only; each summary describes its current failure.
+    #[must_use]
+    pub fn warnings_only(emitter: StructuredLogEmitter) -> Self {
+        Self {
+            retain_sample: false,
+            ..Self::new(emitter)
+        }
+    }
+
+    /// Whether warnings save a sample for later success summaries and recovery.
+    #[must_use]
+    pub const fn retains_sample(&self) -> bool {
+        self.retain_sample
     }
 
     /// Selects one signal's tracker.
@@ -388,6 +407,7 @@ macro_rules! otel_summary_warn {
         let diagnostic_signal = $signal;
         let diagnostic_state = &mut *($diagnostics);
         let diagnostic_emitter = diagnostic_state.emitter().clone();
+        let diagnostic_retain_sample = diagnostic_state.retains_sample();
         let diagnostic_tracker = diagnostic_state.signal(diagnostic_signal);
         if let Some(diagnostic_report) = diagnostic_tracker.failure(diagnostic_now, $category) {
             let diagnostic_attrs =
@@ -402,6 +422,7 @@ macro_rules! otel_summary_warn {
                 std::time::SystemTime::now(),
                 diagnostic_event,
                 diagnostic_attrs,
+                diagnostic_retain_sample,
             );
             if let Some(captured) = captured {
                 diagnostic_tracker.remember(diagnostic_now, captured);
@@ -412,25 +433,29 @@ macro_rules! otel_summary_warn {
 
 /// Observe successful completion and replay a due summary or emit an INFO recovery.
 ///
-/// Summaries reuse the saved failure's encoded body and attributes. Recovery
-/// creates a new record. Both use the active engine filter and emitter, with
-/// fresh summary attributes appended after the ordinary fields.
+/// Summaries reuse the saved failure's encoded body and attributes. Recovery puts
+/// the saved body in `error` without carrying forward failure-only attributes.
+/// Both use the active engine filter and emitter with fresh summary attributes.
 #[macro_export]
 macro_rules! otel_summary_recover {
-    (target: $target:expr, $diagnostics:expr, $signal:expr, $started_at:expr, $name:literal, $($fields:tt)+) => {{
+    (target: $target:expr, $diagnostics:expr, $signal:expr, $started_at:expr, $name:literal $(, $($fields:tt)+)?) => {{
         $crate::otel_summary_recover!(
             target: $target,
             at: std::time::Instant::now(),
             $diagnostics,
             $signal,
             $started_at,
-            $name,
-            $($fields)+
+            $name
+            $(, $($fields)+)?
         );
     }};
-    (target: $target:expr, at: $now:expr, $diagnostics:expr, $signal:expr, $started_at:expr, $name:literal, $($fields:tt)+) => {{
+    (target: $target:expr, at: $now:expr, $diagnostics:expr, $signal:expr, $started_at:expr, $name:literal $(, $($fields:tt)+)?) => {{
         let diagnostic_signal = $signal;
         let diagnostic_state = &mut *($diagnostics);
+        assert!(
+            diagnostic_state.retains_sample(),
+            "otel_summary_recover! requires recovery-enabled diagnostic state"
+        );
         let diagnostic_emitter = diagnostic_state.emitter().clone();
         if let Some(diagnostic_report) =
             diagnostic_state.signal(diagnostic_signal).success($started_at, $now)
@@ -449,12 +474,13 @@ macro_rules! otel_summary_recover {
                 let diagnostic_event = $crate::__log_record_impl!(
                     target: $target,
                     $crate::Level::INFO,
-                    $name,
-                    $($fields)+
+                    $name
+                    $(, $($fields)+)?
                 );
-                let _ = diagnostic_emitter.emit_annotated(
+                diagnostic_emitter.emit_recovery(
                     std::time::SystemTime::now(),
                     diagnostic_event,
+                    diagnostic_report.detail.as_ref(),
                     diagnostic_attrs,
                 );
             }
@@ -469,6 +495,81 @@ mod tests {
     fn sample_record(message: &str) -> LogRecord {
         crate::__log_record_impl!(crate::Level::WARN, "test.failure", message = message)
             .into_record(crate::self_tracing::LogContext::new())
+    }
+
+    /// Scenario: Identical failures are sampled with and without recovery support.
+    /// Guarantees: Warning bytes and counts match, but failure-only state retains no sample.
+    #[test]
+    fn warnings_only_does_not_retain_samples() {
+        use crate::event::{ObservedEvent, ObservedEventReporter};
+        use crate::tracing_init::{ProviderSetup, TracingSetup};
+
+        let (sender, receiver) = flume::bounded(4);
+        let setup = TracingSetup::new(
+            ProviderSetup::InternalAsync {
+                reporter: ObservedEventReporter::new(Default::default(), sender),
+            },
+            Default::default(),
+            crate::self_tracing::LogContext::new,
+        );
+        let mut emitted = Vec::new();
+        setup.with_subscriber(|| {
+            let start = Instant::now();
+            for retain_sample in [false, true] {
+                let mut diagnostics = if retain_sample {
+                    SignalDiagnostics::new(setup.log_emitter())
+                } else {
+                    SignalDiagnostics::warnings_only(setup.log_emitter())
+                };
+                for second in [0, 1, 60] {
+                    crate::otel_summary_warn!(
+                        target: "otel.exporter.test",
+                        at: start + Duration::from_secs(second),
+                        &mut diagnostics,
+                        SignalType::Logs,
+                        DiagnosticErrorKind::Transport,
+                        "test.failure",
+                        message = "offline"
+                    );
+                    let episode = diagnostics
+                        .signal(SignalType::Logs)
+                        .episode
+                        .as_ref()
+                        .unwrap();
+                    assert_eq!(episode.detail.is_some(), retain_sample);
+                }
+                let records: Vec<_> = receiver
+                    .drain()
+                    .map(|event| {
+                        let ObservedEvent::Log(event) = event else {
+                            panic!("expected a log event");
+                        };
+                        assert_eq!(event.record.dropped_attributes_count, 0);
+                        event.record.body_attrs_bytes
+                    })
+                    .collect();
+                assert_eq!(records.len(), 2);
+                emitted.push(records);
+            }
+        });
+        assert_eq!(emitted[0], emitted[1]);
+    }
+
+    /// Scenario: A caller attempts recovery on a failure-only diagnostic tracker.
+    /// Guarantees: Misconfigured recovery fails explicitly rather than losing the error sample.
+    #[test]
+    #[should_panic(expected = "otel_summary_recover! requires recovery-enabled diagnostic state")]
+    fn warnings_only_rejects_recovery() {
+        let mut diagnostics = SignalDiagnostics::<DiagnosticErrorKind>::warnings_only(
+            StructuredLogEmitter::default(),
+        );
+        crate::otel_summary_recover!(
+            target: "otel.exporter.test",
+            &mut diagnostics,
+            SignalType::Logs,
+            Instant::now(),
+            "test.recovery"
+        );
     }
 
     /// Scenario: A destination fails 100,000 times within each reporting window.

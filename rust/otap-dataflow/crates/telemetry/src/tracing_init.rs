@@ -12,6 +12,12 @@ use crate::log_filter::RuntimeLogFilter;
 use crate::self_tracing::{ConsoleWriter, LogContext, LogContextFn, LogRecord, StackLogRecord};
 use otel_arrow_dfe_config::settings::telemetry::logs::LogLevel;
 use otel_arrow_dfe_pdata::otlp::common::{BoundedBuf, ProtoBuffer};
+use otel_arrow_dfe_pdata::proto::consts::field_num::{
+    common::{KEY_VALUE_KEY, KEY_VALUE_VALUE},
+    logs::{LOG_RECORD_ATTRIBUTES, LOG_RECORD_BODY},
+};
+use otel_arrow_dfe_pdata::views::otlp::bytes::decode::ProtoBytesParser;
+use otel_arrow_dfe_pdata::views::otlp::bytes::logs::LogFieldOffsets;
 use std::fmt;
 use std::time::SystemTime;
 use tracing::{Dispatch, Event, Subscriber};
@@ -160,22 +166,24 @@ impl StructuredLogEmitter {
         }
     }
 
-    /// Emits a selected event with annotations and returns its saved base form.
+    /// Emits a selected event with annotations, optionally returning its saved base form.
     #[must_use]
     pub fn emit_annotated(
         &self,
         time: SystemTime,
         event: StackLogRecord,
         annotations: StackLogRecord,
+        retain_sample: bool,
     ) -> Option<LogRecord> {
         let enabled =
             tracing::dispatcher::get_default(|dispatch| dispatch.enabled(event.metadata()));
         if !enabled {
             return None;
         }
-        let (full, base) = event.into_annotated_records(annotations, (self.context_fn)());
+        let (full, base) =
+            event.into_annotated_records(annotations, (self.context_fn)(), retain_sample);
         self.deliver(time, full);
-        Some(base)
+        base
     }
 
     /// Replays a saved event with fresh annotations if the active engine filter allows it.
@@ -200,6 +208,37 @@ impl StructuredLogEmitter {
             context: saved.context,
         };
         self.deliver(time, record);
+    }
+
+    /// Emits recovery with the saved failure body as `error`, without failure-only attributes.
+    ///
+    /// The saved body's encoded AnyValue is reused verbatim, not formatted as a log record.
+    pub fn emit_recovery(
+        &self,
+        time: SystemTime,
+        event: StackLogRecord,
+        saved: Option<&LogRecord>,
+        annotations: StackLogRecord,
+    ) {
+        let mut record = event.into_record((self.context_fn)());
+        let body = saved.and_then(|saved| {
+            ProtoBytesParser::<LogFieldOffsets>::new(&saved.body_attrs_bytes)
+                .advance_to_find_field(LOG_RECORD_BODY)
+        });
+        if let Some(body) = body {
+            // Three one-byte tags, up to three four-byte lengths, and the "error" key.
+            let capacity = record.body_attrs_bytes.len() + body.len() + 3 * (1 + 4) + "error".len();
+            let mut buf = ProtoBuffer::with_capacity_and_limit(capacity, capacity);
+            buf.encode_len_delimited(LOG_RECORD_ATTRIBUTES, |buf| {
+                buf.encode_string(KEY_VALUE_KEY, "error")?;
+                buf.encode_bytes(KEY_VALUE_VALUE, body)
+            })
+            .expect("capacity includes the saved body and error attribute framing");
+            buf.extend_from_slice(&record.body_attrs_bytes)
+                .expect("capacity includes the recovery fields");
+            record.body_attrs_bytes = buf.into_bytes();
+        }
+        self.emit_saved(time, record, annotations);
     }
 }
 
@@ -413,6 +452,7 @@ mod tests {
                         message = "connection refused"
                     ),
                     crate::__log_record_impl!(crate::Level::TRACE, "test.annotations"),
+                    true,
                 )
                 .expect("initial warning is enabled");
             assert!(matches!(receiver.try_recv(), Ok(ObservedEvent::Log(_))));

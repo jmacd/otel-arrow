@@ -1080,8 +1080,7 @@ async fn finalize_completed_export(
             &mut metrics.delivery,
             signal_type,
             diagnostic_started_at,
-            "otlp.exporter.http.export_recovered",
-            message = "OTLP HTTP export recovered"
+            "otlp.exporter.http.export_recovered"
         ),
         Err(error) => otel_summary_warn!(
             &mut metrics.delivery,

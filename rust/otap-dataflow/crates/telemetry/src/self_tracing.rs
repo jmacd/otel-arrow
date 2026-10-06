@@ -190,28 +190,29 @@ impl StackLogRecord {
 
     /// Combines this ordinary record with separately encoded annotations.
     ///
-    /// The returned full record owns one shared `Bytes` allocation. The saved
-    /// base record is a zero-copy prefix slice that excludes the annotations.
+    /// The full record owns one `Bytes` allocation. When requested, a saved base
+    /// record shares a prefix slice excluding the annotations; otherwise no clone
+    /// of the record's bytes or context is made.
     #[must_use]
     pub fn into_annotated_records(
         self,
         annotations: Self,
         context: LogContext,
-    ) -> (LogRecord, LogRecord) {
+        retain_sample: bool,
+    ) -> (LogRecord, Option<LogRecord>) {
         let base_len = self.buf.len();
         let capacity = base_len + annotations.buf.len();
         let mut combined = ProtoBuffer::with_capacity(capacity);
         let _ = combined.extend_from_slice(self.buf.as_ref());
         let _ = combined.extend_from_slice(annotations.buf.as_ref());
         let bytes = combined.into_bytes();
-        let base_bytes = bytes.slice(..base_len);
         let callsite_id = self.callsite_id;
-        let base = LogRecord {
+        let base = retain_sample.then(|| LogRecord {
             callsite_id: callsite_id.clone(),
-            body_attrs_bytes: base_bytes,
+            body_attrs_bytes: bytes.slice(..base_len),
             dropped_attributes_count: self.dropped_count as u16,
             context: context.clone(),
-        };
+        });
         let full = LogRecord {
             callsite_id,
             body_attrs_bytes: bytes,

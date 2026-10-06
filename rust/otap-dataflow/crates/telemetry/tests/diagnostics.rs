@@ -20,7 +20,7 @@ fn counted_message(formats: &Cell<u64>) -> &'static str {
 }
 
 /// Scenario: A busy outage produces a first warning, summary, and recovery.
-/// Guarantees: Sampling constructs only the selected events and formats only selected details.
+/// Guarantees: Only selected details are formatted, and recovery retains the sampled error.
 #[test]
 fn suppression_precedes_record_construction() {
     let (sender, receiver) = flume::unbounded();
@@ -70,11 +70,23 @@ fn suppression_precedes_record_construction() {
     let actual = receiver
         .try_iter()
         .map(|event| match event {
-            ObservedEvent::Log(LogEvent { record, .. }) => (
-                record.callsite().name(),
-                record.callsite().target(),
-                *record.callsite().level(),
-            ),
+            ObservedEvent::Log(LogEvent { record, .. }) => {
+                if *record.callsite().level() == Level::INFO {
+                    let raw = RawLogRecord::new(&record.body_attrs_bytes);
+                    assert!(raw.body().is_none());
+                    let error = raw
+                        .attributes()
+                        .find(|attr| attr.key() == b"error")
+                        .expect("recovery retains the sampled error");
+                    let value = error.value().expect("error has a value");
+                    assert_eq!(value.as_string(), Some(b"connection refused".as_slice()));
+                }
+                (
+                    record.callsite().name(),
+                    record.callsite().target(),
+                    *record.callsite().level(),
+                )
+            }
             ObservedEvent::Engine(_) => panic!("expected log event"),
         })
         .collect::<Vec<_>>();
@@ -82,8 +94,8 @@ fn suppression_precedes_record_construction() {
     assert_eq!(formats.get(), 2);
 }
 
-/// Scenario: A diagnostic contains error detail larger than the bounded ITS event buffer.
-/// Guarantees: Priority context and a truncated error body survive real ITS encoding.
+/// Scenario: Oversized error detail is sampled and then reported on confirmed recovery.
+/// Guarantees: Priority context survives encoding, and recovery preserves the sampled text verbatim.
 #[test]
 fn priority_detail_survives_bounded_its_encoding() {
     let (sender, receiver) = flume::unbounded();
@@ -99,15 +111,25 @@ fn priority_detail_survives_bounded_its_encoding() {
     );
     setup.with_subscriber(|| {
         let mut diagnostics = SignalDiagnostics::new(setup.log_emitter());
-        let text = format!("root cause: {}", "x".repeat(4_000));
+        let start = Instant::now();
+        let text = format!("root cause: \n{}", "x".repeat(4_000));
         otel_arrow_dfe_telemetry::otel_summary_warn!(
             target: "otel.exporter.test",
+            at: start,
             &mut diagnostics,
             otel_arrow_dfe_config::SignalType::Logs,
             DiagnosticErrorKind::Transport,
             "test.export_error",
             retryable = true,
             message = %text
+        );
+        otel_arrow_dfe_telemetry::otel_summary_recover!(
+            target: "otel.exporter.test",
+            at: start + Duration::from_secs(30),
+            &mut diagnostics,
+            otel_arrow_dfe_config::SignalType::Logs,
+            start + Duration::from_secs(1),
+            "test.export_recovered"
         );
     });
 
@@ -116,10 +138,6 @@ fn priority_detail_survives_bounded_its_encoding() {
     else {
         panic!("expected log event");
     };
-    assert!(
-        receiver.try_recv().is_err(),
-        "only one report should be sent"
-    );
     let body_attrs = record.body_attrs_bytes;
     let record = RawLogRecord::new(&body_attrs);
     let body_value = record
@@ -144,4 +162,22 @@ fn priority_detail_survives_bounded_its_encoding() {
             "missing priority attribute {required}"
         );
     }
+
+    let ObservedEvent::Log(LogEvent { record, .. }) =
+        receiver.try_recv().expect("recovery should be delivered")
+    else {
+        panic!("expected log event");
+    };
+    assert_eq!(*record.callsite().level(), Level::INFO);
+    let recovery = RawLogRecord::new(&record.body_attrs_bytes);
+    assert!(recovery.body().is_none());
+    let error = recovery
+        .attributes()
+        .find(|attr| attr.key() == b"error")
+        .expect("recovery retains the sampled error");
+    let value = error.value().expect("error has a value");
+    assert_eq!(value.as_string(), Some(body.as_bytes()));
+    assert!(!recovery.attributes().any(|attr| attr.key() == b"retryable"));
+    assert_eq!(record.dropped_attributes_count, 0);
+    assert!(receiver.is_empty(), "only failure and recovery are emitted");
 }

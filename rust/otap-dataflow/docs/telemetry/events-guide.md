@@ -419,6 +419,11 @@ where relevant. Use `DiagnosticTracker` directly for operations without a
 telemetry signal, or `SignalDiagnostics` for a fixed set of signal scopes.
 Never create unbounded state keyed by client, payload, tenant, or error text.
 
+Use `SignalDiagnostics::warnings_only` when only failures are observed. These
+trackers keep counters but do not retain log records; each warning describes its
+current failure. Use `SignalDiagnostics::new` when also observing success with
+`otel_summary_recover!`, so a sample is available for replay and recovery.
+
 Integrations SHOULD identify the operation boundary with stable, bounded
 attributes such as `stage` or `signal` when relevant. Preparation, delivery,
 and notification are distinct operations and generally require independent
@@ -451,11 +456,12 @@ Integrations may add bounded fields such as `signal`, `stage`, `message`, or a
 retry decision. These fields describe the selected failure event; the common
 counter fields describe its interval and complete episode.
 
-The first report includes its triggering failure. A selected warning saves its
-unannotated event before adding summary attributes to the delivered record. A
+The first report includes its triggering failure. Recovery-enabled trackers save
+the unannotated selected warning before adding summary attributes. A
 success-triggered summary replays that saved event with fresh counters and age.
 Suppressed failures do not construct log records or format their fields.
-Recovery is a distinct current INFO event, not a copy of an earlier error.
+Recovery is an INFO record retaining the saved failure body in `error`, with
+fresh counters and sample age but without failure-only attributes.
 Callers must still redact sensitive data before supplying diagnostic text.
 
 Log frequency intentionally decreases; use component attempt and failure

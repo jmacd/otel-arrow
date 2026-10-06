@@ -143,8 +143,8 @@ impl OtlpHttpExporterMetrics {
         let log_emitter = pipeline_ctx.structured_log_emitter().clone();
         Self {
             delivery: SignalDiagnostics::new(log_emitter.clone()),
-            preparation: SignalDiagnostics::new(log_emitter.clone()),
-            notifications: SignalDiagnostics::new(log_emitter),
+            preparation: SignalDiagnostics::warnings_only(log_emitter.clone()),
+            notifications: SignalDiagnostics::warnings_only(log_emitter),
             boundary: ExporterMetrics::register(pipeline_ctx),
             failures: OtlpHttpExporterFailureMetrics::register(pipeline_ctx),
             auth: auth.map(|a| {
