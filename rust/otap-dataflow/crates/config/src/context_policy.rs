@@ -3,7 +3,7 @@
 
 //! Declarative context entry policies.
 
-use crate::context::{ContextEntryName, ContextEntryRef};
+use crate::context::ContextEntryName;
 use crate::{PipelineGroupId, PipelineId};
 use schemars::JsonSchema;
 use serde::de::{self, MapAccess, Visitor};
@@ -147,7 +147,7 @@ pub enum ContextEntryPart {
     /// Includes values from a transport-header entry.
     TransportHeader {
         /// Exact source context entry reference.
-        name: ContextEntryRef,
+        name: ContextEntryName,
         /// Optional member name within the composite entry.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         store_as: Option<ContextEntryName>,
@@ -155,7 +155,7 @@ pub enum ContextEntryPart {
     /// Includes values from a verified authorized-identity entry.
     AuthorizedIdentity {
         /// Exact source context entry reference.
-        name: ContextEntryRef,
+        name: ContextEntryName,
         /// Optional member name within the composite entry.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         store_as: Option<ContextEntryName>,
@@ -167,7 +167,7 @@ pub enum ContextEntryPart {
     /// satisfies this condition.
     TransportHeaderMatch {
         /// Exact source context entry reference.
-        name: ContextEntryRef,
+        name: ContextEntryName,
         /// Required text value.
         value: String,
     },
@@ -197,7 +197,7 @@ impl ContextEntryPart {
 
     /// Returns the external reference of a member or condition.
     #[must_use]
-    pub fn reference(&self) -> Option<&ContextEntryRef> {
+    pub fn reference(&self) -> Option<&ContextEntryName> {
         match self {
             Self::TransportHeader { name, .. }
             | Self::AuthorizedIdentity { name, .. }
@@ -212,7 +212,7 @@ impl ContextEntryPart {
         match self {
             Self::TransportHeader { name, store_as }
             | Self::AuthorizedIdentity { name, store_as } => {
-                Some(store_as.as_ref().unwrap_or_else(|| name.name()))
+                Some(store_as.as_ref().unwrap_or(name))
             }
             Self::Constant { name, .. } => Some(name),
             Self::TransportHeaderMatch { .. } => None,
@@ -244,7 +244,7 @@ impl JsonSchema for ContextEntryPart {
                         "transport_header_match"
                     ]
                 },
-                "name": generator.subschema_for::<ContextEntryRef>(),
+                "name": generator.subschema_for::<ContextEntryName>(),
                 "store_as": generator.subschema_for::<ContextEntryName>(),
                 "value": {
                     "type": "string"
@@ -304,7 +304,7 @@ entries:
       name: customer
       store_as: customer_id
     - type: transport_header
-      name: captured:workspace
+      name: workspace
 "#,
         )
         .expect("valid context policy");
@@ -321,8 +321,7 @@ entries:
         assert!(matches!(
             &parts[1],
             ContextEntryPart::TransportHeader { name, .. }
-                if name.scope().map(ContextEntryName::as_str) == Some("captured")
-                    && name.name().as_str() == "workspace"
+                if name.as_str() == "workspace"
         ));
     }
 
@@ -393,7 +392,7 @@ entries:
         assert!(matches!(
             &parts[1],
             ContextEntryPart::TransportHeaderMatch { name, value }
-                if name.name().as_str() == "environment" && value == "production"
+                if name.as_str() == "environment" && value == "production"
         ));
         assert!(policy.validation_errors("context").is_empty());
     }
@@ -434,12 +433,29 @@ entries:
     #[test]
     fn rejects_duplicate_output_member_names() {
         for yaml in [
-            "entries: {tenant: [{type: transport_header, name: first:id}, {type: authorized_identity, name: second:id}]}",
+            "entries: {tenant: [{type: transport_header, name: id}, {type: authorized_identity, name: id}]}",
             "entries: {tenant: [{type: transport_header, name: first, store_as: id}, {type: authorized_identity, name: second, store_as: id}]}",
             "entries: {tenant: [{type: constant, name: id, value: first}, {type: transport_header, name: id}]}",
         ] {
             let policy = serde_yaml::from_str::<ContextPolicy>(yaml).expect("valid syntax");
             assert!(!policy.validation_errors("context").is_empty(), "{yaml}");
+        }
+    }
+
+    /// Scenario: a part source name is written as a qualified `scope:name` reference.
+    /// Guarantees: parts accept only flat primitive names, so deserialization rejects the qualified form.
+    #[test]
+    fn rejects_qualified_part_source_names() {
+        for part in [
+            "{type: transport_header, name: first:id}",
+            "{type: authorized_identity, name: first:id}",
+            "{type: transport_header_match, name: first:id, value: prod}",
+        ] {
+            let yaml = format!("entries: {{tenant: [{part}]}}");
+            assert!(
+                serde_yaml::from_str::<ContextPolicy>(&yaml).is_err(),
+                "{yaml}"
+            );
         }
     }
 

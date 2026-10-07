@@ -86,7 +86,7 @@ impl ContextEntryTarget {
                         invalid_context(format!("unknown context member `{composite}:{member}`"))
                     })?;
                 if let (Some(domain), Some(reference)) = (part.domain(), part.reference()) {
-                    visit(domain, reference.name())?;
+                    visit(domain, reference)?;
                 }
                 Ok(())
             }
@@ -96,7 +96,7 @@ impl ContextEntryTarget {
                     if part.member_name().is_some()
                         && let (Some(domain), Some(reference)) = (part.domain(), part.reference())
                     {
-                        visit(domain, reference.name())?;
+                        visit(domain, reference)?;
                     }
                 }
                 Ok(())
