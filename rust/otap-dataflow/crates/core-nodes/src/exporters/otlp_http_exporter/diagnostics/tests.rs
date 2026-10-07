@@ -118,6 +118,14 @@ impl Capture {
             };
             let meta = event.record.callsite_id.0.metadata();
             let record = ProtoRecord::decode(event.record.body_attrs_bytes).unwrap();
+            assert_eq!(
+                record
+                    .attributes
+                    .iter()
+                    .filter(|a| a.key == "signal")
+                    .count(),
+                1
+            );
             let mut fields: Map<_, _> = record
                 .attributes
                 .into_iter()

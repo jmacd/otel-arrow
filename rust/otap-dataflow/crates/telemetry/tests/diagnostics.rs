@@ -3,13 +3,16 @@
 
 //! Episode observations are independent of log filtering; records remain structured.
 
+use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_config::settings::telemetry::logs::LogLevel;
 use otel_arrow_dfe_pdata::otlp::common::ProtoBuffer;
 use otel_arrow_dfe_pdata::proto::opentelemetry::{
     common::v1::{AnyValue, KeyValue, any_value::Value},
     logs::v1::LogRecord as ProtoRecord,
 };
-use otel_arrow_dfe_telemetry::diagnostics::{DiagnosticErrorKind, EpisodeSampler, IntervalSampler};
+use otel_arrow_dfe_telemetry::diagnostics::{
+    DiagnosticErrorKind, EpisodeSampler, IntervalSampler, SignalSet,
+};
 use otel_arrow_dfe_telemetry::event::{ObservedEvent, ObservedEventReporter};
 use otel_arrow_dfe_telemetry::log_filter::{RuntimeLogFilter, RuntimeLogFilterHandle};
 use otel_arrow_dfe_telemetry::self_tracing::encoder::DirectFieldVisitor;
@@ -274,6 +277,65 @@ fn interval_sampler_uses_current_failure() {
         attr(&last.attributes, "suppressed_diagnostics"),
         &Value::IntValue(1)
     );
+    assert!(rx.is_empty());
+}
+
+/// Scenario: Signal-scoped loggers supply their own clock and attributes.
+/// Guarantees: Each signal expression is evaluated once and emitted once.
+#[test]
+fn signal_context_is_evaluated_once() {
+    let (setup, handle, rx) = setup("off");
+    let mut intervals = SignalSet::new(|| IntervalSampler::new(setup.log_emitter()));
+    let mut episodes = SignalSet::new(|| EpisodeSampler::new(setup.log_emitter()));
+    let evaluations = Cell::new(0);
+    setup.with_subscriber(|| {
+        otel_warn!(
+            logger: intervals.logger({
+                evaluations.set(evaluations.get() + 1);
+                SignalType::Logs
+            }, DiagnosticErrorKind::Other),
+            "test.filtered"
+        );
+        assert_eq!(evaluations.get(), 0);
+        handle.apply(Some(&LogLevel::try_from("warn".to_owned()).unwrap()));
+        for signal in [SignalType::Logs, SignalType::Metrics, SignalType::Traces] {
+            otel_warn!(
+                logger: intervals.logger({
+                    evaluations.set(evaluations.get() + 1);
+                    signal
+                }, DiagnosticErrorKind::Other),
+                "test.interval",
+                error = "failed"
+            );
+            let mut diagnostic = episodes.observe(
+                {
+                    evaluations.set(evaluations.get() + 1);
+                    signal
+                },
+                Err(DiagnosticErrorKind::Other),
+                Instant::now(),
+            );
+            otel_warn!(logger: diagnostic, "test.failure", message = "failed");
+        }
+    });
+    assert_eq!(evaluations.get(), 6);
+    for expected in ["logs", "metrics", "traces"] {
+        for _ in 0..2 {
+            let (_, record) = receive(&rx);
+            assert_eq!(
+                record
+                    .attributes
+                    .iter()
+                    .filter(|a| a.key == "signal")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                attr(&record.attributes, "signal"),
+                &Value::StringValue(expected.into())
+            );
+        }
+    }
     assert!(rx.is_empty());
 }
 

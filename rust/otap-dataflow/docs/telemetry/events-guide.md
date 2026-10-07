@@ -420,6 +420,12 @@ where relevant. Use one sampler for an operation without telemetry signals,
 or `SignalSet` for a fixed set of signal scopes.
 Never create unbounded state keyed by client, payload, tenant, or error text.
 
+For a `SignalSet<IntervalSampler<_>>`, use `logger(signal, category)` as the
+logging macro's `logger:` argument. For a `SignalSet<EpisodeSampler<_>>`, call
+`observe(signal, result, started_at)` before choosing WARN or INFO. These helpers
+supply the current time and carry the signal into the record; do not repeat
+`signal` as an event field.
+
 Integrations SHOULD identify the operation boundary with stable, bounded
 attributes such as `stage` or `signal` when relevant. Preparation, delivery,
 and notification are distinct operations and generally require independent

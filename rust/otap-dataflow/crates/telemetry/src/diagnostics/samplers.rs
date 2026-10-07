@@ -1,12 +1,13 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{DiagnosticReport, DiagnosticTracker, ReportKind};
+use super::{DiagnosticReport, DiagnosticTracker, ReportKind, SignalSet};
 use crate::attributes::AttributeEnum;
 use crate::log_sampler::Sampler;
 use crate::self_tracing::encoder::DirectFieldVisitor;
 use crate::self_tracing::{LogContext, LogRecord};
 use crate::tracing_init::StructuredLogEmitter;
+use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_pdata::otlp::common::{BoundedBuf, ProtoBuffer};
 use std::time::{Instant, SystemTime};
 use tracing::{Dispatch, Event, Metadata};
@@ -37,7 +38,17 @@ impl<E: AttributeEnum> IntervalSampler<E> {
             report: self.tracker.failure(now, category),
             sample: Sample::None,
             emitter: &self.emitter,
+            signal: None,
         }
+    }
+}
+
+impl<E: AttributeEnum> SignalSet<IntervalSampler<E>> {
+    /// Observes a failure now and includes its signal in the selected record.
+    pub fn logger(&mut self, signal: SignalType, category: E) -> DiagnosticEmission<'_, E> {
+        self.signal(signal)
+            .failure(Instant::now(), category)
+            .with_signal(signal)
     }
 }
 
@@ -85,7 +96,22 @@ impl<E: AttributeEnum> EpisodeSampler<E> {
             report,
             sample,
             emitter: &self.emitter,
+            signal: None,
         }
+    }
+}
+
+impl<E: AttributeEnum> SignalSet<EpisodeSampler<E>> {
+    /// Observes a completion now, before either log call, and carries its signal.
+    pub fn observe(
+        &mut self,
+        signal: SignalType,
+        result: Result<(), E>,
+        started_at: Instant,
+    ) -> DiagnosticEmission<'_, E> {
+        self.signal(signal)
+            .observe(result, started_at, Instant::now())
+            .with_signal(signal)
     }
 }
 
@@ -105,9 +131,15 @@ pub struct DiagnosticEmission<'a, E> {
     report: Option<DiagnosticReport<E>>,
     sample: Sample<'a>,
     emitter: &'a StructuredLogEmitter,
+    signal: Option<SignalType>,
 }
 
 impl<E: AttributeEnum> DiagnosticEmission<'_, E> {
+    fn with_signal(mut self, signal: SignalType) -> Self {
+        self.signal = Some(signal);
+        self
+    }
+
     /// Counter snapshot selected by the observation, if any.
     pub const fn report(&self) -> Option<&DiagnosticReport<E>> {
         self.report.as_ref()
@@ -164,6 +196,9 @@ impl<E: AttributeEnum> DiagnosticEmission<'_, E> {
             _ => {
                 buf.with_max_remaining(DIAGNOSTIC_RECORD_LIMIT / 2, |buf| {
                     let mut visitor = DirectFieldVisitor::new(buf);
+                    if let Some(signal) = self.signal {
+                        visitor.write_str("signal", signal.as_str());
+                    }
                     event.record(&mut visitor);
                     dropped = visitor.dropped_count();
                 });

@@ -142,10 +142,10 @@ For delivery episodes, observe the completion before either logging statement.
 This lets INFO recovery remain independent of WARN filtering:
 
 ```rust
-let mut diagnostic = metrics.delivery.signal(signal_type).observe(
+let mut diagnostic = metrics.delivery.observe(
+    signal_type,
     result.as_ref().map(|_| ()).map_err(|error| error.error_type()),
     diagnostic_started_at,
-    Instant::now(),
 );
 if diagnostic.is_recovery() {
     otel_info!(
@@ -161,6 +161,20 @@ if diagnostic.is_recovery() {
     );
 }
 ```
+
+For per-signal interval suppression, the logger also supplies the clock:
+
+```rust
+otel_warn!(
+    logger: self.metrics.preparation.logger(signal_type, error_type),
+    "otlp.exporter.http.preparation_error",
+    error = %error
+);
+```
+
+Both helpers evaluate the supplied signal once and include the `signal` attribute
+automatically. Do not repeat it among the event fields. The lower-level
+`failure`/`observe` methods still accept explicit timestamps for controlled clocks.
 
 `EpisodeSampler` retains the first warning for a map-valued snapshot in the
 recovery record. `IntervalSampler` only emits periodic warnings and retains no
