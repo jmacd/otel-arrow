@@ -16,6 +16,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+tracing.workspace = true
 otel-arrow-dfe-channel = { workspace = true }
 otel-arrow-dfe-config = { workspace = true }
 otel-arrow-dfe-engine = { workspace = true }
@@ -158,7 +159,6 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 tokio-stream.workspace = true
-tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["registry", "std"] }
 zstd.workspace = true
 pretty_assertions.workspace = true
