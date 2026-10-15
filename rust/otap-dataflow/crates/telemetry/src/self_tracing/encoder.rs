@@ -121,7 +121,7 @@ impl<'buf, B: BoundedBuf> DirectFieldVisitor<'buf, B> {
     }
 
     /// Encodes a structured value as one attribute within the per-attribute budget.
-    pub fn write_structured(&mut self, key: &str, value: &Structured) {
+    fn write_structured(&mut self, key: &str, value: &Structured) {
         self.write_value_attribute(key, |w| value.value().write(w));
     }
 
@@ -140,22 +140,6 @@ impl<'buf, B: BoundedBuf> DirectFieldVisitor<'buf, B> {
     /// Encodes one attribute whose value is written by `f`.
     fn write_value_attribute(&mut self, key: &str, mut f: impl FnMut(&mut dyn ValueWriter)) {
         self.write_attribute(|buf| write_key_value(buf, LOG_RECORD_ATTRIBUTES, key, 0, &mut f));
-    }
-
-    /// Encode the body as a string (empty strings are skipped), truncating
-    /// safely via [`BoundedBuf::encode_string_truncating`].
-    #[inline]
-    pub fn encode_body_string(&mut self, value: &str) {
-        if !value.is_empty() {
-            self.write_body(|w| w.write_str(value));
-        }
-    }
-
-    /// Encode the body from a Debug value without allocation, truncating
-    /// safely (see [`Self::encode_body_string`]).
-    #[inline]
-    pub fn encode_body_debug(&mut self, value: &dyn std::fmt::Debug) {
-        self.write_body(|w| w.write_debug(value));
     }
 
     /// Encodes the body, written by `f`, rolling it back if it cannot fit.
@@ -341,7 +325,7 @@ fn write_value<B: BoundedBuf>(
 }
 
 /// Encodes a `KeyValue` as a length-delimited `field`; see [`write_value`].
-fn write_key_value<B: BoundedBuf>(
+pub(super) fn write_key_value<B: BoundedBuf>(
     buf: &mut B,
     field: u64,
     key: &str,
@@ -516,18 +500,18 @@ impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.encode_body_string(value);
-        } else {
+        if field.name() != "message" {
             self.write_value_attribute(field.name(), |w| w.write_str(value));
+        } else if !value.is_empty() {
+            self.write_body(|w| w.write_str(value));
         }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.encode_body_debug(value);
-        } else {
+        if field.name() != "message" {
             self.write_value_attribute(field.name(), |w| w.write_debug(value));
+        } else {
+            self.write_body(|w| w.write_debug(value));
         }
     }
 

@@ -7,7 +7,8 @@
 //! this module builds whole requests in a growable [`ProtoBuffer`]. It is
 //! the only place in `self_tracing` that may name that type.
 
-use super::encoder::DirectLogRecordEncoder;
+use super::encoder::{DirectLogRecordEncoder, write_key_value};
+use super::structured::{ArrayWriter, ValueWriter};
 use crate::attributes::AttributeValue;
 use crate::event::LogEvent;
 use crate::registry::{EntityKey, TelemetryRegistryHandle};
@@ -17,7 +18,7 @@ use otel_arrow_dfe_config::pipeline::telemetry::{
 };
 use otel_arrow_dfe_pdata::otlp::common::{BoundedBuf, EncodeFailure, EncodeResult, ProtoBuffer};
 use otel_arrow_dfe_pdata::proto::consts::{
-    field_num::common::*, field_num::logs::*, field_num::resource::*, wire_types,
+    field_num::common::*, field_num::logs::*, field_num::resource::*,
 };
 use slotmap::Key;
 use std::collections::HashMap;
@@ -35,89 +36,46 @@ pub(crate) fn encode_config_resource_field(
     let mut buf = ProtoBuffer::with_capacity(256);
     let _: EncodeResult = buf.encode_len_delimited(RESOURCE_LOGS_RESOURCE, |buf| {
         for (key, value) in resource_attributes {
-            encode_config_resource_attribute(buf, key, value)?;
+            encode_attribute(buf, RESOURCE_ATTRIBUTES, key, |w| {
+                write_config_value(w, value)
+            })?;
         }
         Ok(())
     });
     buf.into_bytes()
 }
 
-/// Encode one configured resource attribute as an OTLP `KeyValue`.
-fn encode_config_resource_attribute(
-    buf: &mut ProtoBuffer,
-    key: &str,
-    value: &ConfigAttributeValue,
-) -> EncodeResult {
-    buf.encode_len_delimited(RESOURCE_ATTRIBUTES, |buf| {
-        buf.encode_string(KEY_VALUE_KEY, key)?;
-        buf.encode_len_delimited(KEY_VALUE_VALUE, |buf| {
-            encode_config_resource_value(buf, value)
-        })
-    })
-}
-
-/// Encode one configured resource value as an OTLP `AnyValue` payload.
-fn encode_config_resource_value(
-    buf: &mut ProtoBuffer,
-    value: &ConfigAttributeValue,
-) -> EncodeResult {
+/// Writes one configured resource value.
+fn write_config_value(w: &mut dyn ValueWriter, value: &ConfigAttributeValue) {
     match value {
-        ConfigAttributeValue::String(value) => {
-            buf.encode_string(ANY_VALUE_STRING_VALUE, value)?;
-        }
-        ConfigAttributeValue::Bool(value) => {
-            buf.encode_field_tag(ANY_VALUE_BOOL_VALUE, wire_types::VARINT)?;
-            buf.encode_varint(u64::from(*value))?;
-        }
-        ConfigAttributeValue::I64(value) => {
-            buf.encode_field_tag(ANY_VALUE_INT_VALUE, wire_types::VARINT)?;
-            buf.encode_varint(*value as u64)?;
-        }
-        ConfigAttributeValue::F64(value) => {
-            buf.encode_field_tag(ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64)?;
-            buf.extend_from_slice(&value.to_le_bytes())?;
-        }
-        ConfigAttributeValue::Array(values) => {
-            buf.encode_len_delimited(ANY_VALUE_ARRAY_VALUE, |buf| match values {
-                ConfigAttributeValueArray::Bool(values) => {
-                    encode_config_resource_array(buf, values, |buf, value| {
-                        buf.encode_field_tag(ANY_VALUE_BOOL_VALUE, wire_types::VARINT)?;
-                        buf.encode_varint(u64::from(*value))
-                    })
-                }
-                ConfigAttributeValueArray::I64(values) => {
-                    encode_config_resource_array(buf, values, |buf, value| {
-                        buf.encode_field_tag(ANY_VALUE_INT_VALUE, wire_types::VARINT)?;
-                        buf.encode_varint(*value as u64)
-                    })
-                }
-                ConfigAttributeValueArray::F64(values) => {
-                    encode_config_resource_array(buf, values, |buf, value| {
-                        buf.encode_field_tag(ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64)?;
-                        buf.extend_from_slice(&value.to_le_bytes())
-                    })
-                }
-                ConfigAttributeValueArray::String(values) => {
-                    encode_config_resource_array(buf, values, |buf, value| {
-                        buf.encode_string(ANY_VALUE_STRING_VALUE, value)
-                    })
-                }
-            })?;
-        }
+        ConfigAttributeValue::String(v) => w.write_str(v),
+        ConfigAttributeValue::Bool(v) => w.write_bool(*v),
+        ConfigAttributeValue::I64(v) => w.write_i64(*v),
+        ConfigAttributeValue::F64(v) => w.write_f64(*v),
+        ConfigAttributeValue::Array(values) => w.array(|a| match values {
+            ConfigAttributeValueArray::Bool(vs) => elements(a, vs, |w, v| w.write_bool(*v)),
+            ConfigAttributeValueArray::I64(vs) => elements(a, vs, |w, v| w.write_i64(*v)),
+            ConfigAttributeValueArray::F64(vs) => elements(a, vs, |w, v| w.write_f64(*v)),
+            ConfigAttributeValueArray::String(vs) => elements(a, vs, |w, v| w.write_str(v)),
+        }),
     }
-    Ok(())
 }
 
-/// Encode a homogeneous configured array as repeated OTLP `AnyValue` entries.
-fn encode_config_resource_array<T>(
-    buf: &mut ProtoBuffer,
-    values: &[T],
-    mut encode_value: impl FnMut(&mut ProtoBuffer, &T) -> EncodeResult,
-) -> EncodeResult {
+/// Writes a homogeneous slice as array elements.
+fn elements<T>(a: &mut dyn ArrayWriter, values: &[T], write: impl Fn(&mut dyn ValueWriter, &T)) {
     for value in values {
-        buf.encode_len_delimited(ARRAY_VALUE_VALUES, |buf| encode_value(buf, value))?;
+        a.element(|w| write(w, value));
     }
-    Ok(())
+}
+
+/// Encodes a `KeyValue` as `field`, with the value written by `f`.
+fn encode_attribute(
+    buf: &mut ProtoBuffer,
+    field: u64,
+    key: &str,
+    mut f: impl FnMut(&mut dyn ValueWriter),
+) -> EncodeResult {
+    write_key_value(buf, field, key, 0, &mut f).map(drop)
 }
 
 // Field numbers for ExportLogsServiceRequest and related messages
@@ -188,76 +146,28 @@ fn encode_scope_attributes<'k, 'v>(
     attrs: impl IntoIterator<Item = (&'k str, &'v AttributeValue)>,
 ) -> Result<Bytes, EncodeFailure> {
     let mut buf = ProtoBuffer::with_capacity(128);
-    for (attr_key, attr_value) in attrs {
-        encode_scope_attribute(&mut buf, attr_key, attr_value)?;
+    for (key, value) in attrs {
+        encode_attribute(&mut buf, INSTRUMENTATION_SCOPE_ATTRIBUTES, key, |w| {
+            write_attribute_value(w, value)
+        })?;
     }
     Ok(buf.into_bytes())
 }
 
-/// Encode a single scope attribute as a KeyValue message for InstrumentationScope.attributes.
-#[inline]
-fn encode_scope_attribute(
-    buf: &mut ProtoBuffer,
-    key: &str,
-    value: &AttributeValue,
-) -> EncodeResult {
-    encode_key_value(buf, INSTRUMENTATION_SCOPE_ATTRIBUTES, key, value)
-}
-
-/// Encode a KeyValue message wrapped in the given outer field tag.
-///
-/// The outer field tag determines context:
-/// - `INSTRUMENTATION_SCOPE_ATTRIBUTES` (field 3) for scope attributes
-/// - `KEY_VALUE_LIST_VALUES` (field 1) for entries inside a kvlist
-#[inline]
-fn encode_key_value(
-    buf: &mut ProtoBuffer,
-    outer_field: u64,
-    key: &str,
-    value: &AttributeValue,
-) -> EncodeResult {
-    buf.encode_len_delimited(outer_field, |buf| {
-        buf.encode_string(KEY_VALUE_KEY, key)?;
-        buf.encode_len_delimited(KEY_VALUE_VALUE, |buf| encode_any_value(buf, value))
-    })
-}
-
-/// Encode an `AttributeValue` as an OTLP AnyValue (the inner value without key wrapping).
-#[inline]
-fn encode_any_value(buf: &mut ProtoBuffer, value: &AttributeValue) -> EncodeResult {
+/// Writes an `AttributeValue`; maps become kvlists.
+fn write_attribute_value(w: &mut dyn ValueWriter, value: &AttributeValue) {
     match value {
-        AttributeValue::String(s) => {
-            buf.encode_string(ANY_VALUE_STRING_VALUE, s.as_str())?;
-        }
-        AttributeValue::Boolean(b) => {
-            buf.encode_field_tag(ANY_VALUE_BOOL_VALUE, wire_types::VARINT)?;
-            buf.encode_varint(u64::from(*b))?;
-        }
-        AttributeValue::Int(i) => {
-            buf.encode_field_tag(ANY_VALUE_INT_VALUE, wire_types::VARINT)?;
-            buf.encode_varint(*i as u64)?;
-        }
-        AttributeValue::UInt(u) => {
-            buf.encode_field_tag(ANY_VALUE_INT_VALUE, wire_types::VARINT)?;
-            buf.encode_varint(*u)?;
-        }
-        AttributeValue::Double(f) => {
-            buf.encode_field_tag(ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64)?;
-            buf.extend_from_slice(&f.to_le_bytes())?;
-        }
-        AttributeValue::Map(m) => {
-            // Encode as kvlist: AnyValue.kvlist_value (field 6) containing
-            // KeyValueList with repeated KeyValue entries (field 1).
-            buf.encode_len_delimited(ANY_VALUE_KVLIST_VALUE, |buf| {
-                for (k, v) in m {
-                    encode_key_value(buf, KEY_VALUE_LIST_VALUES, k, v)?;
-                }
-                Ok(())
-            })?;
-        }
+        AttributeValue::String(v) => w.write_str(v),
+        AttributeValue::Boolean(v) => w.write_bool(*v),
+        AttributeValue::Int(v) => w.write_i64(*v),
+        AttributeValue::UInt(v) => w.write_i64(*v as i64),
+        AttributeValue::Double(v) => w.write_f64(*v),
+        AttributeValue::Map(m) => w.map(|mw| {
+            for (k, v) in m {
+                mw.entry(k, |w| write_attribute_value(w, v));
+            }
+        }),
     }
-
-    Ok(())
 }
 
 fn encode_scope_logs(
