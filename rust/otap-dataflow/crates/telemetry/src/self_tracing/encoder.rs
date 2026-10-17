@@ -3,7 +3,9 @@
 
 //! Direct OTLP bytes encoder for tokio-tracing events.
 
-use super::structured::{ArrayWriter, MAX_DEPTH, MapWriter, Structured, ValueWriter};
+use super::structured::{
+    ArcCarrier, ArrayWriter, BoxCarrier, MAX_DEPTH, MapWriter, StructuredValue, ValueWriter,
+};
 use super::{LogRecord, SavedCallsite};
 use crate::attributes::AttributeValue;
 use crate::event::LogEvent;
@@ -132,10 +134,10 @@ impl<'buf, B: BoundedBuf> DirectFieldVisitor<'buf, B> {
     }
 
     /// Encodes a structured value as one attribute within the per-attribute budget.
-    fn write_structured(&mut self, key: &str, value: &Structured) {
+    fn write_structured(&mut self, key: &str, value: &dyn StructuredValue) {
         self.write_attribute(|buf| {
             write_key_value(buf, LOG_RECORD_ATTRIBUTES, key, 0, &mut |w| {
-                value.value().write(w);
+                value.write(w);
             })
         });
     }
@@ -576,6 +578,7 @@ impl<B: BoundedBuf> ValueWriter for ValueEncoder<'_, B> {
 struct MapEncoder<'a, B: BoundedBuf> {
     buf: &'a mut B,
     depth: usize,
+    /// Sticky loss flag for counting this attribute once, even if later entries fit.
     lost: bool,
 }
 
@@ -592,7 +595,9 @@ impl<B: BoundedBuf> MapWriter for MapEncoder<'_, B> {
 struct ArrayEncoder<'a, B: BoundedBuf> {
     buf: &'a mut B,
     depth: usize,
+    /// Sticky loss flag; a truncated element can still allow later elements.
     lost: bool,
+    /// A whole element was rolled back; skip later elements to preserve a prefix.
     stopped: bool,
 }
 
@@ -661,9 +666,12 @@ impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
         field: &tracing::field::Field,
         value: &(dyn std::error::Error + 'static),
     ) {
-        match value.downcast_ref::<Structured>() {
-            Some(structured) => self.write_structured(field.name(), structured),
-            None => self.record_debug(field, &format_args!("{value}")),
+        if let Some(structured) = value.downcast_ref::<ArcCarrier>() {
+            self.write_structured(field.name(), structured.value());
+        } else if let Some(structured) = value.downcast_ref::<BoxCarrier>() {
+            self.write_structured(field.name(), structured.value());
+        } else {
+            self.record_debug(field, &format_args!("{value}"));
         }
     }
 }
@@ -930,8 +938,8 @@ mod tests {
     use crate::LogContext;
     use crate::attributes::AttributeSetHandler;
     use crate::descriptor::{AttributeField, AttributeValueType, AttributesDescriptor};
-    use crate::self_tracing::StructuredValue;
     use crate::self_tracing::format_log_record_to_string;
+    use crate::self_tracing::{StructArc, StructuredValue};
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
         AnyValue, InstrumentationScope, KeyValue,
@@ -942,7 +950,6 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
     use prost::Message;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
     use tracing::Level;
 
@@ -1955,29 +1962,30 @@ mod tests {
     }
 
     fn encode_probe(limit: usize, value: Probe) -> (ProtoBuffer, u32) {
-        let structured = Structured::from_arc(Arc::new(value));
+        use tracing::field::Visit;
+
+        let structured = StructArc::new(value);
         let mut buf = ProtoBuffer::with_capacity_and_limit(limit, limit);
         let mut visitor = DirectFieldVisitor::new(&mut buf);
-        visitor.write_structured("probe", &structured);
+        let field = BUDGET_TEST_METADATA
+            .fields()
+            .field("a")
+            .expect("known field");
+        visitor.record_error(&field, structured.as_struct());
         let dropped = visitor.dropped_count();
         (buf, dropped)
     }
 
-    /// Scenario: one Arc is emitted in several events and then updated in place.
-    /// Guarantees: emitting leaves the caller as sole owner, so Arc::get_mut succeeds and later events see the new value.
+    /// Scenario: one structured handle is emitted in several events and updated in place.
+    /// Guarantees: logging only borrows the handle, so get_mut succeeds and later events see the new value.
     #[test]
     fn shared_value_can_be_updated_in_place_between_events() {
-        let mut slot = Arc::new(probe(0));
+        let mut slot = StructArc::new(probe(0));
         for count in [1, 2] {
-            Arc::get_mut(&mut slot).expect("sole owner").count = count;
-            let structured = Structured::from_arc(slot.clone());
-            let record = __log_record_impl!(
-                Level::INFO,
-                "test.structured",
-                probe = structured.as_value()
-            )
-            .into_record(LogContext::new());
-            drop(structured);
+            StructArc::get_mut(&mut slot).expect("sole owner").count = count;
+            let record =
+                __log_record_impl!(Level::INFO, "test.structured", probe = slot.as_struct())
+                    .into_record(LogContext::new());
             assert_eq!(record.dropped_attributes_count, 0);
             let decoded =
                 LogRecord::decode(record.body_attrs_bytes.as_ref()).expect("valid record");

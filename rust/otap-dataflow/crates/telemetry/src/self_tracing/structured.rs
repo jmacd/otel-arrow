@@ -1,19 +1,25 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Structured (OTLP AnyValue) event fields.
+//! Structured AnyValue event fields using a downcast to `&(dyn
+//! std::error::Error + 'static)`.
 //!
-//! Tokio tracing has no stable way to carry a structured value through
-//! `field = value`. This module uses the one channel that can be
-//! downcast: `&(dyn std::error::Error + 'static)`. A [`Structured`]
-//! wraps any [`StructuredValue`] and exposes itself through
-//! [`Structured::as_value`]; the direct field encoder recognizes it and
-//! writes an AnyValue map/array instead of text.
+//! A [`StructBox`] owns a [`StructuredValue`] and exposes it through
+//! [`StructBox::as_struct`]; the direct field encoder
+//! recognizes it and writes an AnyValue map/array instead of text.
 //!
-//! ```ignore
-//! struct Point { x: i64, y: i64 }
+//! Callers, to avoid allocations near logging callsites, store a
+//! `StructBox<T>` instead of a `Box<T>` and use `as_struct()` inside
+//! logging statements. Use [`StructArc`] instead when shared ownership
+//! is needed; its logging interface is the same.
 //!
-//! impl StructuredValue for Point {
+//! ```
+//! use otel_arrow_dfe_telemetry::otel_info;
+//! use otel_arrow_dfe_telemetry::self_tracing::{StructBox, StructuredValue, ValueWriter};
+//!
+//! struct State { x: i64, y: i64 }
+//!
+//! impl StructuredValue for State {
 //!     fn write(&self, w: &mut dyn ValueWriter) {
 //!         w.map(|m| {
 //!             m.entry("x", |v| v.write_i64(self.x));
@@ -21,37 +27,45 @@
 //!         });
 //!     }
 //! }
+//! struct Component {
+//!     state: StructBox<State>,
+//! }
 //!
-//! let point = Arc::new(Point { x: 1, y: 2 });
-//! otel_info!("point.moved", to = Structured::from_arc(point.clone()).as_value());
+//! impl Component {
+//!     fn report(&self) {
+//!         otel_info!("complex.state", state = self.state.as_struct());
+//!     }
+//! }
+//! # let component = Component { state: StructBox::new(State { x: 1, y: 2 }) };
+//! # component.report();
 //! ```
 //!
-//! Callers own the `Arc`; there is no constructor that allocates.
-//!
-//! Values are encoded under the same size limits as other event fields:
-//! nesting is limited to [`MAX_DEPTH`] levels, and anything that does not
-//! fit is dropped or truncated and counted once in the record's
-//! `dropped_attributes_count`.
+//! Encoded values are limited to [`MAX_DEPTH`] levels of nesting.
+//! When depth or size limits cause data loss this is counted once in
+//! the record's `dropped_attributes_count`.
 
+use std::any::Any;
 use std::error::Error;
 use std::fmt;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 /// Maximum nesting of maps and arrays; deeper values are dropped.
 pub const MAX_DEPTH: usize = 16;
 
 /// A value that can describe itself as an OTLP AnyValue.
-pub trait StructuredValue: Send + Sync + 'static {
+pub trait StructuredValue: Any + Send + Sync {
     /// Writes exactly one value to `w`.
     fn write(&self, w: &mut dyn ValueWriter);
 }
 
 /// Receives one AnyValue. Writing nothing is an empty value.
 pub trait ValueWriter {
-    /// Writes a string, truncated if it does not fit.
+    /// Writes a string, maybe truncated.
     fn write_str(&mut self, value: &str);
     /// Writes the `Debug` rendering of `value` as a string, formatted in
-    /// place and truncated if it does not fit.
+    /// place and maybe truncated.
     fn write_debug(&mut self, value: &dyn fmt::Debug);
     /// Writes a signed integer.
     fn write_i64(&mut self, value: i64);
@@ -105,41 +119,256 @@ impl dyn ArrayWriter + '_ {
     }
 }
 
-/// Carrier that passes a [`StructuredValue`] through a tracing field.
-#[derive(Clone)]
-pub struct Structured(Arc<dyn StructuredValue>);
+/// A typed, shared value that can be borrowed as a structured tracing field.
+///
+/// Like [`Arc`], cloning shares the allocation, dereferencing borrows `T`, and
+/// [`get_mut`](Self::get_mut) requires unique ownership, including no weak
+/// references. The private carrier erases `T` for the encoder; constructors
+/// preserve its identity for checked downcasts during typed access.
+pub struct StructArc<T: StructuredValue> {
+    carrier: ArcCarrier,
+    marker: PhantomData<T>,
+}
 
-impl Structured {
-    /// Wraps a shared value. The caller owns an `Arc` and clones it per
-    /// event, so emitting costs a reference-count bump. Once the event
-    /// completes the clone is dropped, so a sole owner can update the
-    /// value in place with [`Arc::get_mut`].
-    pub fn from_arc(value: Arc<impl StructuredValue>) -> Self {
-        Self(value)
-    }
-
-    /// The field value to pass to an event macro.
+impl<T: StructuredValue> StructArc<T> {
+    /// Allocates shared storage for a value that will be logged repeatedly.
     #[must_use]
-    pub fn as_value(&self) -> &(dyn Error + 'static) {
-        self
+    pub fn new(value: T) -> Self {
+        Self::from(Arc::new(value))
     }
 
+    /// Borrows the stored carrier for a logging field.
+    ///
+    /// Pass directly as a field value, without `?` or `%`.
+    #[must_use]
+    pub fn as_struct(&self) -> &(dyn Error + 'static) {
+        &self.carrier
+    }
+
+    /// Returns mutable access only when there are no other strong or weak
+    /// references, matching [`Arc::get_mut`].
+    pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        let value: &mut dyn Any = Arc::get_mut(&mut this.carrier.0)?;
+        Some(
+            value
+                .downcast_mut::<T>()
+                .expect("StructArc carrier must contain T"),
+        )
+    }
+}
+
+impl<T: StructuredValue> From<Arc<T>> for StructArc<T> {
+    fn from(value: Arc<T>) -> Self {
+        Self {
+            carrier: StructCarrier(value),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T: StructuredValue> Clone for StructArc<T> {
+    fn clone(&self) -> Self {
+        Self {
+            carrier: StructCarrier(Arc::clone(&self.carrier.0)),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T: StructuredValue> Deref for StructArc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        let value: &dyn Any = self.carrier.0.as_ref();
+        value
+            .downcast_ref::<T>()
+            .expect("StructArc carrier must contain T")
+    }
+}
+
+impl<T: StructuredValue + fmt::Debug> fmt::Debug for StructArc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+/// A typed, exclusively owned value that can be borrowed as a structured field.
+///
+/// Like [`Box`], dereferencing borrows `T` and mutable dereferencing provides
+/// exclusive access. Logging borrows the stored carrier without allocating.
+pub struct StructBox<T: StructuredValue> {
+    carrier: BoxCarrier,
+    marker: PhantomData<T>,
+}
+
+impl<T: StructuredValue> StructBox<T> {
+    /// Allocates exclusive storage for a value that will be logged repeatedly.
+    #[must_use]
+    pub fn new(value: T) -> Self {
+        Self::from(Box::new(value))
+    }
+
+    /// Borrows the stored carrier for a logging field.
+    ///
+    /// Pass directly as a field value, without `?` or `%`.
+    #[must_use]
+    pub fn as_struct(&self) -> &(dyn Error + 'static) {
+        &self.carrier
+    }
+}
+
+impl<T: StructuredValue> From<Box<T>> for StructBox<T> {
+    fn from(value: Box<T>) -> Self {
+        Self {
+            carrier: StructCarrier(value),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T: StructuredValue> Deref for StructBox<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        let value: &dyn Any = self.carrier.0.as_ref();
+        value
+            .downcast_ref::<T>()
+            .expect("StructBox carrier must contain T")
+    }
+}
+
+impl<T: StructuredValue> DerefMut for StructBox<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let value: &mut dyn Any = self.carrier.0.as_mut();
+        value
+            .downcast_mut::<T>()
+            .expect("StructBox carrier must contain T")
+    }
+}
+
+impl<T: StructuredValue + fmt::Debug> fmt::Debug for StructBox<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+/// Carriers erase the value type, retaining only the ownership kind.
+pub(super) struct StructCarrier<S>(S);
+
+pub(super) type ArcCarrier = StructCarrier<Arc<dyn StructuredValue>>;
+pub(super) type BoxCarrier = StructCarrier<Box<dyn StructuredValue>>;
+
+impl<S: Deref<Target = dyn StructuredValue>> StructCarrier<S> {
     pub(super) fn value(&self) -> &dyn StructuredValue {
         &*self.0
     }
 }
 
 // Subscribers that do not understand structured fields see a placeholder.
-impl fmt::Debug for Structured {
+impl<S> fmt::Debug for StructCarrier<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("<structured>")
     }
 }
 
-impl fmt::Display for Structured {
+impl<S> fmt::Display for StructCarrier<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
 }
 
-impl Error for Structured {}
+impl<S: 'static> Error for StructCarrier<S> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct State {
+        count: i64,
+    }
+
+    impl StructuredValue for State {
+        fn write(&self, w: &mut dyn ValueWriter) {
+            w.write_i64(self.count);
+        }
+    }
+
+    /// Scenario: a non-Clone value is accessed and shared through typed handles.
+    /// Guarantees: dereferencing retains its type, cloning shares storage, and mutation requires a sole owner.
+    #[test]
+    fn typed_access_and_unique_mutation() {
+        let mut state = StructArc::new(State { count: 1 });
+        assert_eq!(state.count, 1);
+        StructArc::get_mut(&mut state).expect("sole owner").count = 2;
+        let other = state.clone();
+        assert!(std::ptr::eq(&*state, &*other));
+        assert_eq!(other.count, 2);
+        assert!(StructArc::get_mut(&mut state).is_none());
+        drop(other);
+        StructArc::get_mut(&mut state)
+            .expect("sole owner again")
+            .count = 3;
+        assert_eq!(state.count, 3);
+    }
+
+    /// Scenario: an existing Arc with other strong and weak references becomes a structured handle.
+    /// Guarantees: conversion reuses storage and get_mut preserves Arc's strong and weak ownership rules.
+    #[test]
+    fn existing_arc_ownership_is_preserved() {
+        let original = Arc::new(State { count: 7 });
+        let weak = Arc::downgrade(&original);
+        let mut state = StructArc::from(Arc::clone(&original));
+        assert!(std::ptr::eq(&*state, &*original));
+        assert!(StructArc::get_mut(&mut state).is_none());
+        drop(original);
+        assert!(StructArc::get_mut(&mut state).is_none());
+        drop(weak);
+        assert_eq!(StructArc::get_mut(&mut state).expect("sole owner").count, 7);
+    }
+
+    /// Scenario: a structured field borrows the stored erased carrier.
+    /// Guarantees: field creation neither clones the Arc nor prevents unique mutation after the borrow ends.
+    #[test]
+    fn field_borrows_without_cloning() {
+        let original = Arc::new(State { count: 11 });
+        let weak = Arc::downgrade(&original);
+        let mut state = StructArc::from(original);
+        let field = state.as_struct();
+        assert_eq!(weak.strong_count(), 1);
+        assert!(std::ptr::eq(
+            field.downcast_ref::<ArcCarrier>().expect("known carrier"),
+            &state.carrier,
+        ));
+        drop(weak);
+        assert!(StructArc::get_mut(&mut state).is_some());
+    }
+
+    /// Scenario: a non-Clone value is exclusively owned by a structured box.
+    /// Guarantees: typed access and mutation work, and logging borrows the existing carrier.
+    #[test]
+    fn boxed_value_supports_typed_mutation_and_borrowing() {
+        let mut state = StructBox::new(State { count: 1 });
+        state.count = 2;
+        assert_eq!(state.count, 2);
+        let field = state.as_struct();
+        assert!(std::ptr::eq(
+            field.downcast_ref::<BoxCarrier>().expect("known carrier"),
+            &state.carrier,
+        ));
+        state.count = 3;
+        assert_eq!(state.count, 3);
+    }
+
+    /// Scenario: an existing Box is converted to a structured handle.
+    /// Guarantees: conversion reuses the allocation and preserves mutable typed access.
+    #[test]
+    fn existing_box_storage_is_preserved() {
+        let original = Box::new(State { count: 7 });
+        let address = std::ptr::from_ref(&*original);
+        let mut state = StructBox::from(original);
+        assert_eq!(std::ptr::from_ref(&*state), address);
+        state.count = 8;
+        assert_eq!(state.count, 8);
+    }
+}

@@ -28,7 +28,7 @@ pub use formatter::{
     AnsiCode, ColorMode, ConsoleWriter, RawLoggingLayer, StyledBufWriter,
     format_log_record_to_string,
 };
-pub use structured::{ArrayWriter, MapWriter, Structured, StructuredValue, ValueWriter};
+pub use structured::{ArrayWriter, MapWriter, StructArc, StructBox, StructuredValue, ValueWriter};
 
 /// Initial heap capacity for `LogRecord::new()`'s encoding phase.
 ///
