@@ -4,7 +4,7 @@
 //! Direct OTLP bytes encoder for tokio-tracing events.
 
 use super::structured::{
-    ArcCarrier, ArrayWriter, BoxCarrier, MAX_DEPTH, MapWriter, StructuredValue, ValueWriter,
+    ArrayWriter, MAX_DEPTH, MapWriter, StructCarrier, StructuredValue, ValueWriter,
 };
 use super::{LogRecord, SavedCallsite};
 use crate::attributes::AttributeValue;
@@ -666,12 +666,9 @@ impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
         field: &tracing::field::Field,
         value: &(dyn std::error::Error + 'static),
     ) {
-        if let Some(structured) = value.downcast_ref::<ArcCarrier>() {
-            self.write_structured(field.name(), structured.value());
-        } else if let Some(structured) = value.downcast_ref::<BoxCarrier>() {
-            self.write_structured(field.name(), structured.value());
-        } else {
-            self.record_debug(field, &format_args!("{value}"));
+        match value.downcast_ref::<StructCarrier>() {
+            Some(structured) => self.write_structured(field.name(), structured.value()),
+            None => self.record_debug(field, &format_args!("{value}")),
         }
     }
 }

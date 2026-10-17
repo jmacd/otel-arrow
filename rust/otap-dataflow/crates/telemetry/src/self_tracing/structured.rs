@@ -126,7 +126,7 @@ impl dyn ArrayWriter + '_ {
 /// references. The private carrier erases `T` for the encoder; constructors
 /// preserve its identity for checked downcasts during typed access.
 pub struct StructArc<T: StructuredValue> {
-    carrier: ArcCarrier,
+    carrier: StructCarrier,
     marker: PhantomData<T>,
 }
 
@@ -148,7 +148,7 @@ impl<T: StructuredValue> StructArc<T> {
     /// Returns mutable access only when there are no other strong or weak
     /// references, matching [`Arc::get_mut`].
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
-        let value: &mut dyn Any = Arc::get_mut(&mut this.carrier.0)?;
+        let value: &mut dyn Any = this.carrier.value_mut()?;
         Some(
             value
                 .downcast_mut::<T>()
@@ -160,7 +160,7 @@ impl<T: StructuredValue> StructArc<T> {
 impl<T: StructuredValue> From<Arc<T>> for StructArc<T> {
     fn from(value: Arc<T>) -> Self {
         Self {
-            carrier: StructCarrier(value),
+            carrier: StructCarrier::Shared(value),
             marker: PhantomData,
         }
     }
@@ -168,8 +168,11 @@ impl<T: StructuredValue> From<Arc<T>> for StructArc<T> {
 
 impl<T: StructuredValue> Clone for StructArc<T> {
     fn clone(&self) -> Self {
+        let StructCarrier::Shared(value) = &self.carrier else {
+            unreachable!("StructArc must contain shared storage");
+        };
         Self {
-            carrier: StructCarrier(Arc::clone(&self.carrier.0)),
+            carrier: StructCarrier::Shared(Arc::clone(value)),
             marker: PhantomData,
         }
     }
@@ -179,7 +182,7 @@ impl<T: StructuredValue> Deref for StructArc<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        let value: &dyn Any = self.carrier.0.as_ref();
+        let value: &dyn Any = self.carrier.value();
         value
             .downcast_ref::<T>()
             .expect("StructArc carrier must contain T")
@@ -197,7 +200,7 @@ impl<T: StructuredValue + fmt::Debug> fmt::Debug for StructArc<T> {
 /// Like [`Box`], dereferencing borrows `T` and mutable dereferencing provides
 /// exclusive access. Logging borrows the stored carrier without allocating.
 pub struct StructBox<T: StructuredValue> {
-    carrier: BoxCarrier,
+    carrier: StructCarrier,
     marker: PhantomData<T>,
 }
 
@@ -220,7 +223,7 @@ impl<T: StructuredValue> StructBox<T> {
 impl<T: StructuredValue> From<Box<T>> for StructBox<T> {
     fn from(value: Box<T>) -> Self {
         Self {
-            carrier: StructCarrier(value),
+            carrier: StructCarrier::Owned(value),
             marker: PhantomData,
         }
     }
@@ -230,7 +233,7 @@ impl<T: StructuredValue> Deref for StructBox<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        let value: &dyn Any = self.carrier.0.as_ref();
+        let value: &dyn Any = self.carrier.value();
         value
             .downcast_ref::<T>()
             .expect("StructBox carrier must contain T")
@@ -239,7 +242,10 @@ impl<T: StructuredValue> Deref for StructBox<T> {
 
 impl<T: StructuredValue> DerefMut for StructBox<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let value: &mut dyn Any = self.carrier.0.as_mut();
+        let value: &mut dyn Any = self
+            .carrier
+            .value_mut()
+            .expect("StructBox must exclusively own its value");
         value
             .downcast_mut::<T>()
             .expect("StructBox carrier must contain T")
@@ -252,32 +258,42 @@ impl<T: StructuredValue + fmt::Debug> fmt::Debug for StructBox<T> {
     }
 }
 
-/// Carriers erase the value type, retaining only the ownership kind.
-pub(super) struct StructCarrier<S>(S);
+/// One downcast target for structured fields, regardless of ownership kind.
+pub(super) enum StructCarrier {
+    Shared(Arc<dyn StructuredValue>),
+    Owned(Box<dyn StructuredValue>),
+}
 
-pub(super) type ArcCarrier = StructCarrier<Arc<dyn StructuredValue>>;
-pub(super) type BoxCarrier = StructCarrier<Box<dyn StructuredValue>>;
-
-impl<S: Deref<Target = dyn StructuredValue>> StructCarrier<S> {
+impl StructCarrier {
     pub(super) fn value(&self) -> &dyn StructuredValue {
-        &*self.0
+        match self {
+            Self::Shared(value) => value.as_ref(),
+            Self::Owned(value) => value.as_ref(),
+        }
+    }
+
+    fn value_mut(&mut self) -> Option<&mut dyn StructuredValue> {
+        match self {
+            Self::Shared(value) => Arc::get_mut(value),
+            Self::Owned(value) => Some(value.as_mut()),
+        }
     }
 }
 
 // Subscribers that do not understand structured fields see a placeholder.
-impl<S> fmt::Debug for StructCarrier<S> {
+impl fmt::Debug for StructCarrier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("<structured>")
     }
 }
 
-impl<S> fmt::Display for StructCarrier<S> {
+impl fmt::Display for StructCarrier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
 }
 
-impl<S: 'static> Error for StructCarrier<S> {}
+impl Error for StructCarrier {}
 
 #[cfg(test)]
 mod tests {
@@ -337,7 +353,9 @@ mod tests {
         let field = state.as_struct();
         assert_eq!(weak.strong_count(), 1);
         assert!(std::ptr::eq(
-            field.downcast_ref::<ArcCarrier>().expect("known carrier"),
+            field
+                .downcast_ref::<StructCarrier>()
+                .expect("known carrier"),
             &state.carrier,
         ));
         drop(weak);
@@ -353,7 +371,9 @@ mod tests {
         assert_eq!(state.count, 2);
         let field = state.as_struct();
         assert!(std::ptr::eq(
-            field.downcast_ref::<BoxCarrier>().expect("known carrier"),
+            field
+                .downcast_ref::<StructCarrier>()
+                .expect("known carrier"),
             &state.carrier,
         ));
         state.count = 3;
