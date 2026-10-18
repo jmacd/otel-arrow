@@ -275,8 +275,14 @@ impl InternalTelemetrySystem {
             } else {
                 ObservedEventReporter::new(logging_send_policy.clone(), sender)
             };
-            let resource_field_bytes =
-                self_tracing::encoder::encode_config_resource_field(&config.resource);
+            let resource_field_bytes = self_tracing::encoder::encode_config_resource_field(
+                &config.resource,
+            )
+            .map_err(|failure| {
+                Error::ConfigurationError(format!(
+                    "could not encode internal telemetry resource: {failure:?}"
+                ))
+            })?;
             (
                 reporter,
                 InternalTelemetrySettings {

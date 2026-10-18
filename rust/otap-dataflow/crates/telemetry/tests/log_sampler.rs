@@ -8,14 +8,13 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue}
 use otel_arrow_dfe_telemetry::event::{ObservedEvent, ObservedEventReporter};
 use otel_arrow_dfe_telemetry::log_filter::{RuntimeLogFilter, RuntimeLogFilterHandle};
 use otel_arrow_dfe_telemetry::self_tracing::{
-    LogContext, LogRecord, StructArc, StructBox, StructuredValue, ValueWriter,
+    LogContext, LogRecord, StructBox, StructuredValue, ValueWriter,
 };
 use otel_arrow_dfe_telemetry::tracing_init::{ProviderSetup, TracingSetup};
 use otel_arrow_dfe_telemetry::{Logger, Sampler};
 use prost::Message;
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::{Dispatch, Event, Level, Metadata};
 
@@ -201,7 +200,7 @@ fn macro_forms() {
 }
 
 /// Scenario: ordinary and sampled logging calls borrow a stored structured handle.
-/// Guarantees: accepted fields encode nested values once, rejected fields are not evaluated, and no Arc clone is retained.
+/// Guarantees: accepted fields encode nested values once and rejected fields are not evaluated.
 #[test]
 fn structured_fields_preserve_lazy_evaluation() {
     struct Point {
@@ -226,34 +225,28 @@ fn structured_fields_preserve_lazy_evaluation() {
         }
     }
 
-    let point = Arc::new(Point { x: 1, y: 2 });
-    let state = StructArc::from(Arc::clone(&point));
-    let boxed_state = StructBox::new(Point { x: 1, y: 2 });
+    let state = StructBox::new(Point { x: 1, y: 2 });
     let evaluations = Cell::new(0);
     let (setup, handle, receiver) = setup("off");
-    for field in [state.as_struct(), boxed_state.as_struct()] {
-        let before = evaluations.get();
-        let value = || {
-            evaluations.set(evaluations.get() + 1);
-            field
-        };
-        setup.with_subscriber(|| {
-            handle.apply(Some(&level("off")));
-            otel_info!("point.filtered", to = value());
-            assert_eq!(evaluations.get(), before);
+    let value = || {
+        evaluations.set(evaluations.get() + 1);
+        state.as_struct()
+    };
+    setup.with_subscriber(|| {
+        handle.apply(Some(&level("off")));
+        otel_info!("point.filtered", to = value());
+        assert_eq!(evaluations.get(), 0);
 
-            handle.apply(Some(&level("info")));
-            otel_info!("point.moved", to = value());
-            otel_info!(logger: Select(false), "point.rejected", to = value());
-            assert_eq!(evaluations.get(), before + 1);
-            otel_info!(logger: Select(true), "point.sampled", to = value());
-        });
-    }
+        handle.apply(Some(&level("info")));
+        otel_info!("point.moved", to = value());
+        otel_info!(logger: Select(false), "point.rejected", to = value());
+        assert_eq!(evaluations.get(), 1);
+        otel_info!(logger: Select(true), "point.sampled", to = value());
+    });
 
-    assert_eq!(evaluations.get(), 4);
-    assert_eq!(Arc::strong_count(&point), 2);
+    assert_eq!(evaluations.get(), 2);
     let emitted = records(&receiver);
-    assert_eq!(emitted.len(), 4);
+    assert_eq!(emitted.len(), 2);
     for record in emitted {
         assert_eq!(record.dropped_attributes_count, 0);
         let decoded = otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogRecord::decode(
