@@ -31,11 +31,11 @@ pub trait StructuredValue: Any {
 pub trait ValueWriter {
     /// Writes a string, maybe truncated.
     fn write_str(&mut self, value: &str);
-    /// Writes the `Debug` value as a string, maybe struncated.
+    /// Writes the `Debug` value as a string, maybe truncated.
     fn write_debug(&mut self, value: &dyn fmt::Debug);
-    /// Writes a i64.
+    /// Writes an i64.
     fn write_i64(&mut self, value: i64);
-    /// Writes a f64.
+    /// Writes an f64.
     fn write_f64(&mut self, value: f64);
     /// Writes a boolean.
     fn write_bool(&mut self, value: bool);

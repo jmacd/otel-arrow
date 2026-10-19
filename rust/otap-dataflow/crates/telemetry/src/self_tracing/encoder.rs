@@ -186,15 +186,16 @@ impl<'buf, B: BoundedBuf> DirectFieldVisitor<'buf, B> {
 
     /// Encodes a structured AnyValue as a body or attribute.
     fn write_structured(&mut self, location: ValueLocation<'_>, value: &dyn StructuredValue) {
+        let mut write = |w: &mut ValueEncoder<'_, B>| value.write(w);
         match location {
             ValueLocation::Attribute(key) => {
                 self.write_attribute(|buf| {
-                    write_key_value(buf, LOG_RECORD_ATTRIBUTES, key, 0, |w| value.write(w))
+                    write_key_value_at_depth(buf, LOG_RECORD_ATTRIBUTES, key, Some(0), &mut write)
                 });
             }
             ValueLocation::Body => {
                 let _ = self.buf.try_encode(|buf| {
-                    write_value(buf, LOG_RECORD_BODY, 0, |w| value.write(w)).map(drop)
+                    write_value_at_depth(buf, LOG_RECORD_BODY, Some(0), &mut write).map(drop)
                 });
             }
         }
@@ -398,8 +399,16 @@ fn write_encoded_key_value<B: BoundedBuf>(
 fn write_value<B: BoundedBuf>(
     buf: &mut B,
     field: u64,
-    depth: usize,
-    f: impl FnOnce(&mut ValueEncoder<'_, B>),
+    f: &mut impl FnMut(&mut ValueEncoder<'_, B>),
+) -> Result<bool, EncodeFailure> {
+    write_value_at_depth(buf, field, None, f)
+}
+
+fn write_value_at_depth<B: BoundedBuf>(
+    buf: &mut B,
+    field: u64,
+    depth: Option<usize>,
+    f: &mut impl FnMut(&mut ValueEncoder<'_, B>),
 ) -> Result<bool, EncodeFailure> {
     let mut lost = false;
     buf.encode_len_delimited(field, |buf| {
@@ -421,13 +430,28 @@ fn write_key_value<B: BoundedBuf>(
     buf: &mut B,
     field: u64,
     key: &str,
-    depth: usize,
-    f: impl FnOnce(&mut ValueEncoder<'_, B>),
+    f: &mut impl FnMut(&mut ValueEncoder<'_, B>),
 ) -> Result<bool, EncodeFailure> {
     let mut lost = false;
     buf.encode_len_delimited(field, |buf| {
         buf.encode_string(KEY_VALUE_KEY, key)?;
-        lost = write_value(buf, KEY_VALUE_VALUE, depth, f)?;
+        lost = write_value(buf, KEY_VALUE_VALUE, f)?;
+        Ok::<_, EncodeFailure>(())
+    })?;
+    Ok(lost)
+}
+
+fn write_key_value_at_depth<B: BoundedBuf>(
+    buf: &mut B,
+    field: u64,
+    key: &str,
+    depth: Option<usize>,
+    f: &mut impl FnMut(&mut ValueEncoder<'_, B>),
+) -> Result<bool, EncodeFailure> {
+    let mut lost = false;
+    buf.encode_len_delimited(field, |buf| {
+        buf.encode_string(KEY_VALUE_KEY, key)?;
+        lost = write_value_at_depth(buf, KEY_VALUE_VALUE, depth, f)?;
         Ok::<_, EncodeFailure>(())
     })?;
     Ok(lost)
@@ -436,7 +460,7 @@ fn write_key_value<B: BoundedBuf>(
 /// Writes one AnyValue into a bounded buffer.
 struct ValueEncoder<'a, B: BoundedBuf> {
     buf: &'a mut B,
-    depth: usize,
+    depth: Option<usize>,
     /// `Ok(true)` once any part of the value was lost; a sticky `Err` once
     /// part of it could not be written.
     outcome: Result<bool, EncodeFailure>,
@@ -459,11 +483,11 @@ impl<B: BoundedBuf> ValueEncoder<'_, B> {
 
     /// Writes a container, retaining its prefix when a member cannot be encoded.
     fn nested(&mut self, field: u64, f: impl FnOnce(&mut NestedEncoder<'_, B>)) {
-        if self.depth >= MAX_DEPTH {
+        if self.depth == Some(MAX_DEPTH) {
             self.put(Err(EncodeFailure::Dropped));
             return;
         }
-        let depth = self.depth + 1;
+        let depth = self.depth.map(|depth| depth + 1);
         let mut lost = false;
         let result = self.buf.encode_len_delimited(field, |buf| {
             let mut writer = NestedEncoder {
@@ -490,25 +514,25 @@ impl<B: BoundedBuf> ValueEncoder<'_, B> {
 /// Writes a budgeted prefix of map entries or array elements.
 struct NestedEncoder<'a, B: BoundedBuf> {
     buf: &'a mut B,
-    depth: usize,
+    depth: Option<usize>,
     /// `Ok(true)` retains partial members; `Err` stops subsequent callbacks.
     outcome: Result<bool, EncodeFailure>,
 }
 
 impl<B: BoundedBuf> NestedEncoder<'_, B> {
-    fn entry(&mut self, key: &str, f: impl FnOnce(&mut ValueEncoder<'_, B>)) {
+    fn entry(&mut self, key: &str, mut f: impl FnMut(&mut ValueEncoder<'_, B>)) {
         self.outcome = self.outcome.and_then(|lost| {
             bounded(self.buf, |buf| {
-                write_key_value(buf, KEY_VALUE_LIST_VALUES, key, self.depth, f)
+                write_key_value_at_depth(buf, KEY_VALUE_LIST_VALUES, key, self.depth, &mut f)
             })
             .map(|v| lost | v)
         });
     }
 
-    fn element(&mut self, f: impl FnOnce(&mut ValueEncoder<'_, B>)) {
+    fn element(&mut self, mut f: impl FnMut(&mut ValueEncoder<'_, B>)) {
         self.outcome = self.outcome.and_then(|lost| {
             bounded(self.buf, |buf| {
-                write_value(buf, ARRAY_VALUE_VALUES, self.depth, f)
+                write_value_at_depth(buf, ARRAY_VALUE_VALUES, self.depth, &mut f)
             })
             .map(|v| lost | v)
         });
@@ -658,38 +682,20 @@ pub const fn level_to_severity_number(level: &Level) -> u8 {
 /// The fragment contains only the encoded `resource` field. Both OTLP message
 /// types assign that field the same number, so callers can reuse these bytes
 /// without constructing an intermediate SDK resource.
+#[must_use]
 pub(crate) fn encode_config_resource_field(
     resource_attributes: &HashMap<String, ConfigAttributeValue>,
-) -> Result<Bytes, EncodeFailure> {
+) -> Bytes {
     let mut buf = ProtoBuffer::with_capacity(256);
-    write_config_resource_field(&mut buf, resource_attributes)?;
-    Ok(buf.into_bytes())
-}
-
-fn write_config_resource_field<B: BoundedBuf>(
-    buf: &mut B,
-    resource_attributes: &HashMap<String, ConfigAttributeValue>,
-) -> EncodeResult {
-    buf.try_encode(|buf| {
-        buf.encode_len_delimited(RESOURCE_LOGS_RESOURCE, |buf| {
-            let mut dropped = 0u32;
-            for (key, value) in resource_attributes {
-                let lost = encode_attribute(buf, RESOURCE_ATTRIBUTES, key, |w| {
-                    write_config_value(w, value)
-                });
-                dropped = dropped.saturating_add(u32::from(lost));
-            }
-            write_dropped_count(buf, RESOURCE_DROPPED_ATTRIBUTES_COUNT, dropped)
-        })
-    })
-}
-
-fn write_dropped_count<B: BoundedBuf>(buf: &mut B, field: u64, count: u32) -> EncodeResult {
-    if count != 0 {
-        buf.encode_field_tag(field, wire_types::VARINT)?;
-        buf.encode_varint(u64::from(count))?;
-    }
-    Ok(())
+    let _: EncodeResult = buf.encode_len_delimited(RESOURCE_LOGS_RESOURCE, |buf| {
+        for (key, value) in resource_attributes {
+            encode_attribute(buf, RESOURCE_ATTRIBUTES, key, |w| {
+                write_config_value(w, value)
+            })?;
+        }
+        Ok(())
+    });
+    buf.into_bytes()
 }
 
 /// Writes one configured resource value.
@@ -716,20 +722,20 @@ fn elements<B: BoundedBuf, T>(
 ) {
     for value in values {
         a.element(|w| write(w, value));
-        if a.outcome.is_err() {
-            break;
-        }
     }
 }
 
-/// Encodes one independently budgeted attribute, reporting any partial or total loss.
-fn encode_attribute<B: BoundedBuf>(
-    buf: &mut B,
+/// Encodes a `KeyValue` as `field`, with the value written by `f`.
+fn encode_attribute(
+    buf: &mut ProtoBuffer,
     field: u64,
     key: &str,
-    f: impl FnOnce(&mut ValueEncoder<'_, B>),
-) -> bool {
-    bounded(buf, |buf| write_key_value(buf, field, key, 0, f)).unwrap_or(true)
+    mut f: impl FnMut(&mut ValueEncoder<'_, ProtoBuffer>),
+) -> EncodeResult {
+    buf.try_encode(|buf| match write_key_value(buf, field, key, &mut f)? {
+        false => Ok(()),
+        true => Err(EncodeFailure::Dropped),
+    })
 }
 
 // Field numbers for ExportLogsServiceRequest and related messages
@@ -742,9 +748,6 @@ const EXPORT_LOGS_REQUEST_RESOURCE_LOGS: u64 = 1;
 /// from the registry and encoded as InstrumentationScope.attributes bytes.
 /// Entity keys must remain registered until their first lookup populates this
 /// cache; a key that is neither registered nor cached cannot be encoded.
-///
-/// TODO(4453): Encode scope attributes during entity construction, returning
-/// errors there, and share those bytes with metrics to remove this local cache.
 ///
 /// TODO: ScopeToBytesMap grows without any attention to managing memory.
 /// We will require a way to de-register entities that are no longer use
@@ -774,7 +777,7 @@ impl ScopeToBytesMap {
         }
     }
 
-    /// Get or compute complete scope attribute bytes for an entity key.
+    /// Get or compute scope attributes for a registered or previously cached entity key.
     pub fn get_or_encode(&mut self, key: EntityKey) -> Result<Bytes, MapError> {
         if let Some(cached) = self.cache.get(&key) {
             return Ok(cached.clone());
@@ -798,17 +801,15 @@ impl ScopeToBytesMap {
     }
 }
 
-/// Encode complete scope attributes into growable storage, rejecting any loss.
+/// Encode an iterator of scope attributes.
 fn encode_scope_attributes<'k, 'v>(
     attrs: impl IntoIterator<Item = (&'k str, &'v AttributeValue)>,
 ) -> Result<Bytes, EncodeFailure> {
     let mut buf = ProtoBuffer::with_capacity(128);
     for (key, value) in attrs {
-        if write_key_value(&mut buf, INSTRUMENTATION_SCOPE_ATTRIBUTES, key, 0, |w| {
+        encode_attribute(&mut buf, INSTRUMENTATION_SCOPE_ATTRIBUTES, key, |w| {
             write_attribute_value(w, value)
-        })? {
-            return Err(EncodeFailure::Dropped);
-        }
+        })?;
     }
     Ok(buf.into_bytes())
 }
@@ -824,9 +825,6 @@ fn write_attribute_value<B: BoundedBuf>(w: &mut ValueEncoder<'_, B>, value: &Att
         AttributeValue::Map(m) => w.map(|mw| {
             for (k, v) in m {
                 mw.entry(k, |w| write_attribute_value(w, v));
-                if mw.outcome.is_err() {
-                    break;
-                }
             }
         }),
     }
@@ -844,7 +842,7 @@ fn encode_scope_logs(
             buf.encode_string(INSTRUMENTATION_SCOPE_NAME, target)?;
             for entity_key in context {
                 match scope_cache.get_or_encode(*entity_key) {
-                    Ok(bytes) => buf.extend_from_slice(&bytes)?,
+                    Ok(b) => buf.extend_from_slice(&b)?,
                     Err(MapError::NotRegistered) => {
                         buf.extend_from_slice(&encode_scope_attributes(std::iter::once((
                             "unregistered.entity",
@@ -985,10 +983,8 @@ mod tests {
     /// Guarantees: the reusable OTLP resource fragment preserves every supported value type.
     #[test]
     fn encode_config_resource_field_preserves_supported_values() {
-        let empty = ResourceLogs::decode(
-            encode_config_resource_field(&HashMap::new()).expect("resource fits"),
-        )
-        .expect("empty resource fragment should decode");
+        let empty = ResourceLogs::decode(encode_config_resource_field(&HashMap::new()))
+            .expect("empty resource fragment should decode");
         assert_eq!(
             empty
                 .resource
@@ -1025,7 +1021,7 @@ mod tests {
                 ConfigAttributeValue::Array(ConfigAttributeValueArray::F64(vec![0.25, 0.75])),
             ),
         ]);
-        let bytes = encode_config_resource_field(&resource).expect("resource fits");
+        let bytes = encode_config_resource_field(&resource);
         let decoded = ResourceLogs::decode(bytes).expect("resource fragment should decode");
         let actual = decoded
             .resource
@@ -1086,7 +1082,7 @@ mod tests {
         let time = SystemTime::UNIX_EPOCH + Duration::from_nanos(timestamp_ns);
         let log_event = LogEvent { time, record };
 
-        let resource_bytes = encode_config_resource_field(&HashMap::new()).expect("resource fits");
+        let resource_bytes = encode_config_resource_field(&HashMap::new());
 
         let mut buf = ProtoBuffer::default();
         encode_export_logs_request(
@@ -1319,7 +1315,7 @@ mod tests {
         let time = SystemTime::UNIX_EPOCH + Duration::from_nanos(timestamp_ns);
         let log_event = LogEvent { time, record };
 
-        let resource_bytes = encode_config_resource_field(&HashMap::new()).expect("resource fits");
+        let resource_bytes = encode_config_resource_field(&HashMap::new());
         let mut buf = ProtoBuffer::default();
         encode_export_logs_request(
             &mut buf,
@@ -1363,38 +1359,15 @@ mod tests {
         assert_eq!(expected, decoded);
     }
 
-    /// Scenario: an attribute callback moves an owned string through map and array callbacks.
-    /// Guarantees: internal callbacks accept consuming closures and encode the value exactly once.
-    #[test]
-    fn value_callbacks_can_consume_owned_values() {
-        let mut buf = ProtoBuffer::with_capacity(128);
-        let value = String::from("owned");
-
-        let lost = encode_attribute(&mut buf, LOG_RECORD_ATTRIBUTES, "structured", move |w| {
-            w.map(move |m| {
-                m.entry("items", move |w| {
-                    w.array(move |a| {
-                        a.element(move |w| {
-                            w.write_str(&value);
-                            drop(value);
-                        });
-                    });
-                });
-            });
-        });
-        assert!(!lost);
-
-        let record = LogRecord::decode(buf.as_ref()).expect("valid record");
-        assert_eq!(
-            record.attributes,
-            vec![KeyValue::new(
-                "structured",
-                AnyValue::new_kvlist(vec![KeyValue::new(
-                    "items",
-                    AnyValue::new_array(vec![AnyValue::new_string("owned")]),
-                )]),
-            )]
-        );
+    fn encode_structured_attribute(
+        buf: &mut ProtoBuffer,
+        key: &str,
+        mut write: impl FnMut(&mut ValueEncoder<'_, ProtoBuffer>),
+    ) -> bool {
+        bounded(buf, |buf| {
+            write_key_value_at_depth(buf, LOG_RECORD_ATTRIBUTES, key, Some(0), &mut write)
+        })
+        .unwrap_or(true)
     }
 
     /// Scenario: one value callback writes two AnyValue variants.
@@ -1404,12 +1377,12 @@ mod tests {
     #[should_panic(expected = "value callback must write at most one AnyValue variant")]
     fn value_encoder_rejects_multiple_variants() {
         let mut buf = ProtoBuffer::with_capacity(32);
-        let write = |writer: &mut ValueEncoder<'_, ProtoBuffer>| {
+        let mut write = |writer: &mut ValueEncoder<'_, ProtoBuffer>| {
             writer.write_i64(1);
             writer.write_bool(true);
         };
 
-        let _ = write_value(&mut buf, LOG_RECORD_BODY, 0, write);
+        let _ = write_value(&mut buf, LOG_RECORD_BODY, &mut write);
     }
 
     /// Scenario: four large string attributes compete for a 256-byte buffer.
@@ -2038,13 +2011,15 @@ mod tests {
         );
     }
 
-    fn encode_partial_with_tail(limit: usize, f: impl FnOnce(&mut dyn ValueWriter)) -> AnyValue {
+    fn encode_partial_with_tail(limit: usize, mut f: impl FnMut(&mut dyn ValueWriter)) -> AnyValue {
         use tracing::field::Visit;
 
         let mut buf = ProtoBuffer::with_capacity_and_limit(limit, limit);
         let mut visitor = DirectFieldVisitor::new(&mut buf);
-        visitor
-            .write_attribute(|buf| write_key_value(buf, LOG_RECORD_ATTRIBUTES, "a", 0, |w| f(w)));
+        let mut write = |w: &mut ValueEncoder<'_, ProtoBuffer>| f(w);
+        visitor.write_attribute(|buf| {
+            write_key_value_at_depth(buf, LOG_RECORD_ATTRIBUTES, "a", Some(0), &mut write)
+        });
         visitor.record_bool(
             &BUDGET_TEST_METADATA
                 .fields()
@@ -2136,27 +2111,27 @@ mod tests {
         }
     }
 
-    /// Scenario: a top-level key is too large for its budget in a log or resource.
+    /// Scenario: a top-level structured log key is too large for its budget.
     /// Guarantees: the failed attribute is rolled back and a later small attribute still fits.
     #[test]
     fn top_level_attribute_budgets_are_independent() {
-        for field in [LOG_RECORD_ATTRIBUTES, RESOURCE_ATTRIBUTES] {
-            let mut buf = ProtoBuffer::with_capacity_and_limit(64, 64);
-            assert!(encode_attribute(&mut buf, field, &"x".repeat(64), |_| {
+        let mut buf = ProtoBuffer::with_capacity_and_limit(64, 64);
+        assert!(encode_structured_attribute(
+            &mut buf,
+            &"x".repeat(64),
+            |_| {
                 panic!("oversized key skips its value");
-            }));
-            assert!(buf.is_empty());
-            assert!(!encode_attribute(&mut buf, field, "small", |w| w.write_bool(true)));
-            let attributes = match field {
-                LOG_RECORD_ATTRIBUTES => LogRecord::decode(buf.as_ref()).expect("log").attributes,
-                RESOURCE_ATTRIBUTES => Resource::decode(buf.as_ref()).expect("resource").attributes,
-                _ => unreachable!(),
-            };
-            assert_eq!(
-                attributes,
-                vec![KeyValue::new("small", AnyValue::new_bool(true))]
-            );
-        }
+            }
+        ));
+        assert!(buf.is_empty());
+        assert!(!encode_structured_attribute(&mut buf, "small", |w| {
+            w.write_bool(true)
+        }));
+        let attributes = LogRecord::decode(buf.as_ref()).expect("log").attributes;
+        assert_eq!(
+            attributes,
+            vec![KeyValue::new("small", AnyValue::new_bool(true))]
+        );
     }
 
     fn write_chain(w: &mut dyn ValueWriter, depth: usize, visited: &mut usize) {
@@ -2178,7 +2153,7 @@ mod tests {
         for depth in [0, MAX_DEPTH - 1, MAX_DEPTH, MAX_DEPTH + 1] {
             let mut buf = ProtoBuffer::with_capacity(256);
             let mut visited = 0;
-            let lost = encode_attribute(&mut buf, LOG_RECORD_ATTRIBUTES, "chain", |w| {
+            let lost = encode_structured_attribute(&mut buf, "chain", |w| {
                 write_chain(w, depth, &mut visited);
             });
             let truncated = depth > MAX_DEPTH;
@@ -2197,101 +2172,6 @@ mod tests {
             }
             let record = LogRecord::decode(buf.as_ref()).expect("valid depth-limited value");
             assert_eq!(record.attributes, vec![KeyValue::new("chain", expected)]);
-        }
-    }
-
-    /// Scenario: a resource array exceeds its budget, or its outer framing cannot fit.
-    /// Guarantees: a valid prefix reports one lost attribute; framing failures return an error and roll back.
-    #[test]
-    fn resource_overflow_reports_loss_or_framing_failure() {
-        let values: Vec<i64> = (-10..0).collect();
-        let resource = HashMap::from([(
-            "array".to_owned(),
-            ConfigAttributeValue::Array(ConfigAttributeValueArray::I64(values.clone())),
-        )]);
-        for limit in [0, 1, 2, 3, 128] {
-            let mut buf = ProtoBuffer::with_capacity_and_limit(limit, limit);
-            let result = write_config_resource_field(&mut buf, &resource);
-            if limit < 4 {
-                assert_eq!(result, Err(EncodeFailure::Dropped));
-                assert!(buf.is_empty());
-                continue;
-            }
-            result.expect("resource framing fits");
-            assert!(buf.len() <= limit);
-            let resource = ResourceLogs::decode(buf.as_ref())
-                .expect("valid fragment")
-                .resource
-                .expect("resource");
-            assert_eq!(resource.dropped_attributes_count, 1);
-            assert_eq!(resource.attributes.len(), 1);
-            let Some(AnyValueKind::ArrayValue(array)) =
-                &resource.attributes[0].value.as_ref().expect("value").value
-            else {
-                panic!("expected array");
-            };
-            assert!(!array.values.is_empty());
-            assert!(array.values.len() < values.len());
-            assert_eq!(
-                array.values,
-                values
-                    .iter()
-                    .take(array.values.len())
-                    .map(|v| AnyValue::new_int(*v))
-                    .collect::<Vec<_>>(),
-            );
-        }
-    }
-
-    fn deep_scope_map(depth: usize) -> BTreeMap<String, AttributeValue> {
-        let mut value = AttributeValue::Boolean(true);
-        for _ in 0..depth {
-            value = AttributeValue::Map(BTreeMap::from([("child".to_owned(), value)]));
-        }
-        let AttributeValue::Map(map) = value else {
-            panic!("expected nonzero depth");
-        };
-        map
-    }
-
-    /// Scenario: scope attributes reach or exceed the depth limit before their entity is unregistered.
-    /// Guarantees: incomplete scopes fail export without being cached; complete cached bytes survive unregistration.
-    #[test]
-    fn scope_cache_accepts_only_complete_attributes() {
-        let registry = TelemetryRegistryHandle::new();
-        let mut cache = ScopeToBytesMap::new(registry.clone());
-        for depth in [MAX_DEPTH, MAX_DEPTH + 1] {
-            let key = registry.register_entity(TestMapAttributes::new(deep_scope_map(depth)));
-            let mut events = [LogEvent {
-                time: SystemTime::UNIX_EPOCH,
-                record: __log_record_impl!(Level::INFO, "test.scope.depth")
-                    .into_record(LogContext::from_buf([key])),
-            }];
-            let mut buf = ProtoBuffer::with_capacity(256);
-            let result =
-                encode_export_logs_request(&mut buf, &mut events, &Bytes::new(), &mut cache);
-            assert!(registry.unregister_entity(key));
-            if depth > MAX_DEPTH {
-                assert_eq!(result, Err(EncodeFailure::Dropped));
-                assert!(matches!(
-                    cache.get_or_encode(key),
-                    Err(MapError::NotRegistered)
-                ));
-                continue;
-            }
-            result.expect("complete scope fits");
-            let request = ExportLogsServiceRequest::decode(buf.as_ref()).expect("valid request");
-            let scope_logs = &request.resource_logs[0].scope_logs[0];
-            let scope = scope_logs.scope.as_ref().expect("scope");
-            assert_eq!(scope.dropped_attributes_count, 0);
-            assert_eq!(scope.attributes.len(), 1);
-            assert_eq!(scope_logs.log_records.len(), 1);
-            encode_export_logs_request(&mut buf, &mut events, &Bytes::new(), &mut cache)
-                .expect("cached bytes survive unregistration");
-            assert_eq!(
-                ExportLogsServiceRequest::decode(buf.as_ref()).expect("valid cache hit"),
-                request
-            );
         }
     }
 

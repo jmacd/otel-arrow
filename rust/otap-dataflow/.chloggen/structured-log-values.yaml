@@ -8,7 +8,7 @@ change_type: enhancement
 component: observability
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: Internal logs support structured fields. Event maps and arrays retain a prefix when limits are reached and report lost attributes.
+note: Internal logs support structured fields. Event maps and arrays retain a prefix when limits are reached.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 issues: [1746]
@@ -19,6 +19,6 @@ issues: [1746]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Structured values and scope attributes are limited to 16 container levels.
-  Scope encoding rejects partial values. Log and resource attribute losses
-  remain counted; their top-level budgets stay independent.
+  Structured values are limited to 16 container levels. Loss from structured
+  attributes increments dropped_attributes_count; bodies retain existing
+  rollback behavior.
