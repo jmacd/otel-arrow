@@ -150,28 +150,20 @@ impl<'buf, B: BoundedBuf> DirectFieldVisitor<'buf, B> {
         }
     }
 
-    /// Encodes a numeric or boolean field as an attribute; `message` values
-    /// have no scalar body path and are ignored.
-    ///
-    /// Keep this payload-only path separate from `write_structured`: routing
-    /// scalars through `ValueEncoder` regressed self-tracing benchmarks in
-    /// both #4401 and #4450.
-    fn record_attribute(
-        &mut self,
-        field: &tracing::field::Field,
-        encode: impl FnOnce(&mut B) -> Result<bool, EncodeFailure>,
-    ) {
-        if let ValueLocation::Attribute(key) = value_location(field) {
-            self.write_value_attribute(key, encode);
-        }
-    }
-
     /// Encodes one attribute whose AnyValue payload is written by `encode`.
+    ///
+    /// Keep scalar payloads separate from `write_structured`: routing them
+    /// through `ValueEncoder` regressed self-tracing benchmarks in both #4401
+    /// and #4450.
     fn write_value_attribute(
         &mut self,
         key: &str,
         encode: impl FnOnce(&mut B) -> Result<bool, EncodeFailure>,
     ) {
+        debug_assert_ne!(
+            key, "message",
+            "message fields must be routed before attribute encoding"
+        );
         self.write_attribute(|buf| {
             write_encoded_key_value(buf, LOG_RECORD_ATTRIBUTES, key, encode)
         });
@@ -599,19 +591,23 @@ impl<B: BoundedBuf> ArrayWriter for NestedEncoder<'_, B> {
 
 impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        self.record_attribute(field, |buf| {
-            write_tagged(buf, ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64, |buf| {
-                buf.extend_from_slice(&value.to_le_bytes())
-            })
-        });
+        if let ValueLocation::Attribute(key) = value_location(field) {
+            self.write_value_attribute(key, |buf| {
+                write_tagged(buf, ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64, |buf| {
+                    buf.extend_from_slice(&value.to_le_bytes())
+                })
+            });
+        }
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.record_attribute(field, |buf| {
-            write_tagged(buf, ANY_VALUE_INT_VALUE, wire_types::VARINT, |buf| {
-                buf.encode_varint(value as u64)
-            })
-        });
+        if let ValueLocation::Attribute(key) = value_location(field) {
+            self.write_value_attribute(key, |buf| {
+                write_tagged(buf, ANY_VALUE_INT_VALUE, wire_types::VARINT, |buf| {
+                    buf.encode_varint(value as u64)
+                })
+            });
+        }
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
@@ -619,11 +615,13 @@ impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.record_attribute(field, |buf| {
-            write_tagged(buf, ANY_VALUE_BOOL_VALUE, wire_types::VARINT, |buf| {
-                buf.encode_varint(u64::from(value))
-            })
-        });
+        if let ValueLocation::Attribute(key) = value_location(field) {
+            self.write_value_attribute(key, |buf| {
+                write_tagged(buf, ANY_VALUE_BOOL_VALUE, wire_types::VARINT, |buf| {
+                    buf.encode_varint(u64::from(value))
+                })
+            });
+        }
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
