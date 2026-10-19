@@ -11,40 +11,6 @@
 //! Callers, to avoid allocations near logging callsites, store a
 //! `StructBox<T>` instead of a `Box<T>` and use `as_struct()` inside
 //! logging statements.
-//!
-//! ```
-//! use otel_arrow_dfe_telemetry::otel_info;
-//! use otel_arrow_dfe_telemetry::self_tracing::{StructBox, StructuredValue, ValueWriter};
-//!
-//! struct State { x: i64, y: i64 }
-//!
-//! impl StructuredValue for State {
-//!     fn write(&self, w: &mut dyn ValueWriter) {
-//!         w.map(|m| {
-//!             m.entry("x", |v| v.write_i64(self.x));
-//!             m.entry("y", |v| v.write_i64(self.y));
-//!         });
-//!     }
-//! }
-//! struct Component {
-//!     state: StructBox<State>,
-//! }
-//!
-//! impl Component {
-//!     fn report(&self) {
-//!         otel_info!("complex.state", state = self.state.as_struct());
-//!     }
-//! }
-//! # let component = Component { state: StructBox::new(State { x: 1, y: 2 }) };
-//! # component.report();
-//! ```
-//!
-//! Encoded values are limited to [`MAX_DEPTH`] levels of nesting.
-//! When depth or size limits cause data loss this is counted once in
-//! the record's `dropped_attributes_count`.
-//! Maps and arrays retain a prefix after a member cannot be encoded.
-//! Top-level attributes remain independently budgeted, so later attributes
-//! can still fit after an earlier attribute is dropped.
 
 use std::any::Any;
 use std::error::Error;
@@ -55,8 +21,8 @@ use std::ops::{Deref, DerefMut};
 /// Maximum nesting of maps and arrays; deeper values are dropped.
 pub const MAX_DEPTH: usize = 16;
 
-/// A value that can describe itself as an OTLP AnyValue.
-pub trait StructuredValue: Any + Send + Sync {
+/// A value that can encode itself as an OTLP AnyValue.
+pub trait StructuredValue: Any {
     /// Writes exactly one value to `w`.
     fn write(&self, w: &mut dyn ValueWriter);
 }
@@ -65,12 +31,11 @@ pub trait StructuredValue: Any + Send + Sync {
 pub trait ValueWriter {
     /// Writes a string, maybe truncated.
     fn write_str(&mut self, value: &str);
-    /// Writes the `Debug` rendering of `value` as a string, formatted in
-    /// place and maybe truncated.
+    /// Writes the `Debug` value as a string, maybe struncated.
     fn write_debug(&mut self, value: &dyn fmt::Debug);
-    /// Writes a signed integer.
+    /// Writes a i64.
     fn write_i64(&mut self, value: i64);
-    /// Writes a floating point number.
+    /// Writes a f64.
     fn write_f64(&mut self, value: f64);
     /// Writes a boolean.
     fn write_bool(&mut self, value: bool);
@@ -82,17 +47,13 @@ pub trait ValueWriter {
 
 /// Receives the entries of a map.
 pub trait MapWriter {
-    /// Adds one entry; `f` writes its value. A truncated value is retained.
-    /// Once an entry cannot be encoded, it is dropped and later entries are
-    /// skipped without invoking their callbacks.
+    /// Adds one entry; `f` writes its value.
     fn write_entry(&mut self, key: &str, f: &mut dyn FnMut(&mut dyn ValueWriter));
 }
 
 /// Receives the elements of an array.
 pub trait ArrayWriter {
-    /// Adds one element; `f` writes its value. A truncated value is retained.
-    /// Once an element cannot be encoded, it is dropped and later elements are
-    /// skipped without invoking their callbacks.
+    /// Adds one element; `f` writes its value.
     fn write_element(&mut self, f: &mut dyn FnMut(&mut dyn ValueWriter));
 }
 
