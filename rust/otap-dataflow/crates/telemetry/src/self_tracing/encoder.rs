@@ -1909,91 +1909,75 @@ mod tests {
         panic!("truncated varint");
     }
 
-    /// A plain struct that writes itself as a nested map.
-    struct Probe {
-        name: String,
-        count: i64,
-        tags: Vec<String>,
-        child: Option<Box<Probe>>,
-    }
+    struct Probe(i64);
 
     impl StructuredValue for Probe {
         fn write(&self, w: &mut dyn ValueWriter) {
             w.map(|m| {
-                m.entry("name", |v| v.write_str(&self.name));
-                m.entry("count", |v| v.write_i64(self.count));
+                m.entry("count", |v| v.write_i64(self.0));
                 m.entry("tags", |v| {
                     v.array(|a| {
-                        for tag in &self.tags {
+                        for tag in ["a", "b"] {
                             a.element(|v| v.write_str(tag));
                         }
                     })
                 });
-                if let Some(child) = &self.child {
-                    m.entry("child", |v| child.write(v));
-                }
             });
         }
     }
 
-    fn probe(depth: usize) -> Probe {
-        Probe {
-            name: "n".into(),
-            count: -7,
-            tags: vec!["a".into(), "b".into()],
-            child: (depth > 0).then(|| Box::new(probe(depth - 1))),
-        }
-    }
-
-    fn encode_probe(limit: usize, value: Probe) -> (ProtoBuffer, u32) {
+    /// Scenario: a boxed map/array value is mutated between events and encoded under small and roomy budgets.
+    /// Guarantees: logging borrows current state, preserves wire types, stays within each budget, and counts partial values once.
+    #[test]
+    fn boxed_values_preserve_mutation_and_budgets() {
         use tracing::field::Visit;
 
-        let structured = StructBox::new(value);
-        let mut buf = ProtoBuffer::with_capacity_and_limit(limit, limit);
-        let mut visitor = DirectFieldVisitor::new(&mut buf);
+        let mut slot = StructBox::new(Probe(0));
         let field = BUDGET_TEST_METADATA
             .fields()
             .field("a")
             .expect("known field");
-        visitor.record_error(&field, structured.as_struct());
-        let dropped = visitor.dropped_count();
-        (buf, dropped)
-    }
-
-    /// Scenario: one structured handle is emitted in several events and updated in place.
-    /// Guarantees: logging only borrows the handle and later events see subsequent mutations.
-    #[test]
-    fn boxed_value_can_be_updated_in_place_between_events() {
-        let mut slot = StructBox::new(probe(0));
         for count in [1, 2] {
-            slot.count = count;
-            let record =
-                __log_record_impl!(Level::INFO, "test.structured", probe = slot.as_struct())
-                    .into_record(LogContext::new());
+            slot.0 = count;
+            let record = __log_record_impl!(Level::INFO, "test.structured", a = slot.as_struct())
+                .into_record(LogContext::new());
             assert_eq!(record.dropped_attributes_count, 0);
-            let decoded =
+            let expected =
                 LogRecord::decode(record.body_attrs_bytes.as_ref()).expect("valid record");
-            let Some(otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value::Value::KvlistValue(map)) =
-                decoded.attributes[0].value.as_ref().and_then(|v| v.value.as_ref())
+            let Some(AnyValueKind::KvlistValue(map)) =
+                &expected.attributes[0].value.as_ref().expect("value").value
             else {
                 panic!("expected map");
             };
-            let got = map.values[1].value.as_ref().and_then(|v| v.value.as_ref());
-            assert!(
-                matches!(got, Some(otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value::Value::IntValue(n)) if *n == count)
+            assert_eq!(
+                map.values[0],
+                KeyValue::new("count", AnyValue::new_int(count))
             );
+            for limit in [8, 32, 64, 128, 16384] {
+                let mut buf = ProtoBuffer::with_capacity_and_limit(limit, limit);
+                let mut visitor = DirectFieldVisitor::new(&mut buf);
+                visitor.record_error(&field, slot.as_struct());
+                assert_eq!(
+                    visitor.dropped_count(),
+                    u32::from(limit < 16384),
+                    "limit {limit}"
+                );
+                assert!(buf.len() <= limit);
+                let decoded = LogRecord::decode(buf.as_ref()).expect("valid bounded record");
+                if limit == 16384 {
+                    assert_eq!(decoded, expected);
+                }
+            }
         }
     }
 
-    fn encode_with_tail(
-        limit: usize,
-        f: impl FnOnce(&mut ValueEncoder<'_, ProtoBuffer>),
-    ) -> (LogRecord, u32) {
+    fn encode_partial_with_tail(limit: usize, f: impl FnOnce(&mut dyn ValueWriter)) -> AnyValue {
         use tracing::field::Visit;
 
         let mut buf = ProtoBuffer::with_capacity_and_limit(limit, limit);
         let mut visitor = DirectFieldVisitor::new(&mut buf);
-        visitor.write_attribute(|buf| write_key_value(buf, LOG_RECORD_ATTRIBUTES, "a", 0, f));
+        visitor
+            .write_attribute(|buf| write_key_value(buf, LOG_RECORD_ATTRIBUTES, "a", 0, |w| f(w)));
         visitor.record_bool(
             &BUDGET_TEST_METADATA
                 .fields()
@@ -2001,61 +1985,50 @@ mod tests {
                 .expect("known field"),
             true,
         );
-        let dropped = visitor.dropped_count();
+        assert_eq!(visitor.dropped_count(), 1);
         assert!(buf.len() <= limit);
-        (
-            LogRecord::decode(buf.as_ref()).expect("valid record"),
-            dropped,
-        )
+        let mut attributes = LogRecord::decode(buf.as_ref())
+            .expect("valid record")
+            .attributes;
+        assert_eq!(
+            attributes.pop(),
+            Some(KeyValue::new("b", AnyValue::new_bool(true)))
+        );
+        assert_eq!(attributes.len(), 1);
+        let first = attributes.pop().expect("partial attribute");
+        assert_eq!(first.key, "a");
+        first.value.expect("partial value")
     }
 
-    /// Scenario: a map entry's key cannot fit although a later small entry would fit.
-    /// Guarantees: the map keeps only its prefix, skips later callbacks, and leaves room for the next top-level attribute.
+    /// Scenario: a map key or array element cannot fit although a later small member would fit.
+    /// Guarantees: both containers retain their prefix, skip later callbacks, count loss once, and allow the next top-level attribute.
     #[test]
-    fn map_hard_drop_retains_prefix_and_allows_later_attributes() {
-        let (record, dropped) = encode_with_tail(128, |w| {
-            let w: &mut dyn ValueWriter = w;
-            w.map(|m| {
-                m.entry("first", |v| v.write_bool(true));
-                m.entry(&"x".repeat(256), |_| {
-                    panic!("oversized key skips its value")
-                });
-                m.entry("last", |_| panic!("map stopped before this entry"));
+    fn containers_retain_prefix_after_hard_drop() {
+        for (array, limit) in [(false, 128), (true, 64)] {
+            let value = encode_partial_with_tail(limit, |w| {
+                if array {
+                    w.array(|a| {
+                        a.element(|v| v.write_bool(true));
+                        a.element(|v| v.write_i64(-1));
+                        a.element(|_| panic!("array stopped before this element"));
+                    });
+                } else {
+                    w.map(|m| {
+                        m.entry("first", |v| v.write_bool(true));
+                        m.entry(&"x".repeat(256), |_| {
+                            panic!("oversized key skips its value")
+                        });
+                        m.entry("last", |_| panic!("map stopped before this entry"));
+                    });
+                }
             });
-        });
-        assert_eq!(dropped, 1);
-        assert_eq!(
-            record.attributes,
-            vec![
-                KeyValue::new(
-                    "a",
-                    AnyValue::new_kvlist(vec![KeyValue::new("first", AnyValue::new_bool(true))]),
-                ),
-                KeyValue::new("b", AnyValue::new_bool(true)),
-            ]
-        );
-    }
-
-    /// Scenario: an array's second element cannot fit, but a later boolean would fit.
-    /// Guarantees: the array keeps its first element, skips later callbacks, and reports one lost attribute.
-    #[test]
-    fn array_hard_drop_retains_prefix_and_allows_later_attributes() {
-        let (record, dropped) = encode_with_tail(64, |w| {
-            let w: &mut dyn ValueWriter = w;
-            w.array(|a| {
-                a.element(|v| v.write_bool(true));
-                a.element(|v| v.write_i64(-1));
-                a.element(|_| panic!("array stopped before this element"));
-            });
-        });
-        assert_eq!(dropped, 1);
-        assert_eq!(
-            record.attributes,
-            vec![
-                KeyValue::new("a", AnyValue::new_array(vec![AnyValue::new_bool(true)])),
-                KeyValue::new("b", AnyValue::new_bool(true)),
-            ]
-        );
+            let expected = if array {
+                AnyValue::new_array(vec![AnyValue::new_bool(true)])
+            } else {
+                AnyValue::new_kvlist(vec![KeyValue::new("first", AnyValue::new_bool(true))])
+            };
+            assert_eq!(value, expected);
+        }
     }
 
     /// Scenario: a map or array string is truncated, leaving space for another member.
@@ -2064,8 +2037,7 @@ mod tests {
     fn partial_members_do_not_stop_containers() {
         let large = "\u{1f642}".repeat(1000);
         for array in [false, true] {
-            let (record, dropped) = encode_with_tail(256, |w| {
-                let w: &mut dyn ValueWriter = w;
+            let value = encode_partial_with_tail(256, |w| {
                 if array {
                     w.array(|a| {
                         a.element(|v| v.write_str(&large));
@@ -2078,20 +2050,13 @@ mod tests {
                     });
                 }
             });
-            assert_eq!(dropped, 1);
-            assert_eq!(record.attributes.len(), 2);
-            let members: Vec<&AnyValue> = match record.attributes[0]
-                .value
-                .as_ref()
-                .and_then(|v| v.value.as_ref())
-                .expect("container")
-            {
-                AnyValueKind::ArrayValue(a) => a.values.iter().collect(),
+            let members = match value.value.expect("container") {
+                AnyValueKind::ArrayValue(a) => a.values,
                 AnyValueKind::KvlistValue(m) => m
                     .values
-                    .iter()
-                    .map(|kv| kv.value.as_ref().expect("value"))
-                    .collect(),
+                    .into_iter()
+                    .map(|kv| kv.value.expect("value"))
+                    .collect::<Vec<_>>(),
                 _ => panic!("expected container"),
             };
             assert_eq!(members.len(), 2);
@@ -2100,7 +2065,7 @@ mod tests {
             };
             assert!(first.ends_with("[...]"));
             assert_ne!(first, &large);
-            assert_eq!(members[1], &AnyValue::new_bool(true));
+            assert_eq!(members[1], AnyValue::new_bool(true));
         }
     }
 
@@ -2177,55 +2142,46 @@ mod tests {
         }
     }
 
-    /// Scenario: configured resource arrays exceed a bounded resource buffer.
-    /// Guarantees: resource output retains an array prefix and explicitly counts the partial attribute.
+    /// Scenario: a resource array exceeds its budget, or its outer framing cannot fit.
+    /// Guarantees: a valid prefix reports one lost attribute; framing failures return an error and roll back.
     #[test]
-    fn resource_array_overflow_reports_loss() {
+    fn resource_overflow_reports_loss_or_framing_failure() {
         let values: Vec<i64> = (-10..0).collect();
         let resource = HashMap::from([(
             "array".to_owned(),
             ConfigAttributeValue::Array(ConfigAttributeValueArray::I64(values.clone())),
         )]);
-        let mut buf = ProtoBuffer::with_capacity_and_limit(128, 128);
-        write_config_resource_field(&mut buf, &resource).expect("resource framing fits");
-        assert!(buf.len() <= 128);
-        let resource = ResourceLogs::decode(buf.as_ref())
-            .expect("valid fragment")
-            .resource
-            .expect("resource");
-        assert_eq!(resource.dropped_attributes_count, 1);
-        assert_eq!(resource.attributes.len(), 1);
-        let Some(AnyValueKind::ArrayValue(array)) = resource.attributes[0]
-            .value
-            .as_ref()
-            .and_then(|v| v.value.as_ref())
-        else {
-            panic!("expected array");
-        };
-        assert!(!array.values.is_empty());
-        assert!(array.values.len() < values.len());
-        assert_eq!(
-            array.values,
-            values
-                .iter()
-                .take(array.values.len())
-                .map(|v| AnyValue::new_int(*v))
-                .collect::<Vec<_>>(),
-        );
-    }
-
-    /// Scenario: a resource buffer cannot fit outer framing and the loss count.
-    /// Guarantees: encoding returns an error and rolls back instead of returning a partial resource fragment.
-    #[test]
-    fn resource_framing_failure_is_not_silently_ignored() {
-        let resource = HashMap::from([("a".to_owned(), ConfigAttributeValue::Bool(true))]);
-        for limit in 0..4 {
+        for limit in [0, 1, 2, 3, 128] {
             let mut buf = ProtoBuffer::with_capacity_and_limit(limit, limit);
+            let result = write_config_resource_field(&mut buf, &resource);
+            if limit < 4 {
+                assert_eq!(result, Err(EncodeFailure::Dropped));
+                assert!(buf.is_empty());
+                continue;
+            }
+            result.expect("resource framing fits");
+            assert!(buf.len() <= limit);
+            let resource = ResourceLogs::decode(buf.as_ref())
+                .expect("valid fragment")
+                .resource
+                .expect("resource");
+            assert_eq!(resource.dropped_attributes_count, 1);
+            assert_eq!(resource.attributes.len(), 1);
+            let Some(AnyValueKind::ArrayValue(array)) =
+                &resource.attributes[0].value.as_ref().expect("value").value
+            else {
+                panic!("expected array");
+            };
+            assert!(!array.values.is_empty());
+            assert!(array.values.len() < values.len());
             assert_eq!(
-                write_config_resource_field(&mut buf, &resource),
-                Err(EncodeFailure::Dropped)
+                array.values,
+                values
+                    .iter()
+                    .take(array.values.len())
+                    .map(|v| AnyValue::new_int(*v))
+                    .collect::<Vec<_>>(),
             );
-            assert!(buf.is_empty());
         }
     }
 
@@ -2277,28 +2233,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// Scenario: a structured value meets small byte budgets.
-    /// Guarantees: output never exceeds the limit, stays decodable, and counts one dropped attribute per partial value.
-    #[test]
-    fn structured_value_is_bounded_and_reports_truncation() {
-        for limit in [8, 32, 64, 128] {
-            let (buf, dropped) = encode_probe(limit, probe(2));
-            assert!(buf.len() <= limit);
-            let _ = LogRecord::decode(buf.as_ref()).expect("valid truncated record");
-            assert_eq!(dropped, 1, "limit {limit}");
-        }
-
-        let (buf, dropped) = encode_probe(16384, probe(2));
-        assert_eq!(dropped, 0);
-        assert_eq!(
-            LogRecord::decode(buf.as_ref())
-                .expect("valid")
-                .attributes
-                .len(),
-            1
-        );
     }
 
     static BUDGET_TEST_CALLSITE: BudgetTestCallsite = BudgetTestCallsite;

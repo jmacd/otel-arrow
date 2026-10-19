@@ -221,43 +221,31 @@ mod tests {
         }
     }
 
-    /// Scenario: a typed handle owns erased structured storage.
-    /// Guarantees: the handle occupies only the boxed trait object's two pointers.
+    /// Scenario: non-Clone values are stored in new and converted structured boxes.
+    /// Guarantees: handles add no storage overhead, conversion reuses the allocation, and typed mutation and field borrowing work.
     #[test]
-    fn boxed_handle_has_no_storage_overhead() {
+    fn boxed_storage_preserves_ownership_and_typed_access() {
         assert_eq!(
             size_of::<StructBox<State>>(),
             size_of::<Box<dyn StructuredValue>>(),
         );
-    }
-
-    /// Scenario: a non-Clone value is exclusively owned by a structured box.
-    /// Guarantees: typed access and mutation work, and logging borrows the existing carrier.
-    #[test]
-    fn boxed_value_supports_typed_mutation_and_borrowing() {
-        let mut state = StructBox::new(State { count: 1 });
-        state.count = 2;
-        assert_eq!(state.count, 2);
-        let field = state.as_struct();
-        assert!(std::ptr::eq(
-            field
-                .downcast_ref::<StructCarrier>()
-                .expect("known carrier"),
-            &state.carrier,
-        ));
-        state.count = 3;
-        assert_eq!(state.count, 3);
-    }
-
-    /// Scenario: an existing Box is converted to a structured handle.
-    /// Guarantees: conversion reuses the allocation and preserves mutable typed access.
-    #[test]
-    fn existing_box_storage_is_preserved() {
         let original = Box::new(State { count: 7 });
         let address = std::ptr::from_ref(&*original);
-        let mut state = StructBox::from(original);
-        assert_eq!(std::ptr::from_ref(&*state), address);
-        state.count = 8;
-        assert_eq!(state.count, 8);
+        let converted = StructBox::from(original);
+        assert_eq!(std::ptr::from_ref(&*converted), address);
+        assert_eq!(converted.count, 7);
+        for mut state in [StructBox::new(State { count: 1 }), converted] {
+            state.count = 2;
+            assert_eq!(state.count, 2);
+            assert!(std::ptr::eq(
+                state
+                    .as_struct()
+                    .downcast_ref::<StructCarrier>()
+                    .expect("known carrier"),
+                &state.carrier,
+            ));
+            state.count = 3;
+            assert_eq!(state.count, 3);
+        }
     }
 }
