@@ -107,8 +107,12 @@ pub struct DirectFieldVisitor<'buf, B: BoundedBuf> {
     dropped_count: u32,
 }
 
+/// A value location is a Body or Attribute field.
 enum ValueLocation<'a> {
+    /// Log body, an AnyValue. By convention, the "message" property
+    /// translates into Body.
     Body,
+    /// Log attribute, a KeyValue where Key != "message".
     Attribute(&'a str),
 }
 
