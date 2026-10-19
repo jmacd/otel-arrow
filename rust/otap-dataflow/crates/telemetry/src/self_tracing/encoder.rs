@@ -143,16 +143,13 @@ impl<'buf, B: BoundedBuf> DirectFieldVisitor<'buf, B> {
         }
     }
 
-    /// Encodes a scalar field as an attribute; scalar values of the `message`
-    /// field are ignored unless their visitor method handles them as a body.
-    fn record_attribute(
+    /// Encodes a scalar field according to its body or attribute location.
+    fn record_value(
         &mut self,
         field: &tracing::field::Field,
         write: impl FnOnce(&mut ValueEncoder<'_, B>),
     ) {
-        if field.name() != "message" {
-            self.write_any_value(ValueLocation::Attribute(field.name()), write);
-        }
+        self.write_any_value(value_location(field), write);
     }
 
     /// Encodes an AnyValue as a body or attribute.
@@ -522,11 +519,11 @@ impl<B: BoundedBuf> ArrayWriter for NestedEncoder<'_, B> {
 
 impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        self.record_attribute(field, |w| w.write_f64(value));
+        self.record_value(field, |w| w.write_f64(value));
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.record_attribute(field, |w| w.write_i64(value));
+        self.record_value(field, |w| w.write_i64(value));
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
@@ -534,7 +531,7 @@ impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.record_attribute(field, |w| w.write_bool(value));
+        self.record_value(field, |w| w.write_bool(value));
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -1934,10 +1931,16 @@ mod tests {
         }
     }
 
-    /// Scenario: a structured `message` field writes a nested AnyValue.
-    /// Guarantees: structured messages use the log body rather than an attribute.
+    /// Scenario: scalar and structured `message` fields write AnyValues.
+    /// Guarantees: every message value uses the log body rather than an attribute.
     #[test]
-    fn structured_message_is_log_body() {
+    fn message_values_are_log_body() {
+        let scalar = __log_record_impl!(Level::INFO, "test.scalar_message", message = 7i64)
+            .into_record(LogContext::new());
+        let decoded = LogRecord::decode(scalar.body_attrs_bytes).expect("valid scalar record");
+        assert!(decoded.attributes.is_empty());
+        assert_eq!(decoded.body, Some(AnyValue::new_int(7)));
+
         let slot = StructBox::new(Probe(7));
         let record = __log_record_impl!(
             Level::INFO,
