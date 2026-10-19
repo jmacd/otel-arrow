@@ -3,9 +3,7 @@
 
 //! Direct OTLP bytes encoder for tokio-tracing events.
 
-use super::structured::{
-    ArrayWriter, MAX_DEPTH, MapWriter, StructCarrier, StructuredValue, ValueWriter,
-};
+use super::structured::{ArrayWriter, MAX_DEPTH, MapWriter, StructCarrier, ValueWriter};
 use super::{LogRecord, SavedCallsite};
 use crate::attributes::AttributeValue;
 use crate::event::LogEvent;
@@ -109,6 +107,18 @@ pub struct DirectFieldVisitor<'buf, B: BoundedBuf> {
     dropped_count: u32,
 }
 
+enum ValueLocation<'a> {
+    Body,
+    Attribute(&'a str),
+}
+
+fn value_location(field: &tracing::field::Field) -> ValueLocation<'_> {
+    match field.name() {
+        "message" => ValueLocation::Body,
+        name => ValueLocation::Attribute(name),
+    }
+}
+
 impl<'buf, B: BoundedBuf> DirectFieldVisitor<'buf, B> {
     /// Create a new DirectFieldVisitor that writes to the provided buffer.
     pub const fn new(buf: &'buf mut B) -> Self {
@@ -133,43 +143,36 @@ impl<'buf, B: BoundedBuf> DirectFieldVisitor<'buf, B> {
         }
     }
 
-    /// Encodes a structured value as one attribute within the per-attribute budget.
-    fn write_structured(&mut self, key: &str, value: &dyn StructuredValue) {
-        self.write_attribute(|buf| {
-            write_key_value(buf, LOG_RECORD_ATTRIBUTES, key, 0, |w| {
-                value.write(w);
-            })
-        });
-    }
-
-    /// Encodes the field as an attribute; scalar values of the `message`
-    /// field have no body representation and are ignored.
+    /// Encodes a scalar field as an attribute; scalar values of the `message`
+    /// field are ignored unless their visitor method handles them as a body.
     fn record_attribute(
         &mut self,
         field: &tracing::field::Field,
-        encode: impl FnOnce(&mut B) -> Result<bool, EncodeFailure>,
+        write: impl FnOnce(&mut ValueEncoder<'_, B>),
     ) {
         if field.name() != "message" {
-            self.write_value_attribute(field.name(), encode);
+            self.write_any_value(ValueLocation::Attribute(field.name()), write);
         }
     }
 
-    /// Encodes one attribute whose AnyValue payload is written by `encode`.
-    fn write_value_attribute(
+    /// Encodes an AnyValue as a body or attribute.
+    fn write_any_value(
         &mut self,
-        key: &str,
-        encode: impl FnOnce(&mut B) -> Result<bool, EncodeFailure>,
+        location: ValueLocation<'_>,
+        write: impl FnOnce(&mut ValueEncoder<'_, B>),
     ) {
-        self.write_attribute(|buf| {
-            write_encoded_key_value(buf, LOG_RECORD_ATTRIBUTES, key, encode)
-        });
-    }
-
-    /// Encodes a body payload, rolling it back if it cannot fit.
-    fn write_body(&mut self, encode: impl FnOnce(&mut B) -> Result<bool, EncodeFailure>) {
-        let _ = self
-            .buf
-            .try_encode(|buf| write_encoded_value(buf, LOG_RECORD_BODY, encode).map(drop));
+        match location {
+            ValueLocation::Attribute(key) => {
+                self.write_attribute(|buf| {
+                    write_key_value(buf, LOG_RECORD_ATTRIBUTES, key, 0, write)
+                });
+            }
+            ValueLocation::Body => {
+                let _ = self
+                    .buf
+                    .try_encode(|buf| write_value(buf, LOG_RECORD_BODY, 0, write).map(drop));
+            }
+        }
     }
 }
 
@@ -334,34 +337,6 @@ fn write_tagged<B: BoundedBuf>(
     buf.encode_field_tag(field, wire_type)
         .and_then(|()| encode(buf))
         .map(|()| false)
-}
-
-fn write_encoded_value<B: BoundedBuf>(
-    buf: &mut B,
-    field: u64,
-    encode: impl FnOnce(&mut B) -> Result<bool, EncodeFailure>,
-) -> Result<bool, EncodeFailure> {
-    let mut lost = false;
-    buf.encode_len_delimited_partial(field, |buf| {
-        lost = encode(buf)?;
-        Ok::<_, EncodeFailure>(())
-    })?;
-    Ok(lost)
-}
-
-fn write_encoded_key_value<B: BoundedBuf>(
-    buf: &mut B,
-    field: u64,
-    key: &str,
-    encode: impl FnOnce(&mut B) -> Result<bool, EncodeFailure>,
-) -> Result<bool, EncodeFailure> {
-    let mut lost = false;
-    buf.encode_len_delimited_partial(field, |buf| {
-        buf.encode_string(KEY_VALUE_KEY, key)?;
-        lost = write_encoded_value(buf, KEY_VALUE_VALUE, encode)?;
-        Ok::<_, EncodeFailure>(())
-    })?;
-    Ok(lost)
 }
 
 /// Encodes `f`'s value as a length-delimited `field`. `Ok(true)`
@@ -547,19 +522,11 @@ impl<B: BoundedBuf> ArrayWriter for NestedEncoder<'_, B> {
 
 impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        self.record_attribute(field, |buf| {
-            write_tagged(buf, ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64, |buf| {
-                buf.extend_from_slice(&value.to_le_bytes())
-            })
-        });
+        self.record_attribute(field, |w| w.write_f64(value));
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.record_attribute(field, |buf| {
-            write_tagged(buf, ANY_VALUE_INT_VALUE, wire_types::VARINT, |buf| {
-                buf.encode_varint(value as u64)
-            })
-        });
+        self.record_attribute(field, |w| w.write_i64(value));
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
@@ -567,29 +534,17 @@ impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.record_attribute(field, |buf| {
-            write_tagged(buf, ANY_VALUE_BOOL_VALUE, wire_types::VARINT, |buf| {
-                buf.encode_varint(u64::from(value))
-            })
-        });
+        self.record_attribute(field, |w| w.write_bool(value));
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() != "message" {
-            self.write_value_attribute(field.name(), |buf| {
-                buf.encode_string_truncating(ANY_VALUE_STRING_VALUE, value)
-            });
-        } else if !value.is_empty() {
-            self.write_body(|buf| buf.encode_string_truncating(ANY_VALUE_STRING_VALUE, value));
+        if field.name() != "message" || !value.is_empty() {
+            self.write_any_value(value_location(field), |w| w.write_str(value));
         }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() != "message" {
-            self.write_value_attribute(field.name(), |buf| encode_debug_string(buf, value));
-        } else {
-            self.write_body(|buf| encode_debug_string(buf, value));
-        }
+        self.write_any_value(value_location(field), |w| w.write_debug(value));
     }
 
     fn record_error(
@@ -598,7 +553,9 @@ impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
         value: &(dyn std::error::Error + 'static),
     ) {
         match value.downcast_ref::<StructCarrier>() {
-            Some(structured) => self.write_structured(field.name(), structured.value()),
+            Some(structured) => {
+                self.write_any_value(value_location(field), |w| structured.value().write(w))
+            }
             None => self.record_debug(field, &format_args!("{value}")),
         }
     }
@@ -1975,6 +1932,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Scenario: a structured `message` field writes a nested AnyValue.
+    /// Guarantees: structured messages use the log body rather than an attribute.
+    #[test]
+    fn structured_message_is_log_body() {
+        let slot = StructBox::new(Probe(7));
+        let record = __log_record_impl!(
+            Level::INFO,
+            "test.structured_message",
+            message = slot.as_struct()
+        )
+        .into_record(LogContext::new());
+        let decoded = LogRecord::decode(record.body_attrs_bytes).expect("valid record");
+
+        assert!(decoded.attributes.is_empty());
+        assert_eq!(
+            decoded.body,
+            Some(AnyValue::new_kvlist(vec![
+                KeyValue::new("count", AnyValue::new_int(7)),
+                KeyValue::new(
+                    "tags",
+                    AnyValue::new_array(
+                        vec![AnyValue::new_string("a"), AnyValue::new_string("b"),]
+                    ),
+                ),
+            ]))
+        );
     }
 
     fn encode_partial_with_tail(limit: usize, f: impl FnOnce(&mut dyn ValueWriter)) -> AnyValue {
