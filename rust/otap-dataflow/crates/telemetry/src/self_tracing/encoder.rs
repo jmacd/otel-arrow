@@ -710,12 +710,15 @@ const EXPORT_LOGS_REQUEST_RESOURCE_LOGS: u64 = 1;
 /// Entity keys must remain registered until their first lookup populates this
 /// cache; a key that is neither registered nor cached cannot be encoded.
 ///
+/// TODO(4453): Encode scope attributes during entity construction, returning
+/// errors there, and share those bytes with metrics to remove this local cache.
+///
 /// TODO: ScopeToBytesMap grows without any attention to managing memory.
 /// We will require a way to de-register entities that are no longer use
 /// or to flush memory to maintain a fixed size.
 #[derive(Debug)]
 pub struct ScopeToBytesMap {
-    cache: HashMap<EntityKey, (Bytes, u32)>,
+    cache: HashMap<EntityKey, Bytes>,
     registry: TelemetryRegistryHandle,
 }
 
@@ -724,6 +727,8 @@ pub struct ScopeToBytesMap {
 pub enum MapError {
     /// EntityKey is not registered
     NotRegistered,
+    /// Encoding the registered entity's attributes failed.
+    Failed(EncodeFailure),
 }
 
 impl ScopeToBytesMap {
@@ -736,8 +741,8 @@ impl ScopeToBytesMap {
         }
     }
 
-    /// Get or compute scope attribute bytes and their dropped count for an entity key.
-    pub fn get_or_encode(&mut self, key: EntityKey) -> Result<(Bytes, u32), MapError> {
+    /// Get or compute complete scope attribute bytes for an entity key.
+    pub fn get_or_encode(&mut self, key: EntityKey) -> Result<Bytes, MapError> {
         if let Some(cached) = self.cache.get(&key) {
             return Ok(cached.clone());
         }
@@ -745,10 +750,11 @@ impl ScopeToBytesMap {
         match self.registry.visit_entity(key, |attrs| {
             encode_scope_attributes(attrs.iter_attributes())
         }) {
-            Some(encoded) => {
-                let _ = self.cache.insert(key, encoded.clone());
-                Ok(encoded)
+            Some(Ok(bytes)) => {
+                let _ = self.cache.insert(key, bytes.clone());
+                Ok(bytes)
             }
+            Some(Err(err)) => Err(MapError::Failed(err)),
             None => Err(MapError::NotRegistered),
         }
     }
@@ -759,19 +765,19 @@ impl ScopeToBytesMap {
     }
 }
 
-/// Encode scope attributes, counting each partially or wholly lost attribute once.
+/// Encode complete scope attributes into growable storage, rejecting any loss.
 fn encode_scope_attributes<'k, 'v>(
     attrs: impl IntoIterator<Item = (&'k str, &'v AttributeValue)>,
-) -> (Bytes, u32) {
+) -> Result<Bytes, EncodeFailure> {
     let mut buf = ProtoBuffer::with_capacity(128);
-    let mut dropped = 0u32;
     for (key, value) in attrs {
-        let lost = encode_attribute(&mut buf, INSTRUMENTATION_SCOPE_ATTRIBUTES, key, |w| {
+        if write_key_value(&mut buf, INSTRUMENTATION_SCOPE_ATTRIBUTES, key, 0, |w| {
             write_attribute_value(w, value)
-        });
-        dropped = dropped.saturating_add(u32::from(lost));
+        })? {
+            return Err(EncodeFailure::Dropped);
+        }
     }
-    (buf.into_bytes(), dropped)
+    Ok(buf.into_bytes())
 }
 
 /// Writes an `AttributeValue`; maps become kvlists.
@@ -803,19 +809,19 @@ fn encode_scope_logs(
     buf.encode_len_delimited(RESOURCE_LOGS_SCOPE_LOGS, |buf| {
         buf.encode_len_delimited(SCOPE_LOG_SCOPE, |buf| {
             buf.encode_string(INSTRUMENTATION_SCOPE_NAME, target)?;
-            let mut dropped = 0u32;
             for entity_key in context {
-                let (bytes, count) = match scope_cache.get_or_encode(*entity_key) {
-                    Ok(encoded) => encoded,
-                    Err(MapError::NotRegistered) => encode_scope_attributes(std::iter::once((
-                        "unregistered.entity",
-                        &AttributeValue::Int(entity_key.data().as_ffi() as i64),
-                    ))),
-                };
-                buf.extend_from_slice(&bytes)?;
-                dropped = dropped.saturating_add(count);
+                match scope_cache.get_or_encode(*entity_key) {
+                    Ok(bytes) => buf.extend_from_slice(&bytes)?,
+                    Err(MapError::NotRegistered) => {
+                        buf.extend_from_slice(&encode_scope_attributes(std::iter::once((
+                            "unregistered.entity",
+                            &AttributeValue::Int(entity_key.data().as_ffi() as i64),
+                        )))?)?;
+                    }
+                    Err(MapError::Failed(err)) => return Err(err),
+                }
             }
-            write_dropped_count(buf, INSTRUMENTATION_DROPPED_ATTRIBUTES_COUNT, dropped)
+            Ok(())
         })?;
 
         for event in events {
@@ -2069,15 +2075,11 @@ mod tests {
         }
     }
 
-    /// Scenario: a top-level key is too large for its budget in a log, scope, or resource.
+    /// Scenario: a top-level key is too large for its budget in a log or resource.
     /// Guarantees: the failed attribute is rolled back and a later small attribute still fits.
     #[test]
     fn top_level_attribute_budgets_are_independent() {
-        for field in [
-            LOG_RECORD_ATTRIBUTES,
-            INSTRUMENTATION_SCOPE_ATTRIBUTES,
-            RESOURCE_ATTRIBUTES,
-        ] {
+        for field in [LOG_RECORD_ATTRIBUTES, RESOURCE_ATTRIBUTES] {
             let mut buf = ProtoBuffer::with_capacity_and_limit(64, 64);
             assert!(encode_attribute(&mut buf, field, &"x".repeat(64), |_| {
                 panic!("oversized key skips its value");
@@ -2086,11 +2088,6 @@ mod tests {
             assert!(!encode_attribute(&mut buf, field, "small", |w| w.write_bool(true)));
             let attributes = match field {
                 LOG_RECORD_ATTRIBUTES => LogRecord::decode(buf.as_ref()).expect("log").attributes,
-                INSTRUMENTATION_SCOPE_ATTRIBUTES => {
-                    InstrumentationScope::decode(buf.as_ref())
-                        .expect("scope")
-                        .attributes
-                }
                 RESOURCE_ATTRIBUTES => Resource::decode(buf.as_ref()).expect("resource").attributes,
                 _ => unreachable!(),
             };
@@ -2196,42 +2193,44 @@ mod tests {
         map
     }
 
-    /// Scenario: two scope entities have depth-limited attributes, followed by an unaffected entity.
-    /// Guarantees: partial values do not fail the batch, loss counts sum across cached entities, and later attributes survive.
+    /// Scenario: scope attributes reach or exceed the depth limit before their entity is unregistered.
+    /// Guarantees: incomplete scopes fail export without being cached; complete cached bytes survive unregistration.
     #[test]
-    fn scope_depth_loss_is_preserved_and_aggregated_through_cache() {
+    fn scope_cache_accepts_only_complete_attributes() {
         let registry = TelemetryRegistryHandle::new();
-        let keys = [
-            registry.register_entity(TestMapAttributes::new(deep_scope_map(MAX_DEPTH + 1))),
-            registry.register_entity(TestMapAttributes::new(deep_scope_map(MAX_DEPTH + 1))),
-            registry.register_entity(TestScopeAttributes::new("pipeline", 7)),
-        ];
         let mut cache = ScopeToBytesMap::new(registry.clone());
-        let mut events = [LogEvent {
-            time: SystemTime::UNIX_EPOCH,
-            record: __log_record_impl!(Level::INFO, "test.scope.depth")
-                .into_record(LogContext::from_slice(&keys)),
-        }];
-        let mut buf = ProtoBuffer::with_capacity(256);
-        for attempt in 0..2 {
-            encode_export_logs_request(&mut buf, &mut events, &Bytes::new(), &mut cache)
-                .expect("partial scope values do not fail the batch");
+        for depth in [MAX_DEPTH, MAX_DEPTH + 1] {
+            let key = registry.register_entity(TestMapAttributes::new(deep_scope_map(depth)));
+            let mut events = [LogEvent {
+                time: SystemTime::UNIX_EPOCH,
+                record: __log_record_impl!(Level::INFO, "test.scope.depth")
+                    .into_record(LogContext::from_buf([key])),
+            }];
+            let mut buf = ProtoBuffer::with_capacity(256);
+            let result =
+                encode_export_logs_request(&mut buf, &mut events, &Bytes::new(), &mut cache);
+            assert!(registry.unregister_entity(key));
+            if depth > MAX_DEPTH {
+                assert_eq!(result, Err(EncodeFailure::Dropped));
+                assert!(matches!(
+                    cache.get_or_encode(key),
+                    Err(MapError::NotRegistered)
+                ));
+                continue;
+            }
+            result.expect("complete scope fits");
             let request = ExportLogsServiceRequest::decode(buf.as_ref()).expect("valid request");
             let scope_logs = &request.resource_logs[0].scope_logs[0];
             let scope = scope_logs.scope.as_ref().expect("scope");
-            assert_eq!(scope.dropped_attributes_count, 2);
-            assert_eq!(scope.attributes.len(), 4);
-            assert_eq!(
-                scope.attributes[2],
-                KeyValue::new("pipeline.name", AnyValue::new_string("pipeline"))
-            );
+            assert_eq!(scope.dropped_attributes_count, 0);
+            assert_eq!(scope.attributes.len(), 1);
             assert_eq!(scope_logs.log_records.len(), 1);
-            assert_eq!(scope_logs.log_records[0].dropped_attributes_count, 0);
-            if attempt == 0 {
-                for key in keys {
-                    assert!(registry.unregister_entity(key));
-                }
-            }
+            encode_export_logs_request(&mut buf, &mut events, &Bytes::new(), &mut cache)
+                .expect("cached bytes survive unregistration");
+            assert_eq!(
+                ExportLogsServiceRequest::decode(buf.as_ref()).expect("valid cache hit"),
+                request
+            );
         }
     }
 
