@@ -539,9 +539,7 @@ impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() != "message" || !value.is_empty() {
-            self.write_any_value(value_location(field), |w| w.write_str(value));
-        }
+        self.write_any_value(value_location(field), |w| w.write_str(value));
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
