@@ -539,7 +539,10 @@ impl<B: BoundedBuf> tracing::field::Visit for DirectFieldVisitor<'_, B> {
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.write_any_value(value_location(field), |w| w.write_str(value));
+        match value_location(field) {
+            ValueLocation::Body if value.is_empty() => {}
+            location => self.write_any_value(location, |w| w.write_str(value)),
+        }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -1934,9 +1937,14 @@ mod tests {
     }
 
     /// Scenario: scalar and structured `message` fields write AnyValues.
-    /// Guarantees: every message value uses the log body rather than an attribute.
+    /// Guarantees: every non-empty message value uses the body; an empty string is omitted.
     #[test]
     fn message_values_are_log_body() {
+        let empty = __log_record_impl!(Level::INFO, "test.empty_message", message = "")
+            .into_record(LogContext::new());
+        let decoded = LogRecord::decode(empty.body_attrs_bytes).expect("valid empty record");
+        assert_eq!(decoded.body, None);
+
         let scalar = __log_record_impl!(Level::INFO, "test.scalar_message", message = 7i64)
             .into_record(LogContext::new());
         let decoded = LogRecord::decode(scalar.body_attrs_bytes).expect("valid scalar record");
