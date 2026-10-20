@@ -9,6 +9,126 @@ use otel_arrow_dfe_engine::context_declaration::{ContextMaterializationPlan, Pre
 use otel_arrow_dfe_engine::testing::processor::TestPhase;
 use otel_arrow_dfe_otap::OTAP_PIPELINE_FACTORY;
 
+/// Scenario: the partition processor writes expression results that the batch processor selects.
+/// Guarantees: equal results batch together, and its null-as-empty-binary header differs from absence.
+#[cfg(feature = "partition")]
+#[test]
+fn partition_processor_output_is_a_named_batch_dimension() {
+    use crate::processors::partition_processor::PARTITION_PROCESSOR_FACTORY;
+    use otel_arrow_dfe_engine::capability::registry::Capabilities;
+    use otel_arrow_dfe_engine::testing::install_test_context_bindings;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue};
+    use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let runtime = TestRuntime::new();
+    let controller = ControllerContext::new(runtime.metrics_registry());
+    let mut pipeline = controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+    let mut node = NodeUserConfig::new_processor_config(PARTITION_PROCESSOR_FACTORY.name);
+    node.config = json!({
+        "partition_by": {"opl_expression": "resource.attributes[\"bucket\"]"},
+        "partition_header_name": "bucket"
+    });
+    let config = serde_json::from_value(json!({"nodes": {"partition-source": &node}}))
+        .expect("source pipeline");
+    install_test_context_bindings(&mut pipeline, &OTAP_PIPELINE_FACTORY, config)
+        .expect("source declarations");
+    let pipeline = pipeline.with_node_context(
+        "partition-source".into(),
+        node.r#type.clone(),
+        NodeKind::Processor,
+        HashMap::new(),
+    );
+    let processor = (PARTITION_PROCESSOR_FACTORY.create)(
+        pipeline,
+        test_node("partition-source"),
+        Arc::new(node),
+        &ProcessorConfig::new("partition"),
+        &Capabilities::empty(),
+    )
+    .expect("partition processor");
+    let produced = Rc::new(RefCell::new(Vec::new()));
+    let collected = Rc::clone(&produced);
+    runtime
+        .set_processor(processor)
+        .run_test(move |mut ctx| async move {
+            for (index, bucket) in [Some("a"), Some("b"), Some("a"), None]
+                .into_iter()
+                .enumerate()
+            {
+                let mut logs = residual_logs(index, 1);
+                if let Some(bucket) = bucket {
+                    logs.resource_logs[0].resource = Some(Resource {
+                        attributes: vec![KeyValue::new("bucket", AnyValue::new_string(bucket))],
+                        ..Default::default()
+                    });
+                }
+                ctx.process(Message::PData(OtapPdata::new_default(
+                    encode_logs_otap_batch(&logs).expect("OTAP logs").into(),
+                )))
+                .await
+                .expect("partition input");
+            }
+            let outputs = ctx.drain_pdata().await;
+            assert_eq!(outputs.len(), 4);
+            *collected.borrow_mut() = outputs;
+        })
+        .validate(|_| async {});
+
+    let inputs = std::mem::take(&mut *produced.borrow_mut());
+    let mut cfg = self::config(ResidualFormat::Otap, 2, 4);
+    cfg["partition_by"] = json!([{"type": "named", "named": ["bucket"]}]);
+    let (phase, _) = setup(cfg, json!({}));
+    phase
+        .run_test(move |mut ctx| async move {
+            for input in inputs {
+                ctx.process(Message::PData(input))
+                    .await
+                    .expect("batch partition output");
+            }
+            ctx.process(Message::PData(OtapPdata::new_default(
+                encode_logs_otap_batch(&residual_logs(4, 1))
+                    .expect("unpartitioned input")
+                    .into(),
+            )))
+            .await
+            .expect("input without a partition header");
+            flush_timer(&mut ctx).await;
+            let mut seen = Vec::new();
+            for mut output in ctx.drain_pdata().await {
+                let key = match output.transport_headers() {
+                    None => "missing".to_owned(),
+                    Some(headers) => {
+                        assert_eq!(headers.len(), 1);
+                        let header = headers.iter().next().expect("partition header");
+                        assert_eq!(header.name.as_str(), "bucket");
+                        if header.value.value_kind == ValueKind::Binary {
+                            assert!(header.value.bytes.is_empty());
+                            "null".to_owned()
+                        } else {
+                            std::str::from_utf8(header.value.bytes)
+                                .expect("text result")
+                                .to_owned()
+                        }
+                    }
+                };
+                seen.push((key, output.num_items()));
+            }
+            seen.sort();
+            assert_eq!(
+                seen,
+                [
+                    ("a".into(), 2),
+                    ("b".into(), 1),
+                    ("missing".into(), 1),
+                    ("null".into(), 1)
+                ]
+            );
+        })
+        .validate(|_| async {});
+}
+
 /// Scenario: two selected header references contain equal, different, absent, and empty values.
 /// Guarantees: batching uses the full tuple and preserves available dimensions when another is missing.
 #[test]
@@ -421,11 +541,11 @@ fn partition_configuration_and_factory_binding() {
         json!([]),
         json!([{ "type": "named", "named": ["workspace", "tenant:id"] }]),
         json!([{ "type": "authorized_identity", "named": ["tenant"] }]),
-        json!([{ "type": "composite", "name": "tenant" }]),
+        json!([{ "type": "composite", "named": ["tenant", "delivery"] }]),
         json!([
             { "type": "named", "named": ["workspace", "tenant:id"] },
             { "type": "authorized_identity", "named": ["tenant"] },
-            { "type": "composite", "name": "tenant" }
+            { "type": "composite", "named": ["tenant"] }
         ]),
     ] {
         let cfg = json!({ "partition_by": selection });
@@ -433,7 +553,8 @@ fn partition_configuration_and_factory_binding() {
             prepare(
                 &cfg,
                 json!({
-                    "tenant": [{ "type": "constant", "name": "id", "value": "fixed" }]
+                    "tenant": [{ "type": "constant", "name": "id", "value": "fixed" }],
+                    "delivery": [{ "type": "constant", "name": "route", "value": "primary" }]
                 })
             )
             .is_ok()
@@ -447,12 +568,24 @@ fn partition_configuration_and_factory_binding() {
         json!([{ "type": "transport_header", "name": "tenant", "typo": true }]),
         json!([{ "type": "named", "named": [] }]),
         json!([{ "type": "authorized_identity", "named": [] }]),
-        json!([{ "type": "composite", "name": "unknown" }]),
+        json!([{ "type": "composite", "named": ["unknown"] }]),
+        json!([{ "type": "composite", "name": "tenant" }]),
+        json!([{ "type": "composite", "named": [] }]),
+        json!([{ "type": "composite", "named": ["tenant:customer"] }]),
+        json!([{ "type": "none" }]),
+        json!([{ "type": "all_captured" }]),
+        json!([{}]),
         json!([{ "type": "named", "named": ["tenant:unknown"] }]),
         json!([{ "type": "authorized_identity", "named": ["tenant:id"] }]),
     ] {
-        assert!(prepare(&json!({ "partition_by": selection }), json!({})).is_err());
+        let config = json!({ "partition_by": selection });
+        assert!(prepare(&config, json!({})).is_err());
     }
+    let declare = OTAP_BATCH_PROCESSOR_FACTORY
+        .context_declarations
+        .expect("declarations")
+        .declarations;
+    assert!(declare(&json!({"partition_by": [{"type": "all_captured"}]})).is_err());
     assert!(prepare(&json!({ "max_active_partitions": 0 }), json!({})).is_err());
     let (pipeline, _registry) = create_test_pipeline_context();
     assert!(
@@ -653,7 +786,7 @@ fn partition_passthrough_projects_without_buffering() {
 #[test]
 fn partition_composites_materialize_and_project_atomically() {
     let mut cfg = config(ResidualFormat::Otap, 2, 3);
-    cfg["partition_by"] = json!([{ "type": "composite", "name": "product_user" }]);
+    cfg["partition_by"] = json!([{ "type": "composite", "named": ["product_user", "delivery"] }]);
     let (phase, plan) = setup(
         cfg,
         json!({
@@ -661,7 +794,8 @@ fn partition_composites_materialize_and_project_atomically() {
                 { "type": "transport_header", "name": "account" },
                 { "type": "transport_header", "name": "workspace" },
                 { "type": "transport_header_match", "name": "environment", "value": "prod" }
-            ]
+            ],
+            "delivery": [{ "type": "constant", "name": "route", "value": "primary" }]
         }),
     );
     let plan = plan.expect("batch consumer selects the composite for materialization");
@@ -695,6 +829,15 @@ fn partition_composites_materialize_and_project_atomically() {
             for output in ctx.drain_pdata().await {
                 assert!(output.transport_headers().is_none());
                 assert!(output.peer_addr().is_none());
+                let delivery = output
+                    .materialized_context()
+                    .expect("second selected composite")
+                    .entry(&"delivery".try_into().expect("name"))
+                    .expect("delivery snapshot");
+                assert_eq!(
+                    delivery.members()[0].values().values()[0].as_str(),
+                    Some("primary")
+                );
                 let tuple =
                     output
                         .resolve_materialized_context(&plan, &projection)

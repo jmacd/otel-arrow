@@ -4370,7 +4370,8 @@ mod test {
         impl ConfigNodeContextDeclaration for SelectionConfig {
             fn context_declarations(&self) -> NodeContextDeclarations {
                 [ContextDeclaration::Consumes {
-                    selector: ContextConsumerSelector::values(&self.selectors),
+                    selector: ContextConsumerSelector::values(&self.selectors)
+                        .expect("valid test selectors"),
                 }]
                 .into_iter()
                 .collect()
@@ -4427,7 +4428,7 @@ mod test {
         let pipeline_key =
             otel_arrow_dfe_config::PipelineKey::new("group".into(), "pipeline".into());
         let selectors: Vec<ContextSelector> = serde_json::from_value(selectors).expect("selectors");
-        let selection = ContextConsumerSelector::values(&selectors);
+        let selection = ContextConsumerSelector::values(&selectors).expect("value selection");
         let binding = compiled
             .bind_partition(&pipeline_key, &"reader".into(), &selection)
             .expect("binding");

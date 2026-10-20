@@ -29,7 +29,7 @@ pub use propagation::PreparedHeaderPropagationPolicy;
 use crate::PipelineFactory;
 use crate::error::Error as EngineError;
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
-use otel_arrow_dfe_config::context::ContextSelector;
+use otel_arrow_dfe_config::context::{ContextSelector, ContextSelectorType};
 use otel_arrow_dfe_config::context_policy::{
     ContextEntryDeclaration as ConfigContextEntryDeclaration, ContextEntryPart,
 };
@@ -204,12 +204,11 @@ pub enum ContextConsumerSelector {
 }
 
 impl ContextConsumerSelector {
-    /// Declares an ordered value projection from shared typed selectors.
+    /// Declares an ordered, finite value projection from shared typed selectors.
     ///
     /// Primitive domains come from selector tags, never from name inference.
     /// Qualified members retain the enclosing composite's presence gate.
-    #[must_use]
-    pub fn values(selectors: &[ContextSelector]) -> Self {
+    pub fn values(selectors: &[ContextSelector]) -> Result<Self, Error> {
         let mut entries = Vec::new();
         let mut add = |target| {
             entries.push(ContextEntrySelector {
@@ -218,8 +217,21 @@ impl ContextConsumerSelector {
             })
         };
         for selector in selectors {
-            match selector {
-                ContextSelector::Named { named } => {
+            selector.validate().map_err(invalid_context)?;
+            let named = match selector.selector_type {
+                ContextSelectorType::AllCaptured | ContextSelectorType::None => {
+                    return Err(invalid_context(format!(
+                        "explicit context references are required for a value projection; selector type '{}' is not supported",
+                        selector.selector_type.as_str()
+                    )));
+                }
+                _ => selector
+                    .named
+                    .as_ref()
+                    .expect("validated name-based selector has names"),
+            };
+            match selector.selector_type {
+                ContextSelectorType::Named => {
                     for reference in named {
                         add(match reference.scope() {
                             Some(composite) => ContextEntryTarget::CompositeMember {
@@ -233,22 +245,29 @@ impl ContextConsumerSelector {
                         });
                     }
                 }
-                ContextSelector::AuthorizedIdentity { named } => {
-                    for name in named {
+                ContextSelectorType::AuthorizedIdentity => {
+                    for reference in named {
                         add(ContextEntryTarget::Primitive {
                             domain: ContextDomain::AuthorizedIdentity,
-                            name: name.clone(),
+                            name: reference.name().clone(),
                         });
                     }
                 }
-                ContextSelector::Composite { name } => {
-                    add(ContextEntryTarget::Composite { name: name.clone() });
+                ContextSelectorType::Composite => {
+                    for reference in named {
+                        add(ContextEntryTarget::Composite {
+                            name: reference.name().clone(),
+                        });
+                    }
+                }
+                ContextSelectorType::AllCaptured | ContextSelectorType::None => {
+                    unreachable!("rejected non-finite selector")
                 }
             }
         }
-        Self::Entries {
+        Ok(Self::Entries {
             entries: entries.into_boxed_slice(),
-        }
+        })
     }
 }
 

@@ -18,7 +18,27 @@ use std::hash::{BuildHasherDefault, Hasher};
 fn typed_selection(json: serde_json::Value) -> ContextConsumerSelector {
     let selectors: Vec<otel_arrow_dfe_config::ContextSelector> =
         serde_json::from_value(json).expect("typed selectors");
-    ContextConsumerSelector::values(&selectors)
+    ContextConsumerSelector::values(&selectors).expect("finite value selection")
+}
+
+/// Scenario: a finite grouping projection receives a legacy wildcard, none, or invalid name list.
+/// Guarantees: unsupported and malformed selectors return errors without omitting dimensions.
+#[test]
+fn finite_projection_rejects_non_finite_or_invalid_selectors() {
+    for json in [
+        serde_json::json!([{"type": "none"}]),
+        serde_json::json!([{"type": "all_captured"}]),
+        serde_json::json!([{"type": "named"}]),
+        serde_json::json!([{"type": "composite", "named": []}]),
+        serde_json::json!([{"type": "composite", "named": ["tenant:customer"]}]),
+        serde_json::json!([
+            {"type": "named", "named": ["id"]}, {"type": "all_captured"}
+        ]),
+    ] {
+        let selectors = serde_json::from_value::<Vec<otel_arrow_dfe_config::ContextSelector>>(json)
+            .expect("shared configuration");
+        assert!(ContextConsumerSelector::values(&selectors).is_err());
+    }
 }
 
 fn header_context(headers: &[(&str, &str)]) -> MaterializedContext {
@@ -43,7 +63,7 @@ fn typed_selection_preserves_domains_and_reference_order() {
     let selector = typed_selection(serde_json::json!([
         {"type": "named", "named": ["tenant", "tenant:customer"]},
         {"type": "authorized_identity", "named": ["tenant"]},
-        {"type": "composite", "name": "tenant"}
+        {"type": "composite", "named": ["tenant"]}
     ]));
     let ContextConsumerSelector::Entries { entries } = selector else {
         unreachable!()
@@ -210,7 +230,7 @@ fn partition_member_projection_keeps_gate_without_leaking_members() {
 
     let overlap = typed_selection(serde_json::json!([
         {"type": "named", "named": ["tenant:customer", "tenant:workspace", "tenant:customer"]},
-        {"type": "composite", "name": "tenant"},
+        {"type": "composite", "named": ["tenant"]},
     ]));
     let overlap =
         ContextPartitionBinding::compile(&overlap, Some(&plan)).expect("overlapping binding");

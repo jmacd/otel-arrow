@@ -87,7 +87,7 @@ config:
   # Optional: include a whole composite in the partition key.
   partition_by:
     - type: composite
-      name: product_user
+      named: [product_user]
   # Buffered keys per signal and batching plan, including missing values.
   max_active_partitions: 1024
 
@@ -201,13 +201,20 @@ partition_by:
   composite declaration; it may be an identity, header, constant, or randomness value.
 - `type: authorized_identity` selects verified primitive claims by stored name.
   It accepts unqualified primitive names only; use `type: named` for composite members.
-- `type: composite` selects every member of the composite identified by `name`.
+- `type: composite` selects every member of each composite in its `named` list.
 
 ```yaml
 partition_by:
   - type: composite
-    name: product_user
+    named: [product_user, delivery]
 ```
+
+These use the same projection-selector configuration as
+[transport-header propagation](../../../../../docs/transport-headers.md#selector-values).
+Every name-based selector has a nonempty `named` list of context references.
+Propagation also supports `none` and `all_captured`; batch partitioning rejects
+both because its key must have explicitly selected dimensions. Use an empty
+`partition_by` list, rather than a `none` selector, to disable partitioning.
 
 Composites must be declared under `policies.context.entries`, for example:
 
@@ -222,6 +229,10 @@ policies:
         - type: transport_header
           name: workspace_id
           store_as: workspace
+      delivery:
+        - type: constant
+          name: route
+          value: primary
 ```
 
 Primitive domains are determined by selector types, never inferred from names.
@@ -265,6 +276,38 @@ downstream header propagation with stored names rather than `name: preserve`.
 This projection also applies to retained remainders and in-range passthrough
 inputs. Passthrough preserves completion routing and consumes neither a
 buffered-key slot nor a completion-tracking slot.
+
+### Following the partition processor
+
+The [partition processor](../partition_processor/README.md) evaluates an OPL
+expression over telemetry records and writes each result to
+`partition_header_name`. That result is a transport-header primitive which
+batch can select by its stored name:
+
+```yaml
+nodes:
+  partition:
+    type: processor:partition
+    config:
+      partition_by:
+        opl_expression: resource.attributes["k8s.namespace.name"]
+      partition_header_name: namespace
+  batch:
+    type: processor:batch
+    config:
+      partition_by:
+        - type: named
+          named: [namespace]
+connections:
+  - from: partition
+    to: batch
+```
+
+The two processors have different jobs: partition splits records within one
+input, while batch groups messages using their context values. The partition
+processor's default lossy serialization writes a null expression result as an
+empty binary header. Batch treats that as a present value, distinct from an
+absent header; it cannot recover type distinctions already lost in serialization.
 
 ### Validation rules
 

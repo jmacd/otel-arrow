@@ -13,7 +13,10 @@ use otel_arrow_dfe_config::transport_headers_policy::{
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
-use super::{ContextMaterializationPlan, ContextProjection, ContextValueKind, MaterializedContext};
+use super::{
+    ContextConsumerSelector, ContextEntryTarget, ContextMaterializationPlan, ContextProjection,
+    ContextValueKind, MaterializedContext,
+};
 
 /// An exporter's propagation policy with qualified context references validated.
 #[doc(hidden)]
@@ -58,6 +61,7 @@ impl PreparedHeaderPropagationPolicy {
         policy: HeaderPropagationPolicy,
         declarations: &[ContextEntryDeclaration],
     ) -> Result<Self, String> {
+        policy.validate()?;
         let mut policy = Self {
             default: policy.default,
             overrides: policy.overrides,
@@ -66,12 +70,24 @@ impl PreparedHeaderPropagationPolicy {
         let Some(references) = policy.default.selector.named.as_ref() else {
             return Ok(policy);
         };
+        let ContextConsumerSelector::Entries { entries } =
+            ContextConsumerSelector::values(std::slice::from_ref(&policy.default.selector))
+                .map_err(|error| error.to_string())?
+        else {
+            unreachable!("named propagation has explicit entries");
+        };
         let mut selected_sources = HashMap::<Box<str>, ContextEntryRef>::new();
 
-        for reference in references {
-            let Some(composite_name) = reference.scope() else {
-                register_named_source(&mut selected_sources, reference.name(), reference)?;
-                continue;
+        for (reference, selection) in references.iter().zip(entries.iter()) {
+            let (composite_name, member_name) = match &selection.target {
+                ContextEntryTarget::Primitive { name, .. } => {
+                    register_named_source(&mut selected_sources, name, reference)?;
+                    continue;
+                }
+                ContextEntryTarget::CompositeMember { composite, member } => (composite, member),
+                ContextEntryTarget::Composite { .. } => {
+                    unreachable!("whole-composite propagation is not supported")
+                }
             };
             let declaration = declarations
                 .iter()
@@ -83,23 +99,23 @@ impl PreparedHeaderPropagationPolicy {
             for part in &declaration.definition.0 {
                 match part {
                     ContextEntryPart::Constant { name, .. } => {
-                        if name == reference.name() {
+                        if name == member_name {
                             selected = true;
                         }
                     }
                     ContextEntryPart::Randomness { name, .. } => {
-                        if name == reference.name() {
+                        if name == member_name {
                             selected = true;
                         }
                     }
                     ContextEntryPart::TransportHeader { name, store_as } => {
-                        if store_as.as_ref().unwrap_or(name) == reference.name() {
+                        if store_as.as_ref().unwrap_or(name) == member_name {
                             source_name = Some(name.clone());
                             selected = true;
                         }
                     }
                     ContextEntryPart::AuthorizedIdentity { name, store_as } => {
-                        if store_as.as_ref().unwrap_or(name) == reference.name() {
+                        if store_as.as_ref().unwrap_or(name) == member_name {
                             return Err(format!(
                                 "context entry reference `{reference}` selects authorized-identity member `{name}`, which cannot be propagated as a transport header"
                             ));
@@ -119,9 +135,9 @@ impl PreparedHeaderPropagationPolicy {
             }
             policy.prepared_named.push(PreparedNamedPropagation {
                 composite_name: composite_name.clone(),
-                member_name: reference.name().clone(),
+                member_name: member_name.clone(),
                 source_name,
-                output_name: reference.name().clone(),
+                output_name: member_name.clone(),
             });
         }
         Ok(policy)
@@ -462,6 +478,31 @@ mod tests {
     use otel_arrow_dfe_config::{context_policy, transport_headers};
     use std::cell::Cell;
     use uuid::Uuid;
+
+    /// Scenario: a caller directly compiles a propagation policy with an unsupported selector.
+    /// Guarantees: preparation rejects it explicitly instead of ignoring it or applying a default.
+    #[test]
+    fn common_selector_unsupported_propagation_fails_during_compilation() {
+        for kind in ["authorized_identity", "composite"] {
+            let policy: HeaderPropagationPolicy = serde_json::from_value(serde_json::json!({
+                "default": {"selector": {"type": kind, "named": ["tenant"]}}
+            }))
+            .expect("shared selector shape");
+            let error = CompiledHeaderPropagationPolicy::compile(policy, &[])
+                .expect_err("unsupported selector must not compile");
+            assert!(error.contains("does not yet support"));
+            assert!(error.contains(kind));
+        }
+        let malformed: HeaderPropagationPolicy = serde_json::from_value(serde_json::json!({
+            "default": {"selector": {"type": "none", "named": ["workspace"]}}
+        }))
+        .expect("deserialize shape for validation");
+        assert!(
+            CompiledHeaderPropagationPolicy::compile(malformed, &[])
+                .expect_err("malformed selector")
+                .contains("'named' must not be set")
+        );
+    }
 
     fn context_name(raw: &str) -> ContextEntryName {
         ContextEntryName::try_from(raw).expect("valid test context entry name")

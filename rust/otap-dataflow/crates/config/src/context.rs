@@ -180,44 +180,96 @@ impl PartialEq<&str> for ContextEntryName {
     }
 }
 
+/// Interpretation of a context projection selector.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSelectorType {
+    /// All captured transport headers.
+    AllCaptured,
+    /// No default selection.
+    #[default]
+    None,
+    /// Transport-header primitives or qualified members from any composite domain.
+    Named,
+    /// Verified authorization primitives, not qualified composite members.
+    AuthorizedIdentity,
+    /// Every member of each named composite.
+    Composite,
+}
+
+impl ContextSelectorType {
+    /// Returns the configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllCaptured => "all_captured",
+            Self::None => "none",
+            Self::Named => "named",
+            Self::AuthorizedIdentity => "authorized_identity",
+            Self::Composite => "composite",
+        }
+    }
+}
+
 /// Selects context values independently of a consumer's action or output encoding.
 ///
-/// Unqualified `named` references select transport headers. Qualified references
-/// select composite members with the domain and presence gate of their declaration.
+/// All name-based strategies use ordered `ContextEntryRef` lists. Unqualified
+/// `named` references select transport headers; qualified references retain their
+/// composite's domain and presence gate. Other name-based strategies require
+/// unqualified names. Consumers validate which strategies they support.
 #[derive(
-    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+    Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ContextSelector {
-    /// Transport-header primitives or qualified members from any composite domain.
-    Named {
-        /// References in selection order.
-        named: Vec<ContextEntryRef>,
-    },
-    /// Verified authorization primitives, not qualified composite members.
-    AuthorizedIdentity {
-        /// Stored primitive names in selection order.
-        named: Vec<ContextEntryName>,
-    },
-    /// Every member of one declared composite.
-    Composite {
-        /// Composite entry name.
-        name: ContextEntryName,
-    },
+#[serde(deny_unknown_fields)]
+pub struct ContextSelector {
+    /// Projection strategy, defaulting to `none` for legacy propagation settings.
+    #[serde(rename = "type", default)]
+    pub selector_type: ContextSelectorType,
+    /// Required, nonempty references for name-based strategies; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named: Option<Vec<ContextEntryRef>>,
 }
 
 impl ContextSelector {
-    /// Rejects empty name lists; consumers may separately allow an empty selector list.
-    pub fn validate(&self) -> Result<(), Error> {
-        let empty = match self {
-            Self::Named { named } => named.is_empty(),
-            Self::AuthorizedIdentity { named } => named.is_empty(),
-            Self::Composite { .. } => false,
-        };
-        if empty {
-            return Err(Error::InvalidUserConfig {
-                error: "context selector `named` list must not be empty".into(),
-            });
+    /// Validates the common selector shape, independently of consumer capabilities.
+    pub fn validate(&self) -> Result<(), String> {
+        let kind = self.selector_type.as_str();
+        match (&self.selector_type, &self.named) {
+            (ContextSelectorType::AllCaptured | ContextSelectorType::None, Some(_)) => {
+                return Err(format!("'named' must not be set when type is '{kind}'"));
+            }
+            (ContextSelectorType::AllCaptured | ContextSelectorType::None, None) => {}
+            (_, None) => return Err(format!("'named' list is required when type is '{kind}'")),
+            (_, Some(names)) if names.is_empty() => {
+                return Err(format!(
+                    "'named' list must not be empty when type is '{kind}'"
+                ));
+            }
+            (
+                ContextSelectorType::AuthorizedIdentity | ContextSelectorType::Composite,
+                Some(names),
+            ) => {
+                if let Some(reference) = names.iter().find(|reference| reference.scope().is_some())
+                {
+                    return Err(format!(
+                        "type '{kind}' requires unqualified names, not '{reference}'; use type 'named' for composite members"
+                    ));
+                }
+            }
+            (ContextSelectorType::Named, Some(_)) => {}
         }
         Ok(())
     }
@@ -234,7 +286,9 @@ mod tests {
         for json in [
             serde_json::json!({"type": "named", "named": ["workspace", "tenant:customer"]}),
             serde_json::json!({"type": "authorized_identity", "named": ["customer", "roles"]}),
-            serde_json::json!({"type": "composite", "name": "tenant"}),
+            serde_json::json!({"type": "composite", "named": ["tenant", "delivery"]}),
+            serde_json::json!({"type": "none"}),
+            serde_json::json!({"type": "all_captured"}),
         ] {
             let selector: ContextSelector = serde_json::from_value(json.clone()).expect("selector");
             selector.validate().expect("nonempty selection");
@@ -253,15 +307,35 @@ mod tests {
             serde_json::json!({"type": "named", "name": "workspace"}),
             serde_json::json!({"type": "named", "named": ["workspace"], "extra": true}),
             serde_json::json!({"type": "authorized_identity", "named": ["tenant:customer"]}),
-            serde_json::json!({"type": "composite", "name": "tenant:customer"}),
+            serde_json::json!({"type": "composite", "name": "tenant"}),
+            serde_json::json!({"type": "composite", "named": ["tenant:customer"]}),
+            serde_json::json!({"type": "none", "named": ["tenant"]}),
+            serde_json::json!({"type": "all_captured", "named": ["tenant"]}),
         ] {
-            assert!(serde_json::from_value::<ContextSelector>(json).is_err());
+            if let Ok(selector) = serde_json::from_value::<ContextSelector>(json) {
+                assert!(selector.validate().is_err());
+            }
         }
-        for kind in ["named", "authorized_identity"] {
+        for kind in ["named", "authorized_identity", "composite"] {
             let selector: ContextSelector =
                 serde_json::from_value(serde_json::json!({"type": kind, "named": []}))
                     .expect("typed selector");
             assert!(selector.validate().is_err());
+            let selector: ContextSelector =
+                serde_json::from_value(serde_json::json!({"type": kind})).expect("typed selector");
+            assert!(selector.validate().is_err());
+        }
+    }
+
+    /// Scenario: a legacy propagation selector omits its type or optional name list.
+    /// Guarantees: an empty selector still means none and explicit null names retain legacy behavior.
+    #[test]
+    fn context_selector_preserves_legacy_defaults() {
+        for json in [serde_json::json!({}), serde_json::json!({"named": null})] {
+            let selector: ContextSelector = serde_json::from_value(json).expect("legacy selector");
+            selector.validate().expect("default shape");
+            assert_eq!(selector, ContextSelector::default());
+            assert_eq!(selector.selector_type, ContextSelectorType::None);
         }
     }
 

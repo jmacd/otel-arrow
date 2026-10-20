@@ -54,9 +54,8 @@ use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_engine::MessageSourceLocalEffectHandlerExtension;
 use otel_arrow_dfe_engine::context_declaration::{
-    ConfigNodeContextDeclaration, ContextConsumerSelector, ContextDeclaration,
-    ContextDeclarationProvider, ContextPartitionBinding, ContextPartitionKey,
-    NodeContextDeclarations,
+    ContextConsumerSelector, ContextDeclaration, ContextDeclarationProvider,
+    ContextPartitionBinding, ContextPartitionKey, NodeContextDeclarations,
 };
 use otel_arrow_dfe_engine::{
     ConsumerEffectHandlerExtension, Interests, LocalWakeupRequirements,
@@ -420,9 +419,7 @@ impl Default for Config {
 impl Config {
     /// Validates all active batching plans and their capabilities.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        for selector in &self.partition_by {
-            selector.validate()?;
-        }
+        let _ = ContextConsumerSelector::values(&self.partition_by)?;
         self.plans().map(|_| ())
     }
 
@@ -524,14 +521,13 @@ impl From<&FormatConfig> for BatchSettings {
     }
 }
 
-impl ConfigNodeContextDeclaration for Config {
-    fn context_declarations(&self) -> NodeContextDeclarations {
-        (!self.partition_by.is_empty())
-            .then(|| ContextDeclaration::Consumes {
-                selector: ContextConsumerSelector::values(&self.partition_by),
-            })
+impl Config {
+    fn context_declarations(&self) -> Result<NodeContextDeclarations, ConfigError> {
+        let selector = ContextConsumerSelector::values(&self.partition_by)?;
+        Ok((!self.partition_by.is_empty())
+            .then_some(ContextDeclaration::Consumes { selector })
             .into_iter()
-            .collect()
+            .collect())
     }
 }
 
@@ -774,9 +770,10 @@ impl BatchProcessor {
             })?;
 
         config.validate()?;
-        let declared_selector =
-            (!config.partition_by.is_empty()).then(|| ContextConsumerSelector::values(&config.partition_by));
-        if declared_selector.as_ref()
+        if (!config.partition_by.is_empty())
+            .then(|| ContextConsumerSelector::values(&config.partition_by))
+            .transpose()?
+            .as_ref()
             != partition_binding
                 .as_ref()
                 .map(ContextPartitionBinding::selector)
@@ -1469,11 +1466,17 @@ pub fn create_otap_batch_processor(
         otel_arrow_dfe_config::validation::deserialize_typed_config(&node_config.config)?;
     let binding = (!config.partition_by.is_empty())
         .then(|| {
-            config.validate_context_declarations(&pipeline_ctx)?;
+            pipeline_ctx
+                .compiled_context_bindings()
+                .validate_node_declarations(
+                    &pipeline_ctx.pipeline_key(),
+                    &pipeline_ctx.node_id(),
+                    &config.context_declarations()?,
+                )?;
             pipeline_ctx.compiled_context_bindings().bind_partition(
                 &pipeline_ctx.pipeline_key(),
                 &pipeline_ctx.node_id(),
-                &ContextConsumerSelector::values(&config.partition_by),
+                &ContextConsumerSelector::values(&config.partition_by)?,
             )
         })
         .transpose()?;
@@ -1773,7 +1776,12 @@ pub static OTAP_BATCH_PROCESSOR_FACTORY: otel_arrow_dfe_engine::ProcessorFactory
              _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities| {
                 create_otap_batch_processor(pipeline_ctx, node, node_config, proc_cfg)
             },
-        context_declarations: Some(ContextDeclarationProvider::from_typed_config::<Config>()),
+        context_declarations: Some(ContextDeclarationProvider {
+            declarations: |config| {
+                otel_arrow_dfe_config::validation::deserialize_typed_config::<Config>(config)?
+                    .context_declarations()
+            },
+        }),
         wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
         validate_config: |config| {
             otel_arrow_dfe_config::validation::deserialize_typed_config::<Config>(config)?
