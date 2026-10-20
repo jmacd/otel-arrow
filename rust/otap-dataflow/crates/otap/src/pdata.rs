@@ -20,14 +20,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
-use otel_arrow_dfe_config::transport_headers::{TransportHeaders, TransportHeadersData};
+use otel_arrow_dfe_config::transport_headers::{
+    TransportHeader, TransportHeaders, TransportHeadersData,
+};
 use otel_arrow_dfe_config::{PortName, SignalType};
 use otel_arrow_dfe_engine::_private::AckNackRouting;
 use otel_arrow_dfe_engine::capability::auth::{AuthorizedIdentity, ClaimValue};
 use otel_arrow_dfe_engine::context_declaration::{
-    ContextDomain, ContextFieldLayout, ContextMaterializationPlan, ContextProjection,
-    ContextValueCardinality, ContextValueKind, ContextValueSource, MaterializedContext,
-    MaterializedContextProjection, MaterializedContextValue, MaterializedContextValues,
+    ContextDomain, ContextFieldLayout, ContextMaterializationPlan, ContextPartitionBinding,
+    ContextPartitionKey, ContextProjection, ContextValueCardinality, ContextValueKind,
+    ContextValueSource, MaterializedContext, MaterializedContextProjection,
+    MaterializedContextValue, MaterializedContextValues,
 };
 use otel_arrow_dfe_engine::control::{
     AckMsg, CallData, Frame, NackMsg, NodeControlMsg, RouteData, nanos_since_birth,
@@ -175,6 +178,60 @@ impl fmt::Debug for AuthorizedIdentityEntries {
 }
 
 impl AuthorizedIdentityEntries {
+    fn select(&self, names: &[&str]) -> Self {
+        let entries = self
+            .iter()
+            .filter(|entry| names.contains(&entry.name()))
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Self::default();
+        }
+        let value_count = entries
+            .iter()
+            .map(|entry| entry.value().len())
+            .sum::<usize>();
+        let entry_bytes = entries.len() * AUTHORIZED_ENTRY_LEN;
+        let descriptor_len = entry_bytes + value_count * AUTHORIZED_VALUE_LEN;
+        let blob_len = entries
+            .iter()
+            .map(|entry| entry.name().len() + entry.value().values().map(str::len).sum::<usize>())
+            .sum::<usize>();
+        let mut bytes = vec![0; descriptor_len + blob_len];
+        let mut blob_at = descriptor_len;
+        let mut value_index = 0;
+        for (index, entry) in entries.iter().enumerate() {
+            let entry_at = index * AUTHORIZED_ENTRY_LEN;
+            let claim = entry.value();
+            let name_range = write_context_blob(&mut bytes, &mut blob_at, entry.name().as_bytes())
+                .expect("selected identity name fits");
+            write_context_range(&mut bytes, entry_at, name_range)
+                .expect("selected identity name descriptor");
+            write_context_u32(&mut bytes, entry_at + 8, value_index)
+                .expect("selected identity first value");
+            write_context_u32(&mut bytes, entry_at + 12, claim.len())
+                .expect("selected identity value count");
+            bytes[entry_at + 16] = u8::from(claim.is_many());
+            for value in claim.values() {
+                let range = write_context_blob(&mut bytes, &mut blob_at, value.as_bytes())
+                    .expect("selected identity value fits");
+                write_context_range(
+                    &mut bytes,
+                    entry_bytes + value_index * AUTHORIZED_VALUE_LEN,
+                    range,
+                )
+                .expect("selected identity value descriptor");
+                value_index += 1;
+            }
+        }
+        Self {
+            packed: Some(Arc::new(PackedAuthorizedIdentity {
+                bytes: bytes.into_boxed_slice(),
+                entry_count: entries.len(),
+                value_count,
+            })),
+        }
+    }
+
     fn capture(policy: &AuthorizedIdentityPolicy, identity: &AuthorizedIdentity) -> Option<Self> {
         PackedAuthorizedIdentity::capture(policy, identity).map(|packed| Self {
             packed: Some(Arc::new(packed)),
@@ -811,6 +868,65 @@ impl Context {
         projection: &'a ContextProjection,
     ) -> Option<MaterializedContextProjection<'a>> {
         self.materialized.resolve(plan, projection)
+    }
+
+    /// Computes a partition tuple using the compiled consumer binding.
+    #[must_use]
+    pub fn partition_key(&self, binding: &ContextPartitionBinding) -> ContextPartitionKey {
+        binding.key(
+            &self.materialized,
+            &PdataContextValueSource {
+                authorized_identity: &self.authorized_identity,
+            },
+        )
+    }
+
+    /// Copies only selected entries and members, without routing or unrelated metadata.
+    ///
+    /// Original wire names and peer addresses are omitted because they do not
+    /// participate in partition equality. Composite provenance and snapshots survive.
+    #[must_use]
+    pub fn partition_context(&self, binding: &ContextPartitionBinding) -> Self {
+        let identity_names = binding
+            .primitive_fields()
+            .filter(|field| field.domain == ContextDomain::AuthorizedIdentity)
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        let mut output = Self {
+            materialized: binding.project_materialized(&self.materialized),
+            authorized_identity: self.authorized_identity.select(&identity_names),
+            ..Self::default()
+        };
+        let mut headers = TransportHeaders::new();
+        for header in self
+            .transport_headers()
+            .into_iter()
+            .flat_map(|headers| headers.iter())
+        {
+            if let Some(field) = binding.primitive_fields().find(|field| {
+                field.domain == ContextDomain::TransportHeader
+                    && header
+                        .name
+                        .as_str()
+                        .eq_ignore_ascii_case(field.name.as_str())
+            }) {
+                headers.push(TransportHeader::new(
+                    field.name.clone(),
+                    header.value.value_kind,
+                    header.value.bytes,
+                ));
+            }
+        }
+        output.set_transport_headers(headers);
+        output
+    }
+
+    /// Restricts metadata to the partition selection while retaining completion routing.
+    pub fn retain_partition_context(&mut self, binding: &ContextPartitionBinding) {
+        let projected = self.partition_context(binding);
+        self.authorized_identity = projected.authorized_identity;
+        self.materialized = projected.materialized;
+        self.peer_addr = None;
     }
 
     /// Returns the peer address observed by the receiving socket, if any.
@@ -4236,6 +4352,188 @@ mod test {
             .expect("groups entry")
             .value();
         assert_ne!(one_reader, many_reader);
+    }
+
+    /// Scenario: one binding selects headers, same-named verified claims, and a composite member.
+    /// Guarantees: projection preserves the complete tuple, drops unselected metadata, and keeps routing.
+    #[test]
+    fn partition_typed_projection_combines_domains_and_members() {
+        use otel_arrow_dfe_config::ContextSelector;
+        use otel_arrow_dfe_engine::context_declaration::{
+            ConfigNodeContextDeclaration, ContextConsumerSelector, ContextDeclaration,
+            ContextDeclarationProvider, NodeContextDeclarations,
+        };
+        #[derive(serde::Deserialize)]
+        struct SelectionConfig {
+            selectors: Vec<ContextSelector>,
+        }
+        impl ConfigNodeContextDeclaration for SelectionConfig {
+            fn context_declarations(&self) -> NodeContextDeclarations {
+                [ContextDeclaration::Consumes {
+                    selector: ContextConsumerSelector::values(&self.selectors),
+                }]
+                .into_iter()
+                .collect()
+            }
+        }
+        static FACTORIES: [otel_arrow_dfe_engine::ProcessorFactory<()>; 1] =
+            [otel_arrow_dfe_engine::ProcessorFactory {
+                name: "urn:test:processor:context",
+                create: |_, _, _, _, _| unreachable!("only compile declarations"),
+                context_declarations: Some(ContextDeclarationProvider::from_typed_config::<
+                    SelectionConfig,
+                >()),
+                wiring_contract:
+                    otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
+                validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<
+                    SelectionConfig,
+                >,
+            }];
+        let selectors = serde_json::json!([
+            {"type": "named", "named": ["id", "tenant:customer"]},
+            {"type": "authorized_identity", "named": ["id", "roles"]},
+        ]);
+        let pipeline = serde_json::json!({
+            "policies": {"context": {"entries": {"tenant": [
+                {"type": "authorized_identity", "name": "id", "store_as": "customer"},
+                {"type": "transport_header", "name": "workspace"},
+                {"type": "transport_header_match", "name": "environment", "value": "prod"}
+            ]}}},
+            "nodes": {"reader": {"type": "urn:test:processor:context", "config": {"selectors": selectors}}},
+            "connections": []
+        });
+        let mut resolved = otel_arrow_dfe_config::engine::OtelDataflowSpec::from_json(
+            &serde_json::json!({
+                "version": "otel_dataflow/v1",
+                "engine": {},
+                "groups": {"group": {"pipelines": {"pipeline": pipeline}}}
+            })
+            .to_string(),
+        )
+        .expect("engine configuration")
+        .resolve();
+        resolved
+            .pipelines
+            .retain(|pipeline| pipeline.pipeline_id == "pipeline");
+        assert_eq!(
+            resolved.pipelines.len(),
+            1,
+            "compile only the fixture consumer"
+        );
+        let compiled = otel_arrow_dfe_engine::PipelineFactory::new(&[], &FACTORIES, &[], &[])
+            .compile_initial_context(&resolved)
+            .expect("compile declarations")
+            .bindings;
+        let pipeline_key =
+            otel_arrow_dfe_config::PipelineKey::new("group".into(), "pipeline".into());
+        let selectors: Vec<ContextSelector> = serde_json::from_value(selectors).expect("selectors");
+        let selection = ContextConsumerSelector::values(&selectors);
+        let binding = compiled
+            .bind_partition(&pipeline_key, &"reader".into(), &selection)
+            .expect("binding");
+        let plan = compiled
+            .context_materialization_plan(&pipeline_key)
+            .expect("materialization");
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
+            {"claim": "sub", "store_as": "id"},
+            {"claim": "groups", "store_as": "roles"},
+            {"claim": "sub", "store_as": "unselected"}
+        ]))
+        .expect("identity policy");
+        let identity = AuthorizedIdentity::new()
+            .with_subject("verified")
+            .with_claim_values("groups", ["reader", "writer"]);
+        let mut context = Context::default();
+        context.capture_authorized_identity(&policy, &identity);
+        let mut headers = TransportHeaders::new();
+        for (name, value) in [
+            ("id", "untrusted"),
+            ("workspace", "w"),
+            ("environment", "prod"),
+            ("other", "discard"),
+        ] {
+            headers.push(TransportHeader::captured(
+                name.try_into().expect("name"),
+                "X-Original",
+                true,
+                ValueKind::Text,
+                value.as_bytes(),
+            ));
+        }
+        context.set_transport_headers(headers);
+        context.materialize_context(plan);
+        context.set_peer_addr("127.0.0.1:1234".parse().expect("peer"));
+        context.subscribe_to(Interests::ACKS, TestCallData::default().into(), 1);
+        let key = context.partition_key(&binding);
+        let projected = context.partition_context(&binding);
+        assert_eq!(projected.partition_key(&binding), key);
+        let headers = projected.transport_headers().expect("header");
+        assert_eq!(headers.len(), 1);
+        let header = headers.iter().next().expect("id");
+        assert_eq!(header.value.bytes, b"untrusted");
+        assert!(header.value.original_name.is_none());
+        let claims = projected.authorized_identity_entries().expect("claims");
+        assert_eq!(claims.len(), 2);
+        assert_eq!(
+            claims.get("id").expect("id").value().as_str(),
+            Some("verified")
+        );
+        assert_eq!(
+            claims
+                .get("roles")
+                .expect("roles")
+                .value()
+                .values()
+                .collect::<Vec<_>>(),
+            ["reader", "writer"]
+        );
+        let entries = projected
+            .materialized_context()
+            .expect("composite")
+            .entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].members().len(), 1);
+        assert_eq!(entries[0].members()[0].name().as_str(), "customer");
+        assert!(!projected.has_ack_or_nack_subscribers());
+        assert!(projected.peer_addr().is_none());
+        context.retain_partition_context(&binding);
+        assert!(context.has_ack_or_nack_subscribers());
+        assert_eq!(context.partition_key(&binding), key);
+    }
+
+    /// Scenario: one captured identity entry is selected for a partition output.
+    /// Guarantees: only that verified entry survives, with its original cardinality and ordered values.
+    #[test]
+    fn partition_identity_projection_retains_only_selected_claim() {
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(serde_json::json!([
+            {"claim": "sub", "store_as": "subject"},
+            {"claim": "groups", "store_as": "groups"},
+            {"claim": "empty", "store_as": "empty"}
+        ]))
+        .expect("identity policy");
+        let identity = AuthorizedIdentity::new()
+            .with_subject("reader")
+            .with_claim_values("groups", ["reader", "writer"])
+            .with_claim_values("empty", std::iter::empty::<&str>());
+        let entries =
+            AuthorizedIdentityEntries::capture(&policy, &identity).expect("captured claims");
+        for name in ["subject", "groups", "empty"] {
+            let selected = entries.select(&[name]);
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected.get(name), entries.get(name));
+            assert_eq!(selected.iter().next().expect("selected").name(), name);
+        }
+        assert!(entries.select(&["absent"]).is_empty());
+        let selected = entries.select(&["empty", "groups", "groups"]);
+        assert_eq!(
+            selected.len(),
+            2,
+            "overlapping selections do not duplicate claims"
+        );
+        assert_eq!(selected.get("groups"), entries.get("groups"));
+        assert_eq!(selected.get("empty"), entries.get("empty"));
+        assert!(selected.get("subject").is_none());
+        assert_eq!(entries.len(), 3, "source identity is unchanged");
     }
 
     /// Scenario: a packed authorized identity descriptor is corrupted below its declared count.

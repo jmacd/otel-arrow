@@ -13,12 +13,15 @@
 mod layout;
 /// Materializes selected composites at runtime.
 mod materialization;
+/// Binds whole context entries for collision-safe partitioning.
+mod partition;
 /// Compiles and applies exporter transport-header propagation policies.
 mod propagation;
 
 use PreparedHeaderPropagationPolicy as HeaderPropagationPolicy;
 pub use layout::*;
 pub use materialization::*;
+pub use partition::{ContextPartitionBinding, ContextPartitionKey};
 pub use propagation::CompiledHeaderPropagationPolicy;
 #[doc(hidden)]
 pub use propagation::PreparedHeaderPropagationPolicy;
@@ -26,6 +29,7 @@ pub use propagation::PreparedHeaderPropagationPolicy;
 use crate::PipelineFactory;
 use crate::error::Error as EngineError;
 use otel_arrow_dfe_config::authorized_identity_policy::AuthorizedIdentityPolicy;
+use otel_arrow_dfe_config::context::ContextSelector;
 use otel_arrow_dfe_config::context_policy::{
     ContextEntryDeclaration as ConfigContextEntryDeclaration, ContextEntryPart,
 };
@@ -197,6 +201,55 @@ pub enum ContextConsumerSelector {
         /// Source authority domain.
         domain: ContextDomain,
     },
+}
+
+impl ContextConsumerSelector {
+    /// Declares an ordered value projection from shared typed selectors.
+    ///
+    /// Primitive domains come from selector tags, never from name inference.
+    /// Qualified members retain the enclosing composite's presence gate.
+    #[must_use]
+    pub fn values(selectors: &[ContextSelector]) -> Self {
+        let mut entries = Vec::new();
+        let mut add = |target| {
+            entries.push(ContextEntrySelector {
+                target,
+                form: ContextEntrySelectorForm::Value,
+            })
+        };
+        for selector in selectors {
+            match selector {
+                ContextSelector::Named { named } => {
+                    for reference in named {
+                        add(match reference.scope() {
+                            Some(composite) => ContextEntryTarget::CompositeMember {
+                                composite: composite.clone(),
+                                member: reference.name().clone(),
+                            },
+                            None => ContextEntryTarget::Primitive {
+                                domain: ContextDomain::TransportHeader,
+                                name: reference.name().clone(),
+                            },
+                        });
+                    }
+                }
+                ContextSelector::AuthorizedIdentity { named } => {
+                    for name in named {
+                        add(ContextEntryTarget::Primitive {
+                            domain: ContextDomain::AuthorizedIdentity,
+                            name: name.clone(),
+                        });
+                    }
+                }
+                ContextSelector::Composite { name } => {
+                    add(ContextEntryTarget::Composite { name: name.clone() });
+                }
+            }
+        }
+        Self::Entries {
+            entries: entries.into_boxed_slice(),
+        }
+    }
 }
 
 /// A node's declared context behavior.
@@ -692,6 +745,31 @@ impl CompiledNodeBindings {
 }
 
 impl CompiledContextBindings {
+    /// Binds an ordered value selection already declared by this node.
+    ///
+    /// Composite bindings share the pipeline's materialization plan. Primitive
+    /// bindings keep an explicit source domain, including when the value is absent.
+    pub fn bind_partition(
+        &self,
+        pipeline: &PipelineKey,
+        node: &ConfigNodeId,
+        selector: &ContextConsumerSelector,
+    ) -> Result<ContextPartitionBinding, Error> {
+        let bindings = self
+            .by_pipeline
+            .get(pipeline)
+            .and_then(|nodes| nodes.get(node))
+            .ok_or(Error::UnrecognizedContextDeclaration {})?;
+        let declared = bindings.component_declarations.iter().any(|declaration| {
+            matches!(declaration, ContextDeclaration::Consumes { selector: declared }
+                if declared == selector)
+        });
+        if !declared {
+            return Err(Error::UnrecognizedContextDeclaration {});
+        }
+        ContextPartitionBinding::compile(selector, self.context_materialization_plan(pipeline))
+    }
+
     /// Creates an empty binding set that rejects all node declaration validation.
     #[must_use]
     pub fn empty() -> Self {
@@ -748,8 +826,8 @@ impl CompiledContextBindings {
     /// Returns the pipeline's selected composite materialization plan.
     ///
     /// Consumers may resolve existing [`ContextProjection`] values against this
-    /// plan. General consumer bindings and optimized lookup structures are
-    /// intentionally outside this API.
+    /// plan. Grouping consumers use [`Self::bind_partition`].
+    /// Optimized lookup structures remain outside this API.
     #[must_use]
     pub fn context_materialization_plan(
         &self,

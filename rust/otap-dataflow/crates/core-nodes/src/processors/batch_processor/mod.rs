@@ -16,7 +16,8 @@
 //! defaults to `max_size`. Together they define the range of acceptable
 //! batch sizes `[min_size, max_size]` (unbounded above when `max_size` is
 //! unset). An arriving input already within that range is forwarded as-is
-//! with its original context. All other inputs are buffered and then re-batched
+//! with its original context unless partitioning projects it to the selected
+//! entries and members. All other inputs are buffered and then re-batched
 //! and flushed when either pending data reaches the lower bound required to
 //! make at least one batch or the max_batch_duration is reached.
 //!
@@ -47,10 +48,16 @@ use async_trait::async_trait;
 #[cfg(test)]
 use bytes::Bytes;
 use linkme::distributed_slice;
-use otel_arrow_dfe_config::SignalType;
+use otel_arrow_dfe_config::context::ContextSelector;
 use otel_arrow_dfe_config::error::Error as ConfigError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
+use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_engine::MessageSourceLocalEffectHandlerExtension;
+use otel_arrow_dfe_engine::context_declaration::{
+    ConfigNodeContextDeclaration, ContextConsumerSelector, ContextDeclaration,
+    ContextDeclarationProvider, ContextPartitionBinding, ContextPartitionKey,
+    NodeContextDeclarations,
+};
 use otel_arrow_dfe_engine::{
     ConsumerEffectHandlerExtension, Interests, LocalWakeupRequirements,
     ProcessorRuntimeRequirements, ProducerEffectHandlerExtension,
@@ -77,7 +84,7 @@ use otel_arrow_dfe_telemetry::metrics::MetricSet;
 use otel_arrow_dfe_telemetry_macros::metric_set;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::RangeInclusive;
@@ -236,6 +243,10 @@ pub struct Config {
     pub outbound_request_limit: NonZeroUsize,
     /// Desired output representation, or native batching with OTAP fallback.
     pub format: BatchingFormat,
+    /// Ordered typed context selectors whose values form one partition key.
+    pub partition_by: Vec<ContextSelector>,
+    /// Maximum buffered keys per signal and batching plan, including missing values.
+    pub max_active_partitions: NonZeroUsize,
 }
 
 #[derive(Deserialize)]
@@ -252,6 +263,10 @@ struct ConfigInput {
     outbound_request_limit: NonZeroUsize,
     #[serde(default = "default_batching_format")]
     format: BatchingFormat,
+    #[serde(default)]
+    partition_by: Vec<ContextSelector>,
+    #[serde(default = "default_max_active_partitions")]
+    max_active_partitions: NonZeroUsize,
 }
 
 impl TryFrom<ConfigInput> for Config {
@@ -282,8 +297,14 @@ impl TryFrom<ConfigInput> for Config {
             inbound_request_limit: input.inbound_request_limit,
             outbound_request_limit: input.outbound_request_limit,
             format: input.format,
+            partition_by: input.partition_by,
+            max_active_partitions: input.max_active_partitions,
         })
     }
+}
+
+const fn default_max_active_partitions() -> NonZeroUsize {
+    NonZeroUsize::new(1024).expect("nonzero")
 }
 
 const fn default_otap_min_size_items() -> Option<u64> {
@@ -390,6 +411,8 @@ impl Default for Config {
             outbound_request_limit: default_outbound_request_limit(),
             format: default_batching_format(),
             codecs: BTreeMap::new(),
+            partition_by: Vec::new(),
+            max_active_partitions: default_max_active_partitions(),
         }
     }
 }
@@ -397,6 +420,9 @@ impl Default for Config {
 impl Config {
     /// Validates all active batching plans and their capabilities.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        for selector in &self.partition_by {
+            selector.validate()?;
+        }
         self.plans().map(|_| ())
     }
 
@@ -498,6 +524,17 @@ impl From<&FormatConfig> for BatchSettings {
     }
 }
 
+impl ConfigNodeContextDeclaration for Config {
+    fn context_declarations(&self) -> NodeContextDeclarations {
+        (!self.partition_by.is_empty())
+            .then(|| ContextDeclaration::Consumes {
+                selector: ContextConsumerSelector::values(&self.partition_by),
+            })
+            .into_iter()
+            .collect()
+    }
+}
+
 impl FormatConfig {
     #[cfg(test)]
     const fn new_items(min_size: Option<u64>, max_size: u64) -> FormatConfig {
@@ -561,12 +598,20 @@ struct Inputs {
 
     /// Sum of exact input measurements used only to trigger flushing.
     size: usize,
+
+    /// Detached context projected to this partition.
+    output_context: Context,
+}
+
+enum PendingInputs {
+    Unpartitioned(Inputs),
+    Partitioned(HashMap<ContextPartitionKey, Inputs>),
 }
 
 /// Per-signal buffer state
 struct SignalBuffer {
     /// Pending input state.
-    inputs: Inputs,
+    pending: PendingInputs,
 
     /// Map of inbound requests.  This contains a limited number of pending request
     /// contexts with details for the impl to notify after an outcome is available.
@@ -591,6 +636,7 @@ pub struct BatchProcessor {
     formats: Vec<Option<FormatState>>,
     routes: Vec<(PdataFormat, usize)>,
     metrics: MetricSet<BatchProcessorMetrics>,
+    partition_binding: Option<ContextPartitionBinding>,
 }
 
 struct FormatState {
@@ -603,6 +649,7 @@ struct BatchProcessorFormat<'a> {
     plan: &'a BatchPlan,
     signals: &'a mut SignalBatches,
     metrics: &'a mut MetricSet<BatchProcessorMetrics>,
+    partition_binding: Option<&'a ContextPartitionBinding>,
 }
 
 struct BatchProcessorSignal<'a> {
@@ -612,6 +659,7 @@ struct BatchProcessorSignal<'a> {
     plan: &'a BatchPlan,
     buffer: &'a mut SignalBuffer,
     metrics: &'a mut MetricSet<BatchProcessorMetrics>,
+    partition_binding: Option<&'a ContextPartitionBinding>,
 }
 
 /// Failure classification retained while unwinding all contributing input owners.
@@ -678,6 +726,10 @@ pub struct BatchProcessorMetrics {
     #[metric(unit = "{msg}")]
     nacked_outbound_slots: Counter<u64>,
 
+    /// Requests refused because a new key would exceed the active partition cap.
+    #[metric(unit = "{msg}")]
+    nacked_partition_limit: Counter<u64>,
+
     /// Number of oversize resource entries emitted whole (best-effort) because
     /// splitting them would have exceeded the configured fragment budget.
     #[metric(unit = "{entry}")]
@@ -708,10 +760,31 @@ impl BatchProcessor {
         cfg: &Value,
         metrics: MetricSet<BatchProcessorMetrics>,
     ) -> Result<Self, ConfigError> {
+        Self::build_with_binding(cfg, metrics, None)
+    }
+
+    fn build_with_binding(
+        cfg: &Value,
+        metrics: MetricSet<BatchProcessorMetrics>,
+        partition_binding: Option<ContextPartitionBinding>,
+    ) -> Result<Self, ConfigError> {
         let config: Config =
             serde_json::from_value(cfg.clone()).map_err(|e| ConfigError::InvalidUserConfig {
                 error: format!("invalid OTAP batch processor config: {e}"),
             })?;
+
+        config.validate()?;
+        let declared_selector =
+            (!config.partition_by.is_empty()).then(|| ContextConsumerSelector::values(&config.partition_by));
+        if declared_selector.as_ref()
+            != partition_binding
+                .as_ref()
+                .map(ContextPartitionBinding::selector)
+        {
+            return Err(ConfigError::InvalidUserConfig {
+                error: "batch partition_by requires its declared context binding".into(),
+            });
+        }
 
         let plans = config.plans()?;
         let mut formats: Vec<Option<FormatState>> = vec![None, None];
@@ -756,6 +829,7 @@ impl BatchProcessor {
             formats,
             routes,
             metrics,
+            partition_binding,
         })
     }
 
@@ -785,7 +859,7 @@ impl BatchProcessor {
                 if let Some(mut format) = self.format(index) {
                     format
                         .for_signal(signal)
-                        .flush_signal_impl(effect, Instant::now(), FlushReason::Shutdown)
+                        .flush_signal_impl(effect, Instant::now(), FlushReason::Shutdown, None)
                         .await?;
                 }
             }
@@ -802,6 +876,7 @@ impl BatchProcessor {
                 plan: &state.plan,
                 signals: &mut state.signals,
                 metrics: &mut self.metrics,
+                partition_binding: self.partition_binding.as_ref(),
             })
     }
 
@@ -863,6 +938,7 @@ impl<'a> BatchProcessorFormat<'a> {
                 SignalType::Metrics => &mut self.signals.metrics,
             },
             metrics: self.metrics,
+            partition_binding: self.partition_binding,
         }
     }
 }
@@ -885,17 +961,45 @@ impl<'a> BatchProcessorSignal<'a> {
             return Ok(());
         }
 
-        // Pass-through: an input that is already an acceptable batch is
-        // forwarded as-is with its original context.
+        // Pass-through preserves the payload and applies any partition projection.
         if self.fmtcfg.in_passthrough_range(size) {
             return self.forward_as_is(effect, ctx, payload).await;
         }
+
+        let partition = self
+            .partition_binding
+            .map(|binding| ctx.partition_key(binding));
+        let output_context = match (&self.buffer.pending, &partition, self.partition_binding) {
+            (PendingInputs::Unpartitioned(_), None, None) => Context::default(),
+            (PendingInputs::Partitioned(partitions), Some(key), Some(binding)) => {
+                if !partitions.contains_key(key) {
+                    if partitions.len() >= self.config.max_active_partitions.get() {
+                        self.metrics.nacked_partition_limit.inc();
+                        effect
+                            .notify_nack(NackMsg::new(
+                                "batch active context partition limit exhausted",
+                                OtapPdata::new(ctx, payload),
+                            ))
+                            .await?;
+                        return Ok(());
+                    }
+                    ctx.partition_context(binding)
+                } else {
+                    Context::default()
+                }
+            }
+            _ => unreachable!("pending input mode matches the compiled partition binding"),
+        };
 
         // Capture the receiver-observed peer address before `ctx` may be
         // moved into BatchContext below. The portion retains it so the
         // flush path can merge peer_addr across contributing inputs even
         // when none of them subscribed to ack/nack.
-        let peer_addr = ctx.peer_addr();
+        let peer_addr = self
+            .partition_binding
+            .is_none()
+            .then(|| ctx.peer_addr())
+            .flatten();
 
         // Retain contexts needed for Ack/Nack routing or metrics unwinding.
         let inkey = if ctx.needs_completion_tracking() {
@@ -927,17 +1031,24 @@ impl<'a> BatchProcessorSignal<'a> {
         // scheduling the wakeup until after measuring the accepted payload, so
         // one-request size flushes do not pay set/cancel timer overhead.
         let timeout = self.config.max_batch_duration;
-        let arrival = if timeout != Duration::ZERO && self.buffer.inputs.is_empty() {
+        let arrival = if timeout != Duration::ZERO && self.buffer.pending.is_empty() {
             Some(Instant::now())
         } else {
             None
         };
 
-        self.buffer
-            .inputs
-            .accept(payload, BatchPortion::new(inkey, peer_addr), size);
-
-        let pending_size = self.buffer.inputs.size_by(self.fmtcfg.sizer)?;
+        let inputs = match (&mut self.buffer.pending, &partition) {
+            (PendingInputs::Unpartitioned(inputs), None) => inputs,
+            (PendingInputs::Partitioned(partitions), Some(key)) => {
+                partitions.entry(key.clone()).or_insert_with(|| Inputs {
+                    output_context,
+                    ..Inputs::default()
+                })
+            }
+            _ => unreachable!("pending input mode matches the partition key"),
+        };
+        inputs.accept(payload, BatchPortion::new(inkey, peer_addr), size);
+        let pending_size = inputs.size_by(self.fmtcfg.sizer)?;
 
         // Flush based on size when the batch reaches the lower limit.
         if timeout != Duration::ZERO && (pending_size as u64) < self.fmtcfg.lower_limit() {
@@ -952,19 +1063,20 @@ impl<'a> BatchProcessorSignal<'a> {
                 effect,
                 arrival.unwrap_or_else(Instant::now),
                 FlushReason::Size,
+                partition.as_ref(),
             )
             .await
         }
     }
 
-    /// Sends a whole input in the requested output format with its original context.
+    /// Sends a whole input in the requested output format with projected context.
     /// Matching formats keep their original storage; OTAP fallback plans finish encoding.
     /// Downstream Ack/Nack route directly to the input's subscribers, so no
     /// inbound or outbound slot is used.
     async fn forward_as_is(
         &mut self,
         effect: &mut local::EffectHandler<OtapPdata>,
-        ctx: Context,
+        mut ctx: Context,
         mut payload: OtapPayload,
     ) -> Result<(), EngineError> {
         if let Err(error) = effect.finish_batch(self.plan, &mut payload).await {
@@ -978,6 +1090,9 @@ impl<'a> BatchProcessorSignal<'a> {
             return Ok(());
         }
         self.metrics.passthrough_batches.inc();
+        if let Some(binding) = self.partition_binding {
+            ctx.retain_partition_context(binding);
+        }
         let pdata = OtapPdata::new(ctx, payload);
         effect.send_message_with_source_node(pdata).await?;
         Ok(())
@@ -996,6 +1111,7 @@ impl<'a> BatchProcessorSignal<'a> {
         effect: &mut local::EffectHandler<OtapPdata>,
         now: Instant,
         reason: FlushReason,
+        partition: Option<&ContextPartitionKey>,
     ) -> Result<(), EngineError> {
         // Timer wakeups are already popped from the local scheduler before
         // delivery. Only size/shutdown flushes need to cancel an armed timer.
@@ -1004,13 +1120,8 @@ impl<'a> BatchProcessorSignal<'a> {
         }
 
         // If the input is empty.
-        if self.buffer.inputs.is_empty() {
+        if self.buffer.pending.is_empty() {
             return Ok(());
-        }
-
-        if reason != FlushReason::Timer && self.buffer.wakeup_armed {
-            let _ = effect.cancel_wakeup(self.buffer.slot);
-            self.buffer.wakeup_armed = false;
         }
 
         // If this is a timer-based flush and we were called too soon,
@@ -1023,14 +1134,48 @@ impl<'a> BatchProcessorSignal<'a> {
                 .arrival
                 .is_some_and(|arrival| now.duration_since(arrival) < self.config.max_batch_duration)
         {
+            self.buffer
+                .set_arrival(
+                    self.signal,
+                    self.buffer.arrival.expect("early timer has an arrival"),
+                    self.config.max_batch_duration,
+                    effect,
+                )
+                .await?;
             return Ok(());
         }
 
+        match (&self.buffer.pending, partition) {
+            (PendingInputs::Partitioned(partitions), None) => {
+                let keys: Vec<_> = partitions.keys().cloned().collect();
+                for key in keys {
+                    self.flush_partition(effect, now, reason, Some(&key))
+                        .await?;
+                }
+            }
+            _ => self.flush_partition(effect, now, reason, partition).await?,
+        }
+        if !self.buffer.pending.is_empty() && !self.buffer.wakeup_armed {
+            self.buffer
+                .set_arrival(self.signal, now, self.config.max_batch_duration, effect)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_partition(
+        &mut self,
+        effect: &mut local::EffectHandler<OtapPdata>,
+        now: Instant,
+        reason: FlushReason,
+        partition: Option<&ContextPartitionKey>,
+    ) -> Result<(), EngineError> {
+        let mut inputs = self.buffer.pending.take(partition);
         let flush_started = Instant::now();
         self.metrics
             .flush_pending_requests
-            .record(self.buffer.inputs.requests() as f64);
-        if let Some(bytes) = self.buffer.inputs.known_bytes() {
+            .record(inputs.requests() as f64);
+        if let Some(bytes) = inputs.known_bytes() {
             self.metrics.flush_pending_bytes.record(bytes as f64);
         }
         if let Some(arrival) = self.buffer.arrival {
@@ -1044,7 +1189,15 @@ impl<'a> BatchProcessorSignal<'a> {
                 .record(flush_started.saturating_duration_since(now).as_nanos() as f64);
         }
 
-        let mut inputs = self.buffer.inputs.drain();
+        // Other partitions keep their original deadline even when this key
+        // size-flushes. A remainder on its own starts a new batching window.
+        if self.buffer.pending.is_empty() {
+            if self.buffer.wakeup_armed {
+                let _ = effect.cancel_wakeup(self.buffer.slot);
+                self.buffer.wakeup_armed = false;
+            }
+            self.buffer.arrival = None;
+        }
 
         match reason {
             FlushReason::Size => self.metrics.flushes_size.inc(),
@@ -1078,6 +1231,11 @@ impl<'a> BatchProcessorSignal<'a> {
             self.metrics.split_budget_fallbacks.add(budget_fallbacks);
         }
 
+        let mut remainder = Inputs {
+            output_context: inputs.output_context.clone_detached(),
+            ..Inputs::default()
+        };
+
         // Establish every output reference before releasing any pending input
         // or awaiting an operation that can complete/fail. Ranges, not sizes,
         // determine which original requests must wait for each output.
@@ -1095,7 +1253,6 @@ impl<'a> BatchProcessorSignal<'a> {
         // spanning inputs is sent now through normal multi-owner tracking;
         // retaining and re-splitting it would require finer provenance. Require
         // the last input so older residuals cannot repeatedly reset their timer.
-        let mut retained_partial = false;
         if self.config.max_batch_duration != Duration::ZERO
             && reason == FlushReason::Size
             && self.fmtcfg.max_size.is_some()
@@ -1107,11 +1264,12 @@ impl<'a> BatchProcessorSignal<'a> {
                 let size = self.fmtcfg.sizer.batch_size(last_payload)?;
                 if size > 0 && (size as u64) < self.fmtcfg.lower_limit() {
                     self.buffer
-                        .take_remaining(size, &inputs, &mut output_batches);
-                    self.buffer
-                        .set_arrival(self.signal, now, self.config.max_batch_duration, effect)
-                        .await?;
-                    retained_partial = true;
+                        .take_remaining(size, &inputs, &mut output_batches, &mut remainder);
+                    if self.buffer.pending.is_empty() {
+                        self.buffer
+                            .set_arrival(self.signal, now, self.config.max_batch_duration, effect)
+                            .await?;
+                    }
                 }
             }
         }
@@ -1146,7 +1304,8 @@ impl<'a> BatchProcessorSignal<'a> {
                     continue;
                 }
                 let bytes = records.measured_bytes();
-                let mut pdata = OtapPdata::new(Context::default(), records);
+                let mut pdata =
+                    OtapPdata::new(inputs.output_context.clone_detached(), records);
 
                 // Forward the receiver-observed peer address only when every
                 // input merged into this output batch came from the same peer
@@ -1209,9 +1368,8 @@ impl<'a> BatchProcessorSignal<'a> {
         }
         result?;
 
-        if !retained_partial {
-            self.buffer.arrival = None;
-            self.buffer.wakeup_armed = false;
+        if !remainder.is_empty() {
+            self.buffer.pending.restore(partition, remainder);
         }
 
         Ok(())
@@ -1307,7 +1465,19 @@ pub fn create_otap_batch_processor(
     processor_config: &ProcessorConfig,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     let metrics = BatchProcessorMetrics::register(&pipeline_ctx);
-    let proc = BatchProcessor::build_from_json(&node_config.config, metrics)?;
+    let config: Config =
+        otel_arrow_dfe_config::validation::deserialize_typed_config(&node_config.config)?;
+    let binding = (!config.partition_by.is_empty())
+        .then(|| {
+            config.validate_context_declarations(&pipeline_ctx)?;
+            pipeline_ctx.compiled_context_bindings().bind_partition(
+                &pipeline_ctx.pipeline_key(),
+                &pipeline_ctx.node_id(),
+                &ContextConsumerSelector::values(&config.partition_by),
+            )
+        })
+        .transpose()?;
+    let proc = BatchProcessor::build_with_binding(&node_config.config, metrics, binding)?;
     Ok(ProcessorWrapper::local(
         proc,
         node,
@@ -1364,7 +1534,7 @@ impl local::Processor<OtapPdata> for BatchProcessor {
                     if let Some(mut format) = self.format(index) {
                         format
                             .for_signal(signal)
-                            .flush_signal_impl(effect, when, FlushReason::Timer)
+                            .flush_signal_impl(effect, when, FlushReason::Timer, None)
                             .await?;
                     }
 
@@ -1399,14 +1569,6 @@ impl BatchPortion {
 }
 
 impl Inputs {
-    fn drain(&mut self) -> Self {
-        Self {
-            pending: std::mem::take(&mut self.pending),
-            context: std::mem::take(&mut self.context),
-            size: std::mem::take(&mut self.size),
-        }
-    }
-
     const fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -1438,6 +1600,36 @@ impl Inputs {
     }
 }
 
+impl PendingInputs {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Unpartitioned(inputs) => inputs.is_empty(),
+            Self::Partitioned(partitions) => partitions.is_empty(),
+        }
+    }
+
+    fn take(&mut self, key: Option<&ContextPartitionKey>) -> Inputs {
+        match (self, key) {
+            (Self::Unpartitioned(inputs), None) => std::mem::take(inputs),
+            (Self::Partitioned(partitions), Some(key)) => partitions
+                .remove(key)
+                .expect("flushed partition is buffered"),
+            _ => unreachable!("flush selection matches pending input mode"),
+        }
+    }
+
+    fn restore(&mut self, key: Option<&ContextPartitionKey>, inputs: Inputs) {
+        match (self, key) {
+            (Self::Unpartitioned(pending), None) => *pending = inputs,
+            (Self::Partitioned(partitions), Some(key)) => {
+                let previous = partitions.insert(key.clone(), inputs);
+                assert!(previous.is_none(), "flushed partition is not buffered");
+            }
+            _ => unreachable!("remainder selection matches pending input mode"),
+        }
+    }
+}
+
 fn known_total_bytes(payloads: &[OtapPayload]) -> Option<usize> {
     payloads.iter().try_fold(0usize, |total, payload| {
         payload.measured_bytes().map(|bytes| total + bytes)
@@ -1447,7 +1639,11 @@ fn known_total_bytes(payloads: &[OtapPayload]) -> Option<usize> {
 impl SignalBuffer {
     fn new(cfg: &Config, slot: WakeupSlot) -> Self {
         Self {
-            inputs: Inputs::default(),
+            pending: if cfg.partition_by.is_empty() {
+                PendingInputs::Unpartitioned(Inputs::default())
+            } else {
+                PendingInputs::Partitioned(HashMap::new())
+            },
             inbound: SlotState::new(cfg.inbound_request_limit.get()),
             outbound: SlotState::new(cfg.outbound_request_limit.get()),
             arrival: None,
@@ -1463,12 +1659,13 @@ impl SignalBuffer {
         size: usize,
         from_inputs: &Inputs,
         output_batches: &mut Vec<(OtapPayload, RangeInclusive<usize>)>,
+        remainder: &mut Inputs,
     ) {
         // SAFETY: the caller checked that the last output exists and references
         // exactly one input; BatchPlan validated that this index is in bounds.
         let (remaining, range) = output_batches.pop().expect("checked remainder");
         let part = from_inputs.context[*range.start()];
-        self.inputs.accept(remaining, part, size);
+        remainder.accept(remaining, part, size);
     }
 
     /// Resolves a validated input range into delivery owners and a merged peer.
@@ -1576,13 +1773,18 @@ pub static OTAP_BATCH_PROCESSOR_FACTORY: otel_arrow_dfe_engine::ProcessorFactory
              _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities| {
                 create_otap_batch_processor(pipeline_ctx, node, node_config, proc_cfg)
             },
-        context_declarations: None,
+        context_declarations: Some(ContextDeclarationProvider::from_typed_config::<Config>()),
         wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
-        validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<Config>,
+        validate_config: |config| {
+            otel_arrow_dfe_config::validation::deserialize_typed_config::<Config>(config)?
+                .validate()
+        },
     };
 
 #[cfg(test)]
 mod tests {
+    mod partition;
+
     use super::*;
     use otel_arrow_dfe_config::node::NodeUserConfig;
     use otel_arrow_dfe_config::{PipelineGroupId, PipelineId};

@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Names for context entries.
+//! Names and typed selectors for context entries.
 
 use crate::error::Error;
 use schemars::JsonSchema;
@@ -180,9 +180,90 @@ impl PartialEq<&str> for ContextEntryName {
     }
 }
 
+/// Selects context values independently of a consumer's action or output encoding.
+///
+/// Unqualified `named` references select transport headers. Qualified references
+/// select composite members with the domain and presence gate of their declaration.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContextSelector {
+    /// Transport-header primitives or qualified members from any composite domain.
+    Named {
+        /// References in selection order.
+        named: Vec<ContextEntryRef>,
+    },
+    /// Verified authorization primitives, not qualified composite members.
+    AuthorizedIdentity {
+        /// Stored primitive names in selection order.
+        named: Vec<ContextEntryName>,
+    },
+    /// Every member of one declared composite.
+    Composite {
+        /// Composite entry name.
+        name: ContextEntryName,
+    },
+}
+
+impl ContextSelector {
+    /// Rejects empty name lists; consumers may separately allow an empty selector list.
+    pub fn validate(&self) -> Result<(), Error> {
+        let empty = match self {
+            Self::Named { named } => named.is_empty(),
+            Self::AuthorizedIdentity { named } => named.is_empty(),
+            Self::Composite { .. } => false,
+        };
+        if empty {
+            return Err(Error::InvalidUserConfig {
+                error: "context selector `named` list must not be empty".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: typed selectors contain primitives, qualified members, or a whole composite.
+    /// Guarantees: their tags and ordered references round-trip without untagged shape inference.
+    #[test]
+    fn context_selectors_round_trip() {
+        for json in [
+            serde_json::json!({"type": "named", "named": ["workspace", "tenant:customer"]}),
+            serde_json::json!({"type": "authorized_identity", "named": ["customer", "roles"]}),
+            serde_json::json!({"type": "composite", "name": "tenant"}),
+        ] {
+            let selector: ContextSelector = serde_json::from_value(json.clone()).expect("selector");
+            selector.validate().expect("nonempty selection");
+            assert_eq!(serde_json::to_value(selector).expect("serialize"), json);
+        }
+    }
+
+    /// Scenario: a selector uses an old shorthand, an unknown tag, or malformed fields.
+    /// Guarantees: invalid shapes and empty selections fail rather than becoming default selections.
+    #[test]
+    fn context_selectors_reject_invalid_shapes() {
+        for json in [
+            serde_json::json!("tenant"),
+            serde_json::json!({"type": "transport_header", "name": "workspace"}),
+            serde_json::json!({"named": ["workspace"]}),
+            serde_json::json!({"type": "named", "name": "workspace"}),
+            serde_json::json!({"type": "named", "named": ["workspace"], "extra": true}),
+            serde_json::json!({"type": "authorized_identity", "named": ["tenant:customer"]}),
+            serde_json::json!({"type": "composite", "name": "tenant:customer"}),
+        ] {
+            assert!(serde_json::from_value::<ContextSelector>(json).is_err());
+        }
+        for kind in ["named", "authorized_identity"] {
+            let selector: ContextSelector =
+                serde_json::from_value(serde_json::json!({"type": kind, "named": []}))
+                    .expect("typed selector");
+            assert!(selector.validate().is_err());
+        }
+    }
 
     /// Scenario: a context name contains mixed-case ASCII.
     /// Guarantees: construction and string conversion preserve the configured spelling.

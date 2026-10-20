@@ -4,8 +4,8 @@
 //! Runtime materialization for selected composite context entries.
 //!
 //! This module resolves the existing logical [`ContextProjection`] model. It
-//! intentionally does not provide general consumer bindings, indexed lookups,
-//! projector transforms, or outbound propagation.
+//! leaves consumer bindings and outbound propagation to sibling modules.
+//! Partition projection copies existing snapshots rather than re-materializing them.
 
 use std::fmt;
 use std::sync::Arc;
@@ -91,7 +91,7 @@ impl ContextMaterializationPlan {
 }
 
 /// Text or binary representation retained for one materialized value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContextValueKind {
     /// UTF-8 text.
     Text,
@@ -100,7 +100,7 @@ pub enum ContextValueKind {
 }
 
 /// Whether a source value was scalar or explicitly multi-valued.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContextValueCardinality {
     /// A scalar source value.
     One,
@@ -262,7 +262,11 @@ impl MaterializedContextMember {
     }
 }
 
-/// One present composite and its materialized members.
+/// A composite snapshot and its retained materialized members.
+///
+/// A partition projection may retain only selected members. Its provenance
+/// attests that the original composite's full presence gate was satisfied;
+/// consumers must resolve their requested projection to establish availability.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MaterializedContextEntry {
     name: ContextEntryName,
@@ -331,13 +335,56 @@ impl fmt::Debug for MaterializedContext {
 }
 
 impl MaterializedContext {
+    /// Retains the union of selected members with their original presence proof.
+    pub(super) fn project_partitions<'a>(
+        projections: impl Iterator<Item = MaterializedContextProjection<'a>>,
+    ) -> Self {
+        let mut entries = std::collections::BTreeMap::new();
+        for projection in projections {
+            let source = projection.entry;
+            let entry =
+                entries
+                    .entry(source.name.clone())
+                    .or_insert_with(|| MaterializedContextEntry {
+                        name: source.name.clone(),
+                        members: Box::new([]),
+                        provenance: Arc::clone(&source.provenance),
+                    });
+            assert!(
+                entry.matches_declaration(&source.provenance),
+                "partition projection provenance mismatch"
+            );
+            let mut members = std::mem::take(&mut entry.members).into_vec();
+            projection.visit_members(|member| {
+                if !members.iter().any(|existing| existing.name == member.name) {
+                    let mut member = member.clone();
+                    for value in &mut member.values.values {
+                        value.original_name = None;
+                    }
+                    members.push(member);
+                }
+            });
+            members.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+            entry.members = members.into_boxed_slice();
+        }
+        if entries.is_empty() {
+            return Self::default();
+        }
+        Self {
+            storage: Some(Arc::new(MaterializedContextStorage {
+                transport_headers: None,
+                entries: entries.into_values().collect(),
+            })),
+        }
+    }
+
     /// Returns whether no composites are materialized.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries().is_empty()
     }
 
-    /// Returns all present composites in canonical name order.
+    /// Returns retained composite snapshots in canonical name order.
     #[must_use]
     pub fn entries(&self) -> &[MaterializedContextEntry] {
         self.storage
@@ -469,7 +516,10 @@ impl MaterializedContext {
         self.materialize_fields(plan, fields);
     }
 
-    fn transport_values(&self, field: &ContextFieldLayout) -> Option<MaterializedContextValues> {
+    pub(super) fn transport_values(
+        &self,
+        field: &ContextFieldLayout,
+    ) -> Option<MaterializedContextValues> {
         let values = self
             .transport_headers()?
             .iter()

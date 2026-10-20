@@ -18,7 +18,8 @@ The processor owns buffering, flush deadlines, backpressure, and ACK/NACK routin
 Batches are sized against the configured range of acceptable sizes,
 `[min_size, max_size]`. After preparation in the plan's working representation,
 inputs already in that range bypass buffering and splitting. Matching encodings keep their original
-bytes; fallback or an explicit output format can still require conversion.
+bytes; fallback or an explicit output format can still require conversion. When
+partitioning is enabled, both paths project context to the selected entries.
 
 ## Flush behavior
 
@@ -82,6 +83,13 @@ config:
   # Pending request tracking limits.
   inbound_request_limit: 1024
   outbound_request_limit: 512
+
+  # Optional: include a whole composite in the partition key.
+  partition_by:
+    - type: composite
+      name: product_user
+  # Buffered keys per signal and batching plan, including missing values.
+  max_active_partitions: 1024
 
   # Output: "otap", "otlp", a registered codec name, or "preserve" (default).
   format: preserve
@@ -173,6 +181,90 @@ Each format object contains:
   output floor of (at least) one batch per remaining top-level entry. It does not
   look ahead over later entries and is independent of Ack/Nack outbound-slot
   accounting (which governs _sending_, not up-front allocation).
+
+### Context partitioning
+
+Omit `partition_by` (or use `[]`) to retain unpartitioned behavior. Otherwise,
+configure a list of typed context selectors. Every selector contributes to
+**one ordered partition key**; these are not first-match rules:
+
+```yaml
+partition_by:
+  - type: named
+    named: [workspace_id, "product_user:customer"]
+  - type: authorized_identity
+    named: [customer_id]
+```
+
+- `type: named` selects transport-header primitives by stored name, or composite
+  members using `composite:member`. A qualified member's domain comes from its
+  composite declaration; it may be an identity, header, constant, or randomness value.
+- `type: authorized_identity` selects verified primitive claims by stored name.
+  It accepts unqualified primitive names only; use `type: named` for composite members.
+- `type: composite` selects every member of the composite identified by `name`.
+
+```yaml
+partition_by:
+  - type: composite
+    name: product_user
+```
+
+Composites must be declared under `policies.context.entries`, for example:
+
+```yaml
+policies:
+  context:
+    entries:
+      product_user:
+        - type: authorized_identity
+          name: customer_id
+          store_as: customer
+        - type: transport_header
+          name: workspace_id
+          store_as: workspace
+```
+
+Primitive domains are determined by selector types, never inferred from names.
+References are bound at startup; unknown composites or members, empty `named`
+lists, and untyped selector shorthands are rejected. Overlapping selections
+contribute in configured order, but do not duplicate context fields in outputs.
+Per-partition sizing overrides are not supported.
+
+Capture the primitive sources using the corresponding transport-header and
+authorized-identity policies. A composite is present only when all its members
+are available and all its conditions match. Batching reads the existing
+materialized snapshot; it does not regenerate randomness or re-evaluate
+conditions.
+
+Equal ordered value tuples share a buffer. Value kinds, cardinality, and member
+boundaries are significant; original transport wire names are not. Each absent
+reference contributes a missing marker in its own position, distinct from a
+present empty value. Thus `(customer A, missing)` and `(customer B, missing)`
+remain separate keys. A qualified member is absent when its enclosing composite
+is absent, even if the corresponding primitive exists. A whole-composite
+selection has one atomic presence marker for all its members.
+
+`max_active_partitions` defaults to 1024 and must be positive. It applies
+independently to each signal and format and includes keys containing missing values.
+Excess new buffered keys are Nacked and counted by `nacked.partition.limit`;
+existing keys remain admissible. Draining a partition releases its capacity.
+Completion-tracking limits remain shared across partitions within each signal
+and format. The partition cap is not a byte-memory limit.
+
+Size flushes affect only the selected key. Each signal/format uses one batching
+window: its timer flushes all buffered keys, and flushing one key for size does
+not postpone that window for other keys. Shutdown drains every partition.
+
+Partitioned outputs carry only selected primitives and composite members.
+Selecting a member does not retain unselected siblings; retained members keep
+their snapshot values and originating declaration. Unrelated headers, claims,
+composites, original wire names, and peer addresses are omitted. Missing
+references do not erase other selected values; only all-missing keys produce
+empty request metadata. Configure
+downstream header propagation with stored names rather than `name: preserve`.
+This projection also applies to retained remainders and in-range passthrough
+inputs. Passthrough preserves completion routing and consumes neither a
+buffered-key slot nor a completion-tracking slot.
 
 ### Validation rules
 
@@ -314,6 +406,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 | `otap.processor.batch.batching_errors`               | `{error}`   | Number of batches for which errors encountered.                                                                                                                                                        |
 | `otap.processor.batch.nacked_inbound_slots`          | `{msg}`     | Number of requests nacked due to inbound slot exhaustion.                                                                                                                                              |
 | `otap.processor.batch.nacked_outbound_slots`         | `{msg}`     | Number of requests nacked due to outbound slot exhaustion.                                                                                                                                             |
+| `otap.processor.batch.nacked.partition.limit`        | `{msg}`     | Requests Nacked because a new buffered context key exceeded the active partition limit.                                                                                                                |
 | `otap.processor.batch.split_budget_fallbacks`        | `{entry}`   | Number of oversize resource entries emitted whole because splitting would have exceeded `max_split_fragments`, `max_split_overhead_bytes`, or the per-flush `max_split_fragments_per_flush` threshold. |
 
 ### Events
