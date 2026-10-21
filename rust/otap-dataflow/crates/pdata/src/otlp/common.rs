@@ -335,8 +335,27 @@ pub enum EncodeFailure {
     Dropped,
 }
 
+/// Whether truncated or not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Truncation {
+    None,
+    Some,
+}
+
+/// Successful encode.
+pub struct EncodeSuccess();
+
+impl From<EncodeSuccess> for Truncation {
+    fn from(_: EncodeSuccess) -> Self {
+        Truncation::None
+    }
+}
+
 /// Result type for buffer write methods.
-pub type EncodeResult = std::result::Result<(), EncodeFailure>;
+pub type EncodeResult = std::result::Result<EncodeSuccess, EncodeFailure>;
+
+/// Result type for buffer write methods.
+pub type TruncateResult = std::result::Result<Truncation, EncodeFailure>;
 
 /// Saved buffer position for transactional encoding.
 ///
@@ -496,14 +515,14 @@ pub trait BoundedBuf {
     /// Encode a string field, truncating with a `[...]` suffix if it won't fit.
     ///
     /// Returns `Err(Dropped)` if the string is truncated or entirely dropped.
-    fn encode_string_bounded(&mut self, field_tag: u64, val: &str) -> EncodeResult {
+    fn encode_string_bounded(&mut self, field_tag: u64, val: &str) -> TruncateResult {
         let full_len = val.len();
         let tag_bytes = varint_len((field_tag << 3) | wire_types::LEN);
 
         // Check if the full string fits.
         let full_field_size = tag_bytes + varint_len(full_len as u64) + full_len;
         if self.len() + full_field_size <= self.limit() {
-            return self.encode_string(field_tag, val);
+            return self.encode_string(field_tag, val).map(EncodeSuccess::into);
         }
 
         let suffix_len = TRUNCATION_SUFFIX.len();
@@ -547,7 +566,7 @@ pub trait BoundedBuf {
             .expect("pre-validated fit");
         self.try_extend(TRUNCATION_SUFFIX)
             .expect("pre-validated fit");
-        Err(EncodeFailure::Dropped)
+        Ok(Truncation::Some)
     }
 
     /// Encode a string field, truncating with a suffix if it won't fit.
@@ -557,22 +576,19 @@ pub trait BoundedBuf {
     /// - `Ok(true)` if the value was truncated (with `[...]` suffix appended).
     /// - `Err(Dropped)` if even a minimum truncated form would not fit;
     ///   the buffer is left unchanged in this case.
-    fn encode_string_truncating(
-        &mut self,
-        field_tag: u64,
-        val: &str,
-    ) -> std::result::Result<bool, EncodeFailure> {
-        let start = self.len();
-        match self.encode_string_bounded(field_tag, val) {
-            Ok(()) => Ok(false),
-            Err(failure) => {
-                if self.len() == start {
-                    Err(failure)
-                } else {
-                    Ok(true)
-                }
-            }
-        }
+    fn encode_string_truncating(&mut self, field_tag: u64, val: &str) -> TruncateResult {
+        self.encode_string_bounded(field_tag, val)
+
+        //let start = self.len();
+        //     Ok(()) => Ok(false),
+        //     Err(failure) => {
+        //         if self.len() == start {
+        //             Err(failure)
+        //         } else {
+        //             Ok(true)
+        //         }
+        //     }
+        // }
     }
 
     /// Returns the narrowest placeholder width (1-4 bytes) sufficient
