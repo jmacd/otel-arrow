@@ -48,10 +48,10 @@ use async_trait::async_trait;
 #[cfg(test)]
 use bytes::Bytes;
 use linkme::distributed_slice;
+use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_config::context::ContextSelector;
 use otel_arrow_dfe_config::error::Error as ConfigError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
-use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_engine::MessageSourceLocalEffectHandlerExtension;
 use otel_arrow_dfe_engine::context_declaration::{
     ContextConsumerSelector, ContextDeclaration, ContextDeclarationProvider,
@@ -1301,8 +1301,7 @@ impl<'a> BatchProcessorSignal<'a> {
                     continue;
                 }
                 let bytes = records.measured_bytes();
-                let mut pdata =
-                    OtapPdata::new(inputs.output_context.clone_detached(), records);
+                let mut pdata = OtapPdata::new(inputs.output_context.clone_detached(), records);
 
                 // Forward the receiver-observed peer address only when every
                 // input merged into this output batch came from the same peer

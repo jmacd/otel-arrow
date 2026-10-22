@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use bytes::Bytes;
 use otel_arrow_dfe_config::engine::OtelDataflowSpec;
 use otel_arrow_dfe_config::node::NodeKind;
 use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders, ValueKind};
@@ -368,6 +369,71 @@ fn partition_completion_limits_are_shared() {
     }
 }
 
+/// Scenario: an admitted native-codec payload is buffered with interleaved partition keys.
+/// Guarantees: codec batching combines only equal keys and keeps projected context on each output.
+#[test]
+fn partition_native_codec_keeps_keys_isolated() {
+    let (phase, _) = setup(
+        json!({
+            "format": "preserve",
+            "codecs": {
+                "test-six-byte-pages": {
+                    "min_size": 4,
+                    "max_size": 6,
+                    "sizer": "bytes"
+                }
+            },
+            "partition_by": [{ "type": "named", "named": ["tenant"] }],
+            "max_active_partitions": 2
+        }),
+        json!({}),
+    );
+    phase
+        .run_test(move |mut ctx| async move {
+            let codec = CodecRegistry::global()
+                .expect("codec registry")
+                .resolve(&PAGE_ENCODING)
+                .expect("page codec");
+            for (tenant, bytes) in [
+                ("a", Bytes::from_static(b"aa")),
+                ("b", Bytes::from_static(b"bb")),
+                ("a", Bytes::from_static(b"cc")),
+            ] {
+                let mut pdata = OtapPdata::new_default(
+                    codec
+                        .admit(SignalType::Logs, bytes)
+                        .expect("admit page")
+                        .into(),
+                );
+                headers(&mut pdata, &[("tenant", tenant)]);
+                ctx.process(Message::PData(pdata))
+                    .await
+                    .expect("partitioned page");
+            }
+
+            let mut outputs = ctx.drain_pdata().await;
+            assert_eq!(outputs.len(), 1);
+            let output = outputs.pop().expect("size-flushed partition");
+            assert_eq!(output_tenant(&output).as_deref(), Some("a"));
+            assert_eq!(output.payload_ref().format().name(), PAGE_ENCODING.as_str());
+            assert_eq!(
+                output.payload_ref().encoded_bytes().expect("encoded page"),
+                &Bytes::from_static(b"aacc")
+            );
+
+            flush_timer(&mut ctx).await;
+            let mut outputs = ctx.drain_pdata().await;
+            assert_eq!(outputs.len(), 1);
+            let output = outputs.pop().expect("timer-flushed partition");
+            assert_eq!(output_tenant(&output).as_deref(), Some("b"));
+            assert_eq!(
+                output.payload_ref().encoded_bytes().expect("encoded page"),
+                &Bytes::from_static(b"bb")
+            );
+        })
+        .validate(|_| async {});
+}
+
 /// Scenario: every signal/format pair buffers the same context key and then shuts down.
 /// Guarantees: formats and signals stay separate, each has its own key capacity, and shutdown drains all.
 #[test]
@@ -401,7 +467,7 @@ fn partition_shutdown_preserves_signal_and_format_isolation() {
                     };
                     let mut pdata = OtapPdata::new_default(payload);
                     headers(&mut pdata, &[("tenant", "a")]);
-                    expected.push((pdata.signal_format(), pdata.signal_type()));
+                    expected.push((pdata.payload_ref().format(), pdata.signal_type()));
                     ctx.process(Message::PData(pdata)).await.expect("input");
                 }
             }
@@ -418,7 +484,7 @@ fn partition_shutdown_preserves_signal_and_format_isolation() {
                 assert_eq!(output_tenant(&output).as_deref(), Some("a"));
                 let index = expected
                     .iter()
-                    .position(|pair| *pair == (output.signal_format(), output.signal_type()))
+                    .position(|pair| *pair == (output.payload_ref().format(), output.signal_type()))
                     .expect("one output for each pair");
                 _ = expected.remove(index);
             }

@@ -488,7 +488,7 @@ mod tests {
                 "default": {"selector": {"type": kind, "named": ["tenant"]}}
             }))
             .expect("shared selector shape");
-            let error = CompiledHeaderPropagationPolicy::compile(policy, &[])
+            let error = CompiledHeaderPropagationPolicy::compile_standalone(policy, &[])
                 .expect_err("unsupported selector must not compile");
             assert!(error.contains("does not yet support"));
             assert!(error.contains(kind));
@@ -498,7 +498,7 @@ mod tests {
         }))
         .expect("deserialize shape for validation");
         assert!(
-            CompiledHeaderPropagationPolicy::compile(malformed, &[])
+            CompiledHeaderPropagationPolicy::compile_standalone(malformed, &[])
                 .expect_err("malformed selector")
                 .contains("'named' must not be set")
         );
