@@ -18,15 +18,15 @@ use crate::topic::backend::{PublishFuture, PublishTrackedFuture, SubscriptionBac
 use crate::topic::subscription::{Delivery, RecvDelivery};
 use crate::topic::types::{
     AckFromResult, BroadcastSubscriberId, Envelope, NackFromResult, PublishOutcome,
-    SubscriberOptions, TopicOptions, TrackedPublishOutcome, TrackedPublishPermit,
-    TrackedPublishReceipt, TrackedPublishTracker, TrackedTryPublishOutcome,
+    SubscriberOptions, SubscriptionFilter, TopicOptions, TrackedPublishOutcome,
+    TrackedPublishPermit, TrackedPublishReceipt, TrackedPublishTracker, TrackedTryPublishOutcome,
 };
 use futures_core::Stream;
 use otel_arrow_dfe_config::topic::{TopicBroadcastAckMode, TopicBroadcastOnLagPolicy};
 use otel_arrow_dfe_config::{SubscriptionGroupName, TopicName};
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 struct QueuedEnvelope<T> {
@@ -35,12 +35,14 @@ struct QueuedEnvelope<T> {
 }
 
 struct ConsumerGroup<T> {
+    filter: Option<SubscriptionFilter<T>>,
     tx: async_channel::Sender<QueuedEnvelope<T>>,
     rx: async_channel::Receiver<QueuedEnvelope<T>>,
     admission: Arc<Semaphore>,
 }
 
 struct SingleGroup<T> {
+    filter: Option<SubscriptionFilter<T>>,
     group_name: SubscriptionGroupName,
     tx: async_channel::Sender<QueuedEnvelope<T>>,
     rx: async_channel::Receiver<QueuedEnvelope<T>>,
@@ -380,7 +382,7 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
     fn subscribe_balanced(
         &self,
         group: SubscriptionGroupName,
-        opts: SubscriberOptions,
+        opts: SubscriberOptions<T>,
     ) -> Result<Box<dyn SubscriptionBackend<T>>, Error> {
         match self {
             TopicInner::BalancedOnly(topic) => topic
@@ -395,7 +397,7 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
 
     fn subscribe_broadcast(
         &self,
-        opts: SubscriberOptions,
+        opts: SubscriberOptions<T>,
     ) -> Result<Box<dyn SubscriptionBackend<T>>, Error> {
         match self {
             TopicInner::BalancedOnly(_) => Err(SubscribeBroadcastNotSupported),
@@ -475,7 +477,11 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
         }
 
         let id = self.next_message_id();
-        if let Some(group) = self.group.get() {
+        if let Some(group) = self
+            .group
+            .get()
+            .filter(|g| g.filter.as_ref().is_none_or(|f| f.accepts(&msg)))
+        {
             let permit = acquire_balanced_permit(&group.admission).await?;
             let envelope = Envelope {
                 id,
@@ -498,7 +504,11 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
         }
 
         let id = self.next_message_id();
-        if let Some(group) = self.group.get() {
+        if let Some(group) = self
+            .group
+            .get()
+            .filter(|g| g.filter.as_ref().is_none_or(|f| f.accepts(&msg)))
+        {
             let admission_permit = acquire_balanced_permit(&group.admission).await?;
             let receipt = self.outcomes.register(id, timeout, permit);
             let envelope = Envelope {
@@ -519,7 +529,11 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
         }
 
         let id = self.next_message_id();
-        if let Some(group) = self.group.get() {
+        if let Some(group) = self
+            .group
+            .get()
+            .filter(|g| g.filter.as_ref().is_none_or(|f| f.accepts(&msg)))
+        {
             let Some(permit) = try_acquire_balanced_permit(&group.admission)? else {
                 return Ok((PublishOutcome::DroppedOnFull, id));
             };
@@ -544,7 +558,11 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
         }
 
         let id = self.next_message_id();
-        if let Some(group) = self.group.get() {
+        if let Some(group) = self
+            .group
+            .get()
+            .filter(|g| g.filter.as_ref().is_none_or(|f| f.accepts(&msg)))
+        {
             let Some(admission_permit) = try_acquire_balanced_permit(&group.admission)? else {
                 return Ok(TrackedTryPublishOutcome::DroppedOnFull);
             };
@@ -566,7 +584,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
     fn subscribe_balanced(
         &self,
         group: SubscriptionGroupName,
-        _opts: SubscriberOptions,
+        _opts: SubscriberOptions<T>,
     ) -> Result<BalancedSub<T>, Error> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(TopicClosed);
@@ -575,6 +593,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
         let single_group = self.group.get_or_init(|| {
             let (tx, rx) = async_channel::bounded(self.balanced_capacity);
             SingleGroup {
+                filter: _opts.filter.clone(),
                 group_name: group.clone(),
                 tx,
                 rx,
@@ -584,6 +603,11 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
 
         if single_group.group_name != group {
             return Err(SubscribeSingleGroupViolation);
+        }
+        if !SubscriptionFilter::same(single_group.filter.as_ref(), _opts.filter.as_ref()) {
+            return Err(Error::InternalError {
+                message: "balanced group subscribers must use identical context conditions".into(),
+            });
         }
 
         Ok(BalancedSub {
@@ -610,16 +634,24 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
 /// started at or before that message's ring sequence, or excluded AND started
 /// strictly after it. Lock order is always **registry -> tracker**; tracker code
 /// must never call back into the registry.
-struct BroadcastSubscriberRegistry {
+struct BroadcastSubscriberRegistry<T> {
     next_subscriber_id: AtomicU64,
-    subscribers: Mutex<Arc<HashSet<BroadcastSubscriberId>>>,
+    subscribers: Mutex<BroadcastMembers<T>>,
 }
 
-impl BroadcastSubscriberRegistry {
+struct BroadcastMembers<T> {
+    ids: Arc<HashSet<BroadcastSubscriberId>>,
+    filters: HashMap<BroadcastSubscriberId, SubscriptionFilter<T>>,
+}
+
+impl<T> BroadcastSubscriberRegistry<T> {
     fn new() -> Self {
         Self {
             next_subscriber_id: AtomicU64::new(1),
-            subscribers: Mutex::new(Arc::new(HashSet::new())),
+            subscribers: Mutex::new(BroadcastMembers {
+                ids: Arc::new(HashSet::new()),
+                filters: HashMap::new(),
+            }),
         }
     }
 
@@ -638,7 +670,7 @@ pub(crate) struct BroadcastOnlyTopic<T: Send + Sync + 'static> {
     ack_mode: TopicBroadcastAckMode,
     /// Subscriber registry, present only in `all` (consensus) mode. `first`
     /// mode never constructs or touches it, so it stays zero-overhead.
-    registry: Option<Arc<BroadcastSubscriberRegistry>>,
+    registry: Option<Arc<BroadcastSubscriberRegistry<T>>>,
 }
 
 impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
@@ -706,7 +738,23 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
         // tracker); the tracker must never call back into the registry.
         if let Some(registry) = &self.registry {
             let subscribers = registry.subscribers.lock();
-            let snapshot = Arc::clone(&subscribers);
+            let snapshot = if subscribers.filters.is_empty() {
+                Arc::clone(&subscribers.ids)
+            } else {
+                Arc::new(
+                    subscribers
+                        .ids
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            subscribers
+                                .filters
+                                .get(id)
+                                .is_none_or(|filter| filter.accepts(&msg))
+                        })
+                        .collect(),
+                )
+            };
             let seq = self.broadcast_ring.reserve_seq();
             let receipt = self
                 .outcomes
@@ -756,7 +804,7 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
         Ok(TrackedTryPublishOutcome::Published(receipt))
     }
 
-    fn subscribe_broadcast(&self, _opts: SubscriberOptions) -> BroadcastSub<T> {
+    fn subscribe_broadcast(&self, _opts: SubscriberOptions<T>) -> BroadcastSub<T> {
         // `all` mode: allocate this subscriber's id and couple its `start_seq`
         // with insertion into the registry under one lock (the linearization
         // point). `first` mode stays lock-free.
@@ -765,12 +813,16 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
                 let mut subscribers = registry.subscribers.lock();
                 let start_seq = self.broadcast_ring.current_seq() + 1;
                 let subscriber_id = registry.allocate_id();
-                let _ = Arc::make_mut(&mut subscribers).insert(subscriber_id);
+                let _ = Arc::make_mut(&mut subscribers.ids).insert(subscriber_id);
+                if let Some(filter) = &_opts.filter {
+                    _ = subscribers.filters.insert(subscriber_id, filter.clone());
+                }
                 (start_seq, Some(subscriber_id))
             }
             None => (self.broadcast_ring.current_seq() + 1, None),
         };
         BroadcastSub {
+            filter: _opts.filter,
             ring: Arc::clone(&self.broadcast_ring),
             cursor: Arc::new(Mutex::new(BroadcastCursor {
                 read_seq: start_seq,
@@ -800,6 +852,7 @@ pub(crate) struct MixedTopic<T: Send + Sync + 'static> {
     groups: RwLock<Vec<(SubscriptionGroupName, Arc<ConsumerGroup<T>>)>>,
     group_handles: RwLock<Arc<[Arc<ConsumerGroup<T>>]>>,
     has_balanced_groups: AtomicBool,
+    has_filtered_groups: AtomicBool,
     balanced_capacity: usize,
     broadcast_ring: Arc<FastBroadcastRing<T>>,
     broadcast_on_lag: TopicBroadcastOnLagPolicy,
@@ -820,6 +873,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
             groups: RwLock::new(Vec::new()),
             group_handles: RwLock::new(Arc::from(Vec::new())),
             has_balanced_groups: AtomicBool::new(false),
+            has_filtered_groups: AtomicBool::new(false),
             balanced_capacity: balanced_capacity.max(1),
             broadcast_ring: Arc::new(FastBroadcastRing::new(broadcast_capacity)),
             broadcast_on_lag,
@@ -840,9 +894,10 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
     // acquisitions before awaiting capacity and retry from a fresh snapshot.
     async fn acquire_balanced_admission(
         &self,
+        msg: &T,
     ) -> Result<(Arc<[Arc<ConsumerGroup<T>>]>, BalancedPermitVec), Error> {
         loop {
-            let groups = self.group_handles.read().clone();
+            let groups = self.groups_for(msg);
             let (permits, blocking_group) = Self::try_acquire_balanced_admission(&groups)?;
             if let Some(group) = blocking_group {
                 drop(permits);
@@ -852,6 +907,19 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
                 return Ok((groups, permits));
             }
         }
+    }
+
+    fn groups_for(&self, msg: &T) -> Arc<[Arc<ConsumerGroup<T>>]> {
+        let groups = self.group_handles.read().clone();
+        if !self.has_filtered_groups.load(Ordering::Acquire) {
+            return groups;
+        }
+        groups
+            .iter()
+            .filter(|group| group.filter.as_ref().is_none_or(|f| f.accepts(msg)))
+            .cloned()
+            .collect::<Vec<_>>()
+            .into()
     }
 
     fn try_acquire_balanced_admission(
@@ -883,7 +951,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
 
         let id = self.next_message_id();
         if self.has_balanced_groups.load(Ordering::Acquire) {
-            let (groups, permits) = self.acquire_balanced_admission().await?;
+            let (groups, permits) = self.acquire_balanced_admission(&msg).await?;
             let envelope = Envelope {
                 id,
                 tracked: false,
@@ -918,7 +986,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
 
         let id = self.next_message_id();
         if self.has_balanced_groups.load(Ordering::Acquire) {
-            let (groups, permits) = self.acquire_balanced_admission().await?;
+            let (groups, permits) = self.acquire_balanced_admission(&msg).await?;
             // Tracked publish capacity is consumed only after admission
             // succeeds. Waiting on a full balanced group must not hand back a
             // receipt for a message that has not been accepted anywhere yet.
@@ -963,7 +1031,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
             return Ok((PublishOutcome::Published, id));
         }
 
-        let groups = self.group_handles.read().clone();
+        let groups = self.groups_for(&msg);
         let envelope = Envelope {
             id,
             tracked: false,
@@ -999,7 +1067,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
 
         let id = self.next_message_id();
         if self.has_balanced_groups.load(Ordering::Acquire) {
-            let groups = self.group_handles.read().clone();
+            let groups = self.groups_for(&msg);
             let (permits, blocking_group) = Self::try_acquire_balanced_admission(&groups)?;
             if blocking_group.is_some() {
                 return Ok(TrackedTryPublishOutcome::DroppedOnFull);
@@ -1033,7 +1101,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
     fn subscribe_balanced(
         &self,
         group: SubscriptionGroupName,
-        _opts: SubscriberOptions,
+        _opts: SubscriberOptions<T>,
     ) -> Result<BalancedSub<T>, Error> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(TopicClosed);
@@ -1042,14 +1110,26 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
         let rx = {
             let mut groups = self.groups.write();
             if let Some((_name, group_entry)) = groups.iter().find(|(name, _)| *name == group) {
+                if !SubscriptionFilter::same(group_entry.filter.as_ref(), _opts.filter.as_ref()) {
+                    return Err(Error::InternalError {
+                        message: "balanced group subscribers must use identical context conditions"
+                            .into(),
+                    });
+                }
                 group_entry.rx.clone()
             } else {
                 let (tx, rx) = async_channel::bounded(self.balanced_capacity);
                 let group_entry = Arc::new(ConsumerGroup {
+                    filter: _opts.filter,
                     tx,
                     rx: rx.clone(),
                     admission: Arc::new(Semaphore::new(self.balanced_capacity)),
                 });
+                // Publish this monotonic flag before the new group snapshot.
+                // Unfiltered topics keep the original O(1) snapshot fast path.
+                if group_entry.filter.is_some() {
+                    self.has_filtered_groups.store(true, Ordering::Release);
+                }
                 groups.push((group.clone(), Arc::clone(&group_entry)));
                 let snapshot: Arc<[Arc<ConsumerGroup<T>>]> = groups
                     .iter()
@@ -1068,11 +1148,12 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
         })
     }
 
-    fn subscribe_broadcast(&self, _opts: SubscriberOptions) -> BroadcastSub<T> {
+    fn subscribe_broadcast(&self, _opts: SubscriberOptions<T>) -> BroadcastSub<T> {
         // Mixed topics never run `all` mode (PR3 rejects `all` on non
         // broadcast-only topics), so broadcast subs here are always `first`.
         let start_seq = self.broadcast_ring.current_seq() + 1;
         BroadcastSub {
+            filter: _opts.filter,
             ring: Arc::clone(&self.broadcast_ring),
             cursor: Arc::new(Mutex::new(BroadcastCursor {
                 read_seq: start_seq,
@@ -1131,13 +1212,14 @@ impl<T: Send + Sync + 'static> SubscriptionBackend<T> for BalancedSub<T> {
 }
 
 pub(crate) struct BroadcastSub<T: Send + Sync + 'static> {
+    filter: Option<SubscriptionFilter<T>>,
     ring: Arc<FastBroadcastRing<T>>,
     cursor: Arc<Mutex<BroadcastCursor>>,
     on_lag: TopicBroadcastOnLagPolicy,
     ack_state: AckState,
     /// Subscriber registry, present only in `all` mode. Used to remove this
     /// subscriber and nack any messages it still owes on disconnect/drop.
-    registry: Option<Arc<BroadcastSubscriberRegistry>>,
+    registry: Option<Arc<BroadcastSubscriberRegistry<T>>>,
     /// This subscriber's consensus identity, present only in `all` mode.
     subscriber_id: Option<BroadcastSubscriberId>,
     /// Guards the disconnect path so it runs at most once (lag then drop, etc.).
@@ -1157,7 +1239,7 @@ impl<T: Send + Sync + 'static> SubscriptionBackend<T> for BroadcastSub<T> {
             }
         }
 
-        if let Some(result) = self.try_read_delivery() {
+        if let Some(result) = self.try_read_delivery(cx) {
             return Poll::Ready(result);
         }
 
@@ -1174,7 +1256,7 @@ impl<T: Send + Sync + 'static> SubscriptionBackend<T> for BroadcastSub<T> {
         if should_spin {
             for _ in 0..32 {
                 std::hint::spin_loop();
-                if let Some(result) = self.try_read_delivery() {
+                if let Some(result) = self.try_read_delivery(cx) {
                     return Poll::Ready(result);
                 }
             }
@@ -1189,9 +1271,14 @@ impl<T: Send + Sync + 'static> SubscriptionBackend<T> for BroadcastSub<T> {
             }
         }
 
-        match self.try_read_delivery() {
+        match self.try_read_delivery(cx) {
             Some(result) => Poll::Ready(result),
-            None if self.ring.is_closed() => Poll::Ready(Err(SubscriptionClosed)),
+            None if self.ring.is_closed()
+                && (self.filter.is_none()
+                    || self.cursor.lock().read_seq > self.ring.current_seq()) =>
+            {
+                Poll::Ready(Err(SubscriptionClosed))
+            }
             None => Poll::Pending,
         }
     }
@@ -1206,7 +1293,7 @@ impl<T: Send + Sync + 'static> SubscriptionBackend<T> for BroadcastSub<T> {
 }
 
 impl<T: Send + Sync + 'static> BroadcastSub<T> {
-    fn try_read_delivery(&self) -> Option<Result<RecvDelivery<T>, Error>> {
+    fn try_read_delivery(&self, cx: &mut Context<'_>) -> Option<Result<RecvDelivery<T>, Error>> {
         let read_seq = {
             let cursor = self.cursor.lock();
             if cursor.disconnected_on_lag || cursor.permitted_seq.is_some() {
@@ -1219,6 +1306,17 @@ impl<T: Send + Sync + 'static> BroadcastSub<T> {
             BroadcastReadResult::Ready(envelope) => {
                 let mut cursor = self.cursor.lock();
                 if cursor.disconnected_on_lag || cursor.permitted_seq.is_some() {
+                    return None;
+                }
+                if self
+                    .filter
+                    .as_ref()
+                    .is_some_and(|filter| !filter.accepts(&envelope.payload))
+                {
+                    cursor.read_seq = read_seq + 1;
+                    // No delivery or tracked ownership is acquired for another subset.
+                    // Reschedule so buffered matches cannot strand behind skipped entries.
+                    cx.waker().wake_by_ref();
                     return None;
                 }
                 cursor.permitted_seq = Some(read_seq);
@@ -1287,7 +1385,8 @@ impl<T: Send + Sync + 'static> BroadcastSub<T> {
         }
         {
             let mut subscribers = registry.subscribers.lock();
-            let _ = Arc::make_mut(&mut subscribers).remove(&subscriber_id);
+            let _ = Arc::make_mut(&mut subscribers.ids).remove(&subscriber_id);
+            _ = subscribers.filters.remove(&subscriber_id);
         }
         self.ack_state
             .outcomes

@@ -104,7 +104,7 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
     pub fn subscribe(
         &self,
         mode: SubscriptionMode,
-        opts: SubscriberOptions,
+        opts: SubscriberOptions<T>,
     ) -> Result<Subscription<T>, Error> {
         let backend = match mode {
             SubscriptionMode::Balanced { group } => self.inner.subscribe_balanced(group, opts)?,

@@ -50,6 +50,7 @@ use otel_arrow_dfe_pdata_codec::{
 };
 
 mod delivery;
+mod transfer;
 pub use delivery::{OtapPdataUpdateCause, OtapPdataUpdateError, PdataDelivery};
 
 const AUTHORIZED_ENTRY_LEN: usize = 20;
@@ -386,10 +387,10 @@ fn read_context_str(bytes: &[u8], range: (usize, usize)) -> Option<&str> {
 /// - **Routing stack**: Ack/Nack routing frames used by the pipeline engine
 ///   for result notification. Reset at transport boundaries (topic hops).
 /// - **Transport headers**: Protocol-neutral request-scoped metadata captured
-///   from inbound transport headers. Preserved across transport boundaries.
+///   from inbound transport headers. Transfer bindings select what crosses boundaries.
 /// - **Authorized identity**: Verified claims selected by policy and kept
-///   separate from untrusted transport headers. Preserved across transport
-///   boundaries.
+///   separate from untrusted transport headers. Transfer bindings retain authority
+///   while selecting what crosses boundaries.
 /// - **Materialized entries**: Selected composite snapshots whose values are
 ///   fixed for this context's lifetime.
 /// - **Peer address**: Optional socket address observed by the receiving
@@ -1231,9 +1232,9 @@ impl OtapPdata {
 
     /// Clone this pdata while resetting Ack/Nack routing state to default.
     ///
-    /// This is used at transport boundaries (for example topic hops between
-    /// pipelines) where in-process Ack/Nack routing state must not leak across
-    /// boundaries.
+    /// This only resets delivery bookkeeping; it does not enforce a context
+    /// visibility boundary. Topic nodes use [`Context::export_transfer`] and
+    /// [`Context::import_transfer`] instead.
     ///
     /// Transport headers, authorized identity entries, materialized context,
     /// and peer address are **preserved** because they represent request-scoped

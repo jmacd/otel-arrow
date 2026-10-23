@@ -501,6 +501,7 @@ impl<
         let mut profiles = HashMap::new();
         for (topic_name, spec) in &config.topics {
             let TopicSpec {
+                context,
                 description: _,
                 backend,
                 impl_selection,
@@ -527,6 +528,7 @@ impl<
             _ = profiles.insert(
                 declared_name,
                 TopicRuntimeProfile {
+                    context: context.clone(),
                     backend: *backend,
                     policies: policies.clone(),
                     selected_mode,
@@ -537,6 +539,7 @@ impl<
         for (group_id, group_cfg) in &config.groups {
             for (topic_name, spec) in &group_cfg.topics {
                 let TopicSpec {
+                    context,
                     description: _,
                     backend,
                     impl_selection,
@@ -564,6 +567,7 @@ impl<
                 _ = profiles.insert(
                     declared_name,
                     TopicRuntimeProfile {
+                        context: context.clone(),
                         backend: *backend,
                         policies: policies.clone(),
                         selected_mode,

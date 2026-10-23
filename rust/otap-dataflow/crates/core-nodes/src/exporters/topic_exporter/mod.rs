@@ -14,12 +14,16 @@ use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use linkme::distributed_slice;
 use metrics::{TopicExporterMetrics, TopicRejectionReason, TopicTrackedResult};
+use otel_arrow_dfe_config::context_transfer::ContextExportConfig;
 use otel_arrow_dfe_config::error::Error as ConfigError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::topic::{TopicAckPropagationMode, TopicQueueOnFullPolicy};
 use otel_arrow_dfe_config::{SignalType, TopicName};
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
+use otel_arrow_dfe_engine::context_declaration::{
+    ContextDeclaration, ContextDeclarationProvider, ContextExportBinding,
+};
 use otel_arrow_dfe_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otel_arrow_dfe_engine::error::Error;
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
@@ -55,6 +59,9 @@ pub struct TopicExporterConfig {
     /// If omitted, runtime falls back to the topic declaration policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_on_full: Option<TopicQueueOnFullPolicy>,
+    /// Context export mapping; omission projects declarations visible to this pipeline.
+    #[serde(default)]
+    pub context: ContextExportConfig,
 }
 
 /// Exporter for topic publishing.
@@ -63,6 +70,7 @@ pub struct TopicExporter {
     queue_on_full: TopicQueueOnFullPolicy,
     ack_propagation_mode: TopicAckPropagationMode,
     metrics: TopicExporterMetrics,
+    context: ContextExportBinding,
 }
 
 /// One upstream pdata message currently blocked in the topic runtime under
@@ -118,6 +126,12 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
                 .clone()
                 .unwrap_or_else(|| topic_binding.default_queue_on_full());
             let ack_propagation_mode = topic_binding.default_ack_propagation_mode();
+            let context = pipeline.compiled_context_bindings().bind_context_export(
+                &pipeline.pipeline_key(),
+                &pipeline.node_id(),
+                &config.context,
+                topic_binding.context_transfer(),
+            )?;
             let metrics =
                 TopicExporterMetrics::register(&pipeline, topic_binding.name().to_string());
             let topic = topic_binding.into_handle();
@@ -127,13 +141,22 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
                     queue_on_full,
                     ack_propagation_mode,
                     metrics,
+                    context,
                 },
                 node,
                 node_config,
                 exporter_config,
             ))
         },
-    context_declarations: None,
+    context_declarations: Some(ContextDeclarationProvider {
+        declarations: |config| {
+            Ok([ContextDeclaration::TransferExport {
+                config: TopicExporter::parse_config(config)?.context,
+            }]
+            .into_iter()
+            .collect())
+        },
+    }),
     wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: |config| TopicExporter::parse_config(config).map(|_| ()),
 };
@@ -201,11 +224,11 @@ impl TopicExporter {
     /// path has already reported backpressure.
     fn start_blocked_publish(
         data: OtapPdata,
+        published: Arc<OtapPdata>,
         attempt: ExporterAttempt,
         tracked_publisher: Option<&otel_arrow_dfe_engine::topic::TrackedTopicPublisher<OtapPdata>>,
         topic: &TopicHandle<OtapPdata>,
     ) -> BlockedPublish {
-        let published = Arc::new(data.clone_without_context());
         let future: Pin<Box<dyn Future<Output = Result<BlockedPublishCompletion, Error>>>> =
             if let Some(tracked_publisher) = tracked_publisher.cloned() {
                 Box::pin(async move {
@@ -304,6 +327,7 @@ impl TopicExporter {
     /// wait inside the topic runtime.
     async fn handle_pdata_message(
         mut data: OtapPdata,
+        context: &ContextExportBinding,
         queue_on_full: &TopicQueueOnFullPolicy,
         ack_propagation_mode: TopicAckPropagationMode,
         topic: &TopicHandle<OtapPdata>,
@@ -318,16 +342,35 @@ impl TopicExporter {
         let should_track_end_to_end = ack_propagation_mode == TopicAckPropagationMode::Auto
             && data.has_ack_or_nack_interests();
         let (signal, attempt) = Self::start_attempt(metrics, &mut data);
+        let exported = match data.context().export_transfer(context) {
+            Ok(context) => context,
+            Err(reason) => {
+                let refused = attempt.refused(reason.clone());
+                let _ = metrics
+                    .boundary
+                    .record(attempt.complete(Err::<(), _>(refused)))
+                    .expect_err("context export failed");
+                otel_warn!(
+                    "topic_exporter.context_transfer_failed",
+                    error = reason.clone(),
+                    message = "Topic context export rejected a message"
+                );
+                effect_handler
+                    .notify_nack(NackMsg::new_permanent(reason, data))
+                    .await?;
+                return Ok(None);
+            }
+        };
+        let published = Arc::new(OtapPdata::new(exported, data.payload_ref().clone()));
 
         match queue_on_full {
             TopicQueueOnFullPolicy::Block => {
-                let published = Arc::new(data.clone_without_context());
                 // Preserve a cheap uncontended fast path: only retain a blocked
                 // publish when the topic runtime reports real backpressure.
                 if should_track_end_to_end {
                     let tracked_publisher = tracked_publisher
                         .expect("tracked publisher should exist when ack propagation is auto");
-                    match tracked_publisher.try_publish(published) {
+                    match tracked_publisher.try_publish(Arc::clone(&published)) {
                         Err(error) => Err(Self::expect_runtime_error(
                             Self::record_attempt_result::<()>(
                                 metrics,
@@ -353,13 +396,14 @@ impl TopicExporter {
                             | TrackedTryPublishOutcome::MaxInFlightReached,
                         ) => Ok(Some(Self::start_blocked_publish(
                             data,
+                            published,
                             attempt,
                             Some(tracked_publisher),
                             topic,
                         ))),
                     }
                 } else {
-                    match topic.try_publish(published) {
+                    match topic.try_publish(Arc::clone(&published)) {
                         Err(error) => Err(Self::expect_runtime_error(
                             Self::record_attempt_result::<()>(
                                 metrics,
@@ -375,13 +419,12 @@ impl TopicExporter {
                             Ok(None)
                         }
                         Ok(PublishOutcome::DroppedOnFull) => Ok(Some(Self::start_blocked_publish(
-                            data, attempt, None, topic,
+                            data, published, attempt, None, topic,
                         ))),
                     }
                 }
             }
             TopicQueueOnFullPolicy::DropNewest => {
-                let published = Arc::new(data.clone_without_context());
                 if should_track_end_to_end {
                     let tracked_publisher = tracked_publisher
                         .expect("tracked publisher should exist when ack propagation is auto");
@@ -507,6 +550,7 @@ impl Exporter<OtapPdata> for TopicExporter {
             queue_on_full,
             ack_propagation_mode,
             mut metrics,
+            context,
         } = *self;
 
         let mut pending_messages: HashMap<u64, OtapPdata> = HashMap::new();
@@ -663,6 +707,7 @@ impl Exporter<OtapPdata> for TopicExporter {
                             Message::PData(data) => {
                                 blocked_publish = Self::handle_pdata_message(
                                     data,
+                                    &context,
                                     &queue_on_full,
                                     ack_propagation_mode,
                                     &topic,

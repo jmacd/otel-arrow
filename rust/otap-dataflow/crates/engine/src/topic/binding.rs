@@ -3,7 +3,9 @@
 
 //! Pipeline-scoped topic binding with resolved wiring defaults.
 
+use otel_arrow_dfe_config::context_transfer::ContextTransferSchema;
 use std::ops::Deref;
+use std::sync::Arc;
 
 use crate::topic::handle::TopicHandle;
 use otel_arrow_dfe_config::topic::{TopicAckPropagationMode, TopicQueueOnFullPolicy};
@@ -18,6 +20,7 @@ pub struct PipelineTopicBinding<T: Send + Sync + 'static> {
     handle: TopicHandle<T>,
     queue_on_full_default: TopicQueueOnFullPolicy,
     ack_propagation_mode_default: TopicAckPropagationMode,
+    context_transfer: Option<Arc<ContextTransferSchema>>,
 }
 
 impl<T: Send + Sync + 'static> Clone for PipelineTopicBinding<T> {
@@ -26,6 +29,7 @@ impl<T: Send + Sync + 'static> Clone for PipelineTopicBinding<T> {
             handle: self.handle.clone(),
             queue_on_full_default: self.queue_on_full_default.clone(),
             ack_propagation_mode_default: self.ack_propagation_mode_default,
+            context_transfer: self.context_transfer.clone(),
         }
     }
 }
@@ -38,6 +42,7 @@ impl<T: Send + Sync + 'static> PipelineTopicBinding<T> {
             handle,
             queue_on_full_default: TopicQueueOnFullPolicy::Block,
             ack_propagation_mode_default: TopicAckPropagationMode::Disabled,
+            context_transfer: None,
         }
     }
 
@@ -48,6 +53,7 @@ impl<T: Send + Sync + 'static> PipelineTopicBinding<T> {
             handle: self.handle.clone(),
             queue_on_full_default: policy,
             ack_propagation_mode_default: self.ack_propagation_mode_default,
+            context_transfer: self.context_transfer.clone(),
         }
     }
 
@@ -58,7 +64,21 @@ impl<T: Send + Sync + 'static> PipelineTopicBinding<T> {
             handle: self.handle.clone(),
             queue_on_full_default: self.queue_on_full_default.clone(),
             ack_propagation_mode_default: mode,
+            context_transfer: self.context_transfer.clone(),
         }
+    }
+
+    /// Attaches the topic's shared flat context contract.
+    #[must_use]
+    pub fn with_context_transfer(mut self, schema: Option<ContextTransferSchema>) -> Self {
+        self.context_transfer = schema.map(Arc::new);
+        self
+    }
+
+    /// Returns the contract shared by this topic's publishers and subscribers.
+    #[must_use]
+    pub fn context_transfer(&self) -> Option<&ContextTransferSchema> {
+        self.context_transfer.as_deref()
     }
 
     /// The underlying pure topic runtime handle.

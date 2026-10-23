@@ -43,6 +43,63 @@ fn make_test_pdata() -> OtapPdata {
 /// Guarantees: the receiver obtains the original signal payload.
 #[test]
 fn topic_exporter_to_topic_receiver_transfers_pdata() {
+    topic_transfer_case(false, false);
+}
+
+/// Scenario: a topic declares a flat header contract and both nodes rename their side of the transfer.
+/// Guarantees: factories bind the contract, only mapped metadata crosses, and payload/routing stay independent.
+#[test]
+fn topic_exporter_to_receiver_transfers_mapped_context() {
+    topic_transfer_case(true, false);
+}
+
+/// Scenario: the receiver names its imported header/randomness transfer as a local composite.
+/// Guarantees: generated values survive unchanged, qualified references bind, and flat fields do not leak.
+#[test]
+fn topic_receiver_stores_implicit_composite() {
+    topic_transfer_case(true, true);
+}
+
+/// Scenario: implicit receiver composites collide with visible entries or reference unknown condition keys.
+/// Guarantees: context compilation rejects the configuration before topic subscriptions are created.
+#[test]
+fn topic_implicit_composite_validates_namespace_and_conditions() {
+    let spec = json!({
+        "version": "otel_dataflow/v1",
+        "topics": {"ingress": {"context": {"transfer": {"tenant_id": {"type": "authorized_identity"}}}}},
+        "groups": {"g": {"pipelines": {"p": {"nodes": {
+            "receiver": {"type": "receiver:topic", "config": {
+                "topic": "ingress", "context": {"store_composite": "topic_exp", "conditions": {"tenant_id": "1"}}
+            }}
+        }}}}}
+    });
+    for (collision, unknown_key) in [(true, false), (false, true)] {
+        let mut value = spec.clone();
+        if collision {
+            value["groups"]["g"]["pipelines"]["p"]["policies"] = json!({"context": {"entries": {
+                "topic_exp": [{"type": "constant", "name": "route", "value": "existing"}]
+            }}});
+        }
+        if unknown_key {
+            value["groups"]["g"]["pipelines"]["p"]["nodes"]["receiver"]["config"]["context"]["conditions"] =
+                json!({"unknown": "1"});
+        }
+        let resolved =
+            otel_arrow_dfe_config::engine::OtelDataflowSpec::from_json(&value.to_string())
+                .unwrap()
+                .resolve();
+        let error = otel_arrow_dfe_otap::OTAP_PIPELINE_FACTORY
+            .compile_initial_context(&resolved)
+            .unwrap_err();
+        assert!(error.to_string().contains(if collision {
+            "conflicts"
+        } else {
+            "unknown transfer field"
+        }));
+    }
+}
+
+fn topic_transfer_case(explicit: bool, composite: bool) {
     let (rt, local_tasks) = setup_test_runtime();
     rt.block_on(local_tasks.run_until(async move {
         let broker = TopicBroker::<OtapPdata>::new();
@@ -59,10 +116,19 @@ fn topic_exporter_to_topic_receiver_transfers_pdata() {
             )
             .expect("topic should be created");
 
+        let mut schema_json = json!({
+            "transfer": {"workspace": {"type": "transport_header"}}
+        });
+        if composite {
+            schema_json["transfer"]["randomness"] = json!({"type": "randomness"});
+        }
+        let schema = explicit.then(|| serde_json::from_value(schema_json.clone()).unwrap());
+        let binding = otel_arrow_dfe_engine::topic::PipelineTopicBinding::from(handle)
+            .with_context_transfer(schema);
         let exporter_set = TopicSet::new("exporter-set");
-        _ = exporter_set.insert(topic_name.clone(), handle.clone());
+        _ = exporter_set.insert(topic_name.clone(), binding.clone());
         let receiver_set = TopicSet::new("receiver-set");
-        _ = receiver_set.insert(topic_name.clone(), handle);
+        _ = receiver_set.insert(topic_name.clone(), binding);
 
         let mut exporter_ctx = create_test_pipeline_context();
         exporter_ctx.set_topic_set(exporter_set);
@@ -85,6 +151,67 @@ fn topic_exporter_to_topic_receiver_transfers_pdata() {
                 "group": "sut-workers"
             }
         });
+
+        if explicit {
+            exporter_user_cfg.config["context"] = json!({"export": {
+                "workspace": {"required": true, "selector": {"type": "named", "named": ["source"]}}
+            }});
+            receiver_user_cfg.config["context"] = json!({"import": {"workspace": {"store_as": "destination"}}});
+        }
+        if composite {
+            exporter_user_cfg.config["context"]["export"]["randomness"] =
+                json!({"required": true, "selector": {"type": "named", "named": ["delivery:id"]}});
+            receiver_user_cfg.config["context"] = json!({"store_composite": "topic_exp", "conditions": {"workspace": "value"}});
+        }
+        let mut source_plan = None;
+        for (pipeline, node, user) in [
+            (&mut exporter_ctx, "topic_exporter", &exporter_user_cfg),
+            (&mut receiver_ctx, "topic_receiver", &receiver_user_cfg),
+        ] {
+            let mut pipeline_config = json!({
+                "nodes": {
+                    node: user,
+                    "source_receiver": {"type": "receiver:internal_telemetry", "config": {}}
+                },
+                "policies": {"transport_headers": {
+                    "header_capture": {"headers": [{"match_names": ["X-Shared"], "store_as": "shared"}]}
+                }}
+            });
+            if node == "topic_exporter" {
+                pipeline_config["policies"]["transport_headers"]["header_capture"]["headers"]
+                    .as_array_mut().unwrap().push(json!({"match_names":["X-Private"],"store_as":"private"}));
+                if composite {
+                    pipeline_config["policies"]["context"] = json!({"entries": {
+                        "delivery": [{"type": "randomness", "name": "id", "value": "uuid7"}]
+                    }});
+                }
+            } else if composite {
+                pipeline_config["nodes"]["qualified_reader"] = json!({
+                    "type": "exporter:topic", "config": {"topic": "next", "context": {"export": {
+                        "token": {"selector": {"type": "named", "named": ["topic_exp:randomness"]}}
+                    }}}
+                });
+            }
+            let mut spec = json!({
+                "version": "otel_dataflow/v1",
+                "topics": {"ingress": {}, "next": {}},
+                "groups": {(pipeline.pipeline_group_id().to_string()): {
+                    "pipelines": {(pipeline.pipeline_id().to_string()): pipeline_config}
+                }}
+            });
+            if explicit { spec["topics"]["ingress"]["context"] = schema_json.clone(); }
+            let resolved = otel_arrow_dfe_config::engine::OtelDataflowSpec::from_json(&spec.to_string())
+                .expect("topic config").resolve();
+            let prepared = otel_arrow_dfe_otap::OTAP_PIPELINE_FACTORY.compile_initial_context(&resolved)
+                .expect("compiled topic context declarations");
+            if node == "topic_exporter" {
+                source_plan = prepared.bindings.context_materialization_plan(&pipeline.pipeline_key()).cloned();
+            }
+            pipeline.set_compiled_context_bindings(prepared.bindings);
+            *pipeline = pipeline.clone().with_node_context(
+                node.into(), user.r#type.clone(), user.kind(), Default::default(),
+            );
+        }
 
         let mut exporter = (TOPIC_EXPORTER.create)(
             exporter_ctx,
@@ -160,6 +287,18 @@ fn topic_exporter_to_topic_receiver_transfers_pdata() {
         });
 
         let mut expected = make_test_pdata();
+        let mut headers = otel_arrow_dfe_config::transport_headers::TransportHeaders::new();
+        for name in ["source", "shared", "private"] {
+            headers.push(otel_arrow_dfe_config::transport_headers::TransportHeader::text(
+                name.try_into().unwrap(), b"value".to_vec(),
+            ));
+        }
+        expected.set_transport_headers(headers);
+        let expected_id = source_plan.as_ref().map(|plan| {
+            expected.context_mut().materialize_context(plan);
+            expected.materialized_context().unwrap().entry(&"delivery".try_into().unwrap())
+                .unwrap().member(&"id".try_into().unwrap()).unwrap().values().values()[0].bytes().to_vec()
+        });
         exporter_input_tx
             .send(expected.clone())
             .expect("message should be sent to topic exporter");
@@ -174,6 +313,17 @@ fn topic_exporter_to_topic_receiver_transfers_pdata() {
             expected.num_items(),
             "topic receiver should forward one pdata message"
         );
+        if composite {
+            assert!(delivered.transport_headers().is_none());
+            let entry = delivered.materialized_context().unwrap().entry(&"topic_exp".try_into().unwrap()).unwrap();
+            assert_eq!(entry.members().len(), 2);
+            assert_eq!(entry.member(&"randomness".try_into().unwrap()).unwrap().values().values()[0].bytes(), expected_id.as_ref().unwrap());
+            assert_eq!(entry.member(&"workspace".try_into().unwrap()).unwrap().values().values()[0].bytes(), b"value");
+        } else {
+            let headers = delivered.transport_headers().expect("declared header crosses");
+            assert_eq!(headers.len(), 1);
+            assert_eq!(headers.iter().next().unwrap().name.as_str(), if explicit { "destination" } else { "shared" });
+        }
 
         let deadline = Instant::now() + Duration::from_secs(1);
         exporter_ctrl

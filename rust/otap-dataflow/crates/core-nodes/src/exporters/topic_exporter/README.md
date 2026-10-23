@@ -41,6 +41,73 @@ config:
   queue_on_full: drop_newest
 ```
 
+## Context transfer
+
+Without a topic `context.transfer` contract, topic boundaries intersect declared
+context on both sides. Captured/declared headers and verified identity fields
+must be visible to both pipelines. Composite snapshots survive only when their
+declarations, including scope, match. Undeclared metadata and the socket peer
+address do not cross implicitly. Compatible metadata shares immutable backing
+storage without serializing or rebuilding values; the projection still checks
+the actual entries against the compiled visibility.
+
+For an explicit boundary, declare a flat, typed contract on the topic:
+
+```yaml
+topics:
+  handoff:
+    context:
+      transfer:
+        tenant_id:
+          type: authorized_identity
+        randomness:
+          type: randomness
+        workspace:
+          type: transport_header
+```
+
+Each exporter controls required versus optional values independently:
+
+```yaml
+type: exporter:topic
+config:
+  topic: handoff
+  context:
+    export:
+      tenant_id:
+        required: true
+        selector: {type: authorized_identity, named: [customer_id]}
+      randomness:
+        selector: {type: named, named: ["delivery:id"]}
+      workspace:
+        selector: {type: named, named: ["product_user:workspace"]}
+```
+
+`required` defaults to false. Missing required values permanently NACK the input
+before publication; absent optional values remain absent. Ordered selector names
+are fallback candidates: the first present source wins. A qualified member
+retains its source composite's presence/provenance gate. Whole composites cannot
+be assigned to a flat field.
+
+The contract supports `transport_header`, `authorized_identity`, `constant`,
+`randomness`, and `network_info`. Authority must match, except that any kind may
+be downgraded to `transport_header`. Select the original socket address with
+`{type: network_info, named: [peer_socket_addr]}`. `all_captured` exports a header
+collection into a transport-header field, retaining individual stored/wire names
+and binary values. Collection fields are imported as headers, not scalar
+composite members.
+
+Omitting `context.export` uses optional, same-name primitive sources for the
+contract. An explicit empty export map exports no values. Explicit mappings
+require a topic contract. ACK/NACK frames and source metrics never enter the
+transfer; a blocked publish retains the same exported snapshot.
+
+The shared config/engine/pdata adapter also provides a versioned flat storage
+encoding bounded to 1 MiB serialized bytes and 1,024 fields plus values.
+This spike does not yet write context into Quiver or change durable-buffer
+recovery. The storage representation contains names, kinds, cardinality, and
+values, not process-local layout IDs.
+
 ## Telemetry
 
 These tables list telemetry emitted directly by this node. Common engine
@@ -92,6 +159,7 @@ The bounded `result` values are `ack`, `nack`, `timeout`, `topic_closed`, and
 | `topic_exporter.start` | `info` | Exporter startup with topic name and effective publish policy. |
 | `topic_exporter.drop_newest` | `warn` | A publish was dropped because the topic queue was full and policy dropped newest. |
 | `topic_exporter.outcome_capacity_full` | `warn` | A publish requiring end-to-end outcome tracking was rejected because tracking capacity was exhausted. |
+| `topic_exporter.context_transfer_failed` | `warn` | A required field or transfer contract could not be satisfied; the input is NACKed. |
 
 ## Limits
 

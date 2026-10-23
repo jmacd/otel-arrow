@@ -104,6 +104,13 @@ pub struct ContextMember {
 /// Logical source of one composite member value.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ContextMemberSource {
+    /// A primitive retained from a flat transfer; never generated again on import.
+    Transferred {
+        /// Flat source name.
+        name: ContextEntryName,
+        /// Original authority.
+        kind: otel_arrow_dfe_config::context_transfer::TransferKind,
+    },
     /// Value supplied by one domain-scoped primitive field.
     Field(ContextFieldId),
     /// Inline UTF-8 value supplied by configuration.
@@ -141,6 +148,8 @@ pub enum ContextProjection {
     Primitive(ContextFieldId),
     /// All or selected members from a composite entry.
     Composite {
+        /// Whether the selection denotes the whole entry, including optional transfer members.
+        whole: bool,
         /// Identity of the layout that produced this projection.
         layout: ContextLayoutIdentity,
         /// Composite whose members and conditions determine presence.
@@ -226,6 +235,21 @@ impl ContextLayout {
             let mut conditions = Vec::new();
             for part in &declaration.definition.0 {
                 match part {
+                    ContextEntryPart::Transferred {
+                        name,
+                        kind,
+                        store_as,
+                        ..
+                    } => {
+                        members.push(ContextMember {
+                            name: store_as.clone(),
+                            source: ContextMemberSource::Transferred {
+                                name: name.clone(),
+                                kind: *kind,
+                            },
+                        });
+                        continue;
+                    }
                     ContextEntryPart::Constant { name, value } => {
                         members.push(ContextMember {
                             name: name.clone(),
@@ -353,6 +377,7 @@ impl ContextLayout {
             .ok_or_else(|| invalid(format!("unknown context member `{composite}:{member}`")))?
             .clone();
         Ok(ContextProjection::Composite {
+            whole: false,
             layout: self.identity.clone(),
             entry,
             members: Box::new([member]),
@@ -366,6 +391,7 @@ impl ContextLayout {
     ) -> Result<ContextProjection, Error> {
         let entry = self.entry_id(composite)?;
         Ok(ContextProjection::Composite {
+            whole: true,
             layout: self.identity.clone(),
             entry,
             members: self.entries[entry.index()].members.clone(),
@@ -505,9 +531,9 @@ mod tests {
                     ContextMemberSource::Field(field) => {
                         layout.fields()[field.index()].name.as_str()
                     }
-                    ContextMemberSource::Constant(_) | ContextMemberSource::Randomness(_) => {
-                        member.name.as_str()
-                    }
+                    ContextMemberSource::Constant(_)
+                    | ContextMemberSource::Randomness(_)
+                    | ContextMemberSource::Transferred { .. } => member.name.as_str(),
                 })
                 .collect(),
         }
@@ -726,7 +752,9 @@ mod tests {
                 .iter()
                 .map(|member| match &member.source {
                     ContextMemberSource::Field(field) => layout.fields()[field.index()].domain,
-                    ContextMemberSource::Constant(_) | ContextMemberSource::Randomness(_) => {
+                    ContextMemberSource::Constant(_)
+                    | ContextMemberSource::Randomness(_)
+                    | ContextMemberSource::Transferred { .. } => {
                         panic!("unexpected domainless member")
                     }
                 })

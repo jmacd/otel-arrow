@@ -1257,6 +1257,7 @@ mod tests {
     #[test]
     fn pipeline_context_preserves_compiled_policy_across_node_context() {
         let resolved = otel_arrow_dfe_config::engine::ResolvedOtelDataflowSpec {
+            topic_contexts: Default::default(),
             engine: Default::default(),
             pipelines: Vec::new(),
         };

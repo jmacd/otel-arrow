@@ -24,6 +24,7 @@ pub mod config_provider;
 pub mod context;
 /// Declarative context entry policies.
 pub mod context_policy;
+pub mod context_transfer;
 pub mod conversion;
 pub mod engine;
 /// Environment variable substitution for raw config text.
@@ -58,7 +59,7 @@ pub use topic::{
 /// Validation helpers for node configuration.
 pub mod validation;
 
-pub use context::{ContextEntryName, ContextEntryRef};
+pub use context::{ContextEntryName, ContextEntryRef, ContextSelector, ContextSelectorType};
 pub use conversion::ConversionOptions;
 
 /// Signal types

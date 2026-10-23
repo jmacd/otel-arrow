@@ -529,6 +529,7 @@ impl LogicalPipelineDeployment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Topic runtime properties that cannot be mutated by live rollout.
 pub(super) struct TopicRuntimeProfile {
+    pub(super) context: Option<otel_arrow_dfe_config::context_transfer::ContextTransferSchema>,
     pub(super) backend: TopicBackendKind,
     pub(super) policies: otel_arrow_dfe_config::topic::TopicPolicies,
     pub(super) selected_mode: InferredTopicMode,
