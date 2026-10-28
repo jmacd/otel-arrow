@@ -37,7 +37,9 @@ use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, Timer
 use crate::error::Error;
 use crate::message::{Message, SharedExporterInbox};
 use crate::node::NodeId;
-use crate::pdata_context::CompiledHeaderPropagationPolicy as HeaderPropagationPolicy;
+use crate::pdata_context::{
+    CompiledHeaderPropagationPolicy as HeaderPropagationPolicy, NodeBindings, SinkBinding,
+};
 use crate::runtime_services::{CodecEffectHandler, PipelineRuntimeServices};
 use crate::shared::message::SharedReceiver;
 use crate::terminal_state::TerminalState;
@@ -101,9 +103,8 @@ pub trait Exporter<PData> {
 pub struct EffectHandler<PData> {
     pub(crate) core: EffectHandlerCore<PData>,
     _pd: PhantomData<PData>,
-    /// Immutable propagation policy shared by handler clones.
-    /// `None` disables propagation.
-    propagation_policy: Option<Arc<HeaderPropagationPolicy>>,
+    /// Node-facing pdata context bindings.
+    node_bindings: Option<Arc<NodeBindings>>,
 }
 
 impl<PData> EffectHandler<PData> {
@@ -117,7 +118,7 @@ impl<PData> EffectHandler<PData> {
         EffectHandler {
             core: EffectHandlerCore::new(node_id, metrics_reporter, runtime_services),
             _pd: PhantomData,
-            propagation_policy: None,
+            node_bindings: None,
         }
     }
 
@@ -133,17 +134,34 @@ impl<PData> EffectHandler<PData> {
         self.core.node_interests()
     }
 
+    /// Returns the node's compiled pdata context bindings.
+    #[must_use]
+    pub fn node_bindings(&self) -> Option<&NodeBindings> {
+        self.node_bindings.as_deref()
+    }
+
+    /// Returns the node's header propagation sink.
+    #[must_use]
+    pub fn sink(&self) -> Option<&SinkBinding> {
+        self.node_bindings().and_then(NodeBindings::sink)
+    }
+
+    pub(crate) fn set_node_bindings(&mut self, bindings: Option<Arc<NodeBindings>>) {
+        self.node_bindings = bindings;
+    }
+
     /// Returns the propagation policy.
     ///
     /// `None` disables propagation.
     #[must_use]
     pub fn propagation_policy(&self) -> Option<&HeaderPropagationPolicy> {
-        self.propagation_policy.as_deref()
+        self.node_bindings()
+            .and_then(NodeBindings::header_propagation_policy)
     }
 
     /// Sets the propagation policy for transport header filtering.
     pub fn set_propagation_policy(&mut self, policy: Option<HeaderPropagationPolicy>) {
-        self.propagation_policy = policy.map(Arc::new);
+        NodeBindings::set_propagation_policy(&mut self.node_bindings, policy);
     }
 
     /// Print an info message to the engine's diagnostic stream (stderr).

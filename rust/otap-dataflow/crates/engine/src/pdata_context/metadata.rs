@@ -12,9 +12,9 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::capability::auth::{AuthorizedIdentity, ClaimValue};
+use crate::capability::auth::AuthorizedIdentity;
 use crate::pdata_context::{
-    ContextDomain, ContextFieldLayout, ContextMaterializationPlan, ContextProjection,
+    Claims, ContextDomain, ContextFieldLayout, ContextMaterializationPlan, ContextProjection,
     ContextValueCardinality, ContextValueKind, ContextValueSource, MaterializedContext,
     MaterializedContextProjection, MaterializedContextValue, MaterializedContextValues,
 };
@@ -76,13 +76,18 @@ impl Metadata {
 
     /// Replaces the authorized identity entries with the claims `policy`
     /// selects from a verified identity.
+    pub fn capture_claims(&mut self, policy: &AuthorizedIdentityPolicy, claims: &dyn Claims) {
+        self.authorized_identity =
+            AuthorizedIdentityEntries::capture(policy, claims).unwrap_or_default();
+    }
+
+    /// Replaces the authorized identity entries with claims selected from an engine identity.
     pub fn capture_authorized_identity(
         &mut self,
         policy: &AuthorizedIdentityPolicy,
         identity: &AuthorizedIdentity,
     ) {
-        self.authorized_identity =
-            AuthorizedIdentityEntries::capture(policy, identity).unwrap_or_default();
+        self.capture_claims(policy, identity);
     }
 
     /// Materializes selected composite snapshots exactly once.
@@ -245,8 +250,8 @@ impl fmt::Debug for AuthorizedIdentityEntries {
 }
 
 impl AuthorizedIdentityEntries {
-    fn capture(policy: &AuthorizedIdentityPolicy, identity: &AuthorizedIdentity) -> Option<Self> {
-        PackedAuthorizedIdentity::capture(policy, identity).map(|packed| Self {
+    fn capture(policy: &AuthorizedIdentityPolicy, claims: &dyn Claims) -> Option<Self> {
+        PackedAuthorizedIdentity::capture(policy, claims).map(|packed| Self {
             packed: Some(Arc::new(packed)),
         })
     }
@@ -279,23 +284,22 @@ impl AuthorizedIdentityEntries {
 }
 
 impl PackedAuthorizedIdentity {
-    fn capture(policy: &AuthorizedIdentityPolicy, identity: &AuthorizedIdentity) -> Option<Self> {
+    fn capture(policy: &AuthorizedIdentityPolicy, claims: &dyn Claims) -> Option<Self> {
         let mut entry_count = 0usize;
         let mut value_count = 0usize;
         let mut blob_len = 0usize;
         for projection in policy.iter() {
-            let Some(claim) = identity.claim(&projection.claim) else {
+            let Some(claim) = claims.claim(&projection.claim) else {
                 continue;
             };
             entry_count = entry_count
                 .checked_add(1)
                 .expect("authorized identity entry count overflow");
             value_count = value_count
-                .checked_add(claim.as_slice().len())
+                .checked_add(claim.len())
                 .expect("authorized identity value count overflow");
             blob_len = claim
-                .as_slice()
-                .iter()
+                .values()
                 .try_fold(
                     blob_len
                         .checked_add(projection.store_as.as_str().len())
@@ -327,7 +331,7 @@ impl PackedAuthorizedIdentity {
 
         let mut entry_index = 0;
         for projection in policy.iter() {
-            let Some(claim) = identity.claim(&projection.claim) else {
+            let Some(claim) = claims.claim(&projection.claim) else {
                 continue;
             };
             let entry_at = entry_index * AUTHORIZED_ENTRY_LEN;
@@ -341,11 +345,11 @@ impl PackedAuthorizedIdentity {
                 .expect("authorized identity name range fits descriptor");
             write_context_u32(&mut bytes, entry_at + 8, value_index)
                 .expect("authorized identity first value fits descriptor");
-            write_context_u32(&mut bytes, entry_at + 12, claim.as_slice().len())
+            write_context_u32(&mut bytes, entry_at + 12, claim.len())
                 .expect("authorized identity value count fits descriptor");
-            bytes[entry_at + 16] = u8::from(matches!(claim, ClaimValue::Many(_)));
+            bytes[entry_at + 16] = u8::from(claim.is_many());
 
-            for value in claim.as_slice() {
+            for value in claim.values() {
                 let range = write_context_blob(&mut bytes, &mut blob_at, value.as_bytes())
                     .expect("preallocated authorized identity value range");
                 let value_at = entry_bytes + value_index * AUTHORIZED_VALUE_LEN;

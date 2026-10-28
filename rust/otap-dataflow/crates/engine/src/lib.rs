@@ -1996,14 +1996,6 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
-        let capture_policy = pipeline_ctx
-            .compiled_context_bindings()
-            .header_capture_policy(&pipeline_ctx.pipeline_key(), &pipeline_ctx.node_id())
-            .cloned();
-        let authorized_identity_policy = pipeline_ctx
-            .compiled_context_bindings()
-            .authorized_identity_policy(&pipeline_ctx.pipeline_key(), &pipeline_ctx.node_id())
-            .cloned();
         let context_materialization_plan = pipeline_ctx
             .compiled_context_bindings()
             .context_materialization_plan(&pipeline_ctx.pipeline_key())
@@ -2021,8 +2013,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             capabilities,
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?
-        .with_capture_policy(capture_policy)
-        .with_authorized_identity_policy(authorized_identity_policy)
+        .with_node_bindings(pipeline_ctx.node_bindings())
         .with_context_materialization(context_materialization_plan, self.context_materializer);
         pipeline_ctx
             .admission()
@@ -2164,11 +2155,6 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
-        let propagation_policy = pipeline_ctx
-            .compiled_context_bindings()
-            .header_propagation_policy(&pipeline_ctx.pipeline_key(), &pipeline_ctx.node_id())
-            .cloned();
-
         let exporter = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
@@ -2177,7 +2163,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             capabilities,
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?
-        .with_propagation_policy(propagation_policy);
+        .with_node_bindings(pipeline_ctx.node_bindings());
         pipeline_ctx
             .admission()
             .validate_factory_consumption(normalized.as_str())

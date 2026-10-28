@@ -41,7 +41,9 @@ use crate::error::{Error, TypedError};
 use crate::message::Sender;
 use crate::node::NodeId;
 use crate::output_router::OutputRouter;
-use crate::pdata_context::ContextMaterializationPlan;
+use crate::pdata_context::{
+    Arrival, CaptureStats, ContextMaterializationPlan, Metadata, NodeBindings,
+};
 use crate::readiness::ReadinessSignaller;
 use crate::receiver::ReceiverContextMaterialization;
 use crate::runtime_services::{CodecEffectHandler, PipelineRuntimeServices};
@@ -57,7 +59,7 @@ use otel_arrow_dfe_telemetry::metrics::{MetricSet, MetricSetHandler};
 use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -142,13 +144,10 @@ pub struct EffectHandler<PData> {
     pub(crate) core: EffectHandlerCore<PData>,
     /// Output-port router.
     pub router: OutputRouter<Sender<PData>>,
-    /// Immutable capture policy shared by local handler clones.
-    /// `None` disables capture.
-    capture_policy: Option<Rc<CompiledHeaderCapturePolicy>>,
-    /// Immutable authorized identity policy shared by local handler clones.
-    authorized_identity_policy: Option<Rc<AuthorizedIdentityPolicy>>,
+    /// Node-facing pdata context bindings.
+    node_bindings: Option<Arc<NodeBindings>>,
     /// Data-type-specific context materialization shared by local handler clones.
-    context_materialization_plan: Option<ReceiverContextMaterialization<PData>>,
+    context_materializer: Option<ReceiverContextMaterialization<PData>>,
     /// Optional signal used to gate pipeline startup on receiver initialization.
     readiness: Option<ReadinessSignaller>,
 }
@@ -171,9 +170,8 @@ impl<PData> EffectHandler<PData> {
         EffectHandler {
             core,
             router,
-            capture_policy: None,
-            authorized_identity_policy: None,
-            context_materialization_plan: None,
+            node_bindings: None,
+            context_materializer: None,
             readiness: None,
         }
     }
@@ -208,34 +206,61 @@ impl<PData> EffectHandler<PData> {
         self.core.node_interests()
     }
 
+    /// Returns the node's compiled pdata context bindings.
+    #[must_use]
+    pub fn node_bindings(&self) -> Option<&NodeBindings> {
+        self.node_bindings.as_deref()
+    }
+
+    /// Forms complete metadata for an arriving request.
+    #[must_use]
+    pub fn form_context(&self, arrival: &Arrival<'_>) -> (Metadata, Option<CaptureStats>) {
+        self.node_bindings()
+            .and_then(NodeBindings::arrival)
+            .map_or_else(
+                || (Metadata::default(), None),
+                |binding| binding.form(arrival),
+            )
+    }
+
+    pub(crate) fn set_node_bindings(&mut self, bindings: Option<Arc<NodeBindings>>) {
+        self.node_bindings = bindings;
+    }
+
     /// Returns the capture policy.
     ///
     /// `None` disables capture.
     #[must_use]
     pub fn capture_policy(&self) -> Option<&CompiledHeaderCapturePolicy> {
-        self.capture_policy.as_deref()
+        self.node_bindings()
+            .and_then(NodeBindings::header_capture_policy)
     }
 
     /// Sets the capture policy for transport header extraction.
     pub fn set_capture_policy(&mut self, policy: Option<CompiledHeaderCapturePolicy>) {
-        self.capture_policy = policy.map(Rc::new);
+        NodeBindings::receiver_mut(&mut self.node_bindings).set_capture_policy(policy);
     }
 
     /// Returns the authorized identity claim projection policy.
     #[must_use]
     pub fn authorized_identity_policy(&self) -> Option<&AuthorizedIdentityPolicy> {
-        self.authorized_identity_policy.as_deref()
+        self.node_bindings()
+            .and_then(NodeBindings::authorized_identity_policy)
     }
 
     /// Sets the authorized identity claim projection policy.
     pub fn set_authorized_identity_policy(&mut self, policy: Option<AuthorizedIdentityPolicy>) {
-        self.authorized_identity_policy = policy.map(Rc::new);
+        NodeBindings::receiver_mut(&mut self.node_bindings).set_authorized_identity_policy(policy);
     }
 
     /// Materializes configured context entries before receiver output.
     pub fn materialize_context(&self, data: &mut PData) {
-        if let Some(materialization) = &self.context_materialization_plan {
-            materialization.apply(data);
+        if let Some(materialization) = &self.context_materializer {
+            let arrival = self
+                .node_bindings()
+                .and_then(NodeBindings::arrival)
+                .expect("receiver materializer requires an arrival binding");
+            materialization.apply(data, arrival.materialization_plan());
         }
     }
 
@@ -244,7 +269,7 @@ impl<PData> EffectHandler<PData> {
         &mut self,
         materialization: Option<ReceiverContextMaterialization<PData>>,
     ) {
-        self.context_materialization_plan = materialization;
+        self.context_materializer = materialization;
     }
 
     /// Installs a data-type-specific context materializer.
@@ -253,8 +278,8 @@ impl<PData> EffectHandler<PData> {
         plan: ContextMaterializationPlan,
         materialize: fn(&mut PData, &ContextMaterializationPlan),
     ) {
-        self.context_materialization_plan =
-            Some(ReceiverContextMaterialization::new(plan, materialize));
+        NodeBindings::set_materialization_plan(&mut self.node_bindings, plan);
+        self.set_context_materialization(Some(ReceiverContextMaterialization::new(materialize)));
     }
 
     pub(crate) fn set_readiness_signaller(&mut self, readiness: Option<ReadinessSignaller>) {
