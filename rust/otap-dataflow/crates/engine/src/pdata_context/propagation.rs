@@ -58,6 +58,7 @@ impl PreparedHeaderPropagationPolicy {
         policy: HeaderPropagationPolicy,
         declarations: &[ContextEntryDeclaration],
     ) -> Result<Self, String> {
+        policy.validate()?;
         let mut policy = Self {
             default: policy.default,
             overrides: policy.overrides,
@@ -82,6 +83,19 @@ impl PreparedHeaderPropagationPolicy {
             let mut selected = false;
             for part in &declaration.definition.0 {
                 match part {
+                    ContextEntryPart::Transferred {
+                        name,
+                        kind,
+                        store_as,
+                        ..
+                    } => {
+                        if store_as == reference.name() {
+                            if *kind == otel_arrow_dfe_config::context::transfer::TransferKind::TransportHeader {
+                                source_name = Some(name.clone());
+                            }
+                            selected = true;
+                        }
+                    }
                     ContextEntryPart::Constant { name, .. } => {
                         if name == reference.name() {
                             selected = true;

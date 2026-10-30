@@ -53,6 +53,72 @@ Subscription modes:
 - `broadcast`: each subscriber receives each message.
 - `balanced`: subscribers in the same `group` share the stream.
 
+## Context import and subscription conditions
+
+Without an explicit topic transfer contract, context is projected to the
+destination's compiled declarations. Private or differently scoped composites,
+undeclared headers/claims, and socket peer metadata are removed. Compatible
+snapshots retain their existing values and share their backing storage.
+
+With a [topic transfer contract](../../exporters/topic_exporter/README.md#context-transfer),
+the receiver can name the imported record as a local composite and subscribe
+only to a context subset:
+
+```yaml
+type: receiver:topic
+config:
+  topic: handoff
+  subscription:
+    mode: balanced
+    group: tenant-1
+  context:
+    conditions:
+      tenant_id: "1"
+    store_composite: topic_exp
+```
+
+Conditions are conjunctive exact UTF-8 value matches over transfer keys; a
+missing key does not match, and a repeated field matches if any text value
+matches. Conditions compile to transfer slots, not runtime name resolution.
+Three pipelines can use `tenant_id: "1"`, `"2"`, and `"3"` with distinct groups.
+Workers sharing a balanced group must have identical conditions.
+Those conditions are fixed for the group's lifetime; use a new group name or
+restart the topic runtime when changing them.
+
+The broker applies balanced conditions before queue admission, so unrelated
+tenants do not consume that group's capacity or reach its consumers.
+Broadcast filtering happens before delivery ownership; `all` ACK consensus
+includes only matching subscribers. Broadcast storage remains a shared ring,
+so its topic-wide capacity and lag policy still apply. No matches retain the
+existing no-subscriber publish/outcome behavior.
+
+`store_composite` enters the receiver pipeline's composite namespace and rejects
+collisions with visible declarations or other receiver composites. Downstream
+consumers can select `topic_exp:tenant_id` or `topic_exp:randomness`. Values keep
+their transfer authority: randomness is not regenerated, and identity does not
+become an untrusted header. Transfer composites are present after a matching
+import even when optional keys are absent; absent members remain absent.
+This differs intentionally from existing atomic grouping composites.
+Other receivers sharing the pipeline cannot implicitly generate this composite.
+
+An optional `context.import` map selects and renames members:
+
+```yaml
+context:
+  conditions: {tenant_id: "1"}
+  store_composite: topic_exp
+  import:
+    tenant_id:
+    randomness:
+      store_as: request_id
+```
+
+Omitting `import` selects all transfer keys. Without `store_composite`, selected
+fields are imported as primitives instead. An explicit empty import map selects
+nothing and cannot define a composite. Contract violations are logged and
+tracked deliveries are NACKed before forwarding. Routing/metrics state is
+always fresh on the receiving side.
+
 ## Examples
 
 Balanced subscription:
@@ -73,8 +139,8 @@ This receiver opts into the shared `receiver.received` and
 [shared receiver contract](../../../../../docs/telemetry/metrics-guide.md#shared-receiver-and-exporter-boundary-metrics)
 for their definitions and telemetry policy.
 
-The boundary is one topic delivery; local processing currently records
-`success`, independently of downstream forwarding. Processing duration
+The boundary is one topic delivery; local processing records `success` or a
+context-import refusal, independently of downstream forwarding. Processing duration
 excludes downstream channel waiting. Payload size is omitted because topics
 transport internal PData rather than encoded application payloads.
 
@@ -100,6 +166,7 @@ All receiver metrics include the configured `topic` entity attribute.
 | Event | Severity | Description |
 | --- | --- | --- |
 | `topic_receiver.start` | `info` | Receiver startup with topic, subscription, and ACK propagation mode. |
+| `topic_receiver.context_transfer_failed` | `warn` | A transfer contract or import condition could not be satisfied. |
 | `topic_receiver.drain_ingress_pending_forward_nack_failed` | `warn` | A pending forward could not be NACKed during ingress drain. |
 | `topic_receiver.drain_ingress_drop_pending_forward` | `warn` | A pending forward was dropped during ingress drain. |
 | `topic_receiver.drain_ingress.timeout` | `warn` | Ingress drain timed out. |

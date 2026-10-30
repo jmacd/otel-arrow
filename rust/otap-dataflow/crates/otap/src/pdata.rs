@@ -48,6 +48,7 @@ use otel_arrow_dfe_pdata_codec::{
 };
 
 mod delivery;
+mod transfer;
 pub use delivery::{OtapPdataUpdateCause, OtapPdataUpdateError, PdataDelivery};
 
 /// Context for OTAP requests.
@@ -56,8 +57,8 @@ pub use delivery::{OtapPdataUpdateCause, OtapPdataUpdateError, PdataDelivery};
 /// - **Routing stack**: Ack/Nack routing frames used by the pipeline engine
 ///   for result notification. Reset at transport boundaries (topic hops).
 /// - **Metadata**: Request-scoped message metadata (transport headers,
-///   authorized identity, materialized entries, and peer address). Preserved
-///   across transport boundaries. See [`Metadata`].
+///   authorized identity, materialized entries, and peer address). Transfer
+///   bindings select what crosses transport boundaries. See [`Metadata`].
 /// - **Flow metric and signal**: Delivery bookkeeping, described below.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Context {
@@ -807,9 +808,9 @@ impl OtapPdata {
 
     /// Clone this pdata while resetting Ack/Nack routing state to default.
     ///
-    /// This is used at transport boundaries (for example topic hops between
-    /// pipelines) where in-process Ack/Nack routing state must not leak across
-    /// boundaries.
+    /// This only resets delivery bookkeeping; it does not enforce a context
+    /// visibility boundary. Topic nodes use [`Context::export_transfer`] and
+    /// [`Context::import_transfer`] instead.
     ///
     /// Transport headers, authorized identity entries, materialized context,
     /// and peer address are **preserved** because they represent request-scoped

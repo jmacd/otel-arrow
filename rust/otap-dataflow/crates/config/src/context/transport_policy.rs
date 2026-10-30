@@ -11,8 +11,14 @@
 //!
 //! TODO: Implement the sensitive capability for headers
 
+use crate::context::ContextEntryName;
+#[cfg(test)]
+use crate::context::ContextEntryRef;
 use crate::context::transport_headers::{CapturedTransportHeader, TransportHeaders, ValueKind};
-use crate::context::{ContextEntryName, ContextEntryRef};
+/// Legacy names for the common context projection selector configuration.
+pub use crate::context::{
+    ContextSelector as PropagationSelector, ContextSelectorType as PropagationSelectorType,
+};
 use hashbrown::{Equivalent, HashMap};
 use http::{HeaderMap, HeaderName};
 use schemars::JsonSchema;
@@ -147,6 +153,16 @@ fn hash_header_name<H: Hasher>(name: &str, state: &mut H) {
 }
 
 impl HeaderCapturePolicy {
+    /// Stored primitive names made visible by this capture declaration.
+    pub fn stored_names(&self) -> impl Iterator<Item = ContextEntryName> + '_ {
+        self.headers.iter().flat_map(|rule| {
+            rule.match_names.iter().map(|name| {
+                rule.store_as
+                    .clone()
+                    .unwrap_or_else(|| name.to_ascii_lowercase())
+            })
+        })
+    }
     /// Create a new capture policy from the given defaults and rules.
     #[must_use]
     pub fn new(defaults: CaptureDefaults, headers: Vec<CaptureRule>) -> Self {
@@ -466,12 +482,25 @@ impl HeaderPropagationPolicy {
 
     /// Validate the propagation policy configuration.
     ///
-    /// Currently validates the default selector shape. This is the single
+    /// Validates the shared selector shape and this consumer's supported kinds. This is the single
     /// entry-point that both pipeline-level and node-level validation use so
     /// that invalid selectors cannot be silently accepted in one path while
     /// being rejected in another.
     pub fn validate(&self) -> Result<(), String> {
-        self.default.selector.validate()
+        self.default.selector.validate()?;
+        match self.default.selector.selector_type {
+            PropagationSelectorType::AuthorizedIdentity
+            | PropagationSelectorType::Composite
+            | PropagationSelectorType::Constant
+            | PropagationSelectorType::Randomness
+            | PropagationSelectorType::NetworkInfo => Err(format!(
+                "transport header propagation does not yet support selector type '{}'",
+                self.default.selector.selector_type.as_str()
+            )),
+            PropagationSelectorType::None
+            | PropagationSelectorType::AllCaptured
+            | PropagationSelectorType::Named => Ok(()),
+        }
     }
 }
 
@@ -495,65 +524,19 @@ pub struct PropagationDefault {
     pub on_error: ErrorAction,
 }
 
-/// Selects which captured headers are candidates for propagation.
-#[derive(
-    Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash, PartialOrd, Ord,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum PropagationSelectorType {
-    /// Propagate all captured headers (subject to overrides).
-    AllCaptured,
-    /// Do not propagate any captured headers by default (overrides may
-    /// still select specific headers).
-    #[default]
-    None,
-    /// Propagate only headers whose stored names appear in the `named` list.
-    Named,
-}
-
-/// Selects which captured headers are candidates for propagation.
-///
-/// The `type` field selects the strategy. When `type` is `named`,
-/// the `named` field must contain the list of header names to propagate.
-#[derive(
-    Debug, Default, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash, PartialOrd, Ord,
-)]
-#[serde(deny_unknown_fields)]
-pub struct PropagationSelector {
-    /// The propagation selection strategy to use.
-    #[serde(rename = "type", default)]
-    pub selector_type: PropagationSelectorType,
-
-    /// Required names for `named` selectors.
-    /// Must be absent for other selector types.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub named: Option<Vec<ContextEntryRef>>,
-}
-
 impl PropagationSelector {
-    /// Validate the supplied configuration.
-    pub fn validate(&self) -> Result<(), String> {
-        match (&self.selector_type, &self.named) {
-            (PropagationSelectorType::Named, None) => {
-                Err("'named' list is required when type is 'named'".into())
-            }
-            (PropagationSelectorType::Named, Some(names)) if names.is_empty() => {
-                Err("'named' list must not be empty when type is 'named'".into())
-            }
-            (PropagationSelectorType::AllCaptured | PropagationSelectorType::None, Some(_)) => {
-                Err("'named' must not be set when type is not 'named'".into())
-            }
-            _ => Ok(()),
-        }
-    }
-
     /// Matches a stored transport-header name through `all_captured` or a
     /// primitive entry in `named`, using ASCII case-insensitive comparison.
     #[must_use]
     pub fn selects_primitive_header(&self, header_name: &str) -> bool {
         match &self.selector_type {
             PropagationSelectorType::AllCaptured => true,
-            PropagationSelectorType::None => false,
+            PropagationSelectorType::None
+            | PropagationSelectorType::AuthorizedIdentity
+            | PropagationSelectorType::Composite
+            | PropagationSelectorType::Constant
+            | PropagationSelectorType::Randomness
+            | PropagationSelectorType::NetworkInfo => false,
             PropagationSelectorType::Named => self
                 .named
                 .as_ref()
@@ -1168,6 +1151,45 @@ named:
         );
         let err = policy.validate().unwrap_err();
         assert!(err.contains("'named' list is required"));
+    }
+
+    /// Scenario: common context selectors are passed directly to header propagation.
+    /// Guarantees: both consumers use the same type, while propagation rejects unsupported strategies.
+    #[test]
+    fn propagation_uses_common_selector_with_consumer_validation() {
+        for (kind, names, supported) in [
+            ("none", None, true),
+            ("all_captured", None, true),
+            ("named", Some(vec!["workspace"]), true),
+            ("authorized_identity", Some(vec!["customer"]), false),
+            ("composite", Some(vec!["tenant", "delivery"]), false),
+        ] {
+            let selector: crate::context::ContextSelector =
+                serde_json::from_value(serde_json::json!({"type": kind, "named": names}))
+                    .expect("common selector");
+            selector.validate().expect("common shape");
+            let legacy: PropagationSelector = selector.clone();
+            assert_eq!(legacy, selector);
+            let policy = HeaderPropagationPolicy::new(
+                PropagationDefault {
+                    selector,
+                    ..Default::default()
+                },
+                vec![],
+            );
+            if supported {
+                policy
+                    .validate()
+                    .expect("legacy propagation remains supported");
+            } else {
+                assert!(
+                    policy
+                        .validate()
+                        .expect_err("unsupported selector")
+                        .contains("does not yet support")
+                );
+            }
+        }
     }
 
     /// Scenario: a propagation policy selects all captured headers.

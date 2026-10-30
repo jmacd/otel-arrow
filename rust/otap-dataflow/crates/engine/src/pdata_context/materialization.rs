@@ -93,7 +93,7 @@ impl ContextMaterializationPlan {
 }
 
 /// Text or binary representation retained for one materialized value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContextValueKind {
     /// UTF-8 text.
     Text,
@@ -102,7 +102,7 @@ pub enum ContextValueKind {
 }
 
 /// Whether a source value was scalar or explicitly multi-valued.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContextValueCardinality {
     /// A scalar source value.
     One,
@@ -111,7 +111,8 @@ pub enum ContextValueCardinality {
 }
 
 /// One owned value retained in a materialized context.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterializedContextValue {
     original_name: Option<Box<str>>,
     kind: ContextValueKind,
@@ -169,7 +170,8 @@ impl MaterializedContextValue {
 }
 
 /// Values supplied by one primitive or materialized member.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterializedContextValues {
     cardinality: ContextValueCardinality,
     values: Box<[MaterializedContextValue]>,
@@ -313,6 +315,7 @@ impl MaterializedContextEntry {
 struct MaterializedContextStorage {
     transport_headers: Option<TransportHeadersData>,
     entries: Arc<[MaterializedContextEntry]>,
+    transfer: Option<Arc<super::TransferredContext>>,
 }
 
 /// Immutable composites materialized for one pdata context.
@@ -333,6 +336,68 @@ impl fmt::Debug for MaterializedContext {
 }
 
 impl MaterializedContext {
+    /// Returns a flat snapshot carried by a boundary or imported primitive store.
+    #[must_use]
+    pub fn transferred(&self) -> Option<&Arc<super::TransferredContext>> {
+        self.storage.as_ref().and_then(|s| s.transfer.as_ref())
+    }
+
+    /// Attaches a validated flat snapshot without enlarging pdata.
+    pub fn set_transferred(&mut self, transfer: Arc<super::TransferredContext>) {
+        let storage = self.storage.get_or_insert_with(Default::default);
+        Arc::make_mut(storage).transfer = Some(transfer);
+    }
+
+    /// Projects declared headers and exact composite provenance. Compatible
+    /// snapshots share storage; private or differently scoped entries are removed.
+    #[must_use]
+    pub fn project_visible(&self, visibility: &super::ContextVisibility) -> Self {
+        let Some(storage) = self.storage.as_ref() else {
+            return Self::default();
+        };
+        let entry_allowed = |entry: &MaterializedContextEntry| {
+            visibility
+                .composites
+                .get(&entry.name)
+                .is_some_and(|d| d == entry.provenance.as_ref())
+        };
+        let all_headers = storage.transport_headers.as_ref().is_none_or(|headers| {
+            headers
+                .iter()
+                .all(|h| visibility.contains_header(h.name.as_str()))
+        });
+        if all_headers && storage.entries.iter().all(entry_allowed) && storage.transfer.is_none() {
+            return self.clone();
+        }
+        let mut result = Self::default();
+        let mut headers = TransportHeaders::new();
+        for header in storage.transport_headers.iter().flat_map(|h| h.iter()) {
+            if visibility.contains_header(header.name.as_str()) {
+                headers.push(
+                    otel_arrow_dfe_config::context::transport_headers::TransportHeader::captured(
+                        header.name.as_str().try_into().expect("stored name"),
+                        header.wire_name(),
+                        true,
+                        header.value.value_kind,
+                        header.value.bytes,
+                    ),
+                );
+            }
+        }
+        result.set_transport_headers(headers);
+        let entries: Vec<_> = storage
+            .entries
+            .iter()
+            .filter(|e| entry_allowed(e))
+            .cloned()
+            .collect();
+        if !entries.is_empty() {
+            let target = result.storage.get_or_insert_with(Default::default);
+            Arc::make_mut(target).entries = entries.into();
+        }
+        result
+    }
+
     /// Returns whether no composites are materialized.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -374,6 +439,7 @@ impl MaterializedContext {
             self.storage = Some(Arc::new(MaterializedContextStorage {
                 transport_headers,
                 entries: Arc::from([]),
+                transfer: None,
             }));
             return;
         }
@@ -383,7 +449,10 @@ impl MaterializedContext {
                 .expect("materialized context storage is present"),
         );
         storage.transport_headers = transport_headers;
-        if storage.transport_headers.is_none() && storage.entries.is_empty() {
+        if storage.transport_headers.is_none()
+            && storage.entries.is_empty()
+            && storage.transfer.is_none()
+        {
             self.storage = None;
         }
     }
@@ -397,7 +466,7 @@ impl MaterializedContext {
             .transport_headers
             .take()
             .map(TransportHeaders::from_data);
-        if storage.entries.is_empty() {
+        if storage.entries.is_empty() && storage.transfer.is_none() {
             self.storage = None;
         }
         headers
@@ -441,7 +510,7 @@ impl MaterializedContext {
             .iter()
             .map(|field| source.values(field))
             .collect::<Vec<_>>();
-        self.materialize_fields(plan, fields);
+        self.materialize_fields(plan, fields, None);
     }
 
     /// Materializes composites using transport headers already stored in this context.
@@ -468,10 +537,26 @@ impl MaterializedContext {
                 ContextDomain::AuthorizedIdentity => source.values(field),
             })
             .collect::<Vec<_>>();
-        self.materialize_fields(plan, fields);
+        self.materialize_fields(plan, fields, None);
     }
 
-    fn transport_values(&self, field: &ContextFieldLayout) -> Option<MaterializedContextValues> {
+    /// Constructs a receiver-local transfer composite after its import binding
+    /// has checked the contract and conditions. Ordinary receiver materialization
+    /// never creates these entries, even if another receiver shares the pipeline.
+    pub fn materialize_transfer(
+        &mut self,
+        plan: &ContextMaterializationPlan,
+        transfer: &super::TransferredContext,
+    ) {
+        self.materialize_fields(plan, vec![None; plan.layout.fields().len()], Some(transfer));
+    }
+
+    /// Reads a declared primitive header field while retaining wire spelling and cardinality.
+    #[must_use]
+    pub fn transport_values(
+        &self,
+        field: &ContextFieldLayout,
+    ) -> Option<MaterializedContextValues> {
         let values = self
             .transport_headers()?
             .iter()
@@ -507,6 +592,7 @@ impl MaterializedContext {
         &mut self,
         plan: &ContextMaterializationPlan,
         fields: Vec<Option<MaterializedContextValues>>,
+        transfer: Option<&super::TransferredContext>,
     ) {
         let storage = self
             .storage
@@ -538,6 +624,7 @@ impl MaterializedContext {
             if !entry.members.iter().all(|member| match member.source {
                 ContextMemberSource::Field(field) => fields[field.index()].is_some(),
                 ContextMemberSource::Constant(_) | ContextMemberSource::Randomness(_) => true,
+                ContextMemberSource::Transferred { .. } => transfer.is_some(),
             }) {
                 continue;
             }
@@ -545,6 +632,14 @@ impl MaterializedContext {
             let mut members = Vec::with_capacity(entry.members.len());
             for member in &entry.members {
                 let values = match &member.source {
+                    ContextMemberSource::Transferred { name, kind } => {
+                        let Some(values) =
+                            transfer.and_then(|transfer| transfer.value(*kind, name))
+                        else {
+                            continue;
+                        };
+                        values.clone()
+                    }
                     ContextMemberSource::Field(field) => fields[field.index()]
                         .clone()
                         .expect("required field presence was checked"),
@@ -572,7 +667,10 @@ impl MaterializedContext {
         }
         entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         storage.entries = entries.into();
-        if storage.transport_headers.is_none() && storage.entries.is_empty() {
+        if storage.transport_headers.is_none()
+            && storage.entries.is_empty()
+            && storage.transfer.is_none()
+        {
             self.storage = None;
         }
     }
@@ -588,6 +686,7 @@ impl MaterializedContext {
         projection: &'a ContextProjection,
     ) -> Option<MaterializedContextProjection<'a>> {
         let ContextProjection::Composite {
+            whole,
             layout,
             entry,
             members,
@@ -596,18 +695,33 @@ impl MaterializedContext {
             return None;
         };
         let layout = plan.layout.projected_entry(layout, *entry, members)?;
+        if *whole && members.as_ref() != layout.members.as_ref() {
+            return None;
+        }
         let declaration = plan.declaration(*entry)?;
         let materialized = self.entry(&layout.name)?;
         if !materialized.matches_declaration(declaration) {
             return None;
         }
-        members
-            .iter()
-            .all(|member| materialized.member(&member.name).is_some())
-            .then_some(MaterializedContextProjection {
-                entry: materialized,
-                members,
-            })
+        (*whole
+            && declaration
+                .definition
+                .0
+                .iter()
+                .any(|part| matches!(part, ContextEntryPart::Transferred { .. }))
+            || members
+                .iter()
+                .all(|member| materialized.member(&member.name).is_some()))
+        .then_some(MaterializedContextProjection {
+            entry: materialized,
+            members,
+            optional_members: *whole
+                && declaration
+                    .definition
+                    .0
+                    .iter()
+                    .any(|part| matches!(part, ContextEntryPart::Transferred { .. })),
+        })
     }
 }
 
@@ -616,6 +730,7 @@ impl MaterializedContext {
 pub struct MaterializedContextProjection<'a> {
     entry: &'a MaterializedContextEntry,
     members: &'a [super::ContextMember],
+    optional_members: bool,
 }
 
 impl<'a> MaterializedContextProjection<'a> {
@@ -628,11 +743,14 @@ impl<'a> MaterializedContextProjection<'a> {
     /// Visits selected members in projection order.
     pub fn visit_members(&self, mut visit: impl FnMut(&'a MaterializedContextMember)) {
         for selected in self.members {
-            visit(
-                self.entry
-                    .member(&selected.name)
-                    .expect("resolved projection member is materialized"),
-            );
+            if let Some(member) = self.entry.member(&selected.name) {
+                visit(member);
+            } else {
+                assert!(
+                    self.optional_members,
+                    "resolved projection member is materialized"
+                );
+            }
         }
     }
 }
@@ -672,6 +790,66 @@ mod tests {
 
     fn text(value: &str) -> MaterializedContextValues {
         MaterializedContextValues::text(value.as_bytes().to_vec())
+    }
+
+    /// Scenario: matching pipelines transfer a shared composite and a declared header.
+    /// Guarantees: compatible metadata shares backing storage; private headers and changed scopes do not pass.
+    #[test]
+    fn transfer_visibility_shares_only_compatible_storage() {
+        let declaration = declaration(vec![ContextEntryPart::Randomness {
+            name: name("id"),
+            value: ContextRandomnessKind::Uuid7,
+        }]);
+        let plan = ContextMaterializationPlan::compile(std::slice::from_ref(&declaration)).unwrap();
+        let mut context = MaterializedContext::default();
+        context.materialize(&plan, &TestSource::default());
+        let mut headers = TransportHeaders::new();
+        headers.push(TransportHeader::captured(
+            name("tenant"),
+            "X-Tenant",
+            true,
+            ValueKind::Text,
+            b"a".as_slice(),
+        ));
+        context.set_transport_headers(headers);
+        let mut visible = super::super::ContextVisibility {
+            headers: [name("tenant")].into_iter().collect(),
+            composites: [(name("request"), declaration.clone())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let projected = context.project_visible(&visible);
+        assert!(Arc::ptr_eq(
+            context.storage.as_ref().unwrap(),
+            projected.storage.as_ref().unwrap()
+        ));
+        let id = context
+            .entry(&name("request"))
+            .unwrap()
+            .member(&name("id"))
+            .unwrap()
+            .values()
+            .clone();
+        let mut projected = projected;
+        projected.materialize(&plan, &TestSource::default());
+        assert_eq!(
+            projected
+                .entry(&name("request"))
+                .unwrap()
+                .member(&name("id"))
+                .unwrap()
+                .values(),
+            &id
+        );
+
+        visible.headers.clear();
+        visible.composites.get_mut(&name("request")).unwrap().scope =
+            ContextScope::Pipeline("other".into(), "pipeline".into());
+        let projected = context.project_visible(&visible);
+        assert!(projected.transport_headers().is_none());
+        assert!(projected.entries().is_empty());
+        assert!(context.transport_headers().is_some());
     }
 
     /// Scenario: a selected composite contains only configured domainless values.
@@ -1138,6 +1316,7 @@ mod tests {
             panic!("member projection must be composite");
         };
         let projection = ContextProjection::Composite {
+            whole: false,
             layout,
             entry,
             members: Box::new([crate::pdata_context::ContextMember {

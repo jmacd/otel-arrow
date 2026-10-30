@@ -95,7 +95,8 @@ impl ContextEntryDefinition {
         for (index, part) in self.0.iter().enumerate() {
             let name = match part {
                 ContextEntryPart::TransportHeader { .. }
-                | ContextEntryPart::AuthorizedIdentity { .. } => part
+                | ContextEntryPart::AuthorizedIdentity { .. }
+                | ContextEntryPart::Transferred { .. } => part
                     .member_name()
                     .expect("value-bearing part has a member name"),
                 ContextEntryPart::Constant { name, .. }
@@ -146,6 +147,18 @@ pub enum ContextRandomnessKind {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContextEntryPart {
+    /// Compiler-generated source for an implicit transfer composite, not user configuration.
+    #[serde(skip)]
+    Transferred {
+        /// Flat transfer name.
+        name: ContextEntryName,
+        /// Authority retained by the transfer contract.
+        kind: crate::context::transfer::TransferKind,
+        /// Member name in the receiving composite.
+        store_as: ContextEntryName,
+        /// Bound import conditions, retained as part of the composite's provenance.
+        conditions: std::sync::Arc<BTreeMap<ContextEntryName, String>>,
+    },
     /// Includes a configured constant value.
     Constant {
         /// Member name within the composite entry.
@@ -211,7 +224,7 @@ impl ContextEntryPart {
             Self::AuthorizedIdentity { name, .. } => {
                 Some((ContextDomain::AuthorizedIdentity, name))
             }
-            Self::Constant { .. } | Self::Randomness { .. } => None,
+            Self::Constant { .. } | Self::Randomness { .. } | Self::Transferred { .. } => None,
         }
     }
 
@@ -224,6 +237,7 @@ impl ContextEntryPart {
                 Some(store_as.as_ref().unwrap_or(name))
             }
             Self::Constant { name, .. } | Self::Randomness { name, .. } => Some(name),
+            Self::Transferred { store_as, .. } => Some(store_as),
             Self::TransportHeaderMatch { .. } => None,
         }
     }

@@ -1092,6 +1092,7 @@ connections:
             }]),
         });
         let resolved = ResolvedOtelDataflowSpec {
+            topic_contexts: Default::default(),
             engine: Default::default(),
             pipelines: vec![ResolvedPipelineConfig {
                 pipeline_group_id: "default".into(),

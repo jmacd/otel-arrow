@@ -1140,7 +1140,8 @@ impl<
         );
         Ok(PipelineTopicBinding::from(handle)
             .with_default_queue_on_full(spec.policies.balanced.on_full.clone())
-            .with_default_ack_propagation_mode(spec.policies.ack_propagation.mode))
+            .with_default_ack_propagation_mode(spec.policies.ack_propagation.mode)
+            .with_context_transfer(spec.context.clone()))
     }
 
     fn parse_topic_name(raw: &str) -> Result<TopicName, Error> {

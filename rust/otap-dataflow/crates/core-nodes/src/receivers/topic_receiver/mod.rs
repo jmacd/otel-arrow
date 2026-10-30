@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use linkme::distributed_slice;
 use otel_arrow_dfe_channel::error::SendError;
 use otel_arrow_dfe_config::TopicName;
+use otel_arrow_dfe_config::context::transfer::ContextImportConfig;
 use otel_arrow_dfe_config::error::Error as ConfigError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::topic::{
@@ -25,6 +26,9 @@ use otel_arrow_dfe_engine::control::{CallData, Context8u8, NodeControlMsg};
 use otel_arrow_dfe_engine::error::Error;
 use otel_arrow_dfe_engine::local::receiver as local;
 use otel_arrow_dfe_engine::node::NodeId;
+use otel_arrow_dfe_engine::pdata_context::{
+    ContextDeclaration, ContextDeclarationProvider, ContextImportBinding,
+};
 use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_engine::topic::{
@@ -60,6 +64,9 @@ pub struct TopicReceiverConfig {
     /// Subscription options for this receiver.
     #[serde(default)]
     pub subscription: TopicSubscriptionConfig,
+    /// Context import mapping; omission intersects incoming and destination declarations.
+    #[serde(default)]
+    pub context: ContextImportConfig,
 }
 
 /// Subscription mode for a topic receiver.
@@ -88,6 +95,7 @@ pub struct TopicReceiver {
     ack_propagation_mode: TopicAckPropagationMode,
     broadcast_on_lag: Option<TopicBroadcastOnLagPolicy>,
     metrics: TopicReceiverMetrics,
+    context: ContextImportBinding,
 }
 
 /// Message received from the topic runtime but not yet admitted to the
@@ -135,8 +143,20 @@ pub static TOPIC_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
                     group: group.clone(),
                 },
             };
+            let context = pipeline.compiled_context_bindings().bind_context_import(
+                &pipeline.pipeline_key(),
+                &pipeline.node_id(),
+                &config.context,
+                topic_binding.context_transfer(),
+            )?;
+            let filter = context.conditions().map(|conditions| {
+                otel_arrow_dfe_engine::topic::SubscriptionFilter::new(
+                    conditions.identity(),
+                    move |data: &OtapPdata| data.context().matches_transfer(&conditions),
+                )
+            });
             let subscription = topic_binding
-                .subscribe(mode, SubscriberOptions::default())
+                .subscribe(mode, SubscriberOptions { filter })
                 .map_err(|e| ConfigError::InvalidUserConfig {
                     error: format!(
                         "Failed to subscribe topic receiver to `{}`: {e}",
@@ -156,13 +176,24 @@ pub static TOPIC_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
                     ack_propagation_mode,
                     broadcast_on_lag,
                     metrics,
+                    context,
                 },
                 node,
                 node_config,
                 receiver_config,
             ))
         },
-    context_declarations: None,
+    context_declarations: Some(ContextDeclarationProvider {
+        declarations: |config| {
+            let config = TopicReceiver::parse_config(config)?;
+            Ok([ContextDeclaration::TransferImport {
+                config: config.context,
+                topic: Some(config.topic),
+            }]
+            .into_iter()
+            .collect())
+        },
+    }),
     wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: |config| TopicReceiver::parse_config(config).map(|_| ()),
 };
@@ -193,6 +224,7 @@ impl local::Receiver<OtapPdata> for TopicReceiver {
             ack_propagation_mode,
             broadcast_on_lag,
             mut metrics,
+            context,
         } = *self;
         let subscription_mode = match &config.subscription {
             TopicSubscriptionConfig::Broadcast {} => "broadcast".to_owned(),
@@ -572,12 +604,13 @@ impl local::Receiver<OtapPdata> for TopicReceiver {
                     recv = subscription.recv_delivery(), if draining_deadline.is_none() => {
                         match recv {
                             Ok(RecvDelivery::Message(delivery)) => {
-                                let completed = metrics.boundary.processing().run(|_| {
+                                let completed = metrics.boundary.processing().run(|processing| {
                                     let signal = delivery.envelope().payload.signal_type();
                                     // Topic hop is a transport boundary: reset in-process
                                     // Ack/Nack routing context before forwarding.
-                                    let mut pdata =
-                                        delivery.envelope().payload.clone_without_context();
+                                    let imported = delivery.envelope().payload.context().import_transfer(&context)
+                                        .map_err(|reason| processing.refused(signal, reason))?;
+                                    let mut pdata = OtapPdata::new(imported, delivery.envelope().payload.payload_ref().clone());
                                     let tracked_message_id =
                                         (ack_propagation_mode == TopicAckPropagationMode::Auto
                                             && delivery.tracked())
@@ -591,15 +624,23 @@ impl local::Receiver<OtapPdata> for TopicReceiver {
                                             &mut pdata,
                                         );
                                     }
-                                    Ok::<_, otel_arrow_dfe_otap::metrics::ErrorWithOutcome<std::convert::Infallible>>((
+                                    Ok::<_, otel_arrow_dfe_otap::metrics::ErrorWithOutcome<String>>((
                                         signal,
-                                        (delivery, pdata, tracked_message_id),
+                                        (pdata, tracked_message_id),
                                     ))
                                 });
-                                let (delivery, pdata, tracked_message_id) = metrics
-                                    .boundary
-                                    .record(completed)
-                                    .expect("topic message processing is infallible");
+                                let (pdata, tracked_message_id) = match metrics.boundary.record(completed) {
+                                    Ok(result) => result,
+                                    Err(reason) => {
+                                        otel_warn!("topic_receiver.context_transfer_failed",
+                                            error = reason.clone(), message = "Topic context import rejected a message");
+                                        if delivery.tracked() {
+                                            subscription.nack(delivery.message_id(), reason.as_str())?;
+                                        }
+                                        delivery.commit();
+                                        continue;
+                                    }
+                                };
                                 // Use source-tag-aware send so fan-in wiring can attribute source node.
                                 match effect_handler.try_send_message_with_source_node(pdata) {
                                     Ok(()) => {

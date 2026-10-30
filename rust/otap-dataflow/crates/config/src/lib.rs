@@ -52,7 +52,7 @@ pub use topic::{
 /// Validation helpers for node configuration.
 pub mod validation;
 
-pub use context::{ContextEntryName, ContextEntryRef};
+pub use context::{ContextEntryName, ContextEntryRef, ContextSelector, ContextSelectorType};
 pub use conversion::ConversionOptions;
 
 /// Signal types

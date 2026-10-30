@@ -21,6 +21,8 @@ mod metadata;
 mod propagation;
 /// Node-facing reads over existing header storage and composite projections.
 mod reads;
+/// Compiles transfer contracts and their bounded storage representation.
+mod transfer;
 
 use PreparedHeaderPropagationPolicy as HeaderPropagationPolicy;
 pub use bindings::{
@@ -37,6 +39,7 @@ pub use propagation::CompiledHeaderPropagationPolicy;
 #[doc(hidden)]
 pub use propagation::PreparedHeaderPropagationPolicy;
 pub use reads::{HeaderValue, HeadersRead, Read, ReadMember, ReadValue, ValueRead};
+pub use transfer::*;
 
 use crate::PipelineFactory;
 use crate::error::Error as EngineError;
@@ -92,6 +95,10 @@ pub enum ContextNameMatching {
 /// One selected value source after resolving a primitive or composite target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectedSource<'a> {
+    Transferred(
+        otel_arrow_dfe_config::context::transfer::TransferKind,
+        &'a ContextEntryName,
+    ),
     /// Value supplied by a domain-backed primitive field.
     Field(ContextDomain, &'a ContextEntryName),
     /// Inline configured value with no source domain or wire name.
@@ -104,6 +111,9 @@ impl<'a> SelectedSource<'a> {
     /// Resolves one value-bearing composite part, excluding conditions.
     fn from_part(part: &'a ContextEntryPart) -> Option<Self> {
         match part {
+            ContextEntryPart::Transferred { kind, name, .. } => {
+                Some(Self::Transferred(*kind, name))
+            }
             ContextEntryPart::Constant { name, .. } => Some(Self::Constant(name)),
             ContextEntryPart::Randomness { name, .. } => Some(Self::Randomness(name)),
             ContextEntryPart::TransportHeader { name, .. } => {
@@ -250,6 +260,18 @@ pub enum ContextConsumerSelector {
 /// A node's declared context behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ContextDeclaration {
+    /// Declares export-side transfer sources and the default visibility boundary.
+    TransferExport {
+        /// Node-owned export mapping.
+        config: otel_arrow_dfe_config::context::transfer::ContextExportConfig,
+    },
+    /// Declares import-side transfer destinations.
+    TransferImport {
+        /// Node-owned import mapping.
+        config: otel_arrow_dfe_config::context::transfer::ContextImportConfig,
+        /// Topic contract supplying the implicit composite, if this is a topic boundary.
+        topic: Option<otel_arrow_dfe_config::TopicName>,
+    },
     /// Declares a primitive produced by the node without granting write authority.
     Produces {
         /// Source authority domain.
@@ -282,7 +304,13 @@ pub enum ContextDeclaration {
 impl ContextDeclaration {
     /// Returns whether the declaration describes component reads or writes.
     fn is_component_declaration(&self) -> bool {
-        matches!(self, Self::Produces { .. } | Self::Consumes { .. })
+        matches!(
+            self,
+            Self::Produces { .. }
+                | Self::Consumes { .. }
+                | Self::TransferExport { .. }
+                | Self::TransferImport { .. }
+        )
     }
 
     /// Validates selected sources and computes their original-header-name retention needs.
@@ -292,6 +320,11 @@ impl ContextDeclaration {
     ) -> Result<ContextRuntimeRequirements, Error> {
         let mut requirements = ContextRuntimeRequirements::none();
         match self {
+            Self::TransferExport { .. } | Self::TransferImport { .. } => {
+                requirements
+                    .original_name_retention
+                    .default_preserve_original = true;
+            }
             Self::Consumes {
                 selector: ContextConsumerSelector::Entries { entries },
             } => {
@@ -301,6 +334,11 @@ impl ContextDeclaration {
                             return Ok(());
                         }
                         match source {
+                            SelectedSource::Transferred(kind, _) => {
+                                if kind != otel_arrow_dfe_config::context::transfer::TransferKind::TransportHeader {
+                                    return Err(invalid_context("only transferred transport headers have original wire names"));
+                                }
+                            }
                             SelectedSource::Field(ContextDomain::TransportHeader, name) => {
                                 _ = requirements
                                     .original_name_retention
@@ -472,6 +510,7 @@ pub struct CompiledContextBindings {
     by_pipeline: HashMap<PipelineKey, HashMap<ConfigNodeId, CompiledNodeState>>,
     /// Selected composite materialization plans indexed by pipeline.
     materialization_by_pipeline: HashMap<PipelineKey, ContextMaterializationPlan>,
+    visibility_by_pipeline: HashMap<PipelineKey, Arc<ContextVisibility>>,
 }
 
 /// Stores one node's component declarations, selected composites, and engine context policies.
@@ -513,6 +552,24 @@ impl PreparedNodeContextDeclarations {
             .flat_map(|declaration| {
                 let mut names = Vec::new();
                 match declaration {
+                    ContextDeclaration::TransferExport { config } => {
+                        if let Some(mapping) = &config.export {
+                            for field in mapping.values() {
+                                field
+                                    .selector
+                                    .named
+                                    .iter()
+                                    .flatten()
+                                    .filter_map(|r| r.scope())
+                                    .for_each(|name| names.push(name.clone()));
+                            }
+                        } else {
+                            names.extend(context.iter().map(|c| c.name.clone()));
+                        }
+                    }
+                    ContextDeclaration::TransferImport { .. } => {
+                        names.extend(context.iter().map(|c| c.name.clone()));
+                    }
                     ContextDeclaration::Consumes {
                         selector: ContextConsumerSelector::Entries { entries },
                     } => names.extend(
@@ -719,7 +776,9 @@ impl CompiledNodeState {
                     }
                     component_declarations.push(ContextDeclaration::Consumes { selector });
                 }
-                declaration @ ContextDeclaration::Produces { .. } => {
+                declaration @ (ContextDeclaration::Produces { .. }
+                | ContextDeclaration::TransferExport { .. }
+                | ContextDeclaration::TransferImport { .. }) => {
                     component_declarations.push(declaration);
                 }
                 ContextDeclaration::HeaderCapture { policy } => {
@@ -783,6 +842,7 @@ impl CompiledContextBindings {
         Self {
             by_pipeline: HashMap::new(),
             materialization_by_pipeline: HashMap::new(),
+            visibility_by_pipeline: HashMap::new(),
         }
     }
 
@@ -792,9 +852,14 @@ impl CompiledContextBindings {
         requirements: &ContextRuntimeRequirements,
     ) -> Result<Self, Error> {
         let mut materialization_by_pipeline = HashMap::new();
+        let mut visibility_by_pipeline = HashMap::new();
         let by_pipeline = declarations
             .into_iter()
             .map(|(pipeline, prepared_nodes)| {
+                _ = visibility_by_pipeline.insert(
+                    pipeline.clone(),
+                    Arc::new(ContextVisibility::compile(&prepared_nodes)),
+                );
                 let selected_composites = prepared_nodes
                     .values()
                     .flat_map(|prepared| prepared.composites.iter())
@@ -827,6 +892,7 @@ impl CompiledContextBindings {
         Ok(Self {
             by_pipeline,
             materialization_by_pipeline,
+            visibility_by_pipeline,
         })
     }
 
@@ -884,6 +950,9 @@ impl CompiledContextBindings {
     /// Compares one pipeline's bindings while ignoring nodes without context declarations.
     #[must_use]
     pub fn pipeline_bindings_match(&self, other: &Self, pipeline: &PipelineKey) -> bool {
+        if self.visibility_by_pipeline.get(pipeline) != other.visibility_by_pipeline.get(pipeline) {
+            return false;
+        }
         let current = self.by_pipeline.get(pipeline);
         let candidate = other.by_pipeline.get(pipeline);
         let current_binding_count = current
@@ -979,26 +1048,78 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                 pipeline.pipeline_group_id.clone(),
                 pipeline.pipeline_id.clone(),
             );
-            let mut declarations_by_node = HashMap::new();
+            let mut context = pipeline.policies.context.clone();
+            let mut component_by_node = HashMap::new();
             for (node_id, node_config) in pipeline.pipeline.node_iter() {
-                let component_declarations = self.node_context_declarations(
+                let declarations = self.node_context_declarations(
                     node_config.kind(),
                     node_config.r#type.as_ref(),
                     &node_config.config,
                 )?;
+                for declaration in declarations.iter() {
+                    if let ContextDeclaration::TransferImport { config, topic } = declaration
+                        && let Some(name) = &config.store_composite
+                    {
+                        let topic = topic.as_ref().ok_or_else(|| {
+                            EngineError::ConfigError(Box::new(invalid_context(
+                                "store_composite requires a declared transfer contract",
+                            )))
+                        })?;
+                        let schema = resolved
+                            .topic_contexts
+                            .get(&(pipeline.topic_scope.clone(), topic.clone()))
+                            .or_else(|| {
+                                resolved.topic_contexts.get(&(
+                                    otel_arrow_dfe_config::topic::TopicScope::GLOBAL,
+                                    topic.clone(),
+                                ))
+                            })
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                EngineError::ConfigError(Box::new(invalid_context(
+                                    "store_composite requires a topic context.transfer declaration",
+                                )))
+                            })?;
+                        if context.iter().any(|entry| entry.name == *name) {
+                            return Err(EngineError::ConfigError(Box::new(invalid_context(
+                                format!(
+                                    "implicit transfer composite `{name}` conflicts with a visible composite"
+                                ),
+                            ))));
+                        }
+                        context.push(
+                            implicit_composite(
+                                config,
+                                schema,
+                                name.clone(),
+                                otel_arrow_dfe_config::context::policy::ContextScope::Pipeline(
+                                    pipeline.pipeline_group_id.clone(),
+                                    pipeline.pipeline_id.clone(),
+                                ),
+                            )
+                            .map_err(|error| EngineError::ConfigError(Box::new(error)))?,
+                        );
+                    }
+                }
+                _ = component_by_node.insert(node_id.clone(), declarations);
+            }
+            let mut declarations_by_node = HashMap::new();
+            for (node_id, node_config) in pipeline.pipeline.node_iter() {
+                let component_declarations = component_by_node
+                    .remove(node_id)
+                    .expect("collected node declarations");
                 let wrapper_declarations = Self::wrapper_context_declarations(
                     node_config,
                     &pipeline.policies.transport_headers,
                     &pipeline.policies.authorized_identity,
-                    &pipeline.policies.context,
+                    &context,
                 )?;
                 let declarations = component_declarations
                     .into_iter()
                     .chain(wrapper_declarations)
                     .collect();
-                let mut declarations =
-                    PreparedNodeContextDeclarations::new(declarations, &pipeline.policies.context)
-                        .map_err(|error| EngineError::ConfigError(Box::new(error)))?;
+                let mut declarations = PreparedNodeContextDeclarations::new(declarations, &context)
+                    .map_err(|error| EngineError::ConfigError(Box::new(error)))?;
                 declarations.receiver = node_config.kind() == NodeKind::Receiver;
                 let _ = declarations_by_node.insert(node_id.clone(), declarations);
             }

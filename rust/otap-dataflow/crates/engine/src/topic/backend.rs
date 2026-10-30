@@ -106,12 +106,12 @@ pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
     fn subscribe_balanced(
         &self,
         group: SubscriptionGroupName,
-        opts: SubscriberOptions,
+        opts: SubscriberOptions<T>,
     ) -> Result<Box<dyn SubscriptionBackend<T>>, Error>;
     /// Create a broadcast subscription backend.
     fn subscribe_broadcast(
         &self,
-        opts: SubscriberOptions,
+        opts: SubscriberOptions<T>,
     ) -> Result<Box<dyn SubscriptionBackend<T>>, Error>;
     /// Effective broadcast lag policy for this topic.
     fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy;

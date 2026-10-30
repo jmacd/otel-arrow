@@ -117,6 +117,7 @@ pub fn install_test_context_bindings<PData: 'static + Clone + std::fmt::Debug>(
     pipeline: PipelineConfig,
 ) -> Result<(), crate::error::Error> {
     let resolved = ResolvedOtelDataflowSpec {
+        topic_contexts: Default::default(),
         engine: Default::default(),
         pipelines: vec![ResolvedPipelineConfig {
             pipeline_group_id: pipeline_ctx.pipeline_group_id(),

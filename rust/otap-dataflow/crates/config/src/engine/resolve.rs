@@ -23,6 +23,11 @@ pub const SYSTEM_OBSERVABILITY_PIPELINE_ID: &str = "observability";
 /// using hierarchy precedence rules.
 #[derive(Debug, Clone)]
 pub struct ResolvedOtelDataflowSpec {
+    /// Topic context contracts retained for startup declaration compilation.
+    pub topic_contexts: std::collections::HashMap<
+        (TopicScope, TopicName),
+        Option<crate::context::transfer::ContextTransferSchema>,
+    >,
     /// Engine-wide runtime declarations.
     pub engine: EngineConfig,
     /// Resolved pipeline configurations.
@@ -284,6 +289,19 @@ impl OtelDataflowSpec {
         });
 
         ResolvedOtelDataflowSpec {
+            topic_contexts: self
+                .topics
+                .iter()
+                .map(|(name, spec)| ((TopicScope::GLOBAL, name.clone()), spec.context.clone()))
+                .chain(self.groups.iter().flat_map(|(group, config)| {
+                    config.topics.iter().map(move |(name, spec)| {
+                        (
+                            (TopicScope::startup_group(group.clone()), name.clone()),
+                            spec.context.clone(),
+                        )
+                    })
+                }))
+                .collect(),
             engine: self.engine.clone(),
             pipelines,
         }

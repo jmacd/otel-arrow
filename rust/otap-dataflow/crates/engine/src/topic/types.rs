@@ -822,8 +822,57 @@ pub enum SubscriptionMode {
 }
 
 /// Options provided at subscription time.
-#[derive(Debug, Clone, Default)]
-pub struct SubscriberOptions {}
+pub struct SubscriberOptions<T> {
+    /// Compiled payload predicate. Balanced group members must use the same identity.
+    pub filter: Option<SubscriptionFilter<T>>,
+}
+
+impl<T> Default for SubscriberOptions<T> {
+    fn default() -> Self {
+        Self { filter: None }
+    }
+}
+
+/// Immutable routing predicate shared by topic publishers across pipeline cores.
+///
+/// Send + Sync is required here because the topic runtime is cross-pipeline;
+/// the predicate contains only startup-bound slots and immutable match values.
+pub struct SubscriptionFilter<T> {
+    identity: Arc<[u8]>,
+    matches: Arc<dyn Fn(&T) -> bool + Send + Sync>,
+}
+
+impl<T> Clone for SubscriptionFilter<T> {
+    fn clone(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            matches: self.matches.clone(),
+        }
+    }
+}
+
+impl<T> SubscriptionFilter<T> {
+    /// Associates canonical configuration bytes with a startup-compiled predicate.
+    #[must_use]
+    pub fn new(identity: Vec<u8>, matches: impl Fn(&T) -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            identity: identity.into(),
+            matches: Arc::new(matches),
+        }
+    }
+
+    pub(crate) fn accepts(&self, value: &T) -> bool {
+        (self.matches)(value)
+    }
+
+    pub(crate) fn same(left: Option<&Self>, right: Option<&Self>) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => left.identity == right.identity,
+            _ => false,
+        }
+    }
+}
 
 /// Options for creating/opening a topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

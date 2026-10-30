@@ -11,7 +11,9 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 /// Name of a topic declaration/reference.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[serde(try_from = "String", into = "String")]
 #[schemars(with = "String")]
 pub struct TopicName(String);
@@ -172,6 +174,9 @@ impl From<&'static str> for SubscriptionGroupName {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TopicSpec {
+    /// Optional flat context contract. Omission uses declaration-aware context intersection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::context::transfer::ContextTransferSchema>,
     /// Optional human-readable description of the topic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<Description>,
@@ -194,8 +199,15 @@ impl TopicSpec {
     /// Returns validation errors for this topic specification.
     #[must_use]
     pub fn validation_errors(&self, path_prefix: &str) -> Vec<String> {
-        self.policies
-            .validation_errors(&format!("{path_prefix}.policies"))
+        let mut errors = self
+            .policies
+            .validation_errors(&format!("{path_prefix}.policies"));
+        if let Some(context) = &self.context
+            && let Err(error) = context.validate()
+        {
+            errors.push(format!("{path_prefix}.context: {error}"));
+        }
+        errors
     }
 }
 

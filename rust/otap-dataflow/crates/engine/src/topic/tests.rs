@@ -47,6 +47,195 @@ use tokio::task::JoinSet;
 // Balanced mode - single group
 // =========================================================================
 
+fn tenant_options(tenant: u8) -> SubscriberOptions<u8> {
+    SubscriberOptions {
+        filter: Some(crate::topic::SubscriptionFilter::new(
+            vec![tenant],
+            move |value: &u8| *value == tenant,
+        )),
+    }
+}
+
+/// Scenario: a closed broadcast ring retains many nonmatching messages followed by one match.
+/// Guarantees: bounded polling yields without losing the final matching delivery at shutdown.
+#[tokio::test]
+async fn context_routing_broadcast_drains_matches_after_skipped_prefix() {
+    let broker = TopicBroker::<u8>::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "prefix",
+            TopicOptions::BroadcastOnly {
+                capacity: 128,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+                ack_mode: TopicBroadcastAckMode::First,
+            },
+        )
+        .unwrap();
+    let mut subscriber = topic
+        .subscribe(SubscriptionMode::Broadcast, tenant_options(1))
+        .unwrap();
+    for _ in 0..80 {
+        topic.publish(Arc::new(2)).await.unwrap();
+    }
+    topic.publish(Arc::new(1)).await.unwrap();
+    topic.close();
+    let RecvItem::Message(envelope) = subscriber.recv().await.unwrap() else {
+        panic!("matching delivery");
+    };
+    assert_eq!(*envelope.payload, 1);
+    assert!(matches!(
+        subscriber.recv().await,
+        Err(Error::SubscriptionClosed)
+    ));
+}
+
+/// Scenario: three tenant groups share a capacity-one topic and all three queues fill.
+/// Guarantees: only matching groups consume capacity; unmatched messages retain no-subscriber behavior,
+/// and a group cannot mix predicates that would allow a wrong consumer to take a message.
+#[tokio::test]
+async fn context_routing_balanced_tenant_queues_are_isolated() {
+    let broker = TopicBroker::<u8>::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "tenants",
+            TopicOptions::Mixed {
+                balanced_capacity: 1,
+                broadcast_capacity: 8,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+                ack_mode: TopicBroadcastAckMode::First,
+            },
+        )
+        .unwrap();
+    let mut subscribers = Vec::new();
+    for tenant in 1..=3 {
+        let group = SubscriptionGroupName::parse(&format!("tenant-{tenant}")).unwrap();
+        subscribers.push(
+            topic
+                .subscribe(SubscriptionMode::Balanced { group }, tenant_options(tenant))
+                .unwrap(),
+        );
+    }
+    assert!(
+        topic
+            .subscribe(
+                SubscriptionMode::Balanced {
+                    group: "tenant-1".into()
+                },
+                tenant_options(2)
+            )
+            .is_err()
+    );
+    assert!(
+        topic
+            .subscribe(
+                SubscriptionMode::Balanced {
+                    group: "tenant-1".into()
+                },
+                SubscriberOptions::default()
+            )
+            .is_err()
+    );
+    for tenant in 1..=3 {
+        assert_eq!(
+            topic.try_publish(Arc::new(tenant)).unwrap(),
+            PublishOutcome::Published
+        );
+    }
+    assert_eq!(
+        topic.try_publish(Arc::new(4)).unwrap(),
+        PublishOutcome::Published
+    );
+    assert_eq!(
+        topic.try_publish(Arc::new(2)).unwrap(),
+        PublishOutcome::DroppedOnFull
+    );
+    topic.close();
+    for (index, subscriber) in subscribers.iter_mut().enumerate() {
+        let RecvItem::Message(envelope) = subscriber.recv().await.unwrap() else {
+            panic!("balanced delivery");
+        };
+        assert_eq!(*envelope.payload, index as u8 + 1);
+        assert!(matches!(
+            subscriber.recv().await,
+            Err(Error::SubscriptionClosed)
+        ));
+    }
+
+    let single = broker
+        .create_in_memory_topic("single", TopicOptions::BalancedOnly { capacity: 1 })
+        .unwrap();
+    let mut subscriber = single
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: "tenant".into(),
+            },
+            tenant_options(1),
+        )
+        .unwrap();
+    single.publish(Arc::new(2)).await.unwrap();
+    assert_eq!(
+        single.try_publish(Arc::new(1)).unwrap(),
+        PublishOutcome::Published
+    );
+    single.close();
+    let RecvItem::Message(envelope) = subscriber.recv().await.unwrap() else {
+        panic!("balanced delivery");
+    };
+    assert_eq!(*envelope.payload, 1);
+    assert!(matches!(
+        subscriber.recv().await,
+        Err(Error::SubscriptionClosed)
+    ));
+}
+
+/// Scenario: two matching and one nonmatching broadcast subscribers use all-ack consensus.
+/// Guarantees: consensus waits for both matching subscribers, never the other tenant,
+/// and skipped messages do not create a delivery or acquire acknowledgement ownership.
+#[tokio::test]
+async fn context_routing_broadcast_consensus_counts_only_matching_subscribers() {
+    let broker = TopicBroker::<u8>::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "tenants",
+            TopicOptions::BroadcastOnly {
+                capacity: 8,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+                ack_mode: TopicBroadcastAckMode::All,
+            },
+        )
+        .unwrap();
+    let mut a = topic
+        .subscribe(SubscriptionMode::Broadcast, tenant_options(1))
+        .unwrap();
+    let mut b = topic
+        .subscribe(SubscriptionMode::Broadcast, tenant_options(1))
+        .unwrap();
+    let mut other = topic
+        .subscribe(SubscriptionMode::Broadcast, tenant_options(2))
+        .unwrap();
+    let receipt = topic
+        .tracked_publisher()
+        .publish(Arc::new(1))
+        .await
+        .unwrap();
+    let RecvItem::Message(first) = a.recv().await.unwrap() else {
+        panic!("broadcast delivery");
+    };
+    a.ack(first.id).unwrap();
+    let mut outcome = Box::pin(receipt.wait_for_outcome());
+    assert!(matches!(
+        std::future::poll_fn(|cx| Poll::Ready(outcome.as_mut().poll(cx))).await,
+        Poll::Pending
+    ));
+    let RecvItem::Message(second) = b.recv().await.unwrap() else {
+        panic!("broadcast delivery");
+    };
+    b.ack(second.id).unwrap();
+    assert_eq!(outcome.await, TrackedPublishOutcome::Ack);
+    topic.close();
+    assert!(matches!(other.recv().await, Err(Error::SubscriptionClosed)));
+}
+
 // Two subscribers in the same consumer group receive all 100 messages between
 // them with no duplicates and no losses.
 #[tokio::test]

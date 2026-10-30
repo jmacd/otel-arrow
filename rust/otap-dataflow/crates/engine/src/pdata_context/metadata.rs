@@ -8,6 +8,8 @@
 //! Delivery state (Ack/Nack frames, flow metrics, signal) belongs to the pdata
 //! type that carries this metadata.
 
+mod transfer;
+
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,8 +40,8 @@ use otel_arrow_dfe_config::context::transport_headers::{TransportHeaders, Transp
 ///   real socket (OTLP gRPC/HTTP, OTAP gRPC, syslog/CEF) and left `None` by
 ///   sourceless receivers (file-based, journald).
 ///
-/// All of it is preserved across transport boundaries and copied to split
-/// outputs.
+/// Transfer bindings select what crosses transport boundaries. Split outputs
+/// preserve all metadata.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Metadata {
     /// Verified authorization claims selected by policy.
