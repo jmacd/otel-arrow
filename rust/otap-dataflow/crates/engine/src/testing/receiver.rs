@@ -231,7 +231,11 @@ impl<PData: Clone + Debug + 'static> TestRuntime<PData> {
     }
 
     /// Sets the receiver for the test runtime and returns a test phase.
+    ///
+    /// Receivers without compiled bindings get an arrival binding equivalent to
+    /// a pipeline without context policies, so `form_context` succeeds.
     pub fn set_receiver(self, receiver: ReceiverWrapper<PData>) -> TestPhase<PData> {
+        let receiver = receiver.with_default_arrival_binding();
         let control_sender = receiver.control_sender();
         TestPhase {
             rt: self.rt,
