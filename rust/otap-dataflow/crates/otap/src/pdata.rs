@@ -424,6 +424,17 @@ impl Context {
         self
     }
 
+    /// Takes the request-scoped message metadata, leaving it empty.
+    #[must_use]
+    pub fn take_metadata(&mut self) -> Metadata {
+        std::mem::take(&mut self.metadata)
+    }
+
+    /// Sets the request-scoped message metadata.
+    pub fn set_metadata(&mut self, metadata: Metadata) {
+        self.metadata = metadata;
+    }
+
     /// Returns a reference to the captured transport headers, if any.
     #[must_use]
     pub fn transport_headers(&self) -> Option<&TransportHeadersData> {
