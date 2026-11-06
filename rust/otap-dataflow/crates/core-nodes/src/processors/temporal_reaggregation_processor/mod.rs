@@ -725,8 +725,8 @@ impl TemporalReaggregationProcessor {
                     }
 
                     // The partial-passthrough output represents exactly one
-                    // input, so forward its peer_addr unconditionally.
-                    let passthrough_peer = inbound_ctx.peer_addr();
+                    // input, so it carries that input's whole metadata.
+                    let passthrough_metadata = inbound_ctx.metadata().clone();
 
                     // One ref for the passthrough, we will bump the ack count again
                     // when we actually flush the batch.
@@ -754,11 +754,8 @@ impl TemporalReaggregationProcessor {
 
                     // Subscribe to the outbound
                     let outbound_calldata: CallData = outbound_key.into();
-                    let context = Context::with_capacity(1);
+                    let context = Context::with_capacity(1).with_metadata(passthrough_metadata);
                     let mut pt_pdata = OtapPdata::new(context, OtapPayload::from(records));
-                    if let Some(addr) = passthrough_peer {
-                        pt_pdata.set_peer_addr(addr);
-                    }
 
                     effect_handler.subscribe_to(
                         Interests::ACKS | Interests::NACKS,
@@ -1595,6 +1592,12 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::net::SocketAddr;
+
+    use otel_arrow_dfe_config::context::ContextEntryName;
+    use otel_arrow_dfe_config::context::transport_headers::{
+        TransportHeader, TransportHeaders, ValueKind,
+    };
+    use otel_arrow_dfe_engine::pdata_context::Metadata;
 
     use otel_arrow_dfe_engine::testing::processor::TestContext;
     use otel_arrow_dfe_pdata::otap::OtapBatchStore;
@@ -4115,17 +4118,30 @@ mod tests {
         run_test(config, actions);
     }
 
-    /// Partial-passthrough subscriber path: forwards the single input's
-    /// peer address directly to the passthrough output.
+    /// Scenario: a subscribed input carrying transport headers and a peer
+    /// address is partially aggregated, so the processor emits a
+    /// partial passthrough for the non-aggregated portion.
+    /// Guarantees: the passthrough output carries the input's whole metadata,
+    /// not only its peer address.
     #[test]
-    fn test_passthrough_subscriber_forwards_peer_addr() {
+    fn test_passthrough_subscriber_forwards_whole_metadata() {
         let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let mut metadata = Metadata::default();
+        let mut headers = TransportHeaders::new();
+        headers.push(TransportHeader::new(
+            ContextEntryName::try_from("tenant").expect("valid entry name"),
+            ValueKind::Text,
+            *b"acme",
+        ));
+        metadata.set_transport_headers(headers);
+        metadata.set_peer_addr(peer);
+        let expected = metadata.clone();
         let config = json!({});
         let actions = vec![
-            Action::SendPdataWithPeer {
+            Action::SendPdataWithMetadata {
                 interests: Interests::ACKS | Interests::NACKS,
                 payload: make_mixed_metrics_payload(),
-                peer_addr: peer,
+                metadata,
             },
             // First drained output is the partial passthrough.
             Action::DrainPdata {
@@ -4133,9 +4149,9 @@ mod tests {
                     PdataAction::AssertSubscribers(true),
                     PdataAction::AssertCustom(Box::new(move |out| {
                         assert_eq!(
-                            out.peer_addr(),
-                            Some(peer),
-                            "single-input passthrough must forward peer_addr"
+                            out.metadata(),
+                            &expected,
+                            "single-input passthrough must forward the input metadata"
                         );
                     })),
                     PdataAction::Ack,

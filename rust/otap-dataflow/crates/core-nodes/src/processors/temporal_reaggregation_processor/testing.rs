@@ -17,6 +17,7 @@ use otel_arrow_dfe_engine::control::{
     pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
 };
 use otel_arrow_dfe_engine::message::Message;
+use otel_arrow_dfe_engine::pdata_context::Metadata;
 pub(super) use otel_arrow_dfe_engine::processor::ProcessorWrapper;
 use otel_arrow_dfe_engine::testing::node::test_node;
 pub(super) use otel_arrow_dfe_engine::testing::processor::TestRuntime;
@@ -58,6 +59,14 @@ pub(super) enum Action {
         interests: Interests,
         payload: OtapPayload,
         peer_addr: SocketAddr,
+    },
+
+    /// Send pdata with optional ack/nack subscriber interest and the given
+    /// message metadata.
+    SendPdataWithMetadata {
+        interests: Interests,
+        payload: OtapPayload,
+        metadata: Metadata,
     },
 
     /// Send a message to the processor
@@ -143,6 +152,24 @@ pub(super) fn run_test(config: serde_json::Value, actions: Vec<Action>) {
                         peer_addr,
                     } => {
                         let mut pdata = OtapPdata::new_default(payload).with_peer_addr(peer_addr);
+                        if !interests.is_empty() {
+                            pdata = pdata.test_subscribe_to(
+                                interests,
+                                TestCallData::new_with(input_idx, 0).into(),
+                                1,
+                            );
+                        }
+                        ctx.process(Message::PData(pdata))
+                            .await
+                            .expect("process pdata");
+                        input_idx += 1;
+                    }
+                    Action::SendPdataWithMetadata {
+                        interests,
+                        payload,
+                        metadata,
+                    } => {
+                        let mut pdata = OtapPdata::new_default(payload).with_metadata(metadata);
                         if !interests.is_empty() {
                             pdata = pdata.test_subscribe_to(
                                 interests,
