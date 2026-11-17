@@ -309,6 +309,9 @@ impl NodeBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::receiver::{ReceiverContextMaterialization, resolve_context_materialization_plan};
+    use crate::runtime_services::PipelineRuntimeServices;
+    use crate::testing::test_node;
     use otel_arrow_dfe_config::context::ContextEntryName;
     use otel_arrow_dfe_config::context::policy::{
         ContextEntryDeclaration, ContextEntryDefinition, ContextEntryPart, ContextRandomnessKind,
@@ -317,6 +320,8 @@ mod tests {
     use otel_arrow_dfe_config::context::transport_policy::{
         HeaderCapturePolicy, HeaderPropagationPolicy,
     };
+    use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
+    use std::sync::Arc;
 
     fn name(value: &str) -> ContextEntryName {
         value.try_into().expect("valid context name")
@@ -684,11 +689,6 @@ mod tests {
     /// the sink's policy, clones share bindings, and setters remain isolated.
     #[test]
     fn exporter_handlers_share_sink_bindings() {
-        use crate::runtime_services::PipelineRuntimeServices;
-        use crate::testing::test_node;
-        use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
-        use std::sync::Arc;
-
         let services = PipelineRuntimeServices::new(Default::default()).expect("runtime services");
         let (_metrics_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
         let policy = CompiledHeaderPropagationPolicy::compile_standalone(
@@ -750,11 +750,6 @@ mod tests {
     /// setters do not mutate clones. Missing bindings fail explicitly rather than forming incomplete metadata.
     #[test]
     fn receiver_handlers_preserve_undeclared_and_compiled_formation() {
-        use crate::runtime_services::PipelineRuntimeServices;
-        use crate::testing::test_node;
-        use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
-        use std::sync::Arc;
-
         let services = PipelineRuntimeServices::new(Default::default()).expect("runtime services");
         let (_metrics_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
         let (control, _control_rx) = crate::control::runtime_ctrl_msg_channel(1);
@@ -867,11 +862,9 @@ mod tests {
     /// Guarantees: only a non-empty `Undeclared` plan keeps the materializer, and such a plan without
     /// one fails configuration; every other binding resolves to no send-time materialization.
     #[test]
-    fn send_materializer_resolves_against_arrival_mode() {
-        use crate::receiver::{SendMaterializer, resolve_send_materializer};
-
+    fn context_materialization_plan_resolves_against_arrival_mode() {
         fn noop(_: &mut (), _: &ContextMaterializationPlan) {}
-        let materializer: Option<SendMaterializer<()>> = Some(noop);
+        let materializer: Option<ReceiverContextMaterialization<()>> = Some(noop);
         let plan =
             ContextMaterializationPlan::compile(&[declaration(vec![ContextEntryPart::Constant {
                 name: name("route"),
@@ -891,22 +884,22 @@ mod tests {
         let empty = with_mode(ArrivalMode::Undeclared(ArrivalBinding::default()));
 
         assert!(
-            resolve_send_materializer(Some(&undeclared), materializer)
+            resolve_context_materialization_plan(Some(&undeclared), materializer)
                 .expect("undeclared plan resolves")
                 .is_some()
         );
         assert!(matches!(
-            resolve_send_materializer::<()>(Some(&undeclared), None),
+            resolve_context_materialization_plan::<()>(Some(&undeclared), None),
             Err(crate::error::Error::ConfigError(_))
         ));
         for bindings in [None, Some(&formed), Some(&empty)] {
             assert!(
-                resolve_send_materializer(bindings, materializer)
+                resolve_context_materialization_plan(bindings, materializer)
                     .expect("resolves")
                     .is_none()
             );
             assert!(
-                resolve_send_materializer::<()>(bindings, None)
+                resolve_context_materialization_plan::<()>(bindings, None)
                     .expect("resolves")
                     .is_none()
             );
@@ -918,10 +911,6 @@ mod tests {
     /// plan, so send-time materialization still applies it.
     #[test]
     fn undeclared_setters_retain_installed_materialization() {
-        use crate::runtime_services::PipelineRuntimeServices;
-        use crate::testing::test_node;
-        use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
-
         let services = PipelineRuntimeServices::new(Default::default()).expect("runtime services");
         let (_metrics_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
         let (control, _control_rx) = crate::control::runtime_ctrl_msg_channel(1);

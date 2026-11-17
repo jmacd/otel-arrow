@@ -44,9 +44,9 @@ use crate::output_router::OutputRouter;
 use crate::pdata_context::ContextMaterializationPlan;
 use crate::pdata_context::{Arrival, ContextError, Metadata, NodeBindings};
 use crate::readiness::ReadinessSignaller;
-use crate::receiver::SendMaterializer;
+use crate::receiver::ReceiverContextMaterialization;
 #[cfg(any(test, feature = "test-utils"))]
-use crate::receiver::requires_send_materializer;
+use crate::receiver::requires_context_materialization_plan;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::receiver::test_bindings;
 use crate::runtime_services::{CodecEffectHandler, PipelineRuntimeServices};
@@ -120,7 +120,7 @@ pub struct EffectHandler<PData> {
     /// context, or handler-local when created by the test-only policy setters.
     node_bindings: Option<Arc<NodeBindings>>,
     /// Applier for an undeclared receiver's send-time materialization.
-    send_materializer: Option<SendMaterializer<PData>>,
+    context_materialization_plan: Option<ReceiverContextMaterialization<PData>>,
     /// Optional signal used to gate pipeline startup on receiver initialization.
     readiness: Option<ReadinessSignaller>,
 }
@@ -144,7 +144,7 @@ impl<PData> EffectHandler<PData> {
             core,
             router,
             node_bindings: None,
-            send_materializer: None,
+            context_materialization_plan: None,
             readiness: None,
         }
     }
@@ -219,14 +219,14 @@ impl<PData> EffectHandler<PData> {
     }
 
     /// Installs compiled bindings together with the send-time materializer
-    /// resolved against them by `resolve_send_materializer`.
+    /// resolved against them by `resolve_context_materialization_plan`.
     pub(crate) fn set_node_bindings(
         &mut self,
         bindings: Arc<NodeBindings>,
-        send_materializer: Option<SendMaterializer<PData>>,
+        context_materialization_plan: Option<ReceiverContextMaterialization<PData>>,
     ) {
         self.node_bindings = Some(bindings);
-        self.send_materializer = send_materializer;
+        self.context_materialization_plan = context_materialization_plan;
     }
 
     /// Forms complete request metadata from an Arrival. Callers should reject
@@ -252,7 +252,7 @@ impl<PData> EffectHandler<PData> {
     /// an alternative binding.
     pub fn materialize_context(&self, data: &mut PData) {
         if let (Some(materialize), Some(plan)) = (
-            self.send_materializer,
+            self.context_materialization_plan,
             self.node_bindings
                 .as_deref()
                 .and_then(NodeBindings::send_materialization_plan),
@@ -266,11 +266,12 @@ impl<PData> EffectHandler<PData> {
     pub fn set_context_materializer(
         &mut self,
         plan: ContextMaterializationPlan,
-        materialize: SendMaterializer<PData>,
+        materialize: ReceiverContextMaterialization<PData>,
     ) {
         self.test_bindings().set_materialization_plan(plan);
-        self.send_materializer =
-            requires_send_materializer(self.node_bindings.as_deref()).then_some(materialize);
+        self.context_materialization_plan =
+            requires_context_materialization_plan(self.node_bindings.as_deref())
+                .then_some(materialize);
     }
 
     pub(crate) fn set_readiness_signaller(&mut self, readiness: Option<ReadinessSignaller>) {

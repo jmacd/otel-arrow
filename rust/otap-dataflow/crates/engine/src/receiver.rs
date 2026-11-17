@@ -45,10 +45,10 @@ use std::sync::Arc;
 /// `Undeclared` arrival binding.
 ///
 /// TODO(4541): removed once every receiver declares `Arrival`.
-pub(crate) type SendMaterializer<PData> = fn(&mut PData, &ContextMaterializationPlan);
+pub(crate) type ReceiverContextMaterialization<PData> = fn(&mut PData, &ContextMaterializationPlan);
 
 /// True when the receiver is `Undeclared` and its send-time plan has work.
-pub(crate) fn requires_send_materializer(bindings: Option<&NodeBindings>) -> bool {
+pub(crate) fn requires_context_materialization_plan(bindings: Option<&NodeBindings>) -> bool {
     bindings
         .and_then(NodeBindings::send_materialization_plan)
         .is_some_and(|plan| !plan.is_empty())
@@ -59,11 +59,11 @@ pub(crate) fn requires_send_materializer(bindings: Option<&NodeBindings>) -> boo
 ///
 /// Returns the materializer only for an `Undeclared` binding with a non-empty
 /// plan, and fails when such a binding has no materializer to apply it.
-pub(crate) fn resolve_send_materializer<PData>(
+pub(crate) fn resolve_context_materialization_plan<PData>(
     bindings: Option<&NodeBindings>,
-    materialize: Option<SendMaterializer<PData>>,
-) -> Result<Option<SendMaterializer<PData>>, Error> {
-    if !requires_send_materializer(bindings) {
+    materialize: Option<ReceiverContextMaterialization<PData>>,
+) -> Result<Option<ReceiverContextMaterialization<PData>>, Error> {
+    if !requires_context_materialization_plan(bindings) {
         return Ok(None);
     }
     materialize.map(Some).ok_or_else(|| {
@@ -123,7 +123,7 @@ pub enum ReceiverWrapper<PData> {
         /// Whether outgoing messages need source node tagging.
         source_tag: SourceTagging,
         /// Send-time materializer, resolved against `node_bindings`.
-        send_materializer: Option<SendMaterializer<PData>>,
+        context_materialization_plan: Option<ReceiverContextMaterialization<PData>>,
         /// Runtime bindings: compiler-owned when constructed by the pipeline factory,
         /// or wrapper-local when created by the test-only policy builders.
         node_bindings: Option<Arc<NodeBindings>>,
@@ -154,7 +154,7 @@ pub enum ReceiverWrapper<PData> {
         /// Whether outgoing messages need source node tagging.
         source_tag: SourceTagging,
         /// Send-time materializer, resolved against `node_bindings`.
-        send_materializer: Option<SendMaterializer<PData>>,
+        context_materialization_plan: Option<ReceiverContextMaterialization<PData>>,
         /// Runtime bindings: compiler-owned when constructed by the pipeline factory,
         /// or wrapper-local when created by the test-only policy builders.
         node_bindings: Option<Arc<NodeBindings>>,
@@ -201,7 +201,7 @@ impl<PData> ReceiverWrapper<PData> {
             pdata_receiver: None,
             telemetry: None,
             source_tag: SourceTagging::Disabled,
-            send_materializer: None,
+            context_materialization_plan: None,
             node_bindings: None,
             readiness: None,
         }
@@ -231,7 +231,7 @@ impl<PData> ReceiverWrapper<PData> {
             pdata_receiver: None,
             telemetry: None,
             source_tag: SourceTagging::Disabled,
-            send_materializer: None,
+            context_materialization_plan: None,
             node_bindings: None,
             readiness: None,
         }
@@ -280,7 +280,7 @@ impl<PData> ReceiverWrapper<PData> {
                 pdata_senders,
                 pdata_receiver,
                 source_tag,
-                send_materializer,
+                context_materialization_plan,
                 node_bindings,
                 readiness,
                 ..
@@ -295,7 +295,7 @@ impl<PData> ReceiverWrapper<PData> {
                 pdata_receiver,
                 telemetry: Some(guard),
                 source_tag,
-                send_materializer,
+                context_materialization_plan,
                 node_bindings,
                 readiness,
             },
@@ -309,7 +309,7 @@ impl<PData> ReceiverWrapper<PData> {
                 pdata_senders,
                 pdata_receiver,
                 source_tag,
-                send_materializer,
+                context_materialization_plan,
                 node_bindings,
                 readiness,
                 ..
@@ -324,7 +324,7 @@ impl<PData> ReceiverWrapper<PData> {
                 pdata_receiver,
                 telemetry: Some(guard),
                 source_tag,
-                send_materializer,
+                context_materialization_plan,
                 node_bindings,
                 readiness,
             },
@@ -356,7 +356,7 @@ impl<PData> ReceiverWrapper<PData> {
                 pdata_receiver,
                 telemetry,
                 source_tag,
-                send_materializer,
+                context_materialization_plan,
                 node_bindings,
                 readiness,
                 ..
@@ -383,7 +383,7 @@ impl<PData> ReceiverWrapper<PData> {
                     pdata_receiver,
                     telemetry,
                     source_tag,
-                    send_materializer,
+                    context_materialization_plan,
                     node_bindings,
                     readiness,
                 }
@@ -399,7 +399,7 @@ impl<PData> ReceiverWrapper<PData> {
                 pdata_receiver,
                 telemetry,
                 source_tag,
-                send_materializer,
+                context_materialization_plan,
                 node_bindings,
                 readiness,
                 ..
@@ -426,7 +426,7 @@ impl<PData> ReceiverWrapper<PData> {
                     pdata_receiver,
                     telemetry,
                     source_tag,
-                    send_materializer,
+                    context_materialization_plan,
                     node_bindings,
                     readiness,
                 }
@@ -473,7 +473,7 @@ impl<PData> ReceiverWrapper<PData> {
                     pdata_senders,
                     user_config,
                     source_tag,
-                    send_materializer,
+                    context_materialization_plan,
                     node_bindings,
                     readiness,
                     ..
@@ -503,7 +503,7 @@ impl<PData> ReceiverWrapper<PData> {
                 effect_handler.terminal_metrics_deadline = terminal_metrics_deadline;
                 effect_handler.set_source_tagging(source_tag);
                 if let Some(bindings) = node_bindings {
-                    effect_handler.set_node_bindings(bindings, send_materializer);
+                    effect_handler.set_node_bindings(bindings, context_materialization_plan);
                 }
                 effect_handler.set_readiness_signaller(readiness.map(|state| state.signaller));
                 effect_handler
@@ -520,7 +520,7 @@ impl<PData> ReceiverWrapper<PData> {
                     pdata_senders,
                     user_config,
                     source_tag,
-                    send_materializer,
+                    context_materialization_plan,
                     node_bindings,
                     readiness,
                     ..
@@ -549,7 +549,7 @@ impl<PData> ReceiverWrapper<PData> {
                 );
                 effect_handler.set_source_tagging(source_tag);
                 if let Some(bindings) = node_bindings {
-                    effect_handler.set_node_bindings(bindings, send_materializer);
+                    effect_handler.set_node_bindings(bindings, context_materialization_plan);
                 }
                 effect_handler.set_readiness_signaller(readiness.map(|state| state.signaller));
                 effect_handler
@@ -689,22 +689,22 @@ impl<PData> ReceiverWrapper<PData> {
     pub(crate) fn with_node_bindings(
         mut self,
         bindings: Option<Arc<NodeBindings>>,
-        materialize: Option<SendMaterializer<PData>>,
+        materialize: Option<ReceiverContextMaterialization<PData>>,
     ) -> Result<Self, Error> {
-        let resolved = resolve_send_materializer(bindings.as_deref(), materialize)?;
+        let resolved = resolve_context_materialization_plan(bindings.as_deref(), materialize)?;
         match &mut self {
             Self::Local {
                 node_bindings,
-                send_materializer,
+                context_materialization_plan,
                 ..
             }
             | Self::Shared {
                 node_bindings,
-                send_materializer,
+                context_materialization_plan,
                 ..
             } => {
                 *node_bindings = bindings;
-                *send_materializer = resolved;
+                *context_materialization_plan = resolved;
             }
         }
         Ok(self)
