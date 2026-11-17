@@ -428,7 +428,7 @@ mod tests {
     use super::*;
     use crate::capability::auth::{AuthorizedIdentity, ClaimValue};
     use crate::pdata_context::{
-        Arrival, ArrivalHeaders, CompiledContextBindings, ContextConsumerSelector,
+        Arrival, ArrivalHeaders, ArrivalSources, CompiledContextBindings, ContextConsumerSelector,
         ContextDeclaration, ContextEntrySelectorForm, ContextRuntimeRequirements, NodeBindings,
         NodeContextDeclarations, PreparedNodeContextDeclarations,
     };
@@ -574,6 +574,9 @@ mod tests {
         .collect::<Vec<_>>();
         let bindings = compile(
             [
+                ContextDeclaration::Arrival {
+                    sources: ArrivalSources::ALL,
+                },
                 consumes(selectors.clone()),
                 ContextDeclaration::HeaderCapture {
                     policy: serde_json::from_value(serde_json::json!({
@@ -737,6 +740,9 @@ mod tests {
     fn all_captured_matches_capture_and_overlay_iteration() {
         let bindings = compile(
             [
+                ContextDeclaration::Arrival {
+                    sources: ArrivalSources::ALL,
+                },
                 ContextDeclaration::HeaderCapture {
                     policy: serde_json::from_value(serde_json::json!({
                         "headers": [
@@ -829,6 +835,9 @@ mod tests {
         ];
         let bindings = compile(
             [
+                ContextDeclaration::Arrival {
+                    sources: ArrivalSources::ALL,
+                },
                 consumes(selectors.clone()),
                 ContextDeclaration::HeaderCapture {
                     policy: serde_json::from_value(serde_json::json!({
@@ -1230,6 +1239,9 @@ mod tests {
         ];
         let bindings = compile(
             [
+                ContextDeclaration::Arrival {
+                    sources: ArrivalSources::ALL,
+                },
                 consumes(selectors.to_vec()),
                 ContextDeclaration::AuthorizedIdentityCapture {
                     policy: serde_json::from_value(serde_json::json!([

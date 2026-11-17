@@ -17,7 +17,7 @@ use otel_arrow_dfe_engine::listener_group::ListenerProtocol;
 use otel_arrow_dfe_engine::local::{exporter, receiver};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::pdata_context::{
-    ConfigNodeContextDeclaration, ContextConsumerSelector, ContextDeclaration,
+    ArrivalSources, ConfigNodeContextDeclaration, ContextConsumerSelector, ContextDeclaration,
     ContextDeclarationProvider, ContextDomain, ContextEntrySelector, ContextEntrySelectorForm,
     ContextEntryTake, ContextEntryTarget, ContextNameMatching, NodeContextDeclarations,
 };
@@ -99,9 +99,21 @@ fn wait_for_context_bindings_test_capture() -> std::sync::Weak<CompiledContextBi
     }
 }
 
+/// The single context declaration a test receiver makes; `Produces` and
+/// `Arrival` are mutually exclusive for a receiver.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ContextBindingsTestDeclaration {
+    /// Produces one transport-header entry.
+    Produces(ContextEntryName),
+    /// Forms context at arrival from every source.
+    Arrival,
+}
+
 #[derive(Deserialize)]
 struct ContextBindingsTestConfig {
-    produces: ContextEntryName,
+    #[serde(default)]
+    declares: Option<ContextBindingsTestDeclaration>,
     #[serde(default)]
     probe_controller_lock: bool,
 }
@@ -110,11 +122,19 @@ impl ConfigNodeContextDeclaration for ContextBindingsTestConfig {
     fn context_declarations(
         &self,
     ) -> Result<NodeContextDeclarations, otel_arrow_dfe_config::error::Error> {
-        Ok(std::iter::once(ContextDeclaration::Produces {
-            domain: ContextDomain::TransportHeader,
-            entry: self.produces.clone(),
-        })
-        .collect())
+        Ok(self
+            .declares
+            .iter()
+            .map(|declaration| match declaration {
+                ContextBindingsTestDeclaration::Produces(entry) => ContextDeclaration::Produces {
+                    domain: ContextDomain::TransportHeader,
+                    entry: entry.clone(),
+                },
+                ContextBindingsTestDeclaration::Arrival => ContextDeclaration::Arrival {
+                    sources: ArrivalSources::ALL,
+                },
+            })
+            .collect())
     }
 }
 
@@ -5219,7 +5239,8 @@ fn delete_pipeline_recompiles_context_bindings_without_removed_declarations() {
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: X-Tenant
+              declares:
+                produces: X-Tenant
           exporter:
             type: "urn:test:exporter:example"
             config: null
@@ -5324,7 +5345,8 @@ groups:
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: delete-marker
+              declares:
+                produces: delete-marker
           exporter:
             type: "urn:test:exporter:example"
             config: null
@@ -5336,7 +5358,8 @@ groups:
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: remain-marker
+              declares:
+                produces: remain-marker
               probe_controller_lock: true
           exporter:
             type: "urn:test:exporter:example"
@@ -5377,7 +5400,8 @@ fn reconfigure_rejects_context_bindings_changes_to_target_pipeline() {
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: X-Tenant
+              declares:
+                produces: X-Tenant
           exporter:
             type: "urn:test:exporter:example"
             config: null
@@ -5397,7 +5421,8 @@ nodes:
   receiver:
     type: "urn:test:receiver:context-bindings"
     config:
-      produces: X-Account
+      declares:
+        produces: X-Account
   exporter:
     type: "urn:test:exporter:example"
     config: null
@@ -5441,7 +5466,8 @@ nodes:
   receiver:
     type: "urn:test:receiver:context-bindings"
     config:
-      produces: X-Tenant
+      declares:
+        produces: X-Tenant
   exporter:
     type: "urn:test:exporter:context-reads"
     config:
@@ -5498,7 +5524,8 @@ groups:
                 - match_names: ["x-tenant-id"]
                   store_as: tenant
             config:
-              produces: capture-marker
+              declares:
+                produces: capture-marker
           exporter:
             type: "urn:test:exporter:example"
             config: null
@@ -5510,7 +5537,8 @@ groups:
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: source-marker
+              declares:
+                produces: source-marker
           exporter:
             type: "urn:test:exporter:example"
             header_propagation:
@@ -5537,7 +5565,8 @@ nodes:
   receiver:
     type: "urn:test:receiver:context-bindings"
     config:
-      produces: source-marker
+      declares:
+        produces: source-marker
   exporter:
     type: "urn:test:exporter:example"
     header_propagation:
@@ -5598,7 +5627,7 @@ groups:
                 - match_names: ["x-tenant-id"]
                   store_as: tenant
             config:
-              produces: capture-marker
+              declares: arrival
           exporter:
             type: "urn:test:exporter:example"
             config: null
@@ -5610,7 +5639,8 @@ groups:
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: source-marker
+              declares:
+                produces: source-marker
           exporter:
             type: "urn:test:exporter:example"
             header_propagation:
@@ -5700,7 +5730,8 @@ fn reconfigure_accepts_supported_context_runtime_requirements() {
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: source-marker
+              declares:
+                produces: source-marker
           exporter:
             type: "urn:test:exporter:example"
             header_propagation:
@@ -5756,7 +5787,8 @@ fn runtime_recovery_reuses_context_bindings_snapshot() {
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: X-Tenant
+              declares:
+                produces: X-Tenant
           exporter:
             type: "urn:test:exporter:example"
             config: null
@@ -6245,7 +6277,8 @@ groups:
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: retained-marker
+              declares:
+                produces: retained-marker
           exporter:
             type: "urn:test:exporter:example"
             config: null
@@ -6257,7 +6290,8 @@ groups:
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: X-Tenant
+              declares:
+                produces: X-Tenant
           exporter:
             type: "urn:test:exporter:example"
             config: null
@@ -6319,7 +6353,8 @@ fn reconcile_engine_config_preserves_missing_context_pipeline() {
           receiver:
             type: "urn:test:receiver:context-bindings"
             config:
-              produces: X-Tenant
+              declares:
+                produces: X-Tenant
           exporter:
             type: "urn:test:exporter:example"
             config: null

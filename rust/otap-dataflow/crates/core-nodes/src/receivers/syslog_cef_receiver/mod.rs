@@ -22,7 +22,8 @@ use otel_arrow_dfe_engine::control::NodeControlMsg;
 use otel_arrow_dfe_engine::memory_limiter::LocalReceiverAdmissionState;
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::pdata_context::{
-    Arrival, ArrivalBinding, ArrivalHeaders, ContextDeclarationProvider,
+    Arrival, ArrivalBinding, ArrivalHeaders, ArrivalSources, ContextDeclaration,
+    ContextDeclarationProvider, NodeContextDeclarations,
 };
 use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
@@ -758,10 +759,27 @@ pub static SYSLOG_CEF_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
                     .with_startup_readiness(),
             )
         },
-    context_declarations: Some(ContextDeclarationProvider::arriving()),
+    context_declarations: Some(ContextDeclarationProvider {
+        declarations: syslog_context_declarations,
+    }),
     wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<Config>,
 };
+
+/// Syslog forms each batch's context from its peer address; it receives no
+/// transport headers or authorized identity.
+fn syslog_context_declarations(
+    _: &Value,
+) -> Result<NodeContextDeclarations, otel_arrow_dfe_config::error::Error> {
+    Ok([ContextDeclaration::Arrival {
+        sources: ArrivalSources {
+            peer: true,
+            ..ArrivalSources::default()
+        },
+    }]
+    .into_iter()
+    .collect())
+}
 
 #[async_trait(?Send)]
 impl local::Receiver<OtapPdata> for SyslogCefReceiver {

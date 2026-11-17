@@ -44,9 +44,11 @@ use crate::output_router::OutputRouter;
 use crate::pdata_context::ContextMaterializationPlan;
 use crate::pdata_context::{Arrival, ContextError, Metadata, NodeBindings};
 use crate::readiness::ReadinessSignaller;
-use crate::receiver::ReceiverContextMaterialization;
+use crate::receiver::SendMaterializer;
 #[cfg(any(test, feature = "test-utils"))]
-use crate::receiver::legacy_bindings_mut;
+use crate::receiver::requires_send_materializer;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::receiver::test_bindings;
 use crate::runtime_services::{CodecEffectHandler, PipelineRuntimeServices};
 use crate::shared::message::{SharedReceiver, SharedSender};
 use crate::terminal_state::TerminalState;
@@ -115,10 +117,10 @@ pub struct EffectHandler<PData> {
     /// Output-port router.
     pub router: OutputRouter<SharedSender<PData>>,
     /// Runtime bindings: compiler-owned and shared with the node's pipeline
-    /// context, or handler-local when created by the legacy policy setters.
+    /// context, or handler-local when created by the test-only policy setters.
     node_bindings: Option<Arc<NodeBindings>>,
-    /// Data-type-specific context materialization shared by request handlers.
-    context_materialization_plan: Option<ReceiverContextMaterialization<PData>>,
+    /// Applier for an undeclared receiver's send-time materialization.
+    send_materializer: Option<SendMaterializer<PData>>,
     /// Optional signal used to gate pipeline startup on receiver initialization.
     readiness: Option<ReadinessSignaller>,
 }
@@ -142,7 +144,7 @@ impl<PData> EffectHandler<PData> {
             core,
             router,
             node_bindings: None,
-            context_materialization_plan: None,
+            send_materializer: None,
             readiness: None,
         }
     }
@@ -188,7 +190,7 @@ impl<PData> EffectHandler<PData> {
     /// Sets the capture policy for transport header extraction.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_capture_policy(&mut self, policy: Option<CompiledHeaderCapturePolicy>) {
-        self.legacy_bindings_mut().set_header_capture_policy(policy);
+        self.test_bindings().set_header_capture_policy(policy);
     }
 
     /// Returns the authorized identity claim projection policy.
@@ -200,33 +202,36 @@ impl<PData> EffectHandler<PData> {
     /// Sets the authorized identity claim projection policy.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_authorized_identity_policy(&mut self, policy: Option<AuthorizedIdentityPolicy>) {
-        self.legacy_bindings_mut()
-            .set_authorized_identity_policy(policy);
+        self.test_bindings().set_authorized_identity_policy(policy);
     }
 
-    /// Returns bindings for the legacy policy setters.
+    /// Returns handler-local bindings for the test-only policy setters.
     #[cfg(any(test, feature = "test-utils"))]
-    fn legacy_bindings_mut(&mut self) -> &mut NodeBindings {
-        legacy_bindings_mut(
-            &mut self.node_bindings,
-            self.context_materialization_plan.as_ref(),
-        )
+    fn test_bindings(&mut self) -> &mut NodeBindings {
+        test_bindings(&mut self.node_bindings)
     }
 
     /// Returns this receiver's immutable runtime bindings.
     #[must_use]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn node_bindings(&self) -> Option<&Arc<NodeBindings>> {
         self.node_bindings.as_ref()
     }
 
-    pub(crate) fn set_node_bindings(&mut self, bindings: Arc<NodeBindings>) {
+    /// Installs compiled bindings together with the send-time materializer
+    /// resolved against them by `resolve_send_materializer`.
+    pub(crate) fn set_node_bindings(
+        &mut self,
+        bindings: Arc<NodeBindings>,
+        send_materializer: Option<SendMaterializer<PData>>,
+    ) {
         self.node_bindings = Some(bindings);
+        self.send_materializer = send_materializer;
     }
 
-    /// Forms complete request metadata without removing the legacy send hook.
-    ///
-    /// A receiver rejects the request when this fails.
-    /// Requires an installed arrival binding, even when no capture is configured.
+    /// Forms complete request metadata from an Arrival. Callers should reject
+    /// requests when this returns an error. Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn form_context(
         &self,
         arrival: &Arrival<'_>,
@@ -238,40 +243,34 @@ impl<PData> EffectHandler<PData> {
             .form(arrival)
     }
 
-    /// Materializes configured context entries before receiver output.
+    /// Materializes an undeclared receiver's context at send time.
+    ///
+    /// No-op for receivers that declared `Arrival`: their compiled bindings
+    /// carry no send-time plan because they form complete context at arrival.
+    ///
+    /// TODO(4541): removed once every receiver declares `Arrival` or
+    /// an alternative binding.
     pub fn materialize_context(&self, data: &mut PData) {
-        if let Some(materialization) = &self.context_materialization_plan {
-            materialization.apply(data);
+        if let (Some(materialize), Some(plan)) = (
+            self.send_materializer,
+            self.node_bindings
+                .as_deref()
+                .and_then(NodeBindings::send_materialization_plan),
+        ) {
+            materialize(data, plan);
         }
     }
 
-    /// Sets the pipeline's data-type-specific context materialization.
-    pub(crate) fn set_context_materialization(
-        &mut self,
-        materialization: Option<ReceiverContextMaterialization<PData>>,
-    ) {
-        if let Some(bindings) = &mut self.node_bindings {
-            Arc::make_mut(bindings).set_materialization_plan(
-                materialization
-                    .as_ref()
-                    .map(|materialization| materialization.plan.clone())
-                    .unwrap_or_default(),
-            );
-        }
-        self.context_materialization_plan = materialization;
-    }
-
-    /// Installs a data-type-specific context materializer.
+    /// Installs a send-time materializer and its plan.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_context_materializer(
         &mut self,
         plan: ContextMaterializationPlan,
-        materialize: fn(&mut PData, &ContextMaterializationPlan),
+        materialize: SendMaterializer<PData>,
     ) {
-        self.set_context_materialization(Some(ReceiverContextMaterialization::new(
-            plan,
-            materialize,
-        )));
+        self.test_bindings().set_materialization_plan(plan);
+        self.send_materializer =
+            requires_send_materializer(self.node_bindings.as_deref()).then_some(materialize);
     }
 
     pub(crate) fn set_readiness_signaller(&mut self, readiness: Option<ReadinessSignaller>) {

@@ -90,6 +90,28 @@ impl ArrivalBinding {
     }
 }
 
+/// How a receiver's context is formed, decided once at compile time from
+/// its declarations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ArrivalMode {
+    /// The receiver declared its arrival sources and forms each context itself
+    /// through [`ArrivalBinding::form`], which holds capture policies only for
+    /// those sources. The engine does not materialize at send time.
+    Declared(ArrivalBinding),
+    /// TODO(4541): the receiver's arrival sources are unknown. It reads its
+    /// capture policies directly, and the engine materializes the plan at
+    /// send time.
+    Undeclared(ArrivalBinding),
+}
+
+impl ArrivalMode {
+    fn binding(&self) -> &ArrivalBinding {
+        match self {
+            Self::Declared(binding) | Self::Undeclared(binding) => binding,
+        }
+    }
+}
+
 /// A borrowed outbound value with its transport kind and wire name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PropagatedValue<'a> {
@@ -150,7 +172,7 @@ impl SinkBinding {
 /// private as node-facing binding operations are introduced incrementally.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeBindings {
-    pub(super) arrival: Option<ArrivalBinding>,
+    pub(super) arrival: Option<ArrivalMode>,
     pub(super) sink: Option<SinkBinding>,
     /// Sorted by selector and unique, as produced by sorted declarations.
     pub(super) values: Box<[ValueRead]>,
@@ -162,10 +184,13 @@ pub struct NodeBindings {
 }
 
 impl NodeBindings {
-    /// Returns the receiver's compiled arrival operation.
+    /// Returns the arrival operation of a receiver that declared `Arrival`.
     #[must_use]
     pub fn arrival(&self) -> Option<&ArrivalBinding> {
-        self.arrival.as_ref()
+        match self.arrival.as_ref()? {
+            ArrivalMode::Declared(binding) => Some(binding),
+            ArrivalMode::Undeclared(_) => None,
+        }
     }
 
     /// Returns the exporter's compiled propagation operation, if configured.
@@ -210,11 +235,35 @@ impl NodeBindings {
     }
 
     pub(crate) fn header_capture_policy(&self) -> Option<&CompiledHeaderCapturePolicy> {
-        self.arrival.as_ref()?.header_capture.as_ref()
+        self.arrival.as_ref()?.binding().header_capture.as_ref()
     }
 
     pub(crate) fn authorized_identity_policy(&self) -> Option<&AuthorizedIdentityPolicy> {
-        self.arrival.as_ref()?.authorized_identity_capture.as_ref()
+        self.arrival
+            .as_ref()?
+            .binding()
+            .authorized_identity_capture
+            .as_ref()
+    }
+
+    /// Returns the plan an undeclared receiver's send path must apply.
+    pub(crate) fn send_materialization_plan(&self) -> Option<&ContextMaterializationPlan> {
+        match self.arrival.as_ref()? {
+            ArrivalMode::Declared(_) => None,
+            ArrivalMode::Undeclared(binding) => Some(&binding.materialization),
+        }
+    }
+
+    /// Returns the arrival binding for the test-only setters, creating an
+    /// `Undeclared` one when none was compiled.
+    #[cfg(any(test, feature = "test-utils"))]
+    fn arrival_binding_mut(&mut self) -> &mut ArrivalBinding {
+        match self
+            .arrival
+            .get_or_insert_with(|| ArrivalMode::Undeclared(ArrivalBinding::default()))
+        {
+            ArrivalMode::Declared(binding) | ArrivalMode::Undeclared(binding) => binding,
+        }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -222,9 +271,7 @@ impl NodeBindings {
         &mut self,
         policy: Option<CompiledHeaderCapturePolicy>,
     ) {
-        self.arrival
-            .get_or_insert_with(Default::default)
-            .header_capture = policy;
+        self.arrival_binding_mut().header_capture = policy;
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -232,15 +279,12 @@ impl NodeBindings {
         &mut self,
         policy: Option<AuthorizedIdentityPolicy>,
     ) {
-        self.arrival
-            .get_or_insert_with(Default::default)
-            .authorized_identity_capture = policy;
+        self.arrival_binding_mut().authorized_identity_capture = policy;
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn set_materialization_plan(&mut self, plan: ContextMaterializationPlan) {
-        self.arrival
-            .get_or_insert_with(Default::default)
-            .materialization = plan;
+        self.arrival_binding_mut().materialization = plan;
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -461,7 +505,7 @@ mod tests {
         }
     }
 
-    /// Scenario: an arrival containing constants and randomness reaches the legacy send-time materializer.
+    /// Scenario: an arrival containing constants and randomness reaches the send-time materializer.
     /// Guarantees: the hook retains the exact generated value and metadata without reevaluating inputs.
     #[test]
     fn arrival_materialization_is_idempotent_at_send_time() {
@@ -500,11 +544,7 @@ mod tests {
             7
         );
         let before = metadata.clone();
-        let materialize = crate::receiver::ReceiverContextMaterialization::new(
-            binding.materialization.clone(),
-            Metadata::materialize_context,
-        );
-        materialize.apply(&mut metadata);
+        Metadata::materialize_context(&mut metadata, &binding.materialization);
         assert_eq!(metadata, before);
     }
 
@@ -704,12 +744,12 @@ mod tests {
         ));
     }
 
-    /// Scenario: local and shared receivers lack arrival bindings, use legacy setters, then install and clone compiled bindings.
-    /// Guarantees: legacy setters assemble the compiled arrival binding in the handler's node bindings,
-    /// both formation paths agree, getters borrow compiled policies, and later setters do not mutate clones.
-    /// Missing bindings fail explicitly rather than forming incomplete metadata.
+    /// Scenario: local and shared receivers lack arrival bindings, use the undeclared test setters, then install and clone compiled bindings.
+    /// Guarantees: undeclared test setters expose their policies but never yield a formable arrival binding;
+    /// only compiled `Declared` bindings form context, getters borrow compiled policies, and later
+    /// setters do not mutate clones. Missing bindings fail explicitly rather than forming incomplete metadata.
     #[test]
-    fn receiver_handlers_preserve_legacy_and_compiled_formation() {
+    fn receiver_handlers_preserve_undeclared_and_compiled_formation() {
         use crate::runtime_services::PipelineRuntimeServices;
         use crate::testing::test_node;
         use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
@@ -735,7 +775,7 @@ mod tests {
             .expect("materialization plan"),
         };
         let bindings = Arc::new(NodeBindings {
-            arrival: Some(binding.clone()),
+            arrival: Some(ArrivalMode::Declared(binding.clone())),
             sink: None,
             ..Default::default()
         });
@@ -759,14 +799,23 @@ mod tests {
                     binding.materialization.clone(),
                     Metadata::materialize_context,
                 );
+                assert_eq!(handler.capture_policy(), binding.header_capture.as_ref());
                 assert_eq!(
-                    handler
-                        .node_bindings()
-                        .and_then(|bindings| bindings.arrival()),
-                    Some(&binding)
+                    handler.authorized_identity_policy(),
+                    binding.authorized_identity_capture.as_ref()
                 );
-                assert_eq!(handler.form_context(&arrival), expected);
-                handler.set_node_bindings(Arc::clone(&bindings));
+                assert_eq!(
+                    handler.form_context(&arrival),
+                    Err(ContextError::MissingArrivalBinding),
+                    "undeclared test setters must not grant an arrival binding"
+                );
+                handler.set_node_bindings(Arc::clone(&bindings), None);
+                let mut metadata = Metadata::default();
+                handler.materialize_context(&mut metadata);
+                assert!(
+                    metadata.materialized_context().is_none(),
+                    "installing declared bindings drops the send-time materializer"
+                );
                 let cloned = handler.clone();
                 assert!(Arc::ptr_eq(
                     cloned.node_bindings().expect("cloned bindings"),
@@ -788,7 +837,7 @@ mod tests {
                 assert!(handler.capture_policy().is_none());
                 assert!(handler.authorized_identity_policy().is_none());
                 assert_eq!(cloned.form_context(&arrival), expected);
-                handler.set_node_bindings(Arc::new(NodeBindings::default()));
+                handler.set_node_bindings(Arc::new(NodeBindings::default()), None);
                 assert_eq!(
                     handler.form_context(&arrival),
                     Err(ContextError::MissingArrivalBinding)
@@ -813,11 +862,62 @@ mod tests {
         ));
     }
 
-    /// Scenario: receiver handlers install a materializer before any legacy policy setter.
-    /// Guarantees: the handler-local bindings created by the setter keep the installed plan,
-    /// so formation still materializes composites.
+    /// Scenario: the resolver pairs missing, `Declared`, empty `Undeclared`, and non-empty `Undeclared`
+    /// bindings with a present or absent data-type materializer.
+    /// Guarantees: only a non-empty `Undeclared` plan keeps the materializer, and such a plan without
+    /// one fails configuration; every other binding resolves to no send-time materialization.
     #[test]
-    fn legacy_setters_retain_installed_materialization() {
+    fn send_materializer_resolves_against_arrival_mode() {
+        use crate::receiver::{SendMaterializer, resolve_send_materializer};
+
+        fn noop(_: &mut (), _: &ContextMaterializationPlan) {}
+        let materializer: Option<SendMaterializer<()>> = Some(noop);
+        let plan =
+            ContextMaterializationPlan::compile(&[declaration(vec![ContextEntryPart::Constant {
+                name: name("route"),
+                value: "fixed".to_owned(),
+            }])])
+            .expect("materialization plan");
+        let binding = ArrivalBinding {
+            materialization: plan,
+            ..Default::default()
+        };
+        let with_mode = |mode| NodeBindings {
+            arrival: Some(mode),
+            ..Default::default()
+        };
+        let undeclared = with_mode(ArrivalMode::Undeclared(binding.clone()));
+        let formed = with_mode(ArrivalMode::Declared(binding));
+        let empty = with_mode(ArrivalMode::Undeclared(ArrivalBinding::default()));
+
+        assert!(
+            resolve_send_materializer(Some(&undeclared), materializer)
+                .expect("undeclared plan resolves")
+                .is_some()
+        );
+        assert!(matches!(
+            resolve_send_materializer::<()>(Some(&undeclared), None),
+            Err(crate::error::Error::ConfigError(_))
+        ));
+        for bindings in [None, Some(&formed), Some(&empty)] {
+            assert!(
+                resolve_send_materializer(bindings, materializer)
+                    .expect("resolves")
+                    .is_none()
+            );
+            assert!(
+                resolve_send_materializer::<()>(bindings, None)
+                    .expect("resolves")
+                    .is_none()
+            );
+        }
+    }
+
+    /// Scenario: receiver handlers install a materializer before any undeclared policy setter.
+    /// Guarantees: the handler-local `Undeclared` binding created by the setter keeps the installed
+    /// plan, so send-time materialization still applies it.
+    #[test]
+    fn undeclared_setters_retain_installed_materialization() {
         use crate::runtime_services::PipelineRuntimeServices;
         use crate::testing::test_node;
         use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
@@ -836,13 +936,8 @@ mod tests {
                 let mut handler = $handler;
                 handler.set_context_materializer(plan.clone(), Metadata::materialize_context);
                 handler.set_capture_policy(Some(capture_policy()));
-                let (metadata, _) = handler
-                    .form_context(&Arrival {
-                        headers: ArrivalHeaders::Pairs(&[]),
-                        identity: None,
-                        peer: None,
-                    })
-                    .expect("arrival forms");
+                let mut metadata = Metadata::default();
+                handler.materialize_context(&mut metadata);
                 assert!(metadata.materialized_context().is_some());
             }};
         }

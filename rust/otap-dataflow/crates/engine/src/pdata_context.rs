@@ -29,6 +29,7 @@ mod propagation;
 mod reads;
 
 use PreparedHeaderPropagationPolicy as HeaderPropagationPolicy;
+use bindings::ArrivalMode;
 pub use bindings::{
     Arrival, ArrivalBinding, ArrivalHeaders, ClaimRef, Claims, NodeBindings, PropagatedValue,
     SinkBinding,
@@ -270,11 +271,38 @@ pub enum ContextAction {
     },
 }
 
+/// The sources a receiver supplies when it forms each new context, one per
+/// field of [`Arrival`].
+///
+/// Capture policies are bound only to the sources a receiver declares.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ArrivalSources {
+    /// Inbound transport headers, captured by the header capture policy.
+    pub headers: bool,
+    /// Verified authorization identity, projected by the authorized identity policy.
+    pub identity: bool,
+    /// Peer network address observed at request acceptance.
+    pub peer: bool,
+}
+
+impl ArrivalSources {
+    /// Every arrival source.
+    pub const ALL: Self = Self {
+        headers: true,
+        identity: true,
+        peer: true,
+    };
+}
+
 /// A node's declared context behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ContextDeclaration {
-    /// Declares that a receiver forms each new context at arrival.
-    Arrival,
+    /// Declares that a receiver forms each new context at arrival from the
+    /// given sources.
+    Arrival {
+        /// Sources the receiver supplies.
+        sources: ArrivalSources,
+    },
     /// Declares a static context producer (e.g. traffic generator).
     Produces {
         /// Source authority domain.
@@ -329,10 +357,11 @@ impl ContextDeclaration {
             ) => Some("is managed by the engine"),
             (Self::Consumes { .. }, NodeKind::Processor | NodeKind::Exporter) => None,
             (Self::Consumes { .. }, NodeKind::Receiver) => Some("is not allowed for receivers"),
-            (Self::Arrival | Self::Produces { .. }, NodeKind::Receiver) => None,
-            (Self::Arrival | Self::Produces { .. }, NodeKind::Processor | NodeKind::Exporter) => {
-                Some("is only supported by receivers")
-            }
+            (Self::Arrival { .. } | Self::Produces { .. }, NodeKind::Receiver) => None,
+            (
+                Self::Arrival { .. } | Self::Produces { .. },
+                NodeKind::Processor | NodeKind::Exporter,
+            ) => Some("is only supported by receivers"),
             (Self::Edits { .. } | Self::Merges, NodeKind::Processor) => None,
             (Self::Edits { .. } | Self::Merges, NodeKind::Receiver | NodeKind::Exporter) => {
                 Some("is only supported by processors")
@@ -385,7 +414,7 @@ impl ContextDeclaration {
             Self::Consumes {
                 selector: ContextConsumerSelector::AllCaptured { .. },
             }
-            | Self::Arrival
+            | Self::Arrival { .. }
             | Self::Produces { .. }
             | Self::HeaderCapture { .. }
             | Self::AuthorizedIdentityCapture { .. }
@@ -521,14 +550,6 @@ impl ContextDeclarationProvider {
         }
     }
 
-    /// Declares a receiver that forms each new context at arrival.
-    #[must_use]
-    pub const fn arriving() -> Self {
-        Self {
-            declarations: default_arrival_context_declarations,
-        }
-    }
-
     /// Default Context merging function that maintains only network_info.
     #[must_use]
     pub const fn merging() -> Self {
@@ -536,12 +557,6 @@ impl ContextDeclarationProvider {
             declarations: default_merge_context_declarations,
         }
     }
-}
-
-fn default_arrival_context_declarations(
-    _: &serde_json::Value,
-) -> Result<NodeContextDeclarations, Error> {
-    Ok([ContextDeclaration::Arrival].into_iter().collect())
 }
 
 fn default_merge_context_declarations(
@@ -621,7 +636,7 @@ impl PreparedNodeContextDeclarations {
                     ContextDeclaration::HeaderPropagation { policy } => {
                         policy.visit_composite_names(|name| names.push(name.clone()));
                     }
-                    ContextDeclaration::Arrival
+                    ContextDeclaration::Arrival { .. }
                     | ContextDeclaration::Produces { .. }
                     | ContextDeclaration::Consumes {
                         selector: ContextConsumerSelector::AllCaptured { .. },
@@ -804,9 +819,10 @@ impl CompiledNodeState {
         let mut headers = None;
         let mut edit = None;
         let mut merge = None;
+        let mut arrival_declared = false;
         for declaration in declarations.iter() {
             match declaration {
-                ContextDeclaration::Arrival => {}
+                ContextDeclaration::Arrival { .. } => arrival_declared = true,
                 ContextDeclaration::Consumes { selector } => match selector {
                     ContextConsumerSelector::Entries { entries } => {
                         for entry in entries {
@@ -858,17 +874,22 @@ impl CompiledNodeState {
             }
         }
 
-        // TODO(4541): every receiver gets an arrival binding, declared or not, because
-        // receivers without context declarations still form contexts. Once all nodes
-        // have context declarations, compile it only from `ContextDeclaration::Arrival`.
-        let arrival = (prepared.kind == NodeKind::Receiver
-            || header_capture.is_some()
-            || authorized_identity_capture.is_some())
-        .then_some(ArrivalBinding {
+        let binding = ArrivalBinding {
             header_capture,
             authorized_identity_capture,
             materialization: materialization_plan.clone(),
-        });
+        };
+        // Only a declared `Arrival` yields a formable binding. TODO(4541):
+        // undeclared receivers, and nodes given capture policies, get an
+        // `Undeclared` binding until every receiver declares its arrival.
+        let arrival = if arrival_declared {
+            Some(ArrivalMode::Declared(binding))
+        } else {
+            (prepared.kind == NodeKind::Receiver
+                || binding.header_capture.is_some()
+                || binding.authorized_identity_capture.is_some())
+            .then_some(ArrivalMode::Undeclared(binding))
+        };
 
         let sink = header_propagation.map(|policy| SinkBinding { policy });
 
@@ -1095,8 +1116,16 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
                     node_config.r#type.as_ref(),
                     &node_config.config,
                 )?;
+                let arrival_sources =
+                    component_declarations
+                        .iter()
+                        .find_map(|declaration| match declaration {
+                            ContextDeclaration::Arrival { sources } => Some(*sources),
+                            _ => None,
+                        });
                 let wrapper_declarations = Self::wrapper_context_declarations(
                     node_config,
+                    arrival_sources,
                     &pipeline.policies.transport_headers,
                     &pipeline.policies.authorized_identity,
                     &pipeline.policies.context,
@@ -1120,32 +1149,51 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
     }
 
     /// Derives engine declarations from node header overrides and resolved pipeline policies.
+    ///
+    /// A receiver that declares its arrival sources is given only the capture
+    /// policies for sources it supplies: pipeline policies for other sources do
+    /// not apply to it, and a node-level header capture it cannot honor is an
+    /// error. Undeclared receivers receive every policy.
     fn wrapper_context_declarations(
         node: &NodeUserConfig,
+        arrival_sources: Option<ArrivalSources>,
         pipeline_policy: &Option<TransportHeadersPolicy>,
         authorized_identity: &Option<AuthorizedIdentityPolicy>,
         context: &[ConfigContextEntryDeclaration],
     ) -> Result<NodeContextDeclarations, EngineError> {
+        let supplies_headers = arrival_sources.is_none_or(|sources| sources.headers);
+        let supplies_identity = arrival_sources.is_none_or(|sources| sources.identity);
         let declarations = match node.kind() {
-            NodeKind::Receiver => node
-                .header_capture
-                .as_ref()
-                .or_else(|| {
-                    pipeline_policy
-                        .as_ref()
-                        .map(|policy| &policy.header_capture)
-                })
-                .cloned()
-                .map(|policy| ContextDeclaration::HeaderCapture { policy })
-                .into_iter()
-                .chain(
-                    authorized_identity
-                        .as_ref()
-                        .filter(|policy| !policy.is_empty())
-                        .cloned()
-                        .map(|policy| ContextDeclaration::AuthorizedIdentityCapture { policy }),
-                )
-                .collect(),
+            NodeKind::Receiver => {
+                if node.header_capture.is_some() && !supplies_headers {
+                    return Err(EngineError::ConfigError(Box::new(invalid_context(
+                        format!(
+                            "receiver `{}` supplies no transport headers at arrival; \
+                         remove its `header_capture`",
+                            node.r#type
+                        ),
+                    ))));
+                }
+                node.header_capture
+                    .as_ref()
+                    .or_else(|| {
+                        pipeline_policy
+                            .as_ref()
+                            .map(|policy| &policy.header_capture)
+                    })
+                    .filter(|_| supplies_headers)
+                    .cloned()
+                    .map(|policy| ContextDeclaration::HeaderCapture { policy })
+                    .into_iter()
+                    .chain(
+                        authorized_identity
+                            .as_ref()
+                            .filter(|policy| supplies_identity && !policy.is_empty())
+                            .cloned()
+                            .map(|policy| ContextDeclaration::AuthorizedIdentityCapture { policy }),
+                    )
+                    .collect()
+            }
             NodeKind::Exporter => {
                 let policy = node.header_propagation.as_ref().or_else(|| {
                     pipeline_policy
@@ -1239,7 +1287,7 @@ impl<PData: 'static + Clone + std::fmt::Debug> PipelineFactory<PData> {
         }
         if declarations
             .iter()
-            .any(|declaration| matches!(declaration, ContextDeclaration::Arrival))
+            .any(|declaration| matches!(declaration, ContextDeclaration::Arrival { .. }))
             && declarations
                 .iter()
                 .any(|declaration| matches!(declaration, ContextDeclaration::Produces { .. }))
@@ -1333,7 +1381,9 @@ mod tests {
                     },
                     entry: entry.clone(),
                 })
-                .chain(self.arrival.then_some(ContextDeclaration::Arrival))
+                .chain(self.arrival.then_some(ContextDeclaration::Arrival {
+                    sources: ArrivalSources::ALL,
+                }))
                 .collect())
         }
     }
@@ -1787,7 +1837,7 @@ groups:
         assert!(!different_matching.pipeline_context_compatible(&current, &key));
     }
 
-    /// Scenario: arrival adapters add pipeline materialization without changing legacy declarations or policies.
+    /// Scenario: arrival adapters add pipeline materialization without changing undeclared receiver declarations or policies.
     /// Guarantees: live-update comparison still ignores policy-free receivers and adapter-derived plans.
     #[test]
     fn arrival_adapters_preserve_live_update_inputs() {
@@ -1806,7 +1856,10 @@ groups:
             .expect("pipeline")
             .remove(&receiver)
             .expect("receiver");
-        assert!(removed.bindings.arrival().is_some());
+        assert!(matches!(
+            removed.bindings.arrival,
+            Some(ArrivalMode::Undeclared(_))
+        ));
         assert!(
             compiled
                 .bindings
@@ -1882,7 +1935,7 @@ groups:
     }
 
     /// Scenario: a pipeline contains producing, editing, merging, and plain nodes.
-    /// Guarantees: the receiver gets an arrival binding, the editing processor
+    /// Guarantees: the undeclared receiver gets only an undeclared arrival binding, the editing processor
     /// gets an edit for only its declared entries, and the merging processor
     /// gets a merge binding. Plain nodes get neither edit nor merge bindings.
     #[test]
@@ -1901,7 +1954,11 @@ groups:
         };
 
         let receiver = bindings("receiver");
-        assert!(receiver.arrival().is_some());
+        assert!(matches!(receiver.arrival, Some(ArrivalMode::Undeclared(_))));
+        assert!(
+            receiver.arrival().is_none(),
+            "undeclared arrival is not formable"
+        );
         assert!(receiver.merge().is_none());
         assert!(receiver.edit().is_none());
 
@@ -3017,6 +3074,7 @@ groups:
         assert_eq!(
             PipelineFactory::<()>::wrapper_context_declarations(
                 &receiver,
+                None,
                 &Some(pipeline_policy.clone()),
                 &Some(identity_policy.clone()),
                 &[],
@@ -3038,6 +3096,7 @@ groups:
         assert_eq!(
             PipelineFactory::<()>::wrapper_context_declarations(
                 &receiver,
+                None,
                 &Some(pipeline_policy.clone()),
                 &Some(identity_policy.clone()),
                 &[],
@@ -3061,6 +3120,7 @@ groups:
         assert_eq!(
             PipelineFactory::<()>::wrapper_context_declarations(
                 &exporter,
+                None,
                 &Some(pipeline_policy.clone()),
                 &Some(identity_policy.clone()),
                 &[],
@@ -3078,6 +3138,7 @@ groups:
         assert_eq!(
             PipelineFactory::<()>::wrapper_context_declarations(
                 &exporter,
+                None,
                 &Some(pipeline_policy.clone()),
                 &Some(identity_policy),
                 &[],
@@ -3089,6 +3150,68 @@ groups:
             }]
             .into_iter()
             .collect(),
+        );
+    }
+
+    /// Scenario: pipeline header and identity policies, and a node header override, meet
+    /// receivers that declare only some arrival sources.
+    /// Guarantees: pipeline policies apply only to sources a receiver declares; a node-level
+    /// header capture on a receiver without headers fails configuration; declaring every
+    /// source binds the same policies as an undeclared receiver.
+    #[test]
+    fn wrapper_declarations_follow_arrival_sources() {
+        let identity_policy: AuthorizedIdentityPolicy =
+            serde_json::from_value(serde_json::json!([{"claim": "sub", "store_as": "tenant"}]))
+                .expect("valid authorized identity policy");
+        let pipeline_policy = TransportHeadersPolicy::default();
+        let peer_only = Some(ArrivalSources {
+            peer: true,
+            ..ArrivalSources::default()
+        });
+        let declare = |receiver: &NodeUserConfig, sources| {
+            PipelineFactory::<()>::wrapper_context_declarations(
+                receiver,
+                sources,
+                &Some(pipeline_policy.clone()),
+                &Some(identity_policy.clone()),
+                &[],
+            )
+        };
+
+        let receiver = NodeUserConfig::new_receiver_config("urn:test:receiver:example");
+        assert!(
+            declare(&receiver, peer_only)
+                .expect("wrapper declarations")
+                .is_empty()
+        );
+        assert_eq!(
+            declare(
+                &receiver,
+                Some(ArrivalSources {
+                    identity: true,
+                    ..ArrivalSources::default()
+                })
+            )
+            .expect("wrapper declarations"),
+            [ContextDeclaration::AuthorizedIdentityCapture {
+                policy: identity_policy.clone(),
+            }]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            declare(&receiver, Some(ArrivalSources::ALL)).expect("declared sources"),
+            declare(&receiver, None).expect("undeclared sources"),
+        );
+
+        let mut receiver = receiver;
+        receiver.header_capture = Some(pipeline_policy.header_capture.clone());
+        let error = declare(&receiver, peer_only).expect_err("node capture without headers");
+        assert!(
+            error
+                .to_string()
+                .contains("supplies no transport headers at arrival"),
+            "unexpected error: {error}"
         );
     }
 
@@ -3131,6 +3254,7 @@ default:
 
         let declarations = PipelineFactory::<()>::wrapper_context_declarations(
             &exporter,
+            None,
             &None,
             &None,
             std::slice::from_ref(&declaration),
@@ -3274,9 +3398,14 @@ default:
         let receiver = NodeUserConfig::new_receiver_config("urn:test:receiver:example");
 
         for policy in [None, Some(AuthorizedIdentityPolicy::default())] {
-            let declarations =
-                PipelineFactory::<()>::wrapper_context_declarations(&receiver, &None, &policy, &[])
-                    .expect("wrapper declarations");
+            let declarations = PipelineFactory::<()>::wrapper_context_declarations(
+                &receiver,
+                None,
+                &None,
+                &policy,
+                &[],
+            )
+            .expect("wrapper declarations");
             assert!(declarations.is_empty());
 
             let compiled = compiled_bindings(declarations);
