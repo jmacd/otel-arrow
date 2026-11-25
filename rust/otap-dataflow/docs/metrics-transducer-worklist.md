@@ -3,10 +3,10 @@
 Build a metrics-only, event-time recording engine. A rule selects metrics,
 projects their identity and records their natural aggregates on aligned
 boundaries. Current value, recent history and forwarding after a disconnect are
-reads of the same committed results. A second output is a bounded sample of
-representative inputs: users can query dimensions removed by the rule and
-estimate subset totals without retaining a time series for every contributor.
-This is a work list, not a description of available components or configuration.
+reads of the same committed results. Two bounded exemplar samples serve
+different queries: estimate subset totals over dimensions removed by the rule,
+or find trace links likely to survive consistent trace sampling. This is a work
+list, not a description of available components or configuration.
 
 ## What we should be able to run
 
@@ -241,61 +241,63 @@ sealed boundary, not the wall-clock times of two HTTP scrapes.
   Exercise disk-full and long disconnects. Document supported limits, operator
   recovery actions, node inventory/feature gates, and user-facing changelogs.
 
-### G. Record weighted exemplars and query subset sums
+### G. Estimate subset sums and select trace-linked exemplars
 
-- [ ] **G1. Define the population before sampling (A1, C1-C3).** For each
-  contributing input point with exemplars, use those exemplars: preserve their
-  measurement, event time, filtered attributes and any real trace/span link.
-  Where there are none, synthesize a candidate from the input series'
-  contribution *before* projecting away its dimensions. Mark it as derived
-  from an aggregate, not a traced measurement. Do not invent a trace ID or an
-  individual measurement from a histogram bucket. Define which dimensions
-  a rule may retain for filtering and impose a byte budget as well as a count.
-  Distinguish a measurement population from a series population: to estimate
-  active series cardinality, give each eligible series one contribution per
-  boundary, regardless of report frequency or number of attached exemplars.
-  Do not pool the two kinds of candidates into one estimate unless their
-  weights refer to the same target population without double counting.
-- [ ] **G2. Build a weighted bottom-k reservoir (A3, G1).** Give each eligible
-  candidate stable randomness and a positive selection weight. Keep the `k`
-  smallest ranks and the first excluded rank (or equivalent cutoff); if all
-  fit, local retention probability is one. Use the randomness and threshold
-  convention of [OTel consistent probability sampling][otel-sampling].
-  Specify how the adaptive cutoff gives a per-candidate inclusion probability
-  for unequal weights, including finite-precision ties. Use
-  [priority sampling][priority-sampling] as a reference design. Distinguish
-  selection weight from the value to be estimated: an UpDownCounter change
-  may be negative.
-  Carry known upstream selection probabilities through resampling, accounting
-  for shared randomness. A trace link alone does not establish an exemplar's
-  probability of selection from the original measurements. When it is unknown,
-  keep the exemplar useful for inspection without claiming that estimate.
-- [ ] **G3. Checkpoint and transport sampling state (D2-D4, E4, G2).** Specify
-  an opt-in OTAP representation for provenance, sampling unit, randomness and
-  estimator weights; these are not metric identity attributes. Checkpoint the
-  reservoir and cutoff at the same input cut as the exact aggregate. Replay
-  must not redraw, and delivery retries must not add another candidate. Merge
-  compatible edge reservoirs at the regional stage using their original ranks
-  and cutoffs. If a late revision removes a selected candidate, recover the
-  next eligible candidate from retained inputs or sufficient checkpoint state.
-  Bound total memory across reservoirs, including those for still-open windows.
-- [ ] **G4. Demonstrate subset estimates (F1-F2, G3).** Drop `host` from a
-  service counter; retain it on sampled contributions. Query a subset of hosts
-  across the original input cardinality. For a known sampling design, sum
-  `contribution / inclusion_probability` over matching retained candidates.
-  Use reset-aware deltas for counters (signed for UpDownCounters); accumulate
-  those estimated interval changes for a cumulative query. Do not difference
-  unrelated sampled cumulative readings or count a restatement twice. For a
-  gauge population estimate totals and counts at the same boundary. Report the
-  result as an estimate, separately from the exact recorded service aggregate;
-  no sampled matches is not proof the subset was empty. Exercise both sources
-  of exemplars, mixed presence, replay, and edge-to-regional merging. Use a
-  small enumerable sampling design to check expected estimates against exact
-  subset sums; verify no-sampling equality and the size cap under high churn.
+Make these modes independently selectable per rule. **Series attribution**
+serves someone asking which hosts contributed to a total after `host` was
+removed. **Trace drill-down** serves someone investigating a metric who wants
+a trace they can open. A rule can enable either, both with separate budgets,
+or neither; the exact recorded metric is the same in all four cases.
+
+- [ ] **G1. Sketch original-cardinality counter series (A3, C1-C2).** For each
+  rule window, aggregate at full input identity *before* dropping dimensions
+  such as `host`. Each Counter or UpDownCounter series supplies one item with
+  its own aggregate value, regardless of how often it reported or whether it
+  supplied trace exemplars. Use stable series randomness and a value-dependent
+  weight to assign ranks. Keep the `k` smallest ranks and the first excluded
+  rank (or equivalent estimator state). Retain the original value and allowed
+  dimensions on the series-derived exemplar; do not invent a trace link.
+  Follow [Cohen and Kaplan's bottom-k sketches][bottom-k] for subset estimates.
+  For signed UpDownCounters, distinguish the signed quantity being estimated
+  from the nonnegative selection weight (e.g., its magnitude). Specify the
+  zero-weight case. A gauge reading is not an additive contribution: define a
+  separate gauge population policy rather than weighting a gauge by its value.
+- [ ] **G2. Select trace links by adaptive threshold (A3, C3).** From the
+  supplied trace-linked exemplars, keep the largest 56-bit randomness values
+  `R`, independent of the metric values. Use the least-significant 56 bits of
+  a suitably random trace ID, or the explicit OTel randomness `rv` when
+  available. At a fixed rejection threshold `T`, OTel keeps `R >= T` with
+  probability `(2^56 - T) / 2^56`. Adapt the cutoff to the reservoir budget;
+  specify the order statistic, ties, repeated trace IDs and the keep-all case.
+  This favors links that survive stricter consistent trace samplers, not a
+  guarantee that a backend has the trace. Preserve measurement time, filtered
+  attributes and trace/span IDs. Use [Ting's adaptive-threshold paper][ting]
+  for the sampling design and [OTel consistent sampling][otel-sampling] for
+  the trace convention. This cutoff is not the series sketch's inclusion
+  probability. With no trace-linked inputs, G1 still works and G2 is empty.
+- [ ] **G3. Persist both summaries independently (D2-D4, E4, G1-G2).** Specify
+  the OTAP representation for each candidate's provenance, rank and applicable
+  estimator state outside metric identity. Checkpoint both at the same input
+  cut as the exact aggregate, with separate count and byte budgets. Replay
+  must not redraw and retries must not add another candidate. Merge compatible
+  edge sketches using original series ranks, and trace reservoirs using trace
+  randomness. If a late update changes a series weight or removes a winner,
+  rebuild from retained input or sufficient state instead of keeping a stale
+  rank. Bound retained attributes and total bytes across all open windows.
+- [ ] **G4. Verify each result against its own population (F1-F2, G3).** Query
+  a subset of hosts from a service counter using adjusted weights from G1.
+  Use reset-aware interval contributions (signed for UpDownCounters) and add
+  estimated deltas for a cumulative query. Never difference unrelated sampled
+  series. Compare the estimate against exact subset sums on small enumerable
+  rank fixtures; cover negative changes, skew and keep-all equality. Where
+  the exact total selection weight is available, evaluate subset conditioning
+  against rank conditioning. For G2, use known trace IDs: raising `T` must
+  keep a nested subset, and increasing a metric value must not promote a link.
+  Check direct vs. two-stage results, replay and hard caps for both paths.
 
 **Delivery order:** land A and the storage-only B independently of network
 adapters. Use the sum-only evaluator and sealed publications to deliver F1,
-then F2. Develop the exemplar population and sampler alongside the evaluator,
+then F2. Develop the two exemplar samplers alongside the evaluator,
 then exercise them on both pipelines. Gate progressive refinement and gauge
 histograms separately; keep their conformance fixtures in the plan from the
 outset. PromQL, Parquet export, multi-core routing and a third observation
@@ -312,4 +314,5 @@ timestamp are outside this first operational transducer.
 [prom-spec]: https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/#timestamps
 [resets]: https://opentelemetry.io/docs/specs/otel/metrics/data-model/#cumulative-streams-handling-unknown-start-time
 [otel-sampling]: https://opentelemetry.io/docs/specs/otel/trace/tracestate-probability-sampling/
-[priority-sampling]: https://arxiv.org/abs/cs/0509026
+[bottom-k]: https://www.vldb.org/pvldb/vol1/1453884.pdf
+[ting]: https://arxiv.org/pdf/1708.04970v1
