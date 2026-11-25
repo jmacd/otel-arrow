@@ -20,8 +20,8 @@ a regional stage, recover from a checkpoint, and publish *progressive
 refinements*: provisional results before a window seals, a sealed result, and
 explicit restatements for accepted late data. The fixed rule of work item A1
 (selector, retained dimensions, period, aggregation) is the printed canonical
-form of the simplest plan shape, so every rule can be explained in terms of
-the configuration it is equivalent to.
+form of the simplest plan shape. More complex rules explain their operators
+and required intermediate state directly.
 
 ## Motivation
 
@@ -85,16 +85,16 @@ express: generation, evaluation period and origin, allowed lateness, the
 refinement policy, reader temporality and state budgets. The query replaces
 A1's selector, retained dimensions and aggregation kind.
 
-Prometheus rule files are accepted in their familiar shape. A group's
-`interval` sets the period, its `query_offset` sets the allowed lateness, and
-each `record` rule becomes one transducer rule with constant output
-attributes taken from `labels`:
+For the supported Prometheus rule-file subset, a group's `interval` sets the
+period and `record` supplies the output name. `labels` supplies constant
+output attributes. Keep `query_offset` (which instant to evaluate) separate
+from allowed lateness (when to seal); reject unsupported options on import.
+See the [PromQL front-end contract][promql-design].
 
 ```yaml
 prometheus_rule_groups:
   - name: http
     interval: 1m
-    query_offset: 2m
     rules:
       - record: service:http_requests:increase1m
         expr: sum by (service) (increase(http_requests_total[1m]))
@@ -145,10 +145,11 @@ equivalent fixed rule:
   aggregation: sum
 ```
 
-The PromQL, KQL and OPL rules above print the same plan. An unsupported
-construct is a compile error that names the construct and its source location,
-for example `topk is holistic and has no bounded partial state; rejected at
-1:1`.
+Equivalent rules print the same plan only when their input, arithmetic and
+window policies agree. In particular, raw KQL `bin()` groups a sample exactly
+on the minute into the *next* interval relative to the right-closed rule
+above. An unsupported construct or boundary policy is a compile error that
+names the construct and its source location.
 
 ### Refinement, seen by a capable receiver
 
@@ -187,8 +188,9 @@ fixed rule (A1) ---------------------------------+               |
 The rule plan is the contract between front ends and executors. Two executors
 implement it. The incremental executor runs on the transducer's local runtime
 and is the system of record. The query-time executor evaluates the same plan
-over retained input or committed results; it is the reference oracle for work
-item A3, the verifier for replay, and the basis for later ad hoc queries.
+over retained input or committed results. Both executors are checked against
+the [independent A3 oracle][oracle]. The query-time executor also verifies
+replay and is the basis for later ad hoc queries.
 
 **Equivalence invariant.** For every plan, input cut `C` and sealed-through
 boundary `S`, the incremental executor's committed cells for windows ending at
@@ -247,7 +249,7 @@ of observations with a staleness horizon (C3).
 | PromQL construct | Prometheus | Transducer |
 | --- | --- | --- |
 | Evaluation time `t` | wall-clock schedule with a per-group phase | aligned window end from the rule origin |
-| `query_offset` | evaluate at scheduled time minus offset | allowed lateness before sealing |
+| `query_offset` | evaluate at scheduled time minus offset | preserve the shifted evaluation instant when supported; otherwise reject on import |
 | Gauge instant selector | latest sample in `(t - lookback, t]`; stale marker suppresses | last eligible observation per contributor at the boundary within the staleness horizon (default 5m); `NO_RECORDED_VALUE` suppresses |
 | Counter instant selector | latest raw cumulative value | the contributor's total since the output epoch start (C2 rebase) |
 | `increase(x[R])` | extrapolated from samples in the range | exact sum of resolved deltas in `(t - R, t]`; `R` a multiple of the period |
@@ -260,10 +262,11 @@ of observations with a staleness horizon (C3).
 | Stale markers from recording rules | written when a series disappears | `NO_RECORDED_VALUE` (C2) |
 | `@`, subqueries, `irate`, `idelta`, `changes`, `resets`, `predict_linear`, `holt_winters` | supported | rejected in v0 |
 
-Two rows change results relative to Prometheus, deliberately:
+Two important differences from Prometheus are:
 
-- `increase` and `rate` are exact rather than extrapolated. The transducer
-  knows each contributor's interval boundaries, so it needs no estimate.
+- `increase` and `rate` in the native interval profile are exact for whole
+  contributions. When an interval straddles a required pane, report the
+  unassignable contribution rather than interpolating it.
   Greptime already applies the same rule to OTLP delta series: `increase`
   becomes the window sum and `rate` divides it by the window duration
   ([planner.rs:4317-4357][greptime-delta]).
@@ -313,9 +316,10 @@ KQL `summarize` already parses into
 functions `Sum`, `Count`, `Minimum`, `Maximum` and `Average`; the columnar
 planner currently reports it as not yet supported
 ([planner.rs:496][planner-summary]). The transducer becomes its first
-columnar consumer. Lowering recognizes `bin(time_unix_nano, P)` in the group
-keys as `Window(P)` and the remaining keys as `Aggregate` keys, and requires
-`P` to equal the envelope's period.
+columnar consumer. Matching `P` to the envelope period is necessary but not
+sufficient: a KQL bin labels a left-closed interval by its start. Preserve
+that policy or reject the expression when only right-closed panes are
+available. See [OPL and KQL lowering][opl-design].
 
 OPL adds `aggregate every <period> by <keys> [using <fn>]` to
 [`opl.pest`][opl-grammar]. Without `using`, each metric type takes its natural
@@ -331,14 +335,15 @@ PromQL-only in v0.
 DataFusion 55.1, already a workspace dependency, serves both executors.
 
 **Incremental executor.** `Select` and `Map` use the columnar engine's
-DataFusion expression evaluation. `Aggregate` uses DataFusion
-[`GroupsAccumulator`][groups-acc]s directly and synchronously: projected
-identity hashes give group indices, `update_batch` folds contributions,
-`state(EmitTo)` yields partial state as Arrow arrays, `merge_batch` folds
-staged inputs, refinements and recovered checkpoints, and `evaluate(EmitTo)`
-finalizes a cell at publication. Built-in accumulators cover sum, count, min,
-max and avg; histogram merge (including exponential rescaling) and last value
-per contributor are custom accumulators. Partial state is Arrow, so a
+DataFusion expression evaluation. `Aggregate` uses DataFusion's
+[`GroupsAccumulator`][groups-acc] directly. Each distinct projected key gets
+its own group index; `update_batch` folds contributions and
+`merge_batch` merges compatible partials. `state(EmitTo)` and
+`evaluate(EmitTo)` drain emitted groups. A checkpoint or provisional read
+must preserve live state, for example by retaining versioned partial arrays
+and finalizing a separate accumulator. Built-in accumulators cover sum, count,
+min, max and avg; histogram merge (including exponential rescaling) and last
+value per contributor are custom accumulators. Partial state is Arrow, so a
 checkpoint (D2) writes it to the `metrics_checkpoints` store as Arrow record
 batches and recovery merges it back without a separate format. `Resolve` is a
 custom stateful operator that owns event-time state, as the existing
@@ -381,10 +386,10 @@ answering the steps whose window end lies in `[block_start, block_end)`.
 Sealed windows map onto that contract directly, which makes promql-rs a
 candidate query-time executor and an independent differential oracle for the
 constructs whose semantics coincide with Prometheus's. Its crates are
-unpublished and the workspace disallows git dependencies
-(`deny.toml: allow-git = []`), and its own conformance report shows partial
-native-histogram and subquery coverage; adoption waits for a published
-release.
+unpublished at the inspected revision, and its own conformance report shows
+partial native-histogram and subquery coverage. Waiting for a published
+release is a dependency choice: the workspace `deny.toml` warns about
+unlisted git sources.
 
 ### Progressive refinement
 
@@ -446,11 +451,13 @@ child values for the others (min, max, last value). The parent then publishes
 its own revision under its own policy. This is the Dataflow Model's
 accumulating-and-retracting mode, applied across stages.
 
-**Completeness.** Child publications carry the child's sealed-through boundary
-(E4). A parent window seals when every required child has sealed each child
-window it covers, or when the parent's allowed lateness passes. In the second
-case the sealed parent revision records an incomplete result in its
-publication metadata with the number of missing child windows, and a counter
+**Completeness.** A child's seal identifies a durable publication cut. A
+parent declares complete coverage only after accounting for all publications
+up to each required cut, including explicit progress for empty windows. The
+sealed correction `+8` cannot stand for `98` while revision 1 is missing.
+See the [receiver rules for out-of-order seals][refinement-design]. At a
+configured cutoff the sealed parent revision records an incomplete result
+with the number of missing child windows in its metadata, and a counter
 increments. Required children are the configured writer set, or writers seen
 within a liveness horizon; a writer absent beyond the horizon is retired
 explicitly and recorded.
@@ -499,7 +506,7 @@ a Nack. Every failure surfaces as a counter, a log record, or a Nack.
 | PromQL front end (`promql-parser` 0.11) | `metrics-rules::promql` |
 | KQL `summarize` and OPL `aggregate` lowering | `metrics-rules::opl`; grammar in `query-engine-languages` |
 | Incremental executor, custom accumulators | transducer node crate (D1) |
-| Query-time executor, `TableProvider`s over Quiver | `metrics-rules::reference`, used by A3 and F3 fixtures |
+| Query-time executor, `TableProvider`s over Quiver | Compared against the independent A3 oracle in E6d and F3 |
 | Publication key and mask handling | E4 contract; `exporter:otap`, `receiver:otap` |
 
 ## Drawbacks
@@ -575,6 +582,10 @@ a Nack. Every failure surfaces as a counter, a log record, or a Nack.
 - Exemplar sampling (worklist G) attached to plan cells.
 
 [worklist]: ../docs/metrics-transducer-worklist.md
+[oracle]: ../docs/metrics-transducer/a3.md
+[refinement-design]: ../docs/metrics-transducer/e5.md
+[promql-design]: ../docs/metrics-transducer/e6b.md
+[opl-design]: ../docs/metrics-transducer/e6c.md
 [model]: ../docs/model_requirements.md
 [model-2d]: ../docs/model_requirements.md#two-dimensional-time-axis
 [summary-expr]: ../../contrib/data_engine/expressions/src/summary/summary_data_expression.rs
