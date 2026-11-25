@@ -128,6 +128,9 @@ These are areas where a working query engine prototype may be needed
 first in order to develop OpenTelemetry specifications. The following
 are limitations a query-engine designer might face.
 
+For an implementation plan that exercises these ideas on metrics, see the
+[persistent metrics transducer work list](metrics-transducer-worklist.md).
+
 ### Two-dimensional time axis
 
 In a stream of telemetry data, we have two notions of time. There is a
