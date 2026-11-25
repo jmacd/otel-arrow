@@ -3,8 +3,10 @@
 Build a metrics-only, event-time recording engine. A rule selects metrics,
 projects their identity and records their natural aggregates on aligned
 boundaries. Current value, recent history and forwarding after a disconnect are
-reads of the same committed results. This is a work list, not a description of
-available components or configuration.
+reads of the same committed results. A second output is a bounded sample of
+representative inputs: users can query dimensions removed by the rule and
+estimate subset totals without retaining a time series for every contributor.
+This is a work list, not a description of available components or configuration.
 
 ## What we should be able to run
 
@@ -115,7 +117,8 @@ sealed boundary, not the wall-clock times of two HTTP scrapes.
   between stages, not an unweighted mean of means. Merge compatible histogram
   counts, sum and buckets; specify exact rebinning/downscaling and behavior for
   incompatible layouts. Do not infer interval min/max from cumulative extrema.
-  Document handling of missing fields, exemplars and unsupported metric kinds.
+  Document handling of missing fields and unsupported metric kinds. Preserve
+  input exemplars for the sampling work in G.
 - [ ] **C4. Prototype gauge histograms separately.** Represent the distribution
   of *current* values: merge disjoint contributor populations across space;
   replace a contributor's prior snapshot across time. A move between buckets
@@ -238,12 +241,65 @@ sealed boundary, not the wall-clock times of two HTTP scrapes.
   Exercise disk-full and long disconnects. Document supported limits, operator
   recovery actions, node inventory/feature gates, and user-facing changelogs.
 
+### G. Record weighted exemplars and query subset sums
+
+- [ ] **G1. Define the population before sampling (A1, C1-C3).** For each
+  contributing input point with exemplars, use those exemplars: preserve their
+  measurement, event time, filtered attributes and any real trace/span link.
+  Where there are none, synthesize a candidate from the input series'
+  contribution *before* projecting away its dimensions. Mark it as derived
+  from an aggregate, not a traced measurement. Do not invent a trace ID or an
+  individual measurement from a histogram bucket. Define which dimensions
+  a rule may retain for filtering and impose a byte budget as well as a count.
+  Distinguish a measurement population from a series population: to estimate
+  active series cardinality, give each eligible series one contribution per
+  boundary, regardless of report frequency or number of attached exemplars.
+  Do not pool the two kinds of candidates into one estimate unless their
+  weights refer to the same target population without double counting.
+- [ ] **G2. Build a weighted bottom-k reservoir (A3, G1).** Give each eligible
+  candidate stable randomness and a positive selection weight. Keep the `k`
+  smallest ranks and the first excluded rank (or equivalent cutoff); if all
+  fit, local retention probability is one. Use the randomness and threshold
+  convention of [OTel consistent probability sampling][otel-sampling].
+  Specify how the adaptive cutoff gives a per-candidate inclusion probability
+  for unequal weights, including finite-precision ties. Use
+  [priority sampling][priority-sampling] as a reference design. Distinguish
+  selection weight from the value to be estimated: an UpDownCounter change
+  may be negative.
+  Carry known upstream selection probabilities through resampling, accounting
+  for shared randomness. A trace link alone does not establish an exemplar's
+  probability of selection from the original measurements. When it is unknown,
+  keep the exemplar useful for inspection without claiming that estimate.
+- [ ] **G3. Checkpoint and transport sampling state (D2-D4, E4, G2).** Specify
+  an opt-in OTAP representation for provenance, sampling unit, randomness and
+  estimator weights; these are not metric identity attributes. Checkpoint the
+  reservoir and cutoff at the same input cut as the exact aggregate. Replay
+  must not redraw, and delivery retries must not add another candidate. Merge
+  compatible edge reservoirs at the regional stage using their original ranks
+  and cutoffs. If a late revision removes a selected candidate, recover the
+  next eligible candidate from retained inputs or sufficient checkpoint state.
+  Bound total memory across reservoirs, including those for still-open windows.
+- [ ] **G4. Demonstrate subset estimates (F1-F2, G3).** Drop `host` from a
+  service counter; retain it on sampled contributions. Query a subset of hosts
+  across the original input cardinality. For a known sampling design, sum
+  `contribution / inclusion_probability` over matching retained candidates.
+  Use reset-aware deltas for counters (signed for UpDownCounters); accumulate
+  those estimated interval changes for a cumulative query. Do not difference
+  unrelated sampled cumulative readings or count a restatement twice. For a
+  gauge population estimate totals and counts at the same boundary. Report the
+  result as an estimate, separately from the exact recorded service aggregate;
+  no sampled matches is not proof the subset was empty. Exercise both sources
+  of exemplars, mixed presence, replay, and edge-to-regional merging. Use a
+  small enumerable sampling design to check expected estimates against exact
+  subset sums; verify no-sampling equality and the size cap under high churn.
+
 **Delivery order:** land A and the storage-only B independently of network
 adapters. Use the sum-only evaluator and sealed publications to deliver F1,
-then F2. Gate progressive refinement and gauge histograms separately; keep
-their conformance fixtures in the plan from the outset. PromQL, Parquet export,
-multi-core routing and a third observation timestamp are outside this first
-operational transducer.
+then F2. Develop the exemplar population and sampler alongside the evaluator,
+then exercise them on both pipelines. Gate progressive refinement and gauge
+histograms separately; keep their conformance fixtures in the plan from the
+outset. PromQL, Parquet export, multi-core routing and a third observation
+timestamp are outside this first operational transducer.
 
 [prom-rx]: ../crates/core-nodes/src/receivers/prometheus_receiver/mod.rs
 [prom-config]: ../configs/prometheus-otlp.yaml
@@ -255,3 +311,5 @@ operational transducer.
 [model]: model_requirements.md#gauge-histogram
 [prom-spec]: https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/#timestamps
 [resets]: https://opentelemetry.io/docs/specs/otel/metrics/data-model/#cumulative-streams-handling-unknown-start-time
+[otel-sampling]: https://opentelemetry.io/docs/specs/otel/trace/tracestate-probability-sampling/
+[priority-sampling]: https://arxiv.org/abs/cs/0509026
