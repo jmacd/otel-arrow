@@ -226,6 +226,26 @@ sealed boundary, not the wall-clock times of two HTTP scrapes.
   only when its required children are final or the configured cutoff records
   an incomplete result. Emit sealed ordinary points to unaware peers. Keep
   unrepresentable corrections (e.g., negative histogram bucket deltas) explicit.
+  The [query-defined rules RFC][rules-rfc] specifies revisions, phases,
+  correction and restatement encodings, receiver rules and completeness.
+- [ ] **E6. Accept rules written as queries (A1-A3, C1-C3; RFC).** Lower
+  PromQL recording rules and OPL/KQL aggregation pipelines to one rule plan
+  whose operators declare partial, merge and finalize, per the
+  [query-defined rules RFC][rules-rfc]. Print each plan and, for the
+  projection-and-aggregate shape, its equivalent A1 rule.
+  - **E6a. Rule plan and decomposition classes.** Classify additive,
+    idempotent, algebraic, order-dependent, composite and holistic nodes;
+    reject holistic plans in v0. Use DataFusion `GroupsAccumulator` partial
+    state as the checkpointed Arrow representation (D2).
+  - **E6b. PromQL front end.** Parse with `promql-parser`; evaluate the v0
+    subset in event time with exact `increase`/`rate`; map names, labels,
+    types and units to OTel; accept Prometheus rule-group files.
+  - **E6c. OPL and KQL front ends.** Lower KQL `summarize ... by bin()` and a
+    new OPL `aggregate every <period> by <keys>` operator.
+  - **E6d. Query-time executor.** Evaluate the same plan over retained input
+    and committed results with DataFusion; use it as the A3 oracle and to
+    verify replay. Track prometheus-community/promql-rs as a differential
+    oracle once published.
 
 ### F. Ship the examples and establish equivalence
 
@@ -313,8 +333,11 @@ adapters. Use the sum-only evaluator and sealed publications to deliver F1,
 then F2. Develop the two exemplar samplers alongside the evaluator,
 then exercise them on both pipelines. Gate progressive refinement and gauge
 histograms separately; keep their conformance fixtures in the plan from the
-outset. PromQL, Parquet export, multi-core routing and a third observation
-timestamp are outside this first operational transducer.
+outset. Develop the rule plan (E6a) with the sum-only evaluator so the A1 rule
+is its first canonical shape; add the PromQL and OPL front ends once F1
+records through the plan. Ad hoc PromQL query serving, Parquet export,
+multi-core routing and a third observation timestamp are outside this first
+operational transducer.
 
 [prom-rx]: ../crates/core-nodes/src/receivers/prometheus_receiver/mod.rs
 [prom-config]: ../configs/prometheus-otlp.yaml
@@ -325,6 +348,7 @@ timestamp are outside this first operational transducer.
 [buffer]: ../crates/core-nodes/src/processors/durable_buffer_processor/
 [temporal]: ../crates/core-nodes/src/processors/temporal_reaggregation_processor/README.md
 [state-dir]: state-directory.md
+[rules-rfc]: ../rfcs/0000-query-defined-metric-rules.md
 [model]: model_requirements.md#gauge-histogram
 [prom-spec]: https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/#timestamps
 [resets]: https://opentelemetry.io/docs/specs/otel/metrics/data-model/#cumulative-streams-handling-unknown-start-time
