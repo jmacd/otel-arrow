@@ -174,15 +174,26 @@ sealed boundary, not the wall-clock times of two HTTP scrapes.
 
 ### E. Integrate the protocols
 
-- [ ] **E1. Add `receiver:statsd` (can start after A1).** Specify a bounded
-  UDP listener and a documented dialect. Start with counters and absolute
-  gauges; add timers/distributions, tags, sample rates and relative gauges
-  with fixtures before advertising support. Specify name/type/unit and
-  source-identity mapping; an additive level and a temperature gauge cannot
-  be distinguished from `|g` alone. Assign event time once at ingress for
-  untimestamped observations, define their OTAP interval representation, and
-  replay the assigned times. Bound datagrams, lines, tags and batching. Report
-  parse errors and observable drops; UDP has no end-to-end acceptance ACK.
+- [ ] **E1. Add `receiver:statsd` (can start after A1).** Target the
+  [DogStatsD v1.1 metrics wire format][dogstatsd-v11] over UDP. The first demo
+  needs counters; cover counts, gauges, timers, histograms, distributions and
+  single-value sets before claiming v1.1 metrics compatibility. Events,
+  service checks and later protocol extensions are separate. Specify OTAP
+  name/type/unit and source-identity mappings; `|g` alone cannot distinguish
+  an additive level from a temperature. Assign event time at ingress and
+  replay it unchanged. Bound datagrams, lines, packed values, tags, set
+  cardinality and batching; report parse errors and observable drops.
+  UDP has no end-to-end acceptance ACK.
+
+  Use the [Collector's proposed packed-value support][collector-packed] as a
+  conformance reference. For `c`, `g`, `ms`, `h` and `d`, a colon-separated
+  value list must act like separate single-value lines in wire order, sharing
+  the name, type, tags and applicable sample rate. Do not split `s` values.
+  Check signed relative gauge updates in order and apply the sample rate to
+  each eligible value, not once per packet. Match the proposed parser's edge
+  cases: skip empty entries between values; reject an all-empty list or a
+  malformed/non-finite number without applying any part of that line. Keep
+  the single-value fast path and resolve sender and tags once per packed line.
 - [ ] **E2. Add `exporter:prometheus` (A1, D4 reader contract).** Serve a
   bounded HTTP `/metrics` scrape from one committed snapshot. Negotiate the
   supported text/OpenMetrics formats; define naming, units, label collision
@@ -220,9 +231,11 @@ sealed boundary, not the wall-clock times of two HTTP scrapes.
 
 - [ ] **F1. Local example (B, C1-C2, C5, D, E1-E2).** Ship a runnable one-core
   config, StatsD input fixture, scrape instructions, expected samples and
-  restart procedure. Send `requests:3|c` and `requests:4|c` in one aligned
-  interval: two scrapes at the same commit must show 7, and restarting must
-  still show 7. Add an UpDownCounter and gauge case with explicit mappings.
+  restart procedure. Send `requests:3:4|c|#service:api` in one aligned interval:
+  two scrapes at the same commit must show 7, and restarting must still show
+  7. In a fresh run, send two single-value lines with the same tag and verify
+  the same series and total. Add an UpDownCounter and gauge case with explicit
+  mappings.
 - [ ] **F2. Regional example (F1, E4).** Ship separate edge/regional configs,
   state directories and endpoints. Project away host at the edge, retain edge
   writer identity until regional reconciliation, and aggregate by service.
@@ -305,6 +318,8 @@ timestamp are outside this first operational transducer.
 
 [prom-rx]: ../crates/core-nodes/src/receivers/prometheus_receiver/mod.rs
 [prom-config]: ../configs/prometheus-otlp.yaml
+[dogstatsd-v11]: https://docs.datadoghq.com/extend/dogstatsd/datagram_shell/#dogstatsd-protocol-v11
+[collector-packed]: https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/53348
 [otap-tx]: ../crates/core-nodes/src/exporters/otap_exporter/README.md
 [quiver]: ../crates/quiver/README.md
 [buffer]: ../crates/core-nodes/src/processors/durable_buffer_processor/
