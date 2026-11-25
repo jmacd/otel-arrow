@@ -35,7 +35,8 @@ sealed boundary, not the wall-clock times of two HTTP scrapes.
 | Area | Reuse or gap |
 | --- | --- |
 | Prometheus ingress | [`receiver:prometheus`][prom-rx] already scrapes text/OpenMetrics into OTAP; [example configuration][prom-config]. Its source pipeline requires one core. Use it as an interoperability client, not as the exporter. |
-| StatsD and Prometheus egress | Add a StatsD receiver and a Prometheus scrape exporter for **pipeline metric data**. The engine's admin/self-telemetry endpoint serves a different dataset. |
+| StatsD over UDP | Add paired receive and export nodes using [pdata codecs][codecs] for plain StatsD and DogStatsD. The [syslog exporter proposal][syslog-tx] provides the UDP send and encoded-forwarding pattern. |
+| HTTP pull | Add a codec-aware HTTP endpoint for **pipeline data**. Prometheus `/metrics` is its first use; the existing [admin endpoint][admin-metrics] serves engine self-telemetry. |
 | Regional link | Reuse [`exporter:otap`][otap-tx] and `receiver:otap`. A gRPC stream's batch ACK correlates an attempt; it is not a durable identity for a publication retried on another stream. |
 | Storage | [Quiver][quiver] has WAL recovery, immutable Arrow segments, subscriber progress and a disk budget. The [durable buffer][buffer] already adapts OTAP bundles and separates ingestion from downstream delivery. A restart-safe retention bookmark independent of delivery progress is new work. |
 | Aggregation | Reuse OTAP views, builders and applicable identity logic. The [temporal reaggregation processor][temporal] is an in-memory processor with different supported types and flush semantics; keep its existing contract. |
@@ -174,18 +175,36 @@ sealed boundary, not the wall-clock times of two HTTP scrapes.
 
 ### E. Integrate the protocols
 
-- [ ] **E1. Add `receiver:statsd` (can start after A1).** Target the
-  [DogStatsD v1.1 metrics wire format][dogstatsd-v11] over UDP. The first demo
-  needs counters; cover counts, gauges, timers, histograms, distributions and
-  single-value sets before claiming v1.1 metrics compatibility. Events,
-  service checks and later protocol extensions are separate. Specify OTAP
-  name/type/unit and source-identity mappings; `|g` alone cannot distinguish
-  an additive level from a temperature. Assign event time at ingress and
-  replay it unchanged. Bound datagrams, lines, packed values, tags, set
-  cardinality and batching; report parse errors and observable drops.
-  UDP has no end-to-end acceptance ACK.
+- [ ] **E1. Add StatsD codecs and paired UDP nodes (can start after A1).**
+  - **Codecs.** Register distinct metrics byte encodings for original StatsD
+    (`statsd`) and [DogStatsD v1.1][dogstatsd-v11] (`dogstatsd-v1.1`).
+    Nodes select the wire encoding; pipeline [codec bindings][codecs] supply
+    its decoder and encoder. Put parsing, OTAP mappings and serialization in
+    the codecs. Define which names, types, units and attributes each dialect
+    can represent, and report unrepresentable output. For example, `|g` alone
+    cannot distinguish an additive level from a temperature.
+  - **`receiver:statsd`.** Receive UDP datagrams only; Unix sockets are out of
+    scope. Emit each datagram as a **metrics bytes payload** tagged with the
+    listener's configured encoding. Capture ingress time and sender identity
+    once and retain them with the input so deferred decoding and replay use
+    the original observation. The receiver handles socket limits and reports
+    observable drops; a consumer requests decoding when it needs OTAP records.
+  - **`exporter:statsd`.** Follow the [syslog exporter's UDP path][syslog-tx]
+    with the metrics signal and the selected StatsD encoding. Forward matching
+    encoded datagrams directly; otherwise request the wire bytes from the
+    pipeline codec service. Send bounded datagrams, preserving whole metric
+    lines; send only wire bytes, not local arrival metadata. A successful UDP
+    send confirms local transmission only. Round-trip each dialect over UDP:
+    check byte preservation on a matching relay and metric equivalence for
+    representable OTAP input through encode and decode. Use `requests:3|c` for
+    plain StatsD; exercise tags and packed values only in the DogStatsD codec.
 
-  Use the [Collector's proposed packed-value support][collector-packed] as a
+  Start with counters for the first demo. Before claiming DogStatsD v1.1
+  metrics compatibility, cover counts, gauges, timers, histograms,
+  distributions and single-value sets. Events, service checks and later
+  extensions are separate. Bound lines, packed values, tags, set cardinality
+  and batching; report parse errors. For the DogStatsD codec, use the
+  [Collector's proposed packed-value support][collector-packed] as a
   conformance reference. For `c`, `g`, `ms`, `h` and `d`, a colon-separated
   value list must act like separate single-value lines in wire order, sharing
   the name, type, tags and applicable sample rate. Do not split `s` values.
@@ -193,15 +212,25 @@ sealed boundary, not the wall-clock times of two HTTP scrapes.
   each eligible value, not once per packet. Match the proposed parser's edge
   cases: skip empty entries between values; reject an all-empty list or a
   malformed/non-finite number without applying any part of that line. Keep
-  the single-value fast path and resolve sender and tags once per packed line.
-- [ ] **E2. Add `exporter:prometheus` (A1, D4 reader contract).** Serve a
-  bounded HTTP `/metrics` scrape from one committed snapshot. Negotiate the
-  supported text/OpenMetrics formats; define naming, units, label collision
-  handling, staleness, and format-specific timestamp behavior. Expose monotonic
-  sums as counters; represent non-monotonic totals according to the Prometheus
-  mapping while preserving their additive semantics internally. Make concurrent
-  scrapes read-only. Validate with the existing Prometheus receiver and an
-  independent Prometheus parser or server, not just a golden text comparison.
+  the single-value fast path, reuse the datagram's sender and resolve tags
+  once per packed line.
+- [ ] **E2. Serve committed snapshots over codec-aware HTTP pull (A1, D4).**
+  The endpoint receives HTTP GETs and exports pipeline data in the response;
+  `receiver:prometheus` remains the scraping client. Configure each route with
+  its signal and offered byte encodings. Negotiate `Accept`, ask the pipeline
+  codec service for the selected representation and return its `Content-Type`.
+  Support any registered encoder for the route's signal. Bound concurrency and
+  response size; each request reads one committed snapshot without consuming
+  it or advancing a reader cursor.
+
+  Configure `/metrics` to offer Prometheus text and OpenMetrics. Their codecs
+  own naming, units, label collisions, staleness and format-specific
+  timestamps. Expose monotonic sums as counters and preserve non-monotonic
+  sums' additive semantics internally. Scrape with `receiver:prometheus` and
+  an independent Prometheus parser or server. Configure a second route for
+  `otlp-bytes` metrics and decode its response at the same commit to prove
+  the HTTP server is independent of the exposition format. An `Accept` header
+  matching none of the offered types receives HTTP 406.
 - [ ] **E3. Use per-series first observation for unknown starts (A1, C1).**
   Preserve genuine `_created` times. For absent starts, follow the stateless
   [conversion rules][prom-spec]: leave the field unset. The stateful transducer
@@ -250,8 +279,9 @@ sealed boundary, not the wall-clock times of two HTTP scrapes.
 ### F. Ship the examples and establish equivalence
 
 - [ ] **F1. Local example (B, C1-C2, C5, D, E1-E2).** Ship a runnable one-core
-  config, StatsD input fixture, scrape instructions, expected samples and
-  restart procedure. Send `requests:3:4|c|#service:api` in one aligned interval:
+  config, UDP input fixture, scrape instructions, expected samples and restart
+  procedure. Select the DogStatsD v1.1 codec on ingress and Prometheus text on
+  the HTTP pull route. Send `requests:3:4|c|#service:api` in one interval:
   two scrapes at the same commit must show 7, and restarting must still show
   7. In a fresh run, send two single-value lines with the same tag and verify
   the same series and total. Add an UpDownCounter and gauge case with explicit
@@ -341,6 +371,9 @@ operational transducer.
 
 [prom-rx]: ../crates/core-nodes/src/receivers/prometheus_receiver/mod.rs
 [prom-config]: ../configs/prometheus-otlp.yaml
+[codecs]: codecs.md
+[syslog-tx]: https://github.com/open-telemetry/otel-arrow/pull/4655
+[admin-metrics]: admin/README.md
 [dogstatsd-v11]: https://docs.datadoghq.com/extend/dogstatsd/datagram_shell/#dogstatsd-protocol-v11
 [collector-packed]: https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/53348
 [otap-tx]: ../crates/core-nodes/src/exporters/otap_exporter/README.md
